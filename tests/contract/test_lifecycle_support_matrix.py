@@ -31,6 +31,8 @@ from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
+import skillweave_sdk.validator as _sdk_validator
+
 # ── Paths ───────────────────────────────────────────────────────────────────
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -45,7 +47,16 @@ if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
 
-# ── Fixtures ────────────────────────────────────────────────────────────────
+# ── SDK-backed fixtures (contract authority) ────────────────────────────────
+
+
+def _sdk_schema(contract: str) -> dict:
+    """Return the SDK schema dict for a lifecycle contract name."""
+    reg = _sdk_validator.load_registry()
+    for sid, schema in reg.items():
+        if f"lifecycle/{contract}" in sid:
+            return schema
+    raise ValueError(f"SDK schema not found for lifecycle contract {contract!r}")
 
 
 @pytest.fixture(scope="module")
@@ -58,20 +69,20 @@ def matrix() -> dict:
 
 @pytest.fixture(scope="module")
 def contracts_registry() -> Registry:
-    """All lifecycle schemas registered by ``$id`` for cross-schema ``$ref``."""
+    """All lifecycle schemas registered by ``$id`` from the installed SDK."""
+    reg = _sdk_validator.load_registry()
     resources = []
-    for schema_file in CONTRACTS_DIR.glob("*.schema.json"):
-        doc = json.loads(schema_file.read_text(encoding="utf-8"))
-        resources.append(
-            (doc["$id"], Resource.from_contents(doc, default_specification=DRAFT202012))
-        )
+    for sid, schema in reg.items():
+        if "lifecycle" in sid:
+            resources.append(
+                (schema["$id"], Resource.from_contents(schema, default_specification=DRAFT202012))
+            )
     return Registry().with_resources(resources)
 
 
 def _validator(contract_name: str, registry: Registry) -> Draft202012Validator:
-    entry = LOCK["contracts"][contract_name]
-    schema_path = CONTRACTS_DIR / entry["schema"]
-    doc = json.loads(schema_path.read_text(encoding="utf-8"))
+    """Return a validator for the named contract using the SDK schema."""
+    doc = _sdk_schema(contract_name)
     return Draft202012Validator(doc, registry=registry)
 
 
@@ -134,9 +145,7 @@ def test_matrix_irreversible_surfaces_match_runtime():
 
 def test_matrix_evidence_strengths_match_schema():
     """The matrix evidence strengths match the evidence-contract schema enum."""
-    schema = json.loads(
-        (CONTRACTS_DIR / "evidence-contract.schema.json").read_text(encoding="utf-8")
-    )
+    schema = _sdk_schema("evidence-contract")
     schema_strengths = set(schema["$defs"]["evidenceStrength"]["enum"])
     with open(MATRIX_PATH) as f:
         matrix = yaml.safe_load(f)

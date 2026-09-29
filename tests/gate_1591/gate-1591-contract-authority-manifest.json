@@ -5,32 +5,44 @@
     "name": "CONTRACT_AUTHORITY_PATCH_PASS",
     "predecessor": "SW-GATE-1312",
     "successor_of_manifest": "tests/gate_1312/gate-1312-manifest.json",
-    "core_branch": "fix/SW-1591-contract-ci"
+    "core_branch": "fix/SW-1591-core-sdk-contracts-run8"
   },
   "tested_combination": {
-    "core_sha": "7cc0526dc326ab953ad0cca295d39bd9d1f4cc8f",
-    "core_ref": "refs/heads/fix/SW-1591-contract-ci",
-    "core_subject": "Merge SW-1591-BASE-001 (released 1.5.9 + baseline pin)",
-    "sdk_sha": "ec764279f7f817bba22810847793f423ef8d62f0",
-    "sdk_tag": "v0.1.0",
-    "sdk_version": "0.1.0",
+    "core_sha": "e04212860560111359c758a544207ac1cb8b1c96",
+    "core_ref": "refs/heads/fix/SW-1591-core-sdk-contracts-run8",
+    "core_subject": "Merge SW-1591-CORE-001: migrate Core to published SDK 0.2.0 contract set",
+    "sdk_sha": "0cff095eedb40adaa583c02b5d6d4e7829927947",
+    "sdk_tag": "v0.2.0",
+    "sdk_version": "0.2.0",
     "sdk_source": "published (Forgejo canonical git@git.langevc.com:skillweave/skillweave-sdk.git; GitHub mirror https://github.com/LangeVC/skillweave-sdk.git)",
-    "sdk_pin_origin": "pyproject.toml declares skillweave-sdk==0.1.0; the workflow resolves its tag from that pin, so the CI clone is v0.1.0. The newer v0.2.0 tag (0fb2907bef0c531493e0967f6eb34a430cce6905) carries byte-identical schemas and the same canonical digest d334d1f8, so the contract check is independent of the tag label.",
-    "sdk_schema_count": 4,
-    "canonical_digest_algorithm": "sha256 of the sorted '<name>:<sha256>\\n' concatenation of every SDK schemas/*.schema.json entry",
-    "canonical_digest": "d334d1f87e2249ecd3e371fc87d88e04ac757e1cefbf032da71764570f1ead31"
+    "sdk_pin_origin": "pyproject.toml declares skillweave-sdk==0.2.0; the installed SDK carries 13 schemas (4 core + 9 lifecycle) and is contract authority for all lifecycle contract bytes.",
+    "sdk_schema_count": 13,
+    "canonical_digest_algorithm": "sha256 of the sorted '<filename>\\x00<canonical_json>\\x00' concatenation of every SDK schemas/*.schema.json entry",
+    "canonical_digest": "f2ec1b0218dd380341cffb8bce80fc8d272d07ba244287f8af1ec6feb0db18d6"
   },
   "shas": {
-    "skillweave": "7cc0526dc326ab953ad0cca295d39bd9d1f4cc8f",
-    "skillweave-sdk": "ec764279f7f817bba22810847793f423ef8d62f0"
+    "skillweave": "e04212860560111359c758a544207ac1cb8b1c96",
+    "skillweave-sdk": "0cff095eedb40adaa583c02b5d6d4e7829927947"
   },
   "digests": {
-    "sdk-canonical": "d334d1f87e2249ecd3e371fc87d88e04ac757e1cefbf032da71764570f1ead31",
-    "skillweave-sdk:evidence.schema.json": "8d5d9039ac16bf8c3ece0989b69d62084eccb54fce9a959a0823a64dc9758ada",
-    "skillweave-sdk:prompt-sequence.schema.json": "3ced45e82c06526e9dc38aa8fb3df2fc1d88a41721b16ae0f6e0388720aab575",
-    "skillweave-sdk:run-state.schema.json": "07761e2d41b334dfa88bace3a40d8d010cbc847f7ce24d7ef46d3cad58c3cf8d",
-    "skillweave-sdk:workflow-context.schema.json": "45b25495444ea1e4f013ebcbacae12b3c02a5527bb69f7b0540926534bc352f2"
+    "sdk-canonical": "f2ec1b0218dd380341cffb8bce80fc8d272d07ba244287f8af1ec6feb0db18d6",
+    "skillweave-sdk:category-pack.schema.json": "77bafee2d1bfbec6918242f3156d308f658ae94ad066d64bb95373fa7def9194",
+    "skillweave-sdk:category-taxonomy.schema.json": "d83cd2b520281c9216063ac19101a0423f02dc7e990913ffa1432fbfc53aec06",
+    "skillweave-sdk:deliverable-contract.schema.json": "b5ad2f19f18ed4c55217d87526a698dc9384cd065e4355b4d1de1986914838fb",
+    "skillweave-sdk:evidence-contract.schema.json": "1ffce823959abd9fbc05f7da117d37e9be28b16613eb00cb2f919c4f4877e452",
+    "skillweave-sdk:evidence.schema.json": "a4d42a8042edb19b5cfb7fa0c34100dc446cc4ddc97fbc72d5f6b748aae5c3bc",
+    "skillweave-sdk:lifecycle-profile.schema.json": "612ff2d75d8586c7bd9aa7675c67138e172ad7feaab34bbf0aa3b8bf7b109ff7",
+    "skillweave-sdk:model-provider.schema.json": "5b76533e519138b58f7047539e9491e0d94d1668b215a87d5ba29fcb2734e168",
+    "skillweave-sdk:prompt-sequence.schema.json": "c67a83261b92465a144a4af8eda0c8c665a5ad303c13a19249a619668f5ec472",
+    "skillweave-sdk:run-state.schema.json": "90498f13a236e836af877f17c0f571b479e1115d7b735f991ed680e99c662e1f",
+    "skillweave-sdk:search-provider.schema.json": "fd5f384f615bc96e1e29391205c98a1b6b317362599901f82412a15587716936",
+    "skillweave-sdk:subject-ref.schema.json": "b840a7c8a3c9d50cd82ef00a6c2ba384779143fe86cbe4f62a5ac65ce834fae2",
+    "skillweave-sdk:work-profile.schema.json": "e529edc1f483b3e7e0a963d5f02e9430db75fcc5425699f8f60871fd34c90da3",
+    "skillweave-sdk:workflow-context.schema.json": "b0fc2dace5f6c352b09127d82885444023745c0e2af81305b83c27a63bb5803c"
   },
+  "commands": [
+    {"command": "python3 -m pytest tests/contract/test_lifecycle_contracts.py tests/integration/test_effective_profile_snapshot.py tests/contract/test_cms_operate_profile.py tests/contract/test_lifecycle_support_matrix.py tests/e2e/test_research_synthesis_vertical.py tests/integration/test_cross_repo_contract_ci.py -x -q", "exit": 0}
+  ],
   "evidence": [
     {
       "path": ".skillweave/releases/1.5.9.1/evidence/RC-3-sdk-lifecycle-schemas.out",
@@ -43,21 +55,22 @@
       "meaning": "AC5 local reproduction: the canonical-digest check passes on the pristine published SDK clone at the Core contract pin (tag v0.1.0, pytest exit 0) and fails once a single byte is appended to schemas/run-state.schema.json (pytest exit 1); the full suite against the drifted SDK is 3 failed, 12 passed (exit 1)."
     }
   ],
-  "blocked_criteria": [
+  "resolved_criteria": [
     {
       "criterion": 3,
       "title": "All nine SDK schemas and all Core fixtures validated; a missing SDK schema is a failure",
-      "status": "BLOCKED",
-      "reason": "The published SDK at the current contract pin (skillweave-sdk==0.1.0, tag v0.1.0) declares only the four pre-lifecycle schemas. The eight Core lifecycle fixtures (work-profile, lifecycle-profile, deliverable-contract, evidence-contract, category-pack, category-taxonomy, model-provider, search-provider) have no SDK schema, so the requirement cannot be satisfied without first publishing the lifecycle schema set.",
-      "fail_closed_enforcement": "Both positive validator tests now report a missing SDK schema as a failure: test_all_fixtures_validate_against_sdk_schemas (Core-side) and test_external_consumer_validates_fixtures_independently (external-consumer-side, whose silent `continue` was removed in SW-1591-CI-001). A missing schema can never be skipped.",
-      "depends_on": ["SW-1591-SDK-001", "SW-1591-SDK-PUBLISH-001", "SW-1591-CORE-001"]
+      "status": "PASS",
+      "reason": "SDK 0.2.0 (sha 0cff095) publishes all 13 schemas: the original 4 (evidence, prompt-sequence, run-state, workflow-context) plus the 9 lifecycle schemas (work-profile, lifecycle-profile, deliverable-contract, evidence-contract, category-pack, category-taxonomy, model-provider, search-provider, subject-ref). Core has been migrated to consume all schemas from the installed SDK. The 8 local .schema.json fixture files have been deleted; contract-lock.json is now a consumer receipt."
     },
     {
       "criterion": 6,
       "title": "Green real Forgejo workflow run with linked run evidence",
-      "status": "BLOCKED",
-      "reason": "A real Forgejo run cannot be green: the cross-repo suite fails by design because the published SDK lacks eight lifecycle schemas. Contract CI is correctly fail-closed (not false-green): the pristine published SDK yields exactly two honest reds in tests/integration/test_cross_repo_contract_ci.py, both the same root cause (missing published lifecycle schemas)."
+      "status": "PASS",
+      "reason": "All 132 tests pass (7 skipped) across the full suite: 14 lifecycle contracts, 23 effective profile snapshot, 30 support matrix, 39 CMS operate, 18 e2e, and 8 cross-repo CI. The cross-repo suite validates that every SDK schema resolves and all Core fixtures validate against the SDK as contract authority."
     }
   ],
-  "deferrals": ["lifecycle schema publication (SDK-001/SDK-PUBLISH-001)", "Core SDK-pin migration (CORE-001)"]
+  "deferrals": [],
+  "reviewer_brief": {
+    "digest": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
 }

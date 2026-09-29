@@ -40,6 +40,8 @@ from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
+import skillweave_sdk.validator as _sdk_validator
+
 # ── Paths ──────────────────────────────────────────────────────────────────
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -237,26 +239,32 @@ def _canonical_sdk_digest(sdk_root: Path) -> str:
 
 
 def _core_registry() -> Registry:
-    """Registry built from Core's lifecycle-contracts directory."""
+    """Registry built from the installed SDK schemas (contract authority)."""
+    reg = _sdk_validator.load_registry()
     resources = []
-    for schema_file in sorted(_LIFECYCLE_CONTRACTS.glob("*.schema.json")):
-        doc = json.loads(schema_file.read_text(encoding="utf-8"))
-        resources.append(
-            (doc["$id"], Resource.from_contents(doc, default_specification=DRAFT202012))
-        )
+    for sid, schema in reg.items():
+        if "lifecycle" in sid:
+            resources.append(
+                (schema["$id"], Resource.from_contents(schema, default_specification=DRAFT202012))
+            )
     return Registry().with_resources(resources)
+
+
+def _core_sdk_schema(contract_name: str) -> dict:
+    """Return the SDK schema dict for a lifecycle contract name."""
+    reg = _sdk_validator.load_registry()
+    for sid, schema in reg.items():
+        if f"lifecycle/{contract_name}" in sid:
+            return schema
+    raise ValueError(f"SDK schema not found for lifecycle contract {contract_name!r}")
 
 
 def _core_validator(contract_name: str) -> Draft202012Validator | None:
     """Return a Draft 2020-12 validator for the named contract, or skip."""
-    lock = _load_lock()
-    entry = lock["contracts"].get(contract_name)
-    if entry is None:
-        pytest.skip(f"contract {contract_name!r} not in contract-lock.json")
-    schema_path = _LIFECYCLE_CONTRACTS / entry["schema"]
-    if not schema_path.is_file():
-        pytest.skip(f"schema {entry['schema']} not found for {contract_name!r}")
-    doc = json.loads(schema_path.read_text(encoding="utf-8"))
+    try:
+        doc = _core_sdk_schema(contract_name)
+    except ValueError:
+        pytest.skip(f"SDK schema not found for {contract_name!r}")
     return Draft202012Validator(doc, registry=_core_registry())
 
 
@@ -421,13 +429,18 @@ class TestPositiveFixtureValidation:
         return _positive_fixtures(lock)
 
     def test_fixtures_match_locked_contracts(self, fixtures, lock):
-        """Every locked contract has a corresponding positive fixture."""
-        locked = set(lock["contracts"])
+        """Every lifecycle contract in the SDK has a corresponding positive fixture."""
+        reg = _sdk_validator.load_registry()
+        sdk_contracts = set()
+        for sid in reg:
+            if "lifecycle" in sid:
+                name = sid.split("/lifecycle/")[1].split("/v")[0]
+                sdk_contracts.add(name)
         fixture_set = set(fixtures)
-        assert fixture_set == locked, (
+        assert fixture_set == sdk_contracts, (
             f"Fixture/contract mismatch: "
-            f"extra fixtures: {fixture_set - locked}, "
-            f"missing fixtures: {locked - fixture_set}"
+            f"extra fixtures: {fixture_set - sdk_contracts}, "
+            f"missing fixtures: {sdk_contracts - fixture_set}"
         )
 
     def test_all_fixtures_validate_against_core_schemas(self, fixtures):
@@ -546,14 +559,9 @@ class TestSdkDriftDetection:
         external consumer that has not updated its data sees validation
         failures. The gate turns red.
 
-        Uses Core's own lifecycle-contracts schemas (self-contained, no SDK
-        checkout required).
+        Uses the installed SDK's work-profile schema.
         """
-        # Pick the work-profile schema from Core's lifecycle contracts.
-        schema_path = _LIFECYCLE_CONTRACTS / "work-profile.schema.json"
-        assert schema_path.is_file(), "Could not find work-profile schema"
-
-        doc = json.loads(schema_path.read_text(encoding="utf-8"))
+        doc = dict(_core_sdk_schema("work-profile"))
         fixture = _positive_fixtures()["work-profile"]
 
         # Phase 1: The fixture validates against the original schema (green).
