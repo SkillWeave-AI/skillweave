@@ -1,0 +1,161 @@
+........................................................................ [  5%]
+........................................................................ [ 10%]
+........................................................................ [ 16%]
+..........................F............................................. [ 21%]
+........................................................................ [ 27%]
+........................................................................ [ 32%]
+........................................................................ [ 38%]
+........................................................................ [ 43%]
+........................................................................ [ 49%]
+........................................................................ [ 54%]
+........................................................................ [ 59%]
+........................................................................ [ 65%]
+........................................................................ [ 70%]
+........................................................................ [ 76%]
+........................................................................ [ 81%]
+........................................................................ [ 87%]
+............................................F........................... [ 92%]
+FF.FF................................................................... [ 98%]
+..........................                                               [100%]
+=================================== FAILURES ===================================
+________________ test_thirteen_skills_are_named_and_match_disk _________________
+
+    def test_thirteen_skills_are_named_and_match_disk():
+        text = _doc.read_text()
+        on_disk = _skills_on_disk()
+>       assert len(on_disk) == 13, f"expected 13 skillweave-* skills, found {len(on_disk)}"
+E       AssertionError: expected 13 skillweave-* skills, found 14
+E       assert 14 == 13
+E        +  where 14 = len(['skillweave-blueprint', 'skillweave-council', 'skillweave-design', 'skillweave-discovery', 'skillweave-launch', 'skillweave-lifecycle', ...])
+
+tests/unit/test_doc_arch.py:75: AssertionError
+____________ TestSubstrateDocumentationAndDrift.test_no_disk_drift _____________
+
+self = <test_substrate_drift.TestSubstrateDocumentationAndDrift object at 0x10a6b0fc0>
+
+    def test_no_disk_drift(self):
+        """Verify that every entry currently on disk in .skillweave/ is documented."""
+        drift_errors = check_substrate_drift(DOC_PATH, DOT_SKILLWEAVE)
+>       assert not drift_errors, "\n".join(drift_errors)
+E       AssertionError: Undocumented .skillweave area(s) detected on disk: ['releases']. Please register and document them in docs/substrate-map.md.
+E       assert not ["Undocumented .skillweave area(s) detected on disk: ['releases']. Please register and document them in docs/substrate-map.md."]
+
+tests/unit/test_substrate_drift.py:257: AssertionError
+_ TestBundlePinsMatchOnDiskSkills.test_every_bundle_pin_names_an_on_disk_skill_with_matching_source _
+
+self = <test_version_sync.TestBundlePinsMatchOnDiskSkills object at 0x10a718050>
+
+    def test_every_bundle_pin_names_an_on_disk_skill_with_matching_source(self):
+        skills = self._skill_by_name()
+        for entry in self._bundle_capabilities():
+            name = entry["name"]
+            assert name in skills, f"bundle pin {name} has no on-disk skill"
+            expected_source = f"./skills/{name}"
+>           assert entry["source"] == expected_source, (
+                f"bundle pin {name} source {entry['source']!r} != on-disk {expected_source!r}"
+            )
+E           AssertionError: bundle pin skillweave-entry source './skills/skillweave' != on-disk './skills/skillweave-entry'
+E           assert './skills/skillweave' == './skills/skillweave-entry'
+E             
+E             - ./skills/skillweave-entry
+E             ?                    ------
+E             + ./skills/skillweave
+
+tests/unit/test_version_sync.py:146: AssertionError
+_ TestBundlePinsMatchOnDiskSkills.test_bundle_pin_version_matches_on_disk_skill_version _
+
+self = <test_version_sync.TestBundlePinsMatchOnDiskSkills object at 0x10a718190>
+
+    def test_bundle_pin_version_matches_on_disk_skill_version(self):
+        skills = self._skill_by_name()
+        for entry in self._bundle_capabilities():
+            name = entry["name"]
+            on_disk = skills[name]["version"]
+>           assert entry["version"] == on_disk, (
+                f"bundle pin {name} version {entry['version']!r} != on-disk skill {on_disk!r}"
+            )
+E           AssertionError: bundle pin skillweave-entry version '1.5.8' != on-disk skill '1.3.11'
+E           assert '1.5.8' == '1.3.11'
+E             
+E             - 1.3.11
+E             + 1.5.8
+
+tests/unit/test_version_sync.py:155: AssertionError
+____ TestRequiredSurfaces.test_required_surfaces_share_the_runtime_version _____
+
+self = <test_version_sync.TestRequiredSurfaces object at 0x10a718410>
+
+    def test_required_surfaces_share_the_runtime_version(self):
+        runtime = _read_first_match(
+            "pyproject.toml", r'^version\s*=\s*"(\d+\.\d+\.\d+)"'
+        )
+        assert runtime is not None, "pyproject.toml has no version"
+        assert re.fullmatch(r"\d+\.\d+\.\d+", runtime), f"not semver: {runtime!r}"
+    
+        for loc in _locations():
+            value = _read_first_match(loc["path"], loc["pattern"])
+            assert value is not None, f"no match for {loc['role']} at {loc['path']}"
+            if not loc.get("required", True):
+                # Informational (member pins + member files) may legitimately lag.
+                continue
+>           assert value == runtime, (
+                f"{loc['role']} at {loc['path']} is {value!r}, not runtime {runtime!r} "
+                f"(a required surface drifted from the runtime version)"
+            )
+E           AssertionError: distribution_bundle at capability.yaml is '1.5.8', not runtime '1.5.9' (a required surface drifted from the runtime version)
+E           assert '1.5.8' == '1.5.9'
+E             
+E             - 1.5.9
+E             ?     ^
+E             + 1.5.8
+E             ?     ^
+
+tests/unit/test_version_sync.py:188: AssertionError
+___ TestRequiredSurfaces.test_same_version_cannot_hide_a_different_inventory ___
+
+self = <test_version_sync.TestRequiredSurfaces object at 0x10a6b1cd0>
+
+    def test_same_version_cannot_hide_a_different_inventory(self):
+        # The lockstep version matches, but two inventories must still agree on
+        # their member set. Same version with a different skill list is a real
+        # failure state, detected here as same-version-different-inventory.
+        bundle_members = {
+            e["name"] for e in self._bundle_capabilities()
+        }
+        declared_skills = {
+            loc["path"].split("/")[1]
+            for loc in _skill_entries()
+            if loc["path"].startswith("skills/")
+        }
+>       assert bundle_members == declared_skills, (
+            f"same-version-different-inventory: bundle members "
+            f"{sorted(bundle_members)} != declared skills {sorted(declared_skills)}"
+        )
+E       AssertionError: same-version-different-inventory: bundle members ['skillweave-blueprint', 'skillweave-council', 'skillweave-design', 'skillweave-discovery', 'skillweave-entry', 'skillweave-launch', 'skillweave-lifecycle', 'skillweave-observe', 'skillweave-onboarding', 'skillweave-post-release', 'skillweave-promptchain-execute', 'skillweave-promptchain-generate', 'skillweave-promptchain-validate', 'skillweave-releasechain', 'skillweave-repo-health'] != declared skills ['skillweave', 'skillweave-blueprint', 'skillweave-council', 'skillweave-design', 'skillweave-discovery', 'skillweave-launch', 'skillweave-lifecycle', 'skillweave-observe', 'skillweave-onboarding', 'skillweave-post-release', 'skillweave-promptchain-execute', 'skillweave-promptchain-generate', 'skillweave-promptchain-validate', 'skillweave-releasechain', 'skillweave-repo-health']
+E       assert {'skillweave-...-launch', ...} == {'skillweave'...-launch', ...}
+E         
+E         Extra items in the left set:
+E         'skillweave-entry'
+E         Extra items in the right set:
+E         'skillweave'
+E         Use -v to get more diff
+
+tests/unit/test_version_sync.py:205: AssertionError
+=============================== warnings summary ===============================
+tests/unit/test_legacy_test_double_deprecation.py:26
+  /Users/andrelange/workspaces/skillweave-temp/.worktrees/sw1591/run-1/base/tests/unit/test_legacy_test_double_deprecation.py:26: DeprecationWarning: DEPRECATION NOTICE (SW-DEPR-001): 'skillweave.executor' is deprecated. No public executor name points to simulation. Real execution is handled by RunService ('skillweave.runsvc.service') or PromptChain ('skillweave.promptchain.execute'). For unit testing simulation, migrate imports to 'skillweave.legacy.test_double'.
+    import skillweave.executor as public_executor_shim
+
+tests/unit/test_legacy_exec.py::test_quarantine_warning_banner_is_stable
+  /opt/homebrew/lib/python3.14/site-packages/_pytest/python.py:166: LegacyExecutorWarning: WARNING(SW-LEGACY-EXEC-001): a direct call to the legacy simulating executor was made. This produces fabricated, in-process results and is NOT part of the canonical self-hosting path. Use the Run Application Service or the self-hosting entry for a real, evidence-backed run. (Migration note SW-DEPR-001: For testing, use skillweave.legacy.test_double).
+    result = testfunction(**testargs)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/unit/test_doc_arch.py::test_thirteen_skills_are_named_and_match_disk
+FAILED tests/unit/test_substrate_drift.py::TestSubstrateDocumentationAndDrift::test_no_disk_drift
+FAILED tests/unit/test_version_sync.py::TestBundlePinsMatchOnDiskSkills::test_every_bundle_pin_names_an_on_disk_skill_with_matching_source
+FAILED tests/unit/test_version_sync.py::TestBundlePinsMatchOnDiskSkills::test_bundle_pin_version_matches_on_disk_skill_version
+FAILED tests/unit/test_version_sync.py::TestRequiredSurfaces::test_required_surfaces_share_the_runtime_version
+FAILED tests/unit/test_version_sync.py::TestRequiredSurfaces::test_same_version_cannot_hide_a_different_inventory
+6 failed, 1316 passed, 2 warnings in 24.24s

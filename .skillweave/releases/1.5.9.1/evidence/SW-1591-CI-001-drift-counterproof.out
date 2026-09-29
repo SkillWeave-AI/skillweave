@@ -1,0 +1,19 @@
+# SW-1591-CI-001 AC5 drift counterproof - local reproduction
+## published SDK (pristine)
+origin: git@git.langevc.com:skillweave/skillweave-sdk.git
+sha:    ec764279f7f817bba22810847793f423ef8d62f0 (tag v0.1.0, the Core contract pin)
+.                                                                        [100%]
+1 passed, 14 deselected in 0.05s
+pytest exit: 0
+## one-byte drift appended to schemas/run-state.schema.json
+before: 07761e2d41b334dfa88bace3a40d8d010cbc847f7ce24d7ef46d3cad58c3cf8d
+after:  f85cdae1e4e25c00e1648954575d778c958f9aebc283801e64d74e0693aa5bf7
+FAILED tests/integration/test_cross_repo_contract_ci.py::TestPositiveFixtureValidation::test_every_sdk_schema_byte_matches_the_pinned_canonical_digest
+1 failed, 14 deselected in 0.06s
+pytest exit: 1
+## full suite against drifted published SDK
+FAILED tests/integration/test_cross_repo_contract_ci.py::TestPositiveFixtureValidation::test_all_fixtures_validate_against_sdk_schemas
+FAILED tests/integration/test_cross_repo_contract_ci.py::TestPositiveFixtureValidation::test_every_sdk_schema_byte_matches_the_pinned_canonical_digest
+FAILED tests/integration/test_cross_repo_contract_ci.py::TestPositiveFixtureValidation::test_external_consumer_validates_fixtures_independently
+3 failed, 12 passed in 0.13s
+pytest exit: 1
