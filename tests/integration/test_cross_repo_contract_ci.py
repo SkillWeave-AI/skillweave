@@ -20,7 +20,7 @@ Repository model
 * ``skillweave-sdk`` — owns the contract bytes; resolved from
   ``SKILLWEAVE_SDK_DIR`` env var or the pinned version in ``pyproject.toml``.
 
-When the SDK checkout is absent, SDK-dependent assertions ``pytest.skip``
+When the SDK checkout is absent, SDK-dependent assertions ``pytest.fail``
 with a named reason and the report lists which criteria were exercised.
 """
 
@@ -264,7 +264,7 @@ def _core_validator(contract_name: str) -> Draft202012Validator | None:
     try:
         doc = _core_sdk_schema(contract_name)
     except ValueError:
-        pytest.skip(f"SDK schema not found for {contract_name!r}")
+        pytest.fail(f"SDK schema not found for {contract_name!r}")
     return Draft202012Validator(doc, registry=_core_registry())
 
 
@@ -276,7 +276,7 @@ def _sdk_registry(sdk_root: Path) -> Registry:
     """
     sdk_schemas = sdk_root / "schemas"
     if not sdk_schemas.is_dir():
-        pytest.skip(f"SDK schemas dir not found at {sdk_schemas}")
+        pytest.fail(f"SDK schemas dir not found at {sdk_schemas}")
 
     resources = []
     for schema_file in sorted(sdk_schemas.glob("*.schema.json")):
@@ -287,7 +287,7 @@ def _sdk_registry(sdk_root: Path) -> Registry:
             (doc["$id"], Resource.from_contents(doc, default_specification=DRAFT202012))
         )
     if not resources:
-        pytest.skip(f"no schema resources found in SDK at {sdk_schemas}")
+        pytest.fail(f"no schema resources found in SDK at {sdk_schemas}")
     return Registry().with_resources(resources)
 
 
@@ -655,7 +655,7 @@ class TestNoLocalCheckoutDependency:
         """
         sdk_dir = os.environ.get(_SDK_DIR_ENV)
         if sdk_dir is None:
-            pytest.skip("SKILLWEAVE_SDK_DIR not set; not running in CI mode")
+            pytest.fail("SKILLWEAVE_SDK_DIR not set; not running in CI mode")
         sdk_path = Path(sdk_dir)
         assert sdk_path.is_dir(), (
             f"SKILLWEAVE_SDK_DIR={sdk_dir} does not exist — "
@@ -677,7 +677,7 @@ def sdk_checkout() -> Path:
     """Resolve the SDK checkout, skipping when absent."""
     sdk = _resolve_sdk()
     if sdk is None:
-        pytest.skip(
+        pytest.fail(
             "skillweave-sdk not available. Set SKILLWEAVE_SDK_DIR or "
             "place a skillweave-sdk checkout next to this repo."
         )
