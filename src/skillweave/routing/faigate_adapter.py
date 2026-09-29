@@ -490,6 +490,22 @@ class AttributedResponse(str):
         obj.substituted = flag
         return obj
 
+    def __getnewargs_ex__(self) -> tuple[tuple[str], dict[str, Any]]:
+        """Hand ``copy`` and ``pickle`` the keyword-only arguments ``__new__`` needs.
+
+        Both rebuild a ``str`` subclass by calling ``__new__``. Without this they
+        pass the text alone, and ``dataclasses.asdict()`` or ``copy.deepcopy()``
+        on a council result raises ``TypeError``. The recorded substitution
+        verdict is handed over as recorded, never recomputed.
+        """
+        return (str(self),), {
+            "requested_model": self.requested_model,
+            "answering_model": self.answering_model,
+            "provider": self.provider,
+            "served_by": self.served_by,
+            "is_substituted": self.is_substituted,
+        }
+
 
 def _extract_answer(envelope: dict, requested_model: str, provider: str = "unknown") -> AttributedResponse:
     """Read the answer content, actual answering model, and served_by from a response.

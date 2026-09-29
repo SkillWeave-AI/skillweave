@@ -1,6 +1,6 @@
 kind: bundle
 name: skillweave
-version: 1.5.8
+version: 1.5.9
 description: A complete 7-phase AI-assisted development lifecycle ecosystem.
 author: SkillWeave Team
 license: Apache-2.0
@@ -69,5 +69,5 @@ capabilities:
   source: ./skills/skillweave-repo-health
   version: 1.3.11
 - name: skillweave-entry
-  source: ./skills/skillweave
-  version: 1.5.8
+  source: ./skills/skillweave-entry
+  version: 1.3.11

@@ -3,13 +3,22 @@
 # Validates the contract boundary between SkillWeave Core, the SDK, and
 # external consumers:
 #
-#   1. SDK, Core and external consumer pin full tested SHAs.
-#   2. Positive fixtures validate in all participating repositories.
-#   3. An intentional SDK drift makes the consumer gate red.
-#   4. Contract CI does not depend on an unpublished local checkout.
+#   1. SDK and Core pin a full tested SHA / exact version.
+#   2. Every SDK schema and every Core fixture is actually validated.
+#   3. An intentional one-byte SDK schema drift makes the consumer gate red.
+#   4. The tested-combination manifest checks exact Core SHA, SDK SHA, SDK
+#      version and canonical digest — not only non-null values.
+#   5. Contract CI does not depend on an unpublished local checkout.
 #
 # The SDK is resolved from its pinned version in pyproject.toml, cloned from
-# the public mirror — never from a sibling checkout or unpublished path.
+# the published Forgejo (contract authority) or GitHub (read-only mirror)
+# source and recorded as tag plus full commit SHA — never from a sibling
+# checkout or unpublished path.
+#
+# SW-1591-CI-001: the "Resolve pinned SDK version" inline Python is indented to
+# the block scalar's own indentation. Commit 16e95d5 fixed exactly these six
+# lines; without them YAML parsing stops at the `import re` line and the whole
+# workflow never runs (a false-green boundary).
 
 name: Contract CI — Cross-Repo Contract Validation
 
@@ -41,12 +50,12 @@ jobs:
         id: sdk-pin
         run: |
           SDK_PIN="$(python3 -c "
-import re
-with open('pyproject.toml') as f:
-    text = f.read()
-m = re.search(r'\"skillweave-sdk==([^\"]+)\"', text)
-print(m.group(1) if m else '')
-")"
+          import re
+          with open('pyproject.toml') as f:
+              text = f.read()
+          m = re.search(r'\"skillweave-sdk==([^\"]+)\"', text)
+          print(m.group(1) if m else '')
+          ")"
           if [ -z "${SDK_PIN}" ]; then
             echo "::error::Could not resolve skillweave-sdk pin from pyproject.toml"
             exit 1
@@ -54,34 +63,63 @@ print(m.group(1) if m else '')
           echo "SDK pin: v${SDK_PIN}"
           echo "version=${SDK_PIN}" >> "$GITHUB_OUTPUT"
 
-      - name: Check out pinned SDK from the public mirror
+      - name: Check out pinned SDK from a published source
+        env:
+          SDK_VERSION: ${{ steps.sdk-pin.outputs.version }}
         run: |
-          SDK_VERSION="${{ steps.sdk-pin.outputs.version }}"
+          set -eu
           TAG="v${SDK_VERSION}"
-          # Clone from the public mirror — no unpublished checkout, no sibling
-          # path dependency. The mirror is the published source an external
-          # consumer pulls from.
-          if ! git clone --depth 1 --branch "${TAG}" \
-            https://github.com/LangeVC/skillweave-sdk.git /tmp/skillweave-sdk 2>/dev/null; then
-            # Fallback: shallow clone then checkout tag (handles cases where
-            # the tag is not the default branch tip).
-            git clone --depth 50 https://github.com/LangeVC/skillweave-sdk.git /tmp/skillweave-sdk
-            cd /tmp/skillweave-sdk
-            if ! git checkout "${TAG}"; then
-              echo "::error::SDK tag ${TAG} not found on the public mirror"
-              exit 1
+          # Published sources, in authority order: Forgejo is canonical, the
+          # GitHub mirror is read-only distribution. No sibling checkout, no
+          # unpublished local path.
+          SOURCES="git@git.langevc.com:skillweave/skillweave-sdk.git https://github.com/LangeVC/skillweave-sdk.git"
+          CLONED=0
+          for SOURCE in ${SOURCES}; do
+            rm -rf /tmp/skillweave-sdk
+            # Prefer an exact tag clone; fall back to a shallow clone plus
+            # checkout for sources where the tag is not the default branch tip.
+            if git clone --depth 1 --branch "${TAG}" "${SOURCE}" /tmp/skillweave-sdk 2>/dev/null; then
+              CLONED=1
+            elif git clone --depth 50 "${SOURCE}" /tmp/skillweave-sdk 2>/dev/null &&
+                 git -C /tmp/skillweave-sdk checkout "${TAG}" 2>/dev/null; then
+              CLONED=1
             fi
+            if [ "${CLONED}" -eq 1 ]; then
+              echo "SDK resolved from published source: ${SOURCE}"
+              break
+            fi
+          done
+          if [ "${CLONED}" -ne 1 ]; then
+            echo "::error::SDK tag ${TAG} not found on any published source"
+            exit 1
           fi
-          SDK_SHA="$(cd /tmp/skillweave-sdk && git rev-parse HEAD)"
+          SDK_SHA="$(git -C /tmp/skillweave-sdk rev-parse HEAD)"
+          SDK_REMOTE="$(git -C /tmp/skillweave-sdk remote get-url origin)"
           echo "SDK checked out at: ${TAG} -> ${SDK_SHA}"
           echo "SKILLWEAVE_SDK_DIR=/tmp/skillweave-sdk" >> "$GITHUB_ENV"
+          echo "SKILLWEAVE_SDK_TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "SKILLWEAVE_SDK_SHA=${SDK_SHA}" >> "$GITHUB_ENV"
+          echo "SKILLWEAVE_SDK_REMOTE=${SDK_REMOTE}" >> "$GITHUB_ENV"
+
+      - name: Record SDK tag and full commit SHA
+        run: |
+          set -eu
+          echo "### Contract CI — pinned SDK" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| field | value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| tag | ${SKILLWEAVE_SDK_TAG} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| commit | ${SKILLWEAVE_SDK_SHA} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| remote | ${SKILLWEAVE_SDK_REMOTE} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| core | $(git rev-parse HEAD) |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify SDK is from a published source (not a local checkout)
         run: |
+          set -eu
           cd /tmp/skillweave-sdk
           REMOTE="$(git remote get-url origin)"
           case "${REMOTE}" in
-            *github.com*) echo "SDK origin: ${REMOTE} — published source" ;;
+            *github.com*|*forgejo*|*git.langevc.com*) echo "SDK origin: ${REMOTE} — published source" ;;
             *)
               echo "::error::SDK origin ${REMOTE} is not a published source"
               exit 1
@@ -94,3 +132,92 @@ print(m.group(1) if m else '')
         run: |
           python3 -m pytest tests/integration/test_cross_repo_contract_ci.py \
             -v --tb=short 2>&1
+
+  # SW-1591-CI-001 AC5: prove that a one-byte SDK schema drift turns an
+  # external-consumer run red under the same shell and workflow commands as the
+  # green job above. This job must fail (the drift is intentional); a green run
+  # here means the drift went undetected and Contract CI is false-green.
+  drift-counterproof:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: https://github.com/actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: https://github.com/actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install pytest PyYAML jsonschema referencing
+
+      - name: Check out pinned SDK from a published source
+        run: |
+          set -eu
+          SDK_PIN="$(python3 -c "
+          import re
+          with open('pyproject.toml') as f:
+              text = f.read()
+          m = re.search(r'\"skillweave-sdk==([^\"]+)\"', text)
+          print(m.group(1) if m else '')
+          ")"
+          if [ -z "${SDK_PIN}" ]; then
+            echo "::error::Could not resolve skillweave-sdk pin from pyproject.toml"
+            exit 1
+          fi
+          TAG="v${SDK_PIN}"
+          for SOURCE in git@git.langevc.com:skillweave/skillweave-sdk.git https://github.com/LangeVC/skillweave-sdk.git; do
+            rm -rf /tmp/skillweave-sdk
+            if git clone --depth 1 --branch "${TAG}" "${SOURCE}" /tmp/skillweave-sdk 2>/dev/null; then
+              break
+            elif git clone --depth 50 "${SOURCE}" /tmp/skillweave-sdk 2>/dev/null &&
+                 git -C /tmp/skillweave-sdk checkout "${TAG}" 2>/dev/null; then
+              break
+            fi
+          done
+          if [ ! -d /tmp/skillweave-sdk/schemas ]; then
+            echo "::error::SDK tag ${TAG} not found on any published source"
+            exit 1
+          fi
+          echo "SKILLWEAVE_SDK_DIR=/tmp/skillweave-sdk" >> "$GITHUB_ENV"
+
+      - name: Inject one-byte drift into a published SDK schema
+        run: |
+          set -eu
+          TARGET="/tmp/skillweave-sdk/schemas/run-state.schema.json"
+          echo "Before: $(sha256sum "${TARGET}" | cut -d' ' -f1)"
+          # One byte, appended: the drift a consumer must not miss. The schema
+          # stays parseable so the failure is a validation failure, not a
+          # JSON parse error.
+          python3 - "${TARGET}" <<'PY'
+          import sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          data = p.read_bytes()
+          p.write_bytes(data + b"\n")
+          PY
+          echo "After:  $(sha256sum "${TARGET}" | cut -d' ' -f1)"
+
+      - name: Assert the drifted consumer run is red
+        run: |
+          set -eu
+          export SKILLWEAVE_SDK_DIR=/tmp/skillweave-sdk
+          # The canonical-digest check covers every schema byte, so it is red
+          # for exactly one reason here: the file we just appended a byte to.
+          # That isolates the proof to the drift instead of riding on any
+          # pre-existing red elsewhere in the suite.
+          set +e
+          python3 -m pytest tests/integration/test_cross_repo_contract_ci.py \
+            -q -p no:randomly \
+            -k test_every_sdk_schema_byte_matches_the_pinned_canonical_digest 2>&1
+          RC=$?
+          set -e
+          if [ "${RC}" -eq 0 ]; then
+            echo "::error::Drifted SDK passed the consumer gate — false green"
+            exit 1
+          fi
+          echo "Drift counterproof: one-byte drift detected, consumer gate red (pytest exit ${RC})"
+          echo "### Contract CI — drift counterproof" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "A one-byte append to schemas/run-state.schema.json turned the consumer gate red (pytest exit ${RC})." >> "$GITHUB_STEP_SUMMARY"

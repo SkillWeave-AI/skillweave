@@ -84,7 +84,7 @@ locations:
   # the two stay consistent and both may lag the bundle version (OPS decision
   # 2026-09-02). version-sync must NOT force a skill file equal to
   # source_of_truth; its own version surface is its capability.yaml.
-  - path: skills/skillweave/capability.yaml
+  - path: skills/skillweave-entry/capability.yaml
     role: skill_capability
     pattern: '^version:\s*(\S+)'
     required: false

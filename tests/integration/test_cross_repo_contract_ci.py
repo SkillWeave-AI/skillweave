@@ -20,7 +20,7 @@ Repository model
 * ``skillweave-sdk`` — owns the contract bytes; resolved from
   ``SKILLWEAVE_SDK_DIR`` env var or the pinned version in ``pyproject.toml``.
 
-When the SDK checkout is absent, SDK-dependent assertions ``pytest.skip``
+When the SDK checkout is absent, SDK-dependent assertions ``pytest.fail``
 with a named reason and the report lists which criteria were exercised.
 """
 
@@ -40,12 +40,19 @@ from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
+import skillweave_sdk.validator as _sdk_validator
+
 # ── Paths ──────────────────────────────────────────────────────────────────
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _LIFECYCLE_CONTRACTS = _REPO_ROOT / "schemas" / "lifecycle-contracts"
 _PYPROJECT = _REPO_ROOT / "pyproject.toml"
-_GATE_MANIFEST = _REPO_ROOT / "tests" / "gate_1312" / "gate-1312-manifest.json"
+# The tested-combination manifest for this gate. Gate-1591 supersedes Gate-1312
+# (whose manifest is immutable historical evidence and is never re-pointed);
+# the 1312 manifest remains a read-only fallback so the suite still runs in a
+# tree that predates the successor.
+_GATE_MANIFEST = _REPO_ROOT / "tests" / "gate_1591" / "gate-1591-contract-authority-manifest.json"
+_GATE_MANIFEST_FALLBACK = _REPO_ROOT / "tests" / "gate_1312" / "gate-1312-manifest.json"
 _LOCK_PATH = _LIFECYCLE_CONTRACTS / "contract-lock.json"
 
 # ── SDK resolution ─────────────────────────────────────────────────────────
@@ -74,19 +81,48 @@ def _resolve_sdk() -> Path | None:
     return None
 
 
-def _is_published_source(sdk_root: Path) -> bool:
-    """Return True if the SDK checkout origin is a published remote."""
+# Published remote hosts. Forgejo (git.langevc.com) is the contract-authority
+# remote; the GitHub mirror is distribution-only. A local path, a file:// URL
+# or an unpublished checkout must NOT match — that is the false-green this
+# pattern exists to prevent.
+#
+# A git remote URL is either a scheme URL ("ssh://host/…", "https://host/…")
+# or scp-like ("user@host:path"). Each host must appear as the authority in
+# one of those positions, so a filesystem path that merely contains a host-like
+# segment (e.g. "/Users/…/repositories/forgejo/skillweave-sdk") does not match.
+def _host_pattern(host: str) -> str:
+    # Match the host as a DNS label at the authority position: it may be
+    # followed by more labels (subdomains) and then the path separator or port.
+    return rf"(?:^|://|@){re.escape(host)}(?:\.[^/]*)?(?:[:/]|$)"
+
+
+_PUBLISHED_HOSTS = (
+    _host_pattern("github.com"),
+    _host_pattern("gitlab.com"),
+    _host_pattern("git.langevc.com"),
+    _host_pattern("forgejo"),
+)
+
+
+def _sdk_origin_url(sdk_root: Path) -> str | None:
+    """Return the SDK checkout's origin URL, or ``None`` when unavailable."""
     try:
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
             capture_output=True, text=True, check=True,
             cwd=str(sdk_root),
         )
-        url = result.stdout.strip()
-        # Published sources: github.com or other forge remotes.
-        return bool(re.search(r"github\.com|forgejo|gitlab\.com", url))
     except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return result.stdout.strip() or None
+
+
+def _is_published_source(sdk_root: Path) -> bool:
+    """Return True if the SDK checkout origin is a published remote."""
+    url = _sdk_origin_url(sdk_root)
+    if url is None:
         return False
+    return any(re.search(host, url) for host in _PUBLISHED_HOSTS)
 
 
 def _sdk_pin_from_pyproject() -> str | None:
@@ -101,7 +137,12 @@ def _load_lock() -> dict:
 
 
 def _load_manifest() -> dict:
-    return json.loads(_GATE_MANIFEST.read_text(encoding="utf-8"))
+    for path in (_GATE_MANIFEST, _GATE_MANIFEST_FALLBACK):
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    raise FileNotFoundError(
+        f"no tested-combination manifest found (looked for {_GATE_MANIFEST})"
+    )
 
 
 # ── Positive fixtures ─────────────────────────────────────────────────────
@@ -176,30 +217,54 @@ def _positive_fixtures(lock: dict | None = None) -> dict[str, dict]:
     }
 
 
+# ── Tested-combination manifest ───────────────────────────────────────────
+
+
+def _canonical_sdk_digest(sdk_root: Path) -> str:
+    """Canonical digest over every ``schemas/*.schema.json`` byte in the SDK.
+
+    Same algorithm the tested-combination manifest records: sha256 over the
+    sorted ``<name>:<sha256>\\n`` concatenation. It covers schema bytes that no
+    fixture currently exercises, so removing or rewriting such a schema still
+    turns the gate red.
+    """
+    entries = []
+    for schema_file in sorted((sdk_root / "schemas").glob("*.schema.json")):
+        digest = hashlib.sha256(schema_file.read_bytes()).hexdigest()
+        entries.append(f"{schema_file.name}:{digest}\n")
+    return hashlib.sha256("".join(entries).encode("utf-8")).hexdigest()
+
+
 # ── Contract validators ────────────────────────────────────────────────────
 
 
 def _core_registry() -> Registry:
-    """Registry built from Core's lifecycle-contracts directory."""
+    """Registry built from the installed SDK schemas (contract authority)."""
+    reg = _sdk_validator.load_registry()
     resources = []
-    for schema_file in sorted(_LIFECYCLE_CONTRACTS.glob("*.schema.json")):
-        doc = json.loads(schema_file.read_text(encoding="utf-8"))
-        resources.append(
-            (doc["$id"], Resource.from_contents(doc, default_specification=DRAFT202012))
-        )
+    for sid, schema in reg.items():
+        if "lifecycle" in sid:
+            resources.append(
+                (schema["$id"], Resource.from_contents(schema, default_specification=DRAFT202012))
+            )
     return Registry().with_resources(resources)
+
+
+def _core_sdk_schema(contract_name: str) -> dict:
+    """Return the SDK schema dict for a lifecycle contract name."""
+    reg = _sdk_validator.load_registry()
+    for sid, schema in reg.items():
+        if f"lifecycle/{contract_name}" in sid:
+            return schema
+    raise ValueError(f"SDK schema not found for lifecycle contract {contract_name!r}")
 
 
 def _core_validator(contract_name: str) -> Draft202012Validator | None:
     """Return a Draft 2020-12 validator for the named contract, or skip."""
-    lock = _load_lock()
-    entry = lock["contracts"].get(contract_name)
-    if entry is None:
-        pytest.skip(f"contract {contract_name!r} not in contract-lock.json")
-    schema_path = _LIFECYCLE_CONTRACTS / entry["schema"]
-    if not schema_path.is_file():
-        pytest.skip(f"schema {entry['schema']} not found for {contract_name!r}")
-    doc = json.loads(schema_path.read_text(encoding="utf-8"))
+    try:
+        doc = _core_sdk_schema(contract_name)
+    except ValueError:
+        pytest.fail(f"SDK schema not found for {contract_name!r}")
     return Draft202012Validator(doc, registry=_core_registry())
 
 
@@ -211,7 +276,7 @@ def _sdk_registry(sdk_root: Path) -> Registry:
     """
     sdk_schemas = sdk_root / "schemas"
     if not sdk_schemas.is_dir():
-        pytest.skip(f"SDK schemas dir not found at {sdk_schemas}")
+        pytest.fail(f"SDK schemas dir not found at {sdk_schemas}")
 
     resources = []
     for schema_file in sorted(sdk_schemas.glob("*.schema.json")):
@@ -222,7 +287,7 @@ def _sdk_registry(sdk_root: Path) -> Registry:
             (doc["$id"], Resource.from_contents(doc, default_specification=DRAFT202012))
         )
     if not resources:
-        pytest.skip(f"no schema resources found in SDK at {sdk_schemas}")
+        pytest.fail(f"no schema resources found in SDK at {sdk_schemas}")
     return Registry().with_resources(resources)
 
 
@@ -272,17 +337,78 @@ class TestShaPinning:
             f"External consumer pin {sdk_sha!r} is not a full 40-char SHA"
         )
 
-    def test_all_pinned_shas_are_known_tested_combinations(self, sdk_checkout):
-        """Every pinned SHA resolves to a commit on the published remote.
-
-        This validates that the pinned SHAs represent real, tested commits
-        and not invented or untested values.
+    def test_every_pin_resolves_on_the_published_sdk_remote(self, sdk_checkout):
+        """Every SDK SHA pinned in the gate manifest must exist on the published
+        SDK remote. A pin that resolves nowhere is an untested placeholder even
+        when it is not the all-zero hash.
         """
         manifest = _load_manifest()
         shas = manifest.get("shas", {})
-        for name, sha in shas.items():
-            assert sha != "0000000000000000000000000000000000000000", (
-                f"{name} SHA is the null hash (untested placeholder)"
+        sdk_pins = {n: s for n, s in shas.items() if n.startswith("skillweave-sdk")}
+        assert sdk_pins, "gate manifest must pin at least one skillweave-sdk SHA"
+        for name, sha in sdk_pins.items():
+            assert re.fullmatch(r"[0-9a-f]{40}", sha), (
+                f"{name} pin {sha!r} is not a full 40-char hex SHA"
+            )
+            assert sha != "0" * 40, f"{name} SHA is the null hash (untested placeholder)"
+            reachable = subprocess.run(
+                ["git", "-C", str(sdk_checkout), "cat-file", "-e", f"{sha}^{{commit}}"],
+                capture_output=True,
+            )
+            assert reachable.returncode == 0, (
+                f"{name} pin {sha} does not resolve to a commit on the published "
+                f"SDK checkout — the pin names an untested combination"
+            )
+
+    def test_exact_tested_combination_is_pinned(self, sdk_checkout):
+        """The pin must name an *exact* tested combination, not merely a
+        non-null value: full SDK SHA, SDK version from the published
+        ``schema_version.toml``, and this Core's own SHA must all be pinned and
+        consistent with each other.
+        """
+        manifest = _load_manifest()
+        sdk_sha_pin = manifest["shas"]["skillweave-sdk"]
+
+        # The published SDK at the pinned SHA declares its own version; that
+        # version must appear in the manifest's declared combination.
+        combined = json.dumps(manifest.get("tested_combination") or {}, sort_keys=True)
+        combined += json.dumps(manifest.get("shas", {}), sort_keys=True)
+        combined += json.dumps(manifest.get("digests", {}), sort_keys=True)
+        sdk_sha_live = subprocess.run(
+            ["git", "-C", str(sdk_checkout), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert sdk_sha_pin == sdk_sha_live, (
+            f"manifest pins SDK {sdk_sha_pin} but the published checkout is at "
+            f"{sdk_sha_live}; the tested combination is stale"
+        )
+
+        # SDK version comes from the SDK's own authority file, not Core's guess.
+        version = None
+        version_file = sdk_checkout / "schema_version.toml"
+        m = re.search(
+            r'^version\s*=\s*"([^"]+)"',
+            version_file.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        if m:
+            version = m.group(1)
+        assert version, f"published SDK {sdk_checkout} declares no schema version"
+        assert version in combined, (
+            f"SDK version {version} is not recorded anywhere in the tested "
+            f"combination manifest"
+        )
+
+        # The Core SHA in the combination must be a real commit in this repo.
+        core_sha = (manifest.get("tested_combination") or {}).get("core_sha")
+        if core_sha:
+            resolves = subprocess.run(
+                ["git", "-C", str(_REPO_ROOT), "cat-file", "-e", f"{core_sha}^{{commit}}"],
+                capture_output=True,
+            )
+            assert resolves.returncode == 0, (
+                f"tested combination names Core SHA {core_sha}, which does not "
+                f"resolve in this repository"
             )
 
 
@@ -303,13 +429,18 @@ class TestPositiveFixtureValidation:
         return _positive_fixtures(lock)
 
     def test_fixtures_match_locked_contracts(self, fixtures, lock):
-        """Every locked contract has a corresponding positive fixture."""
-        locked = set(lock["contracts"])
+        """Every lifecycle contract in the SDK has a corresponding positive fixture."""
+        reg = _sdk_validator.load_registry()
+        sdk_contracts = set()
+        for sid in reg:
+            if "lifecycle" in sid:
+                name = sid.split("/lifecycle/")[1].split("/v")[0]
+                sdk_contracts.add(name)
         fixture_set = set(fixtures)
-        assert fixture_set == locked, (
+        assert fixture_set == sdk_contracts, (
             f"Fixture/contract mismatch: "
-            f"extra fixtures: {fixture_set - locked}, "
-            f"missing fixtures: {locked - fixture_set}"
+            f"extra fixtures: {fixture_set - sdk_contracts}, "
+            f"missing fixtures: {sdk_contracts - fixture_set}"
         )
 
     def test_all_fixtures_validate_against_core_schemas(self, fixtures):
@@ -349,6 +480,26 @@ class TestPositiveFixtureValidation:
             f"SDK schema validation failures: {failures}"
         )
 
+    def test_every_sdk_schema_byte_matches_the_pinned_canonical_digest(
+        self, sdk_checkout
+    ):
+        """Every SDK schema byte is covered by the pinned canonical digest.
+
+        The digest names the exact schema bytes the tested combination was
+        validated against. A missing, added or rewritten schema changes the
+        digest and fails here even when no fixture references that schema.
+        """
+        manifest = _load_manifest()
+        recorded = (manifest.get("tested_combination") or {}).get("canonical_digest")
+        assert recorded, (
+            "manifest must record tested_combination.canonical_digest"
+        )
+        actual = _canonical_sdk_digest(sdk_checkout)
+        assert actual == recorded, (
+            f"SDK canonical digest drifted: manifest pins {recorded}, live bytes "
+            f"hash to {actual}. The SDK schema set is not the tested combination."
+        )
+
     def test_external_consumer_validates_fixtures_independently(
         self, fixtures, sdk_checkout
     ):
@@ -380,7 +531,9 @@ class TestPositiveFixtureValidation:
             if not schema_path.is_file():
                 schema_path = sdk_checkout / "schemas" / f"{contract}.schema.json"
             if not schema_path.is_file():
-                continue  # Not every fixture has a matching SDK schema.
+                # AC3: a missing SDK schema is a failure, never a silent skip.
+                failures.append((contract, f"no SDK schema for {contract}"))
+                continue
             doc = json.loads(schema_path.read_text(encoding="utf-8"))
             validator = Draft202012Validator(doc, registry=consumer_registry)
             errors = sorted(validator.iter_errors(instance), key=lambda e: list(e.path))
@@ -406,14 +559,9 @@ class TestSdkDriftDetection:
         external consumer that has not updated its data sees validation
         failures. The gate turns red.
 
-        Uses Core's own lifecycle-contracts schemas (self-contained, no SDK
-        checkout required).
+        Uses the installed SDK's work-profile schema.
         """
-        # Pick the work-profile schema from Core's lifecycle contracts.
-        schema_path = _LIFECYCLE_CONTRACTS / "work-profile.schema.json"
-        assert schema_path.is_file(), "Could not find work-profile schema"
-
-        doc = json.loads(schema_path.read_text(encoding="utf-8"))
+        doc = dict(_core_sdk_schema("work-profile"))
         fixture = _positive_fixtures()["work-profile"]
 
         # Phase 1: The fixture validates against the original schema (green).
@@ -507,7 +655,7 @@ class TestNoLocalCheckoutDependency:
         """
         sdk_dir = os.environ.get(_SDK_DIR_ENV)
         if sdk_dir is None:
-            pytest.skip("SKILLWEAVE_SDK_DIR not set; not running in CI mode")
+            pytest.fail("SKILLWEAVE_SDK_DIR not set; not running in CI mode")
         sdk_path = Path(sdk_dir)
         assert sdk_path.is_dir(), (
             f"SKILLWEAVE_SDK_DIR={sdk_dir} does not exist — "
@@ -529,7 +677,7 @@ def sdk_checkout() -> Path:
     """Resolve the SDK checkout, skipping when absent."""
     sdk = _resolve_sdk()
     if sdk is None:
-        pytest.skip(
+        pytest.fail(
             "skillweave-sdk not available. Set SKILLWEAVE_SDK_DIR or "
             "place a skillweave-sdk checkout next to this repo."
         )
