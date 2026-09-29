@@ -70,7 +70,7 @@ jobs:
 
           text = yaml_path.read_text("utf-8")
 
-          m = re.search(r"^\s+product_name:\s*(.+)$", text, re.MULTILINE)
+          m = re.search(r"^product_name:\s*(.+)$", text, re.MULTILINE)
           product_name = m.group(1).strip().strip("\"'") if m else ""
           if not product_name:
               sys.stderr.write(
@@ -79,7 +79,7 @@ jobs:
               )
               sys.exit(2)
 
-          m = re.search(r"^\s+pattern:\s*(.+)$", text, re.MULTILINE)
+          m = re.search(r"^pattern:\s*(.+)$", text, re.MULTILINE)
           pattern_raw = m.group(1).strip() if m else ""
           if (
               len(pattern_raw) >= 2

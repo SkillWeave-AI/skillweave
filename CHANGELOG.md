@@ -1,3 +1,33 @@
+## v1.5.9 (2026-09-30) — Contract Authority, Work Contracts & Methodology Registry
+
+SkillWeave v1.5.9 delivers the Contract Authority framework, cross-repo contract CI, work contracts, methodology registry, bounded repair, assay methodology, and infrastructure fixes for the release pipeline.
+
+### Contract Authority
+- **Cross-Repo Contract CI**: Fail-closed contract validation against the published SDK 0.2.0 schema set, with a drift counterproof job that proves one-byte schema drift turns the gate red.
+- **Core → SDK 0.2.0 Migration**: Core now validates against the published `skillweave-sdk` contract set instead of inline schemas.
+- **Council AttributedResponse**: `copy()`, `asdict()` and `pickle` now survive round-trips without losing attribution metadata.
+- **Skill Inventory Fixes**: Resolved 6 inventory test failures caused by the contract migration.
+
+### Features
+- **Work Contracts**: Discriminated `SubjectRef` variants (repository, content, configuration, deployment, incident) with `WorkContract` binding authority, write scope, irreversible actions, verification, rollback, and budget. Exact-brief contract via SHA-256 digest.
+- **Methodology Registry**: Versioned registry for REX, Ralph, Gauntlet, and Assay methodologies with compatibility matrix. Legacy `execution_model` values migrate deterministically.
+- **Assay Methodology**: Append-only state machine (PIN → HYPOTHESIS → PROBE → MEASURE → CLASSIFY → REMEDIATE → PASS/HOLD) with conservative, moderate, and unicorn autonomy policies.
+- **Bounded Preflight Repair**: Versioned `PreflightFailure` contract with grounded repair engine. Repairs are 1:1 substitutions preserving write scope; repeated fingerprints, target drift, and authority expansion trigger holds.
+- **Blueprint Data Contracts**: PRDs crossing storage, process, adapter, telemetry or public-API boundaries now require exact versioned data contracts instead of prose.
+- **Discovery Trace Graph**: Digest-bound trace from discovery Markdown to epics/tasks/deferrals. Silent loss of mandatory problems, missing links, and post-grounding digest drift all fail closed.
+- **Grounding Manifest**: Bounded, deterministic, read-only scanner producing digest-bearing manifests with language detection, symbol citations, and gap tracking.
+- **Blueprint Ticket Handshake**: Authority-aware planning ticket handshake with four terminal states (linked, created, not_applicable, needs_authority) and duplicate-title prevention.
+- **CMS Operate Profile**: Provider-neutral CMS Ops profile with Blueprint-always contracts, generic roles, and conditional skip-reasons.
+- **Edition Contracts**: Consent boundary export and Community/Pro contract separation.
+- **Telemetry**: Privacy-safe local empirical telemetry with shape-based path detection (not vendor-prefix denylist), disabled and local-only by default.
+- **Repository-Scoped Lane Contracts**: `RepositoryTarget` binding for lane contracts.
+- **Durable Async Run Lifecycle**: `start`/`inspect`/`kill` with durable state.
+- **Evidence-Backed Lane Outcome Resolution**: Lane outcomes resolved from evidence, not stdout.
+
+### Infrastructure
+- **Release Pipeline**: Flattened `release_title_policy` fields to `.version.yaml` root level for `ops-engine` parser compatibility. Updated `TITLE_GATE_PY` regex to match root-level keys.
+
+
 ## v1.5.8 (2026-09-27) — Generic Routing, Messaging & Validation Expansion
 
 SkillWeave v1.5.8 completes the Generic Lifecycle execution capability. It introduces a modular routing adapter, dedicated worker messaging channels, deterministic blocker slicing, and massive vertical and horizontal testing expansions for both Software Delivery and Research Synthesis pipelines.
