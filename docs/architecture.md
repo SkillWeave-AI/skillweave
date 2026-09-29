@@ -80,21 +80,23 @@ owner:
 
 ## Skill layer
 
-Thirteen skills ship as `skillweave-*` packages:
+Fifteen skills ship as `skillweave-*` packages:
 
 1. `skillweave-blueprint`
 2. `skillweave-council`
 3. `skillweave-design`
 4. `skillweave-discovery`
-5. `skillweave-launch`
-6. `skillweave-lifecycle`
-7. `skillweave-observe`
-8. `skillweave-post-release`
-9. `skillweave-promptchain-execute`
-10. `skillweave-promptchain-generate`
-11. `skillweave-promptchain-validate`
-12. `skillweave-releasechain`
-13. `skillweave-repo-health`
+5. `skillweave-entry`
+6. `skillweave-launch`
+7. `skillweave-lifecycle`
+8. `skillweave-observe`
+9. `skillweave-onboarding`
+10. `skillweave-post-release`
+11. `skillweave-promptchain-execute`
+12. `skillweave-promptchain-generate`
+13. `skillweave-promptchain-validate`
+14. `skillweave-releasechain`
+15. `skillweave-repo-health`
 
 ## Repository boundary
 

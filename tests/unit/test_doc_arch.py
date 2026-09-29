@@ -4,7 +4,7 @@ A machine check over ``docs/architecture.md`` proves the doc is current:
 
 1. **No stale statements.** The doc must not claim ``v0.4.4``, "five skills"
    (or "Five Integrated Skills"), or a simulator-as-executor path.
-2. **13 skills.** The skill layer section names exactly the thirteen
+2. **15 skills.** The skill layer section names exactly the fifteen
    ``skillweave-*`` packages that ship in ``skills/``.
 3. **Diagram matches the callgraph.** The canonical run path lists the six
    record stages in the order the Run Application Service produces them
@@ -72,7 +72,7 @@ def test_doc_exists_and_is_current():
 def test_thirteen_skills_are_named_and_match_disk():
     text = _doc.read_text()
     on_disk = _skills_on_disk()
-    assert len(on_disk) == 13, f"expected 13 skillweave-* skills, found {len(on_disk)}"
+    assert len(on_disk) == 15, f"expected 15 skillweave-* skills, found {len(on_disk)}"
     for skill in on_disk:
         assert skill in text, f"architecture doc is missing skill {skill!r}"
 
