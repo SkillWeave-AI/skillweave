@@ -55,23 +55,20 @@ from typing import Any, Mapping, Optional, Sequence
 # ── SDK contract pinning ───────────────────────────────────────────────────
 #
 # The SDK (skillweave-sdk) is contract authority. It owns the preview schema
-# version and the canonical schema digest; this module *pins* those values and
-# refuses a source that diverges. The values below mirror the released
-# ``skillweave_sdk.validator`` ``PREVIEW_SCHEMA_VERSION`` / ``EXPECTED_SCHEMA_DIGEST``
-# and are checked against an injected schema-set digest at resolution time, so
-# the core can bind the SDK without importing it (the SDK must stay importable
-# with no runtime present). A divergence from the canonical SDK is an error,
-# never a silent drift.
+# version and the canonical schema digest; this module imports those values
+# from the installed SDK rather than hardcoding unpublished bytes. A source
+# that diverges from the canonical SDK is refused — never a silent drift.
+
+import skillweave_sdk
+import skillweave_sdk.validator as _sdk_validator
 
 #: The SDK preview schema version this resolver binds to.
-SDK_PREVIEW_SCHEMA_VERSION = "0.1.0"
+SDK_PREVIEW_SCHEMA_VERSION = skillweave_sdk.SCHEMA_VERSION
 
 #: The canonical SDK schema digest every source must have been authored
 #: against. A source that claims this version but was signed against different
 #: bytes (same version, different bytes) is refused, not trusted.
-SDK_EXPECTED_SCHEMA_DIGEST = (
-    "2a52a4b820f0a1263149433e2f7e47e113133f54e6b38fd59c4cc93f7272e83e"
-)
+SDK_EXPECTED_SCHEMA_DIGEST = _sdk_validator.EXPECTED_SCHEMA_DIGEST
 
 #: The six source kinds in precedence order (strongest first).
 SOURCE_KINDS = (

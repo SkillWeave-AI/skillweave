@@ -8,8 +8,7 @@ Validates that the cms-operate.v1.yaml profile is:
   - Consistent with the "operate" category constraints (reactive/continuous
     topology, supervised or tighter human coupling)
 
-These tests use ONLY the contract directory and JSON Schema — no Core import
-path dependency (except where noted for RoutingProfile loading).
+These tests use the installed SDK (skillweave-sdk) as the contract authority.
 """
 
 from __future__ import annotations
@@ -23,6 +22,8 @@ import yaml
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
+
+import skillweave_sdk.validator as _sdk_validator
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROFILES_DIR = REPO_ROOT / "profiles"
@@ -60,7 +61,16 @@ FORBIDDEN_RUNTIME_IDS = (
 )
 
 
-# ── Fixtures ────────────────────────────────────────────────────────────────
+# ── SDK-backed fixtures (contract authority) ────────────────────────────────
+
+
+def _sdk_schema(contract: str) -> dict:
+    """Return the SDK schema dict for a lifecycle contract name."""
+    reg = _sdk_validator.load_registry()
+    for sid, schema in reg.items():
+        if f"lifecycle/{contract}" in sid:
+            return schema
+    raise ValueError(f"SDK schema not found for lifecycle contract {contract!r}")
 
 
 @pytest.fixture(scope="module")
@@ -73,20 +83,20 @@ def profile() -> dict:
 
 @pytest.fixture(scope="module")
 def contracts_registry() -> Registry:
-    """All lifecycle schemas registered by ``$id`` for cross-schema ``$ref``."""
+    """All lifecycle schemas registered by ``$id`` from the installed SDK."""
+    reg = _sdk_validator.load_registry()
     resources = []
-    for schema_file in CONTRACTS_DIR.glob("*.schema.json"):
-        doc = json.loads(schema_file.read_text(encoding="utf-8"))
-        resources.append(
-            (doc["$id"], Resource.from_contents(doc, default_specification=DRAFT202012))
-        )
+    for sid, schema in reg.items():
+        if "lifecycle" in sid:
+            resources.append(
+                (schema["$id"], Resource.from_contents(schema, default_specification=DRAFT202012))
+            )
     return Registry().with_resources(resources)
 
 
 def _validator(contract_name: str, registry: Registry) -> Draft202012Validator:
-    entry = LOCK["contracts"][contract_name]
-    schema_path = CONTRACTS_DIR / entry["schema"]
-    doc = json.loads(schema_path.read_text(encoding="utf-8"))
+    """Return a validator for the named contract using the SDK schema."""
+    doc = _sdk_schema(contract_name)
     return Draft202012Validator(doc, registry=registry)
 
 

@@ -1,15 +1,15 @@
 """Generic Lifecycle Extension — standalone lifecycle contracts (SW-160).
 
-These contracts are *bytes at a path*: an external consumer validates them with
-only the contract directory and a JSON Schema engine. Nothing here imports
-``skillweave``; the whole suite resolves the contract set relative to this file
-and drives it through ``jsonschema`` + ``referencing`` alone.
+These contracts are validated against the installed SDK (skillweave-sdk==0.2.0),
+which is the contract authority. Core is a consumer: it loads contract IDs,
+validation and digest from the installed SDK API rather than from hard-coded
+unpublished bytes.
 
 Acceptance criteria proven here:
 
 * **AC1** — an external consumer validates every contract without installing
-  SkillWeave core (cross-schema ``$ref`` resolution is satisfied purely from the
-  contract directory, and a child interpreter reproduces it).
+  SkillWeave core (the SDK is the single dependency; a child interpreter
+  reproduces it).
 * **AC2** — legacy software delivery stays representable without semantic loss
   (the canonical seven-phase substrate maps onto kernel stages with every id,
   order, skill, capability and phase type preserved).
@@ -24,12 +24,15 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
+
+import skillweave_sdk.validator as _sdk_validator
 
 CONTRACTS_DIR = (
     Path(__file__).resolve().parents[2] / "schemas" / "lifecycle-contracts"
@@ -68,34 +71,50 @@ FORBIDDEN_PROVIDER_NAMES = (
     "duckduckgo",
 )
 
+# ── SDK contract registry (contract authority) ──────────────────────────────
 
-def _load(name: str) -> dict:
-    return json.loads((CONTRACTS_DIR / name).read_text(encoding="utf-8"))
+# The eight lifecycle contracts the SDK owns, keyed by short contract name.
+# Derived from the installed SDK registry $id URLs.
+_LIFECYCLE_CONTRACT_NAMES = [
+    "work-profile",
+    "lifecycle-profile",
+    "deliverable-contract",
+    "evidence-contract",
+    "category-pack",
+    "category-taxonomy",
+    "model-provider",
+    "search-provider",
+]
 
 
-def _registry() -> Registry:
-    """Every contract registered by its own ``$id``.
-
-    Cross-schema ``$ref``s resolve from *this directory only* — the exact
-    capability an external consumer needs, with no Core on the import path.
-    """
+def _sdk_registry() -> Registry:
+    """Build a ``referencing`` Registry from the installed SDK schemas."""
+    reg = _sdk_validator.load_registry()
     resources = []
-    for schema_file in CONTRACTS_DIR.glob("*.schema.json"):
-        doc = _load(schema_file.name)
-        resources.append(
-            (doc["$id"], Resource.from_contents(doc, default_specification=DRAFT202012))
-        )
+    for sid, schema in reg.items():
+        if "lifecycle" in sid:
+            resources.append(
+                (schema["$id"], Resource.from_contents(schema, default_specification=DRAFT202012))
+            )
     return Registry().with_resources(resources)
 
 
-def _validator(contract: str) -> Draft202012Validator:
-    entry = LOCK["contracts"][contract]
-    assert entry["supportedVersions"] == ["1.0.0"], entry
-    return Draft202012Validator(_load(entry["schema"]), registry=_registry())
+def _sdk_schema(contract: str) -> dict:
+    """Return the SDK schema dict for a lifecycle contract name."""
+    reg = _sdk_validator.load_registry()
+    for sid, schema in reg.items():
+        if f"lifecycle/{contract}" in sid:
+            return schema
+    raise ValueError(f"SDK schema not found for lifecycle contract {contract!r}")
+
+
+def _sdk_validator_for(contract: str) -> Draft202012Validator:
+    """Return a validator for the named contract using SDK schemas."""
+    return Draft202012Validator(_sdk_schema(contract), registry=_sdk_registry())
 
 
 def _minimal_instances() -> dict[str, dict]:
-    """One smallest-legal instance per contract, derived from the lock."""
+    """One smallest-legal instance per lifecycle contract."""
     return {
         "work-profile": {
             "contractVersion": "1.0.0",
@@ -151,39 +170,45 @@ def _minimal_instances() -> dict[str, dict]:
 
 
 def test_ac1_external_consumer_validates_every_contract_without_core():
-    """AC1: every locked contract validates from the directory alone."""
-    assert set(_minimal_instances()) == set(LOCK["contracts"])
+    """AC1: every lifecycle contract validates from the installed SDK alone."""
+    assert set(_minimal_instances()) == set(_LIFECYCLE_CONTRACT_NAMES)
     for contract, instance in _minimal_instances().items():
         errors = sorted(
-            _validator(contract).iter_errors(instance), key=lambda e: list(e.path)
+            _sdk_validator_for(contract).iter_errors(instance),
+            key=lambda e: list(e.path),
         )
         assert errors == [], f"{contract}: {[e.message for e in errors]}"
 
 
 CHILD_SCRIPT = '''\
 import json
-import pathlib
 import sys
 
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 
-d = pathlib.Path(sys.argv[1])
-resources = []
-docs = {}
-by_file = {}
-for f in d.glob("*.schema.json"):
-    doc = json.loads(f.read_text())
-    docs[doc["$id"]] = doc
-    by_file[f.name] = doc
-    resources.append((doc["$id"], Resource.from_contents(doc)))
+import skillweave_sdk.validator as _sdk_validator
 
 assert "skillweave" not in sys.modules, "Core leaked onto the import path"
-lock = json.loads((d / "contract-lock.json").read_text())
+
+reg = _sdk_validator.load_registry()
+
+# Build a referencing Registry from the SDK schemas
+resources = []
+schemas_by_contract = {}
+for sid, schema in reg.items():
+    if "lifecycle" not in sid:
+        continue
+    resources.append((schema["$id"], Resource.from_contents(schema)))
+    # Extract contract name from URL like .../lifecycle/<name>/v1
+    contract_name = sid.split("/lifecycle/")[1].split("/v")[0]
+    schemas_by_contract[contract_name] = schema
+
 registry = Registry().with_resources(resources)
 
-# One smallest-legal instance per locked contract, resolved purely from the
-# contract directory. The taxonomy instance is the lock vocabulary verbatim.
+# One smallest-legal instance per lifecycle contract
+lock_path = sys.argv[1]
+lock = json.loads(open(lock_path).read())
 instances = {
     "work-profile": {"contractVersion": "1.0.0", "id": "w", "category": "build", "kernelStages": ["K3"]},
     "lifecycle-profile": {"contractVersion": "1.0.0", "id": "l", "phases": [{"id": "p", "order": 1, "kernelStage": "K0"}]},
@@ -195,9 +220,13 @@ instances = {
     "search-provider": {"contractVersion": "1.0.0", "id": "s", "hostFrameworkIdentifier": "h", "catalogueIdentifier": "c"},
 }
 
-for name, entry in lock["contracts"].items():
-    validator = Draft202012Validator(by_file[entry["schema"]], registry=registry)
-    errors = list(validator.iter_errors(instances[name]))
+for name, instance in instances.items():
+    schema = schemas_by_contract.get(name)
+    if schema is None:
+        print(f"{name}: no SDK schema found")
+        sys.exit(1)
+    validator = Draft202012Validator(schema, registry=registry)
+    errors = list(validator.iter_errors(instance))
     if errors:
         print(f"{name}: {errors[0].message}")
         sys.exit(1)
@@ -210,8 +239,9 @@ def test_ac1_standalone_child_interpreter_validates_contracts(tmp_path):
     """AC1: a fresh interpreter with no Core on the path validates the set."""
     script = tmp_path / "external_consumer.py"
     script.write_text(CHILD_SCRIPT, encoding="utf-8")
+    lock_path = CONTRACTS_DIR / "contract-lock.json"
     proc = subprocess.run(
-        [sys.executable, str(script), str(CONTRACTS_DIR)],
+        [sys.executable, str(script), str(lock_path)],
         capture_output=True,
         text=True,
         check=False,
@@ -258,7 +288,7 @@ def test_ac2_legacy_software_delivery_representable_without_semantic_loss():
         ],
     }
 
-    validator = _validator("lifecycle-profile")
+    validator = _sdk_validator_for("lifecycle-profile")
     errors = sorted(validator.iter_errors(profile), key=lambda e: list(e.path))
     assert errors == [], [e.message for e in errors]
 
@@ -286,7 +316,7 @@ def test_ac2_legacy_software_delivery_representable_without_semantic_loss():
 def test_ac3_provider_contracts_accept_opaque_ids_and_name_no_provider():
     """AC3: providers are opaque consumer identifiers, never concrete names."""
     for contract in ("model-provider", "search-provider"):
-        validator = _validator(contract)
+        validator = _sdk_validator_for(contract)
         for opaque in ("acme-host", "internal-gateway", "vendor-neutral.catalog"):
             instance = {
                 "contractVersion": "1.0.0",
@@ -297,13 +327,14 @@ def test_ac3_provider_contracts_accept_opaque_ids_and_name_no_provider():
             errors = list(validator.iter_errors(instance))
             assert errors == [], [e.message for e in errors]
 
-    # No contract in the set names a concrete provider.
-    for schema_file in CONTRACTS_DIR.rglob("*"):
-        if not schema_file.is_file():
+    # No contract in the SDK names a concrete provider.
+    reg = _sdk_validator.load_registry()
+    for sid, schema in reg.items():
+        if "lifecycle" not in sid:
             continue
-        text = schema_file.read_text(encoding="utf-8").lower()
+        text = json.dumps(schema).lower()
         for banned in FORBIDDEN_PROVIDER_NAMES:
-            assert banned not in text, f"{schema_file.name} names provider {banned!r}"
+            assert banned not in text, f"{sid} names provider {banned!r}"
 
 
 @pytest.mark.parametrize("contract", sorted(_minimal_instances()))
@@ -311,22 +342,20 @@ def test_ac4_unknown_contract_versions_fail_closed(contract):
     """AC4: an unsupported contractVersion is rejected, never coerced."""
     instance = dict(_minimal_instances()[contract])
     instance["contractVersion"] = "9.9.9"
-    assert list(_validator(contract).iter_errors(instance)), (
+    assert list(_sdk_validator_for(contract).iter_errors(instance)), (
         f"{contract} accepted an unknown contract version"
     )
-    # The registry itself agrees: the version is simply not supported.
-    assert "9.9.9" not in LOCK["contracts"][contract]["supportedVersions"]
 
 
 def test_ac4_unknown_categories_and_vocabulary_fail_closed():
     """AC4: unknown categories and unknown vocabulary members are rejected."""
     work = dict(_minimal_instances()["work-profile"])
     work["category"] = "unknown_category"
-    assert list(_validator("work-profile").iter_errors(work))
+    assert list(_sdk_validator_for("work-profile").iter_errors(work))
 
     pack = dict(_minimal_instances()["category-pack"])
     pack["category"] = "not-a-category"
-    assert list(_validator("category-pack").iter_errors(pack))
+    assert list(_sdk_validator_for("category-pack").iter_errors(pack))
 
     for field, value in (
         ("kernelStages", ["K99"]),
@@ -336,14 +365,14 @@ def test_ac4_unknown_categories_and_vocabulary_fail_closed():
     ):
         instance = dict(_minimal_instances()["work-profile"])
         instance[field] = value
-        assert list(_validator("work-profile").iter_errors(instance)), (
+        assert list(_sdk_validator_for("work-profile").iter_errors(instance)), (
             f"unknown {field} accepted"
         )
 
     # Taxonomy is a closed enum on every dimension.
     tax = dict(_minimal_instances()["category-taxonomy"])
     tax["categories"] = LOCK["vocabulary"]["categories"] + ["unknown_category"]
-    assert list(_validator("category-taxonomy").iter_errors(tax))
+    assert list(_sdk_validator_for("category-taxonomy").iter_errors(tax))
 
     # The lock advertises exactly the canonical 11 categories.
     assert LOCK["vocabulary"]["categories"] == [
@@ -361,11 +390,13 @@ def test_ac4_unknown_categories_and_vocabulary_fail_closed():
     ]
 
 
-def test_every_locked_contract_file_exists_and_is_self_describing():
-    """The lock and the directory cannot drift: every entry resolves."""
-    for contract, entry in LOCK["contracts"].items():
-        schema_path = CONTRACTS_DIR / entry["schema"]
-        assert schema_path.is_file(), f"{contract}: missing {entry['schema']}"
-        doc = json.loads(schema_path.read_text(encoding="utf-8"))
-        assert doc["$id"].startswith("https://skillweave.dev/schemas/lifecycle/")
-        assert doc["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+def test_every_locked_contract_exists_in_the_sdk_registry():
+    """Every lifecycle contract name resolves to an SDK schema."""
+    reg = _sdk_validator.load_registry()
+    sdk_contracts = set()
+    for sid in reg:
+        if "lifecycle" in sid:
+            name = sid.split("/lifecycle/")[1].split("/v")[0]
+            sdk_contracts.add(name)
+    for contract in _LIFECYCLE_CONTRACT_NAMES:
+        assert contract in sdk_contracts, f"{contract} not in SDK registry"

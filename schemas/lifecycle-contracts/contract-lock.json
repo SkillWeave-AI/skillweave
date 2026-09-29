@@ -3,39 +3,11 @@
     "name": "skillweave-lifecycle-contracts",
     "version": "1.0.0"
   },
-  "contracts": {
-    "work-profile": {
-      "schema": "work-profile.schema.json",
-      "supportedVersions": ["1.0.0"]
-    },
-    "lifecycle-profile": {
-      "schema": "lifecycle-profile.schema.json",
-      "supportedVersions": ["1.0.0"]
-    },
-    "deliverable-contract": {
-      "schema": "deliverable-contract.schema.json",
-      "supportedVersions": ["1.0.0"]
-    },
-    "evidence-contract": {
-      "schema": "evidence-contract.schema.json",
-      "supportedVersions": ["1.0.0"]
-    },
-    "category-pack": {
-      "schema": "category-pack.schema.json",
-      "supportedVersions": ["1.0.0"]
-    },
-    "category-taxonomy": {
-      "schema": "category-taxonomy.schema.json",
-      "supportedVersions": ["1.0.0"]
-    },
-    "model-provider": {
-      "schema": "model-provider.schema.json",
-      "supportedVersions": ["1.0.0"]
-    },
-    "search-provider": {
-      "schema": "search-provider.schema.json",
-      "supportedVersions": ["1.0.0"]
-    }
+  "consumerReceipt": {
+    "sdkVersion": "0.2.0",
+    "sdkCanonicalDigest": "f2ec1b0218dd380341cffb8bce80fc8d272d07ba244287f8af1ec6feb0db18d6",
+    "consumedAt": "2026-09-29",
+    "consumer": "skillweave-core"
   },
   "vocabulary": {
     "categories": [

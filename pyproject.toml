@@ -29,7 +29,7 @@ dependencies = [
     # an exact version and consumes the pinned artifact; it never copies the
     # schema authority into its own tree (see docs/architecture.md, "Repository
     # boundary", and tests/contract/test_preview_core_pro_boundary.py).
-    "skillweave-sdk==0.1.0",
+    "skillweave-sdk==0.2.0",
 ]
 
 [project.optional-dependencies]

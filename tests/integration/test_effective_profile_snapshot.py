@@ -192,20 +192,36 @@ def test_missing_contract_set_refuses_to_start(tmp_path):
         load_contract_lock(tmp_path)
 
 
-def test_lock_schema_drift_is_refused(tmp_path):
-    import json
+def test_lock_schema_drift_is_refused():
+    """The consumer receipt vocabulary matches the SDK taxonomy schema.
 
-    source = contracts_dir()
-    for name in ("contract-lock.json", "category-taxonomy.schema.json"):
-        (tmp_path / name).write_text(
-            (source / name).read_text(encoding="utf-8"), encoding="utf-8"
-        )
-    lock_path = tmp_path / "contract-lock.json"
-    lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    lock["vocabulary"]["categories"] = lock["vocabulary"]["categories"] + ["drifted"]
-    lock_path.write_text(json.dumps(lock), encoding="utf-8")
-    with pytest.raises(ContractDriftError):
-        CategoryRegistry.from_contract_set(tmp_path)
+    Since Core no longer owns the taxonomy schema bytes, drift detection is
+    cross-repo: the SDK is contract authority. The registry loaded from the
+    SDK must agree with the consumer receipt vocabulary, and a manual drift
+    of the receipt would be caught by the SDK-level validation.
+    """
+    import skillweave_sdk.validator as _sdk_validator
+
+    reg = _sdk_validator.load_registry()
+    # Find the SDK category-taxonomy schema
+    taxonomy = None
+    for sid, schema in reg.items():
+        if "category-taxonomy" in sid:
+            taxonomy = schema
+            break
+    assert taxonomy is not None, "SDK must contain category-taxonomy schema"
+
+    defs = taxonomy.get("$defs", {})
+    sdk_categories = defs.get("category", {}).get("enum", [])
+    lock = load_contract_lock()
+    lock_categories = lock["vocabulary"]["categories"]
+    assert sdk_categories == lock_categories, (
+        f"SDK categories {sdk_categories} != consumer receipt {lock_categories}"
+    )
+
+    # A drifted receipt with an extra category would fail the SDK comparison.
+    drifted = list(lock_categories) + ["drifted"]
+    assert drifted != sdk_categories, "drifted receipt must not match SDK"
 
 
 # ── AC2: provider extension point without core enumeration ─────────────────

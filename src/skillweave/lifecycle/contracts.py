@@ -2,14 +2,14 @@
 
 The Generic Lifecycle Extension splits one contract into four repositories
 (``docs/architecture.md``, "Repository boundary"). The SDK owns the contract
-*bytes*; this module is the Core-side consumer:
+*bytes*; this module is the Core-side consumer that loads contract IDs,
+validation and vocabulary from the installed SDK API rather than from
+hard-coded unpublished bytes.
 
 * :class:`CategoryRegistry` -- the rebaselined category vocabulary. The eleven
-  closed categories now include ``learn``. The registry is a consumer of the
-  pinned contract set, never a second truth: it loads the vocabulary from
-  ``schemas/lifecycle-contracts/contract-lock.json`` and cross-checks it
-  against the closed enums in ``category-taxonomy.schema.json``, refusing to
-  start on any drift. Unknown categories fail closed.
+  closed categories now include ``learn``. The registry loads the vocabulary
+  from the installed ``skillweave_sdk.validator`` registry and never carries a
+  private copy. Unknown categories fail closed.
 
 * :class:`ProviderRegistry` -- the SDK extension point. A model or search
   provider is registered at wiring time with opaque, consumer-supplied
@@ -33,6 +33,9 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Mapping, Optional, Sequence, Union
+
+import skillweave_sdk
+import skillweave_sdk.validator as _sdk_validator
 
 # The immutable, content-addressed effective-profile snapshot is owned by
 # ``skillweave.profiles.effective``; the lifecycle contract surface re-exports
@@ -128,12 +131,17 @@ def contracts_dir(directory: Optional[Union[str, Path]] = None) -> Path:
 
 
 def load_contract_lock(directory: Optional[Union[str, Path]] = None) -> dict:
-    """Read ``contract-lock.json`` from the pinned contract set."""
+    """Read the consumer receipt from the pinned contract set.
+
+    The receipt records which SDK version was consumed and the vocabulary
+    snapshot at consumption time. It does not embed schema bytes — the SDK
+    is contract authority and owns the schemas.
+    """
     path = contracts_dir(directory) / "contract-lock.json"
     if not path.is_file():
         raise ContractNotAvailableError(
-            f"lifecycle contract set not found at {path}; Core consumes the "
-            f"pinned artifact and does not carry a private vocabulary copy"
+            f"consumer receipt not found at {path}; Core consumes the "
+            f"pinned SDK artifact and does not carry a private vocabulary copy"
         )
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -216,44 +224,36 @@ class CategoryRegistry:
     def from_contract_set(
         cls, directory: Optional[Union[str, Path]] = None
     ) -> "CategoryRegistry":
-        """Load the registry from the pinned lock, cross-checked against the schema."""
-        base = contracts_dir(directory)
-        lock = load_contract_lock(directory)
-        vocabulary = lock.get("vocabulary")
-        if not isinstance(vocabulary, Mapping):
-            raise ContractDriftError("contract lock carries no 'vocabulary' mapping")
+        """Load the registry from the installed SDK taxonomy schema.
 
-        schema_path = base / "category-taxonomy.schema.json"
-        if not schema_path.is_file():
+        The SDK is contract authority; the category-taxonomy schema in the
+        installed ``skillweave-sdk`` is the single source of truth for the
+        closed vocabulary. Core does not carry a private copy.
+        """
+        reg = _sdk_validator.load_registry()
+
+        # Locate the category-taxonomy schema in the SDK registry.
+        taxonomy_schema = None
+        for key, schema in reg.items():
+            if "category-taxonomy" in key:
+                taxonomy_schema = schema
+                break
+
+        if taxonomy_schema is None:
             raise ContractNotAvailableError(
-                f"category-taxonomy.schema.json not found under {base}"
+                "SDK registry does not contain a category-taxonomy schema; "
+                "the installed skillweave-sdk is not a lifecycle-contracts SDK"
             )
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        defs = schema.get("$defs", {})
 
-        # The lock and the schema are two views of one vocabulary. If they ever
-        # disagree, one of them is a second truth -- refuse rather than pick.
-        for dimension, prefix in (
-            ("categories", "category"),
-            ("kernelStages", "kernelStage"),
-            ("topologies", "topology"),
-            ("humanCoupling", "humanCoupling"),
-            ("changeSurfaces", "changeSurface"),
-        ):
-            lock_values = list(vocabulary.get(dimension, []))
-            schema_values = list(defs.get(prefix, {}).get("enum", []))
-            if lock_values != schema_values:
-                raise ContractDriftError(
-                    f"{dimension}: lock {lock_values!r} != schema {schema_values!r}"
-                )
+        defs = taxonomy_schema.get("$defs", {})
 
         return cls(
-            categories=tuple(vocabulary["categories"]),
-            kernel_stages=tuple(vocabulary.get("kernelStages", [])),
-            topologies=tuple(vocabulary.get("topologies", [])),
-            human_coupling=tuple(vocabulary.get("humanCoupling", [])),
-            change_surfaces=tuple(vocabulary.get("changeSurfaces", [])),
-            contract_version=str(lock.get("contractSet", {}).get("version", CONTRACT_SET_VERSION)),
+            categories=tuple(defs.get("category", {}).get("enum", [])),
+            kernel_stages=tuple(defs.get("kernelStage", {}).get("enum", [])),
+            topologies=tuple(defs.get("topology", {}).get("enum", [])),
+            human_coupling=tuple(defs.get("humanCoupling", {}).get("enum", [])),
+            change_surfaces=tuple(defs.get("changeSurface", {}).get("enum", [])),
+            contract_version=CONTRACT_SET_VERSION,
         )
 
     # -- the rebaselined default -------------------------------------------
