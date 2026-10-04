@@ -19,7 +19,9 @@ bound evidence, child vs coordinator) live in the SDK schema's open
 proven in ``tests/unit/test_1510_cap.py``. This file only binds the wire shape.
 """
 
+import importlib.util
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,13 +41,59 @@ from skillweave.routing.harness_adapter import (  # noqa: E402
     admit_native_plan,
 )
 
+#: The SDK-owned, frozen execution contract this gate consumes. It is the one
+#: authority for the snapshot wire shape; Core never copies the bytes.
 _SCHEMA_REL = Path(
     "integrations/skillweave-sdk/src/skillweave_sdk/schemas/execution/"
     "capability-snapshot-v1.schema.json"
 )
+_SCHEMA_BASENAME = "capability-snapshot-v1.schema.json"
 
 
 def _find_schema():
+    """Locate the frozen capability-snapshot schema, fail-closed when absent.
+
+    Resolution order, all *read-only*:
+
+    1. ``SKILLWEAVE_CAPABILITY_SCHEMA`` — an explicit path to the schema file.
+    2. ``SKILLWEAVE_SCHEMA_DIR`` — a schemas directory holding the file.
+    3. installed ``skillweave_sdk.schemas.execution`` package data.
+    4. the seq-13 ``integrations/skillweave-sdk`` tree, discovered by walking
+       the test file's parents (the layout the recovery harness uses).
+
+    Crucially, an undiscoverable schema is **not** a reason to skip: skipping
+    would let the shape contract never run and pass green by omission. This
+    helper returns ``None`` only so the module-scope guard below can fail
+    *loudly* with an actionable message instead.
+    """
+    override = os.environ.get("SKILLWEAVE_CAPABILITY_SCHEMA")
+    if override:
+        candidate = Path(override)
+        if candidate.is_dir():
+            candidate = candidate / _SCHEMA_BASENAME
+        if candidate.is_file():
+            return candidate
+
+    schemas_env = os.environ.get("SKILLWEAVE_SCHEMA_DIR")
+    if schemas_env:
+        candidate = Path(schemas_env) / "execution" / _SCHEMA_BASENAME
+        if candidate.is_file():
+            return candidate
+        candidate = Path(schemas_env) / _SCHEMA_BASENAME
+        if candidate.is_file():
+            return candidate
+
+    # Installed SDK package data, if this SDK build ships the execution set.
+    try:
+        spec = importlib.util.find_spec("skillweave_sdk")
+    except (ImportError, ValueError):
+        spec = None
+    if spec is not None and spec.submodule_search_locations:
+        for base in spec.submodule_search_locations:
+            candidate = Path(base) / "schemas" / "execution" / _SCHEMA_BASENAME
+            if candidate.is_file():
+                return candidate
+
     for parent in Path(__file__).resolve().parents:
         candidate = parent / _SCHEMA_REL
         if candidate.is_file():
@@ -53,10 +101,23 @@ def _find_schema():
     return None
 
 
-SCHEMA_PATH = _find_schema()
-pytestmark = pytest.mark.skipif(
-    SCHEMA_PATH is None, reason="frozen capability-snapshot-v1 schema not present"
-)
+def _resolve_or_fail() -> Path:
+    found = _find_schema()
+    if found is None:
+        # Fail the collection/session rather than skipping: an undiscoverable
+        # schema must be a loud, actionable failure so this contract can never
+        # be reported green without actually validating the frozen shape.
+        raise RuntimeError(
+            "frozen capability-snapshot-v1 schema could not be discovered; the "
+            "SDK shape contract would otherwise never run. Set "
+            "SKILLWEAVE_CAPABILITY_SCHEMA to the schema file or "
+            "SKILLWEAVE_SCHEMA_DIR to the SDK schemas directory (holding "
+            "execution/capability-snapshot-v1.schema.json)."
+        )
+    return found
+
+
+SCHEMA_PATH = _resolve_or_fail()
 
 
 def _canonical_snapshot(**overrides):

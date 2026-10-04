@@ -47,13 +47,29 @@ from skillweave.routing.harness_adapter import (  # noqa: E402
 # -- Fixtures: a real offline executable, a pinned plugin, one snapshot shape --
 
 SKILL_DIGEST = "a" * 64
-RUNTIME_CONFIG_DIGEST = "b" * 64
+#: A runtime configuration that is deliberately *not* the selected one — and,
+#: as the controller's counterproof used, not even a well-formed digest. The
+#: fixtures derive the real selected digest from the config shape instead of
+#: pasting it, so no stage proof can bind a fabricated constant and pass.
+OTHER_RUNTIME_CONFIG_DIGEST = "different-runtime-not-even-a-digest"
 WORKER_TOOLS = ("Read", "Bash", "Edit")
 NATIVE_TOOLS = ("Read", "Bash", "Edit", "Agent", "Skill", "Task")
 
 
 def _digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _shape_digest(value):
+    """The selected-configuration digest, computed the way the host binding does.
+
+    Mirrors ``HostBinding.__init__``: a digest of ``[coordinator, child, mode]``.
+    Deriving it here (rather than pasting a constant) means the stage proofs in
+    the fixtures bind the *actual* selected configuration, and a test that
+    changes the configuration changes the digest with it.
+    """
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 class _Host:
@@ -74,7 +90,17 @@ class _Host:
             "mode": "bare", "tools": list(NATIVE_TOOLS), "model": self.model,
         }
 
-    def binding(self, *, coordinator=None, child=None, mode="bare", model=None):
+    def config_digest(self, *, coordinator=None, child=None, mode="bare"):
+        coord = self.coordinator_config if coordinator is None else coordinator
+        kid = self.child_config if child is None else child
+        return _shape_digest([coord, kid, mode])
+
+    def binding(
+        self, *, coordinator=None, child=None, mode="bare", model=None,
+        config_digest=None,
+    ):
+        coord = self.coordinator_config if coordinator is None else coordinator
+        kid = self.child_config if child is None else child
         return {
             "binary_path": str(self.binary),
             "binary_sha256": _digest(self.binary),
@@ -83,10 +109,11 @@ class _Host:
             "plugin_sha256": _digest(self.plugin),
             "mode": mode,
             "model": model or self.model,
-            "coordinator_config": self.coordinator_config
-            if coordinator is None
-            else coordinator,
-            "child_worker_config": self.child_config if child is None else child,
+            "coordinator_config": coord,
+            "child_worker_config": kid,
+            "config_digest": config_digest
+            if config_digest is not None
+            else _shape_digest([coord, kid, mode]),
         }
 
     def snapshot(
@@ -111,7 +138,8 @@ class _Host:
             else (now + timedelta(minutes=5)).isoformat()
         )
         binding = self.binding() if binding is None else binding
-        run_attested = self.good_run_attested() if run_attested is None else run_attested
+        if run_attested is None:
+            run_attested = self.good_run_attested(binding["config_digest"])
         return {
             "schema_version": version,
             "snapshot_id": "cap-1510",
@@ -134,26 +162,19 @@ class _Host:
             },
         }
 
-    def good_run_attested(self):
-        """The one shape that carries *bound* expansion plus workflow stages."""
+    def good_run_attested(self, runtime_config_digest):
+        """Bound expansion plus stages, all bound to *the selected* config digest."""
+        stage = {
+            "skill_digest": SKILL_DIGEST,
+            "runtime_config_digest": runtime_config_digest,
+            "observer": "fixture-host-collector",
+        }
         return {
             "workflow_stages": {
-                "skill-expanded": {
-                    "skill_digest": SKILL_DIGEST,
-                    "runtime_config_digest": RUNTIME_CONFIG_DIGEST,
-                    "observer": "fixture-host-collector",
-                },
-                "codebase-analyzed": {
-                    "skill_digest": SKILL_DIGEST,
-                    "runtime_config_digest": RUNTIME_CONFIG_DIGEST,
-                    "observer": "fixture-host-collector",
-                },
+                "skill-expanded": dict(stage),
+                "codebase-analyzed": dict(stage),
             },
-            "native_expansion": {
-                "skill_digest": SKILL_DIGEST,
-                "runtime_config_digest": RUNTIME_CONFIG_DIGEST,
-                "observer": "fixture-host-collector",
-            },
+            "native_expansion": dict(stage),
         }
 
 
@@ -431,17 +452,18 @@ def test_self_asserted_authenticated_flag_is_never_a_measurement():
 def test_expansion_bound_to_a_different_skill_digest_is_refused():
     # The expansion observation is real and bound, but it binds a *different*
     # skill digest than the plan requires: bound evidence for some other skill
-    # is not evidence for this one.
-    run_attested = {
-        "workflow_stages": {},
-        "native_expansion": {
-            "skill_digest": "c" * 64,
-            "runtime_config_digest": RUNTIME_CONFIG_DIGEST,
-            "observer": "fixture-host-collector",
-        },
-    }
+    # is not evidence for this one. The runtime config digest is the real
+    # selected one, so the only defect is the skill digest.
     with tempfile.TemporaryDirectory() as area:
         host = _Host(area)
+        run_attested = {
+            "workflow_stages": {},
+            "native_expansion": {
+                "skill_digest": "c" * 64,
+                "runtime_config_digest": host.config_digest(),
+                "observer": "fixture-host-collector",
+            },
+        }
         exc = _refused(
             capability_snapshot=host.snapshot(run_attested=run_attested),
             native_requirements=_needs(),
@@ -456,13 +478,14 @@ def test_a_stdout_claim_without_binding_is_not_stage_proof():
     # valid here, so the refusal must come from the claimed workflow stage.
     with tempfile.TemporaryDirectory() as area:
         host = _Host(area)
+        digest = host.config_digest()
         exc = _refused(
             capability_snapshot=host.snapshot(
                 run_attested={
                     "workflow_stages": {"codebase-analyzed": "yes it analyzed"},
                     "native_expansion": {
                         "skill_digest": SKILL_DIGEST,
-                        "runtime_config_digest": RUNTIME_CONFIG_DIGEST,
+                        "runtime_config_digest": digest,
                         "observer": "fixture-host-collector",
                     },
                 }
@@ -474,28 +497,107 @@ def test_a_stdout_claim_without_binding_is_not_stage_proof():
 
 
 def test_required_stage_missing_from_bound_evidence_is_refused():
-    run_attested = {
-        "native_expansion": {
-            "skill_digest": SKILL_DIGEST,
-            "runtime_config_digest": RUNTIME_CONFIG_DIGEST,
-            "observer": "fixture-host-collector",
-        },
-        "workflow_stages": {
-            "skill-expanded": {
-                "skill_digest": SKILL_DIGEST,
-                "runtime_config_digest": RUNTIME_CONFIG_DIGEST,
-                "observer": "fixture-host-collector",
-            },
-        },
-    }
     with tempfile.TemporaryDirectory() as area:
         host = _Host(area)
+        digest = host.config_digest()
+        run_attested = {
+            "native_expansion": {
+                "skill_digest": SKILL_DIGEST,
+                "runtime_config_digest": digest,
+                "observer": "fixture-host-collector",
+            },
+            "workflow_stages": {
+                "skill-expanded": {
+                    "skill_digest": SKILL_DIGEST,
+                    "runtime_config_digest": digest,
+                    "observer": "fixture-host-collector",
+                },
+            },
+        }
         exc = _refused(
             capability_snapshot=host.snapshot(run_attested=run_attested),
             native_requirements=_needs("skill-expanded", "codebase-analyzed"),
             host_binding=host.binding(),
         )
         assert "codebase-analyzed" in exc.asset
+
+
+def test_a_stage_bound_to_a_different_runtime_config_is_refused():
+    # The expansion observation is real, carries the right skill digest and an
+    # observer, but it binds a runtime configuration that is NOT the selected
+    # one: a proof for a different runtime does not describe this run. This is
+    # the controller-reproduced defect where a non-digest value slipped through.
+    digest = OTHER_RUNTIME_CONFIG_DIGEST
+    with tempfile.TemporaryDirectory() as area:
+        host = _Host(area)
+        selected = host.config_digest()
+        assert digest != selected
+        stage = {
+            "skill_digest": SKILL_DIGEST,
+            "runtime_config_digest": selected,
+            "observer": "fixture-host-collector",
+        }
+        bad = dict(stage, runtime_config_digest=digest)
+        run_attested = {
+            "workflow_stages": {"skill-expanded": dict(stage), "codebase-analyzed": dict(bad)},
+            "native_expansion": dict(stage),
+        }
+        exc = _refused(
+            capability_snapshot=host.snapshot(run_attested=run_attested),
+            native_requirements=_needs(),
+            host_binding=host.binding(),
+        )
+        assert "codebase-analyzed" in exc.asset
+
+
+def test_a_stage_bound_to_a_non_digest_runtime_config_is_refused():
+    # A typed-field check: even when the claimed stage has all three keys, a
+    # runtime_config_digest that is not a digest is not a measurement.
+    with tempfile.TemporaryDirectory() as area:
+        host = _Host(area)
+        bad = {
+            "skill_digest": SKILL_DIGEST,
+            "runtime_config_digest": "not-a-digest",
+            "observer": "fixture-host-collector",
+        }
+        exc = _refused(
+            capability_snapshot=host.snapshot(
+                run_attested={"workflow_stages": {}, "native_expansion": dict(bad)}
+            ),
+            native_requirements=_needs(),
+            host_binding=host.binding(),
+        )
+        assert "native_expansion" in exc.asset
+
+
+# -- Measured child tools cannot be overridden by a configuration claim ------
+
+def test_a_config_claiming_agent_skill_cannot_override_a_measured_bare_child():
+    # The *configuration* the binding selects advertises the full native tool
+    # set; the *measured* child worker observation says it holds only
+    # Read/Bash. The measurement wins: a config claim cannot promote a bare
+    # child into a native-capable one.
+    with tempfile.TemporaryDirectory() as area:
+        host = _Host(area)
+        # The binding's child config is the wide one (NATIVE_TOOLS); only the
+        # snapshot's detected child worker says otherwise.
+        binding = host.binding()
+        admission = admit_native_plan(
+            _native_plan(host.binary)[1],
+            capability_snapshot=host.snapshot(
+                binding=binding, child_tools=["Read", "Bash"]
+            ),
+            native_requirements=_needs(),
+            host_binding=binding,
+        )
+        assert admission.admitted is False
+        assert admission.observed["detected_child_tools"] == ["Bash", "Read"]
+        # The selected config still claims the wider set, yet the *measured*
+        # child tool list decides.
+        assert "Agent" in admission.observed["child_tools"]
+        assert "Agent" in admission.observed["declared_child_tools"]
+        assert "Agent" not in admission.observed["detected_child_tools"]
+        assert admission.asset.startswith("native_requirements.required_tools")
 
 
 # -- Measured replacement at execution: the pin no longer describes reality --
@@ -542,12 +644,16 @@ def test_plugin_replaced_after_planning_invalidates_the_pin():
 
 def test_child_configuration_mutated_after_measurement_is_refused():
     # The snapshot was taken on a child config without Agent/Skill, but the live
-    # binding claims a wider one: a contradiction fails closed.
+    # binding claims a wider one: a contradiction fails closed. The digest is
+    # held equal so the *content* reconciliation is what catches the mutation,
+    # proving the gate compares the configuration itself and not only a digest.
     narrow = {"mode": "bare", "tools": list(WORKER_TOOLS), "model": "fixture-model"}
     with tempfile.TemporaryDirectory() as area:
         host = _Host(area)
         snap = host.snapshot(child_tools=list(WORKER_TOOLS))
-        snap["capabilities"]["host_binding"] = host.binding(child=narrow)
+        snap["capabilities"]["host_binding"] = host.binding(
+            child=narrow, config_digest=host.config_digest()
+        )
         counter = _Counter()
         with pytest.raises(HarnessAdapterError) as exc:
             _native_plan(host.binary)[0].execute(

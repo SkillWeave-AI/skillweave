@@ -88,17 +88,31 @@ a record produced by the measuring boundary that names
 under `run_attested.native_expansion` (expansion) or
 `run_attested.workflow_stages.<stage>`. A bare string claiming a stage happened,
 a `system_init` event, or an `installed`/`models_visible` flag is **not** bound
-evidence. An observation bound to a *different* skill digest is not evidence for
-this plan's skill.
+evidence.
+
+All three fields are *typed*: `skill_digest` and `runtime_config_digest` must be
+well-formed hex digests (a label such as
+`"different-runtime-not-even-a-digest"` is not a measurement), and `observer`
+must be a non-empty string. And both digests are *reconciled against the actual
+run*: the observation's `skill_digest` must equal the plan's required skill
+digest, and its `runtime_config_digest` must equal the **actually selected**
+configuration digest (the snapshot's binding digest, or the live binding's
+computed digest). An observation bound to a *different* skill digest — or a
+*different* runtime configuration than the one this plan selected — is not
+evidence for this run, and fails closed. This is what stops a real-looking stage
+proof for some other runtime from admitting the plan.
 
 ## The child worker, not the coordinator, is the surface
 
 The plan runs on the selected **child-worker** configuration. Its effective
 tool list must hold every required tool plus the workflow tools (`Agent`,
-`Skill`). A coordinator's tool list never stands in for the child's: a bare
-worker with only `Read`/`Bash`/`Edit` cannot execute an Understand-style plan
-requiring `Agent`/`Skill`, however loudly the declaration or the coordinator
-advertises them.
+`Skill`). Crucially, the gate enforces the **measured** child tool list from the
+snapshot's `detected` record, not merely the tool list a configuration *claims*:
+if the measured child worker holds only `Read`/`Bash` while the selected
+configuration (or the coordinator, or the declaration) asserts `Agent`/`Skill`,
+the measurement wins and the plan is refused. A coordinator's tool list never
+stands in for the child's, and a configuration claim cannot override a measured
+fact.
 
 Both surfaces stay visible in the admission record (`child_tools`,
 `coordinator_tools`, `missing_child_tools`), so a reviewer can see exactly why a
@@ -155,13 +169,21 @@ still-mandatory gate. Until that gate exists, treat every snapshot as carrying
 
 - `tests/unit/test_1510_cap.py` — the admission semantics: presence, version,
   temporal, subject/issuer, child-vs-coordinator, weak-vs-bound evidence,
-  semantic stage mismatch, measured binary/plugin replacement **after** planning,
-  and one genuine measured positive fixture. Every case drives the real
-  `execute` seam with an injected launch counter, so "zero work on rejection" is
-  measured (`launches == 0`), not asserted by wording.
+  semantic stage mismatch (a stage proof bound to a *different* runtime
+  configuration or to a non-digest value is refused), a measured bare child that
+  a wide configuration claim cannot override, measured binary/plugin replacement
+  **after** planning, and one genuine measured positive fixture. The stage
+  proofs in the fixtures derive the selected configuration digest from the
+  configuration shape — no fabricated constant — so a proof can only pass by
+  binding the *actual* selected runtime. Every case drives the real `execute`
+  seam with an injected launch counter, so "zero work on rejection" is measured
+  (`launches == 0`), not asserted by wording.
 - `tests/contract/test_1510_cap_schema.py` — binds the gate to the frozen SDK
   schema: the declared version equals the schema `const`, a canonical snapshot
   validates, and the gate's fail-closed checks land on the schema's required
-  top-level keys.
+  top-level keys. The schema is discovered from `SKILLWEAVE_CAPABILITY_SCHEMA`,
+  `SKILLWEAVE_SCHEMA_DIR`, the installed SDK package data, or the sibling SDK
+  tree; an **undiscoverable** schema fails the session loudly rather than
+  skipping, so the shape contract can never be reported green by omission.
 - `tests/integration/test_harness_adapter.py` — the surrounding adapter suite,
   including the lockstep vocabulary and eager-closure (layering) checks.

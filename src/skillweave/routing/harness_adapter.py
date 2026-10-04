@@ -992,20 +992,37 @@ class CapabilityAdmission:
         }
 
 
+def _looks_like_digest(value: Any) -> bool:
+    """Whether ``value`` is a hex digest string (not an arbitrary label)."""
+    if not isinstance(value, str) or len(value) < 32:
+        return False
+    return all(ch in "0123456789abcdefABCDEF" for ch in value)
+
+
 def _bound_stage_present(
     run_attested: Mapping[str, Any],
     stage: str,
     *,
     skill_digest: str,
+    runtime_config_digest: str,
 ) -> tuple[bool, Optional[str]]:
     """Whether *bound* evidence exists for workflow ``stage``.
 
     Bound evidence lives under ``run_attested['workflow_stages']`` (or
     ``run_attested['native_expansion']`` for the expansion stage) as a record
-    that binds the skill digest, the selected runtime-config digest and an
-    observer identity. A bare string, a ``system_init`` event, or an
-    ``installed``/``models_visible`` flag is *not* bound evidence. Returns
-    ``(present, reason_or_none)``.
+    that binds, with *typed* fields:
+
+    - the ``skill_digest`` (a hex digest) the observation expanded, equal to
+      the plan's required skill digest;
+    - the selected ``runtime_config_digest`` (a hex digest) the observation ran
+      under, equal to the *actual* selected configuration digest — a proof that
+      merely asserts a stage happened under some other runtime is not evidence
+      for this run; and
+    - a non-empty ``observer`` identity string.
+
+    A bare string claiming a stage happened, a ``system_init`` event, an
+    ``installed``/``models_visible`` flag, or a label that is not shaped like a
+    digest is *not* bound evidence. Returns ``(present, reason_or_none)``.
     """
     stages = _as_mapping(run_attested.get("workflow_stages"))
     proof = stages.get(stage)
@@ -1014,14 +1031,35 @@ def _bound_stage_present(
     if not isinstance(proof, Mapping):
         return False, f"stage {stage!r} has no bound observation"
     for required in _BOUND_STAGE_REQUIRED_KEYS:
-        if not proof.get(required):
+        value = proof.get(required)
+        if not isinstance(value, str) or not value.strip():
             return False, (
                 f"stage {stage!r} observation lacks bound {required!r}"
             )
+    if not _looks_like_digest(proof.get("skill_digest")):
+        return False, (
+            f"stage {stage!r} skill_digest {proof.get('skill_digest')!r} is not "
+            "a digest"
+        )
+    if not _looks_like_digest(proof.get("runtime_config_digest")):
+        return False, (
+            f"stage {stage!r} runtime_config_digest "
+            f"{proof.get('runtime_config_digest')!r} is not a digest"
+        )
     if str(proof.get("skill_digest")) != skill_digest:
         return False, (
             f"stage {stage!r} binds skill digest {proof.get('skill_digest')!r}, "
             f"not the required {skill_digest!r}"
+        )
+    if not _looks_like_digest(runtime_config_digest):
+        return False, "no selected runtime configuration digest to bind against"
+    if str(proof.get("runtime_config_digest")) != runtime_config_digest:
+        # The observation ran under a *different* runtime configuration than the
+        # one this plan selected: the proof does not bind this run.
+        return False, (
+            f"stage {stage!r} binds runtime config "
+            f"{proof.get('runtime_config_digest')!r}, not the selected "
+            f"{runtime_config_digest!r}"
         )
     return True, None
 
@@ -1340,23 +1378,31 @@ def admit_native_plan(
             observed=observed,
         )
 
-    # ── Required tools: the CHILD worker must hold them ─────────────────────
+    # ── Required tools: the *measured* CHILD worker must hold them ──────────
+    # The config a binding *claims* is not the measurement. If the snapshot
+    # carries a detected child-tool observation it is authoritative and must
+    # hold every required tool; a config that merely asserts Agent/Skill while
+    # the detected child worker holds only Read/Bash cannot admit the plan.
     child_tools = _tool_set(
         _as_mapping(binding.child_worker_config).get("tools")
     )
+    detected_child_tools = _detected_child_tools(snapshot)
+    observed["detected_child_tools"] = sorted(detected_child_tools)
     required_tools = {str(t) for t in native.required_tools} | set(WORKFLOW_STAGE_TOOLS)
     absent = sorted(t for t in required_tools if t not in child_tools)
-    if absent:
-        # Declared tools (or a coordinator's list) never satisfy this: a bare
-        # worker with only Read/Bash/Edit cannot run Understand requiring
-        # Agent/Skill, however loudly the declaration advertises them.
+    measured_absent = sorted(t for t in required_tools if t not in detected_child_tools)
+    if absent or measured_absent:
+        blockers = absent or measured_absent
+        # Declared tools (or a coordinator's list) never satisfy this, and a
+        # configuration claim cannot override the measured child tools.
         return CapabilityAdmission(
             admitted=False,
             reason=(
                 "selected child worker mode lacks required native tool(s) "
-                f"{absent}; declared/coordinator tools cannot satisfy them"
+                f"{blockers}; declared/coordinator/config claims cannot satisfy "
+                "them"
             ),
-            asset=f"native_requirements.required_tools:{absent[0]}",
+            asset=f"native_requirements.required_tools:{blockers[0]}",
             observed=observed,
         )
 
@@ -1366,9 +1412,21 @@ def admit_native_plan(
         key for key in WEAK_RUN_ATTESTED_KEYS if key in run_attested
     )
     observed["evidence_level"] = snapshot.get("evidence_level")
+    # The *actual* selected configuration digest the proofs must bind. Prefer an
+    # explicit snapshot binding digest, then the live binding's digest (computed
+    # from the configuration shape when not stated).
+    selected_config_digest = str(
+        _snapshot_host_binding(snapshot).get("config_digest", "")
+        or binding.config_digest
+        or ""
+    )
+    observed["selected_config_digest"] = selected_config_digest
 
     expansion_ok, expansion_reason = _bound_stage_present(
-        run_attested, "skill-expanded", skill_digest=native.skill_digest
+        run_attested,
+        "skill-expanded",
+        skill_digest=native.skill_digest,
+        runtime_config_digest=selected_config_digest,
     )
     if not expansion_ok:
         return CapabilityAdmission(
@@ -1385,7 +1443,10 @@ def admit_native_plan(
         if stage in ("skill-expanded", "expand", "expansion"):
             continue
         stage_ok, stage_reason = _bound_stage_present(
-            run_attested, str(stage), skill_digest=native.skill_digest
+            run_attested,
+            str(stage),
+            skill_digest=native.skill_digest,
+            runtime_config_digest=selected_config_digest,
         )
         if not stage_ok:
             return CapabilityAdmission(
