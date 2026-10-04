@@ -398,6 +398,23 @@ class RunApplicationService:
         db_path = self.store.db_path
         EventType = _runtime_attr("journal", "EventType")
 
+        # Store initial lifecycle metadata BEFORE launching the child, so the
+        # wrapper starts at version 2 (not version 1).  This prevents a race
+        # where a fast child completes before the parent gets to write its
+        # own lifecycle metadata: the parent would see VersionConflictError
+        # because the wrapper already bumped the version.
+        self.store.update_metadata(
+            rid,
+            expected_version=1,
+            metadata={
+                "runlifecycle": {
+                    "command": list(command),
+                    "pid": 0,
+                    "lifecycle_state": "running",
+                },
+            },
+        )
+
         # Build the detached wrapper script that writes completion/error
         # back to the same kernel store.
         wrapper_src = (
@@ -497,18 +514,22 @@ class RunApplicationService:
             },
         )
 
-        # Store lifecycle metadata (PID, command) in the kernel record.
-        self.store.update_metadata(
-            rid,
-            expected_version=1,
-            metadata={
-                "runlifecycle": {
-                    "command": list(command),
-                    "pid": proc.pid,
-                    "lifecycle_state": "running",
-                },
-            },
-        )
+        # Update the PID (placeholder was 0) at the current version.
+        # If the wrapper already completed, this CAS will fail harmlessly —
+        # the PID is already in the journal event and the lifecycle metadata.
+        current = self.store.get_run(rid)
+        if current is not None:
+            try:
+                lifecycle = dict(current.metadata.get("runlifecycle", {}))
+                lifecycle["pid"] = proc.pid
+                self.store.update_metadata(
+                    rid,
+                    expected_version=current.version,
+                    metadata={"runlifecycle": lifecycle},
+                )
+            except Exception:
+                # Race with wrapper completion — PID was best-effort.
+                pass
 
         run = self.store.get_run(rid)
         return {
@@ -574,9 +595,21 @@ class RunApplicationService:
                 result = "graceful_kill" if killed_graceful else "already_dead"
 
         # Atomic CAS terminal transition with event in same transaction.
+        # The lane state machine does not permit a direct transition from
+        # "preflight" to "advance_or_stop".  Advance through legal intermediate
+        # states first.
         run = self.store.get_run(run_id)
         if run is not None and not RunStateModel.is_terminal(run.state):
             try:
+                if run.state == "preflight":
+                    self.store.transition(
+                        run_id,
+                        "batch_selection",
+                        expected_state=run.state,
+                        expected_version=run.version,
+                        reason="service: kill advance",
+                    )
+                    run = self.store.get_run(run_id)
                 self.store.transition(
                     run_id,
                     "advance_or_stop",
