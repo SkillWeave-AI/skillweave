@@ -2,8 +2,8 @@
 # Decided by ADR-0001 (lvc-ops, OPS-001). Deploy as `.forgejo/workflows/mirror.yml`
 # verbatim in every repo that has one. The GitHub target is resolved from two
 # Actions variables read via the `vars` context (no token, no API):
-#   GH_REPO_OWNER  — org scope, the owning GitHub org/user (e.g. LangeVC)
-#   GH_REPO        — repo scope, the full owner/name destination (e.g. LangeVC/skillweave)
+#   GH_REPO_OWNER  — org scope, the owning GitHub org/user (e.g. SkillWeave-AI)
+#   GH_REPO        — repo scope, the full owner/name destination (e.g. SkillWeave-AI/skillweave)
 # A preflight guard in the mirror job enforces the mapping contract in cost
 # order — double match (string), existence (reachability), then permission
 # (ownership) — and exports the vetted destination for the push steps. Nothing
@@ -294,13 +294,15 @@ jobs:
 
       # --- Preflight guard: enforce the mapping contract before any push.
       # Reads GH_REPO_OWNER (org scope) and GH_REPO (repo scope) through the
-      # `vars` context — no token, no API. Checks, in cost order:
+      # `vars` context. Runs the ops-engine MirrorHandler.prove_destination
+      # proof in cost order:
       #   1. presence  (either unset -> named error naming the variable + scope)
       #   2. DOUBLE MATCH  (GH_REPO owner prefix == GH_REPO_OWNER, case-sensitive)
       #      A pure string comparison, runs BEFORE any call to GitHub.
       #   3. existence (real git ls-remote reachability)
-      #   4. permission (permissions.push for the mirror token — reachability is
-      #      NOT ownership; a public repo someone else owns passes ls-remote).
+      #   4. permission (permissions.push for the mirror token)
+      #   5. exact identity (full_name, repository id, visibility) when
+      #      GH_EXPECTED_VISIBILITY / GH_EXPECTED_REPOSITORY_ID are set.
       # Each failure exits 1 at this named step, before any push. On success the
       # vetted destination is exported as GH_REPO for the push/dispatch steps.
       - name: Preflight — resolve, double-match, verify, and vouch for the destination
@@ -308,6 +310,8 @@ jobs:
           GH_MIRROR_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
           GH_REPO_OWNER: ${{ vars.GH_REPO_OWNER }}
           GH_REPO: ${{ vars.GH_REPO }}
+          GH_EXPECTED_VISIBILITY: ${{ vars.GH_EXPECTED_VISIBILITY }}
+          GH_EXPECTED_REPOSITORY_ID: ${{ vars.GH_EXPECTED_REPOSITORY_ID }}
         run: |
           set -euo pipefail
 
@@ -316,11 +320,11 @@ jobs:
 
           # 1. Presence — either missing is a named error, before any network.
           if [ -z "${owner}" ]; then
-            echo "::error::preflight: GH_REPO_OWNER is UNSET. Set the ORG-level Actions variable GH_REPO_OWNER to the GitHub org/user that owns the mirror (e.g. LangeVC)."
+            echo "::error::preflight: GH_REPO_OWNER is UNSET. Set the ORG-level Actions variable GH_REPO_OWNER to the GitHub org/user that owns the mirror (e.g. SkillWeave-AI)."
             exit 1
           fi
           if [ -z "${repo}" ]; then
-            echo "::error::preflight: GH_REPO is UNSET. Set the REPOSITORY-level Actions variable GH_REPO to the full destination (owner/repo, e.g. LangeVC/skillweave)."
+            echo "::error::preflight: GH_REPO is UNSET. Set the REPOSITORY-level Actions variable GH_REPO to the full destination (owner/repo, e.g. SkillWeave-AI/skillweave)."
             exit 1
           fi
           echo "preflight: GH_REPO_OWNER='${owner}'  GH_REPO='${repo}'"
@@ -335,24 +339,35 @@ jobs:
           fi
           echo "preflight: double match OK — owner prefix '${repo_owner}' == GH_REPO_OWNER '${owner}'"
 
-          # 3. Existence — first network call: prove the destination reachable.
-          echo "preflight: checking '${repo}' is reachable on github.com..."
-          if ! git ls-remote "https://x-access-token:${GH_MIRROR_TOKEN}@github.com/${repo}.git" HEAD >/dev/null 2>&1; then
-            echo "::error::preflight: destination '${repo}' does not exist (or is not reachable) on github.com."
-            echo "::error::Correct the GH_REPO variable to an existing repository. Refusing to push."
-            exit 1
-          fi
-          echo "preflight: '${repo}' is reachable."
+          # 3-5. Python proof: EXISTS, IS OURS, and exact identity.
+          # Uses ops-engine MirrorHandler.prove_destination which accepts
+          # optional expected_visibility and expected_repository_id.
+          python3 - "${repo}" "${GH_MIRROR_TOKEN:-}" "${GH_EXPECTED_VISIBILITY:-}" "${GH_EXPECTED_REPOSITORY_ID:-}" <<'PROVE_PY'
+          import asyncio, os, sys
+          from ops_engine.modules.mirror import MirrorHandler, MirrorDestinationError
 
-          # 4. Permission — reachability is NOT ownership. A public repository
-          #    someone else owns passes ls-remote but must not be pushed to.
-          push_ok="$(curl -sS -H "Authorization: token ${GH_MIRROR_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("permissions",{}).get("push", False))' 2>/dev/null || echo False)"
-          if [ "${push_ok}" != "True" ]; then
-            echo "::error::preflight: destination '${repo}' exists and is reachable, but the mirror token may NOT push to it (permissions.push != true)."
-            echo "::error::Reachability is not ownership. Grant the mirror token push access to '${repo}', or correct GH_REPO. Refusing to push."
-            exit 1
-          fi
-          echo "preflight: '${repo}' is reachable AND the mirror token may push to it."
+          async def main():
+              destination = sys.argv[1]
+              token = sys.argv[2] if sys.argv[2] else None
+              visibility = sys.argv[3] if sys.argv[3] else None
+              repo_id_str = sys.argv[4]
+              repo_id = int(repo_id_str) if repo_id_str else None
+
+              try:
+                  await MirrorHandler.prove_destination(
+                      destination,
+                      token=token,
+                      expected_visibility=visibility,
+                      expected_repository_id=repo_id,
+                  )
+              except MirrorDestinationError as exc:
+                  print(f"::error::preflight: {exc}", file=sys.stderr)
+                  sys.exit(1)
+
+          asyncio.run(main())
+          PROVE_PY
+
+          echo "preflight: '${repo}' is reachable, writable, and identity verified."
 
           # Export the vetted destination so the push steps push exactly what
           # this step vouched for.
