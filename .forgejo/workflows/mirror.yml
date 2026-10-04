@@ -305,6 +305,54 @@ jobs:
       #      GH_EXPECTED_VISIBILITY / GH_EXPECTED_REPOSITORY_ID are set.
       # Each failure exits 1 at this named step, before any push. On success the
       # vetted destination is exported as GH_REPO for the push/dispatch steps.
+      - name: Provision pinned ops-engine (operator-issued immutable artifact)
+        env:
+          OPS_ENGINE_VERSION: ${{ vars.OPS_ENGINE_VERSION }}
+          OPS_ENGINE_WHEEL_URL: ${{ vars.OPS_ENGINE_WHEEL_URL }}
+          OPS_ENGINE_WHEEL_SHA256: ${{ vars.OPS_ENGINE_WHEEL_SHA256 }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::pinned-engine: $*" >&2; exit 1; }
+
+          # The generic shared engine is provisioned HERE, per job, from an
+          # operator-selected IMMUTABLE release artifact.  Nothing about the
+          # engine comes from the runner image: the runner image is unspecified,
+          # so a bare preinstalled import is not a reproducible dependency.  The
+          # pin is an exact version plus the artifact SHA256 (Actions variables),
+          # and the artifact BYTES are enforced below -- the wheel is not
+          # installed until its bytes match the pin.  Every failure is
+          # fail-closed.  See docs/mirror-migration.md.
+          [ -n "${OPS_ENGINE_VERSION:-}" ] || fail "OPS_ENGINE_VERSION is unset. Set the operator Actions variable to the exact immutable ops-engine version."
+          [ -n "${OPS_ENGINE_WHEEL_URL:-}" ] || fail "OPS_ENGINE_WHEEL_URL is unset. Set it to the https URL of the immutable ops-engine wheel."
+          [ -n "${OPS_ENGINE_WHEEL_SHA256:-}" ] || fail "OPS_ENGINE_WHEEL_SHA256 is unset. Set it to the SHA256 of that exact wheel."
+
+          if ! [[ "${OPS_ENGINE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            fail "OPS_ENGINE_VERSION '${OPS_ENGINE_VERSION}' is malformed (expected MAJOR.MINOR.PATCH)."
+          fi
+          case "${OPS_ENGINE_WHEEL_URL}" in
+            https://*) ;;
+            *) fail "OPS_ENGINE_WHEEL_URL must be an https URL; refusing '${OPS_ENGINE_WHEEL_URL}'." ;;
+          esac
+          if ! [[ "${OPS_ENGINE_WHEEL_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            fail "OPS_ENGINE_WHEEL_SHA256 must be 64 lowercase hex characters."
+          fi
+          [ "${OPS_ENGINE_VERSION}" != "3.4.2" ] || fail "OPS_ENGINE_VERSION 3.4.2 is the old published artifact and lacks the exact-identity ABI; pin a release that carries it."
+
+          wheel="${RUNNER_TEMP}/$(basename "${OPS_ENGINE_WHEEL_URL}")"
+          curl -fsSL "${OPS_ENGINE_WHEEL_URL}" -o "${wheel}"
+          actual="$(python3 - "${wheel}" <<'SHA_PY'
+          import hashlib, sys
+          print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+          SHA_PY
+          )"
+          [ "${actual}" = "${OPS_ENGINE_WHEEL_SHA256}" ] || fail "downloaded wheel sha256 ${actual} != pinned ${OPS_ENGINE_WHEEL_SHA256}; refusing to install unverified bytes."
+
+          lib="${RUNNER_TEMP}/ops-engine-lib"
+          python3 -m pip install --disable-pip-version-check --no-input --target "${lib}" "${wheel}"
+          got="$(PYTHONPATH="${lib}${PYTHONPATH:+:${PYTHONPATH}}" python3 -c 'import importlib.metadata as m; print(m.version("ops-engine"))')"
+          [ "${got}" = "${OPS_ENGINE_VERSION}" ] || fail "installed ops-engine version ${got} != pinned ${OPS_ENGINE_VERSION}."
+          echo "PYTHONPATH=${lib}${PYTHONPATH:+:${PYTHONPATH}}" >> "${GITHUB_ENV:?GITHUB_ENV unset}"
+          echo "pinned-engine: installed ops-engine ${got} (sha256 ${actual})"
       - name: Dependency check — operator-issued immutable engine with required ABI
         run: |
           set -euo pipefail
@@ -312,11 +360,13 @@ jobs:
           import importlib.metadata as md, sys, inspect
           from ops_engine.modules.mirror import MirrorHandler, MirrorDestinationError
 
-          # The operator issues the immutable engine artifact externally.  This
-          # step only verifies the installed engine has the required ABI before
-          # any preflight or push.  The engine is NOT installed by this workflow
-          # — it is a shared-engine dependency of the runner image.  The pending
-          # shared-engine integration/publication is tracked in docs/mirror-migration.md.
+          # The pinned engine is installed by the preceding provisioning step
+          # (from the operator-selected immutable artifact) and imported here
+          # through the PYTHONPATH it exported.  This step verifies that PINNED
+          # artifact carries the exact-identity ABI before any preflight or push:
+          # an ABI guard on whatever the runner image happened to preinstall
+          # would not be a reproducible dependency.  The artifact pin and the
+          # pending external release dependency are in docs/mirror-migration.md.
           try:
               got = md.version("ops-engine")
           except md.PackageNotFoundError:
