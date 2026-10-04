@@ -46,9 +46,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/LangeVC/skillweave"
-Repository = "https://github.com/LangeVC/skillweave"
-Issues = "https://github.com/LangeVC/skillweave/issues"
+Homepage = "https://git.langevc.com/skillweave/skillweave"
+Repository = "https://git.langevc.com/skillweave/skillweave"
+Issues = "https://git.langevc.com/skillweave/skillweave/issues"
 
 [project.scripts]
 skillweave-install = "skillweave.installer:main"

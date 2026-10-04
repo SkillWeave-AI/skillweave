@@ -5,8 +5,8 @@ description: Entry-point facade for SkillWeave — start, continue, inspect, or 
 author: SkillWeave Team
 license: Apache-2.0
 owner: LangeVC
-repository: https://github.com/LangeVC/skillweave
-homepage: https://github.com/LangeVC/skillweave
+repository: https://git.langevc.com/skillweave/skillweave
+homepage: https://git.langevc.com/skillweave/skillweave
 frameworks:
 - opencode
 - claude-code

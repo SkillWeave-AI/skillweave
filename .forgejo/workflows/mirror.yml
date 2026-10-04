@@ -305,28 +305,44 @@ jobs:
       #      GH_EXPECTED_VISIBILITY / GH_EXPECTED_REPOSITORY_ID are set.
       # Each failure exits 1 at this named step, before any push. On success the
       # vetted destination is exported as GH_REPO for the push/dispatch steps.
-      - name: Install pinned ops-engine
-        run: pip install ops-engine==3.4.2
-      - name: Dependency check — pinned ops-engine must be importable
+      - name: Dependency check — operator-issued immutable engine with required ABI
         run: |
           set -euo pipefail
           python3 - <<'DEP_PY'
-          import importlib.metadata as md, sys
-          REQUIRED = "3.4.2"
+          import importlib.metadata as md, sys, inspect
+          from ops_engine.modules.mirror import MirrorHandler, MirrorDestinationError
+
+          # The operator issues the immutable engine artifact externally.  This
+          # step only verifies the installed engine has the required ABI before
+          # any preflight or push.  The engine is NOT installed by this workflow
+          # — it is a shared-engine dependency of the runner image.  The pending
+          # shared-engine integration/publication is tracked in docs/mirror-migration.md.
           try:
               got = md.version("ops-engine")
           except md.PackageNotFoundError:
               print("::error::ops-engine is NOT INSTALLED. "
-                    "The preflight guard requires ops-engine v{} which is "
-                    "a shared-engine dependency outside this workflow. "
-                    "Install it in the runner image or via CI setup.".format(REQUIRED), file=sys.stderr)
+                    "The preflight guard requires an operator-issued ops-engine "
+                    "installed in the runner image or via CI setup. "
+                    "See docs/mirror-migration.md for the shared-engine requirement.",
+                    file=sys.stderr)
               sys.exit(1)
-          if got != REQUIRED:
-              print("::error::ops-engine version mismatch: installed {}, required {}. "
-                    "The preflight guard requires exactly the pinned version.".format(got, REQUIRED), file=sys.stderr)
-              sys.exit(1)
-          from ops_engine.modules.mirror import MirrorHandler, MirrorDestinationError
-          print("dependency check: ops-engine {} OK, MirrorHandler importable".format(got))
+
+          # Verify the exact identity ABI that the old published artifact lacks.
+          sig = inspect.signature(MirrorHandler.prove_destination)
+          for kw in ("expected_visibility", "expected_repository_id"):
+              if kw not in sig.parameters:
+                  print("::error::ops-engine {} MirrorHandler.prove_destination "
+                        "lacks required kwarg {!r}. "
+                        "The installed engine is the old published artifact which "
+                        "does not support exact identity checks. "
+                        "Install the operator-issued immutable engine with the "
+                        "required ABI. "
+                        "See docs/mirror-migration.md.".format(got, kw),
+                        file=sys.stderr)
+                  sys.exit(1)
+
+          print("dependency check: ops-engine {} OK, prove_destination accepts "
+                "expected_visibility and expected_repository_id".format(got))
           DEP_PY
 
 

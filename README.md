@@ -1,10 +1,10 @@
 # SkillWeave
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.5.5-blue)](https://github.com/LangeVC/skillweave/releases/tag/v1.5.5)
+[![Version](https://img.shields.io/badge/version-1.5.9-blue)](https://github.com/SkillWeave-AI/skillweave/releases/tag/v1.5.9)
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![Skills](https://img.shields.io/badge/skills-13-blue)](skills/)
-[![Status](https://img.shields.io/badge/status-production--stable-green)](https://github.com/LangeVC/skillweave)
+[![Status](https://img.shields.io/badge/status-production--stable-green)](https://github.com/SkillWeave-AI/skillweave)
 [![Capacium](https://img.shields.io/badge/Capacium-Install%20via%20cap-0B1020?style=flat-square&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjIwMCA1MCAyNTAgNTAwIj48cGF0aCBmaWxsPSIjRjdGQUZDIiBkPSJNMzA4LjgzLDU5MC40N2wtMzYuMDItMzYuMjQtMjExLjMyLS4wNC0uMDItMjExLjczLTMzLjExLTMzLjk3LDMzLjEtMzIuODMuMDYtMjE1Ljc0LDIxMy43NC0uMDQsMzMuNDQtMzIuOTcsMzIuNzIsMzIuOTUsMjE0LjAxLjA2LjA5LDIxNS42MiwzMi44NSwzMi43Ni0zMi45OCwzMy4xMS4wNywyMTIuNzQtMjEwLjQuMTItMzYuMjMsMzYuMjJaTTMwOS4wNiw1NTQuMzhsNzUuNTktNzYuODQsMTM5LjgzLTE0MS4zMSwyNy43MS0yOC4xNi05MC42NS05MC43Mi0xNTMuMjItMTUzLjE0LTEyMS41MiwxMjAuNTQtOTQuOTMsOTUuNDYtMjguMTIsMjguNDQsMTA0Ljc1LDEwNS41LDc0LjA4LDczLjY2LDY2LjQ3LDY2LjU3Wk0yMTcuMjYsMTE4LjQ0bDMyLjE0LTMyLjAyLTE2Mi41MS0uMDMuMDQsMTYyLjQ4TDIxNy4yNiwxMTguNDRaTTUyOS44OSw4Ni4zNmwtMTYyLjY1LjA2LDE2Mi42MSwxNjIuNDguMDQtMTYyLjUzWk0yMTIuNTksNDk0LjQ4bC04MC41NS04MS44Ny00NS4wMi00NS43Mi0uMTEsMTYyLjA2LDE1OS40Ny0uMDUtMzMuNzktMzQuNDJaTTM2OC4zNSw1MjguOTRoMTYxLjUzcy0uMDUtMTYyLjA0LS4wNS0xYy4wNGwtNTUuMSw1NC45OS0xMDYuMzgsMTA3LjA1WiIvPjxwYXRoIGZpbGw9IiNGOEZBRkMiIGQ9Ik0zMDguODIsNDgwLjA3bC03OS43Ny00Ny43My02Ny4xMi00MC4wNy0uMDItMTcwLjczLDE0Ni43Mi04NC4yNSw2NC44MywzNi44NSw4Mi45Miw0Ny4xNS4wMiwxNzEuNDgtMTQ3LjU5LDg3LjNaTTMyNi41OSwyMzEuNTRjMTYuMDgsNC4zNiwyOS43MywxMy4zOCw0MC40NywyNi4xNmw0OS41OS0yOC40OS0xMDcuNzgtNjIuODEtMTA3LjE3LDYyLjQzLDQ5Ljc1LDI4LjU1YzE4LjI2LTIyLjY2LDQ2Ljk5LTMyLjg0LDc1LjE1LTI1Ljg0Wk0yOTUuODIsMzg2LjQ2Yy00Ny41OS0xMC4yMS03NC45Ni02MC44My01Ny4xOC0xMDYuMzlsLTUwLjktMjkuNjEtLjA4LDEyOC40LDEwOC4wNiw2Mi4zMi4xLTU0LjdWTTMyMS45NSwzODYuNmwuMjgsNTQuNjQsMTA3LjktNjIuMjktLjA1LTEyOC4yNC00OS43NCwyOS4yN2MxMy43MSwzNS41OS41OSw3NS40My0zMS4zOSw5NS43My04LjMyLDUuNzEtMTcuMTgsOC44Ni0yNi45OSwxMC44OFoiLz48L3N2Zz4%3D&labelColor=0B1020&logoColor=F7FAFC)](https://github.com/Capacium/capacium)
 
 **Multi-agent AI skill orchestration — 13 skills, 7 lifecycle phases, any AI coding agent.**
@@ -86,7 +86,7 @@ cap install skillweave
 ### Via Python installer
 
 ```bash
-git clone https://github.com/LangeVC/skillweave.git
+git clone https://github.com/SkillWeave-AI/skillweave.git
 cd SkillWeave
 python3 -m skillweave.installer --interactive
 ```

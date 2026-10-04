@@ -1,13 +1,13 @@
 #!/bin/bash
 # SkillWeave Online Installer
-# One-line installer: curl -s https://raw.githubusercontent.com/LangeVC/skillweave/main/install.sh | bash
+# One-line installer: curl -s https://raw.githubusercontent.com/SkillWeave-AI/skillweave/main/install.sh | bash
 #
 # This script downloads the latest SkillWeave release and installs it to all detected AI agents.
 # It supports offline installation if the repository is already cloned locally.
 
 set -e
 
-SKILLWEAVE_REPO="https://github.com/LangeVC/skillweave.git"
+SKILLWEAVE_REPO="https://github.com/SkillWeave-AI/skillweave.git"
 TEMP_DIR="/tmp/skillweave-install-$(date +%s)"
 INSTALL_SCRIPT="scripts/install-skills.sh"
 DEFAULT_BRANCH="main"
