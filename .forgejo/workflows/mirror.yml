@@ -305,6 +305,8 @@ jobs:
       #      GH_EXPECTED_VISIBILITY / GH_EXPECTED_REPOSITORY_ID are set.
       # Each failure exits 1 at this named step, before any push. On success the
       # vetted destination is exported as GH_REPO for the push/dispatch steps.
+      - name: Install pinned ops-engine
+        run: pip install ops-engine==3.4.2
       - name: Dependency check — pinned ops-engine must be importable
         run: |
           set -euo pipefail
