@@ -33,8 +33,33 @@ cannot silently clobber each other.
 | `run_id`          | TEXT | FK to `runs.run_id`                             |
 | `event_type`      | TEXT | Logical event type                              |
 | `payload`         | TEXT | JSON payload                                    |
+| `correlation_id`  | TEXT | Optional correlation id                         |
+| `causation_id`    | TEXT | Optional causation id                           |
 | `idempotency_key` | TEXT | Optional deduplication key                      |
-| `created_at`      | TEXT | ISO-8601 timestamp                              |
+| `timestamp`       | TEXT | ISO-8601 timestamp                              |
+| `version`         | INT  | Run version at which the event was written      |
+
+The unique index `idx_events_idempotency` on
+`(run_id, idempotency_key)` (where the key is not NULL) makes a logical
+event with a given key exactly-once per run.
+
+**`outbox`** — transactional outbox for atomic transitions.
+
+| Column         | Type | Description                                     |
+|----------------|------|-------------------------------------------------|
+| `id`           | INT  | Auto-increment delivery id                      |
+| `run_id`       | TEXT | FK to `runs.run_id`                             |
+| `event_type`   | TEXT | Logical event type                              |
+| `payload`      | TEXT | JSON payload                                    |
+| `idempotency_key`| TEXT | Optional deduplication key                    |
+| `created_at`   | TEXT | ISO-8601 timestamp                              |
+| `delivered_at` | TEXT | Delivery timestamp, or NULL while undelivered   |
+
+`runs`, `events` and `outbox` live in the same `.skillweave/store.db`
+database.  `SQLiteRunStore` and `EventJournal` open their own connections to
+that database; because the `events` schema is created idempotently
+(`CREATE TABLE IF NOT EXISTS`), the two classes share the one physical
+`events` table rather than maintaining separate journals.
 
 ### State machine
 
@@ -78,15 +103,43 @@ version) from overwriting a cancelled run's terminal state.
 
 ## Outbox / unit-of-work contract
 
-`transition_with_event()` writes to the `outbox` table, not the `events`
-table.  Outbox events must be explicitly dispatched/delivered to the events
-table by an outbox relay process.  Direct `journal.append()` writes to the
-`events` table and is immediately readable via `get_events()`.
+`transition_with_event()` commits the run-row state change and the outbox
+event in **one** `BEGIN IMMEDIATE` transaction, so the terminal state and its
+intent to emit one logical event can never diverge.  By default the logical
+event is written **only** to the `outbox` table; it becomes visible in the
+readable `events` journal once a relay calls `mark_outbox_delivered()`.
 
-The kill path in `RunApplicationService` uses `store.transition()` (runs
-table) + `journal.append()` (events table) rather than
-`transition_with_event()` (outbox table), so the kill event is immediately
-visible in the event stream.
+```python
+# default: outbox only
+store.transition_with_event(run_id, target_state, ..., event_type="finished")
+
+# journal_event=True: also co-insert the logical event into `events`
+# inside the SAME transaction (sequence = MAX(sequence)+1 under the
+# same write lock).  Used by reconcile_terminal so a reader cannot
+# observe a terminal state with no logical record.
+```
+
+The wrapper completion path and `reconcile_terminal()` pass
+`journal_event=True`, so a finished/error completion is atomic with a single
+logical journal event.  Direct `journal.append()` also writes to the `events`
+table and is immediately readable via `get_events()`.
+
+**Downstream limit:** there is currently **no outbox relay/drain** in the
+source tree — nothing moves undelivered `outbox` rows into `events` and calls
+`mark_outbox_delivered()`.  Events written only to the outbox (e.g. the kill
+path's `process_killed`, which uses `transition_with_event` without
+`journal_event`) are durable and readable via `list_outbox()`, but they are
+**not** visible through the `events` journal (`read_events()` /
+`get_events()`) until a relay exists.  Downstream consumers that read only the
+journal will therefore not see outbox-only events.
+
+The kill path in `RunApplicationService` advances the lane through legal
+intermediate states and then commits the terminal state,
+`lifecycle_state="killed"` and the `process_killed` intent in one
+`transition_with_event()` transaction.  A kill event is *also* appended to the
+journal only on the already-terminal branch (idempotent re-kill), so a normal
+cancellation's event lives in the outbox while the run's terminal state and
+lifecycle are immediately durable.
 
 ## Lifecycle facade
 
@@ -117,34 +170,54 @@ startup bookkeeping.
 
 ## Cancellation atomicity
 
-`kill_run` in `RunApplicationService` performs three steps atomically:
-
-1. **Advance lane state** through legal intermediate states (preflight →
-   batch_selection → advance_or_stop).
-2. **Set lifecycle metadata** (`lifecycle_state="killed"`) **before** the
-   terminal transition.  `update_metadata()` rejects terminal records, so the
-   lifecycle state must be set while the run is still non-terminal.
-3. **Append kill event** to the journal **after** the terminal transition.
-   Once the run is terminal, a stale wrapper cannot resurrect it or append a
-   second terminal event.
-
-If any step fails (CAS conflict), the entire operation is abandoned —
-partial state is not committed.
+`kill_run` in `RunApplicationService` advances the lane through legal
+intermediate states (separate forward-only transactions), then commits the
+**terminal transition, `lifecycle_state="killed"` and the `process_killed`
+outbox intent in a single `transition_with_event()` transaction**.  Because
+the terminal state and its lifecycle are co-committed, there is no crash
+window in which lifecycle says killed while the lane is still non-terminal.
+Once the run is terminal, a stale wrapper cannot resurrect it or append a
+second terminal event.  If the final transaction fails (CAS conflict), the
+operation returns the current persisted state rather than a hardcoded
+"killed"; the intermediate advances always move forward, so a crash during
+them never leaves a resurrectable "killed" run.
 
 ## Detached wrapper completion
 
 The child process runs a wrapper script that:
 
 1. Captures stdout/stderr from the real command.
-2. On success/failure, reads the current run record.
-3. If the run is still non-terminal, advances the lane state through legal
-   transitions (preflight → batch_selection → advance_or_stop), sets
-   lifecycle metadata (`lifecycle_state`, `exit_code`), and appends a
-   `finished` or `error` event.
-4. If the run has been killed (terminal), the wrapper's transition attempt
-   fails with `InvalidTransitionError` or `VersionConflictError`, which the
-   wrapper catches silently — it does **not** append a finished event after
-   cancellation.
+2. On success/failure, records a durable completion **intent** and then
+   reconciles it (`CompletionReconciler.reconcile()`).
+3. The reconciler re-reads the run and, while it is non-terminal, walks the
+   legal lane transitions and commits the terminal state, the lifecycle
+   metadata (`lifecycle_state`, `exit_code`) and **exactly one** logical
+   `finished`/`error` journal event together in one `BEGIN IMMEDIATE`
+   transaction.
+4. If the run has already been killed (terminal), reconciliation returns the
+   existing winner unchanged — it does **not** attach lifecycle metadata or
+   append a terminal event after cancellation.
+
+### Durable reconciliation under contention
+
+A single CAS attempt is not enough for the out-of-band wrapper: any competing
+metadata writer bumps the run `version`, so a **fixed** retry budget can be
+exhausted and a completed child's outcome silently lost.
+`reconcile_terminal()` therefore retries **without a finite bound**: on each
+`VersionConflictError` it re-reads the current non-terminal snapshot and tries
+again.  This is what lets a finite burst of legal competing writes (e.g. 20
+version bumps from an independent SQLite connection) never discard a
+completion.  The loop terminates as soon as a terminal state is observed, so
+exactly one terminal event is written however many writers race.
+
+The intent (`_pending_completion` metadata) is written *before* the terminal
+commit.  A crash between the intent and the commit leaves the intent
+readable, so `CompletionReconciler.resume_pending()` finishes the recorded
+outcome on a later pass instead of losing it.
+
+Only `VersionConflictError` is retried.  Any other storage failure (for
+example a SQLite I/O error) propagates to the caller, so an I/O failure is
+never swallowed and never reported as an apparent successful completion.
 
 The wrapper uses its own `SQLiteRunStore` connection (separate from the
 launcher), so the parent can exit without affecting the child's ability to
@@ -218,4 +291,17 @@ store is closed.
 
 Event sequences are allocated atomically within `BEGIN IMMEDIATE`
 transactions.  Parallel writers never receive duplicate or out-of-order
-sequences.  Sequences are per-run, starting at 1.
+sequences.  Sequences are per-run, starting at 1.  A co-committed
+(`journal_event=True`) logical event allocates its sequence with
+`MAX(sequence)+1` for the run under the same write lock as the state change,
+so it cannot race a concurrent `journal.append()`.
+
+### Journal vs outbox visibility
+
+There is no drain/relay from `outbox` into `events`.  `read_events()` /
+`get_events()` see only the `events` table; events committed solely to the
+outbox (the default, e.g. `process_killed`) are durable but visible only via
+`list_outbox()`.  Completion events (wrapper terminal `finished`/`error`) are
+co-committed with `journal_event=True` and are therefore immediately visible
+in the journal.  Downstream consumers that need every logical event must read
+both the journal and the undelivered outbox, or a relay must be added.

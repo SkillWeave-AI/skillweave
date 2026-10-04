@@ -27,7 +27,12 @@ if str(_src) not in sys.path:
 
 import pytest
 
-from skillweave.runtime.store import SQLiteRunStore, RunRecord, RunStateModel
+from skillweave.runtime.store import (
+    SQLiteRunStore,
+    RunRecord,
+    RunStateModel,
+    CompletionReconciler,
+)
 from skillweave.runtime.journal import EventJournal
 from skillweave.runtime.errors import (
     VersionConflictError,
@@ -1479,6 +1484,184 @@ class TestLateWrapper:
 
 
 # =========================================================================
+# Criterion 2 follow-up: durable reconciliation under finite contention
+# =========================================================================
+
+
+class TestDurableCompletionReconciliation:
+    """A finite burst of legal competing writers must not lose a completion.
+
+    The controller's finite-budget fixture (an out-of-band SQLite connection
+    that bumps a non-terminal run's version after the detached wrapper reads
+    it) previously discarded the child's outcome once the fixed retry budget was
+    exhausted.  These tests pin the durable semantics: reconciliation retries
+    without a finite bound, co-commits exactly one logical journal event, and
+    never overturns a genuine terminal (cancelled) winner.
+    """
+
+    def test_reconcile_survives_more_conflicts_than_any_fixed_budget(self):
+        """20 real competing writes must not exhaust a fixed retry budget.
+
+        Each competing writer is a separate SQLite connection doing a legal
+        metadata write (mirroring the wrapper read seam).  The reconciler must
+        still commit the terminal state, the lifecycle metadata and exactly one
+        logical journal event.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            run_id = "reconcile-storm-1"
+            store.save_run(_make_run(run_id))
+
+            competing = 20
+            for n in range(1, competing + 1):
+                other = SQLiteRunStore(db_path)
+                snap = other.get_run(run_id)
+                other.update_metadata(
+                    run_id,
+                    expected_version=snap.version,
+                    metadata={"fixture_other_writer": n},
+                )
+                other.close()
+
+            snapshot = store.get_run(run_id)
+            assert not RunStateModel.is_terminal(snapshot.state)
+            assert snapshot.version == competing + 1
+
+            record = CompletionReconciler(
+                store, run_id,
+                target_state="advance_or_stop",
+                lifecycle_update={"lifecycle_state": "succeeded", "exit_code": 0},
+                event_type="finished",
+                event_payload={"returncode": 0},
+                idempotency_key="wrapper:finish:" + run_id + ":0",
+                reason="wrapper: process completed",
+            ).reconcile()
+
+            assert RunStateModel.is_terminal(record.state)
+            assert record.metadata["runlifecycle"]["lifecycle_state"] == "succeeded"
+
+            journal = EventJournal(db_path)
+            finished = [e for e in journal.get_events(run_id) if e.event_type == "finished"]
+            journal.close()
+            assert len(finished) == 1, "exactly one logical terminal event expected"
+
+            # An independent reopen observes the same durable terminal outcome.
+            reopened = SQLiteRunStore(db_path)
+            assert RunStateModel.is_terminal(reopened.get_run(run_id).state)
+            reopened.close()
+            store.close()
+
+    def test_reconcile_preserves_genuine_terminal_winner(self):
+        """A committed cancellation is never overturned by a late completion."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            run_id = "reconcile-winner-1"
+            store.save_run(_make_run(run_id))
+            store.transition(
+                run_id, "batch_selection",
+                expected_state="preflight", expected_version=1,
+                reason="kill: advance",
+            )
+            cancelled = store.transition(
+                run_id, "advance_or_stop",
+                expected_state="batch_selection", expected_version=2,
+                reason="kill", stop_reason="operator_halt",
+            )
+            assert RunStateModel.is_terminal(cancelled.state)
+
+            result = CompletionReconciler(
+                store, run_id,
+                target_state="advance_or_stop",
+                lifecycle_update={"lifecycle_state": "succeeded", "exit_code": 0},
+                event_type="finished",
+                event_payload={"returncode": 0},
+                idempotency_key="wrapper:finish:" + run_id + ":0",
+                reason="wrapper: process completed",
+            ).reconcile()
+
+            assert result.version == cancelled.version
+            assert result.metadata.get("runlifecycle") is None, (
+                "late completion must not attach lifecycle metadata to a winner"
+            )
+            journal = EventJournal(db_path)
+            finished = [e for e in journal.get_events(run_id) if e.event_type == "finished"]
+            journal.close()
+            assert finished == [], "late completion must not append a terminal event"
+            store.close()
+
+    def test_reconcile_terminal_does_not_swallow_io_failure(self):
+        """A non-CAS storage failure must propagate, never look like success."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            run_id = "reconcile-io-1"
+            store.save_run(_make_run(run_id))
+
+            original = store.transition_with_event
+
+            def _explode(*args, **kwargs):
+                raise OSError("injected disk failure")
+
+            store.transition_with_event = _explode
+            try:
+                with pytest.raises(OSError):
+                    CompletionReconciler(
+                        store, run_id,
+                        target_state="advance_or_stop",
+                        lifecycle_update={"lifecycle_state": "succeeded", "exit_code": 0},
+                        event_type="finished",
+                        event_payload={"returncode": 0},
+                        idempotency_key="wrapper:finish:" + run_id + ":0",
+                        reason="wrapper: process completed",
+                    ).reconcile()
+            finally:
+                store.transition_with_event = original
+
+            # No false terminal state was persisted.
+            assert not RunStateModel.is_terminal(store.get_run(run_id).state)
+            store.close()
+
+    def test_resume_pending_completes_recorded_intent_after_crash(self):
+        """A recorded intent (crash before commit) is finished on a later pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            run_id = "reconcile-resume-1"
+            store.save_run(_make_run(run_id))
+
+            reconciler = CompletionReconciler(
+                store, run_id,
+                target_state="advance_or_stop",
+                lifecycle_update={"lifecycle_state": "failed", "exit_code": 3},
+                event_type="error",
+                event_payload={"error": "boom"},
+                idempotency_key="wrapper:error:" + run_id,
+                reason="wrapper: error: boom",
+            )
+            reconciler.record_intent()
+            pending = store.get_run(run_id).metadata.get("_pending_completion")
+            assert isinstance(pending, dict) and pending["target_state"] == "advance_or_stop"
+            assert not RunStateModel.is_terminal(store.get_run(run_id).state)
+            store.close()
+
+            # Simulate a restart with a fresh connection: the intent survives and
+            # is completed exactly once.
+            reopened = SQLiteRunStore(db_path)
+            finished = CompletionReconciler.resume_pending(reopened, run_id)
+            assert finished is not None and RunStateModel.is_terminal(finished.state)
+
+            journal = EventJournal(db_path)
+            errors = [e for e in journal.get_events(run_id) if e.event_type == "error"]
+            journal.close()
+            assert len(errors) == 1
+            # Idempotent: a second resume finds a terminal run and does nothing.
+            assert CompletionReconciler.resume_pending(reopened, run_id) is None
+            reopened.close()
+
+
+# =========================================================================
 # Run standalone
 # =========================================================================
 
@@ -1489,6 +1672,7 @@ def _run_all() -> int:
         TestCriterion3_LegacyMigration(),
         TestCrashIdempotency(),
         TestLateWrapper(),
+        TestDurableCompletionReconciliation(),
     ]
     failed = 0
     total = 0
