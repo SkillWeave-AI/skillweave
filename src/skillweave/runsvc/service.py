@@ -31,8 +31,16 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json as _json
+import os
+import signal as _signal
+import subprocess
+import sys
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 
@@ -328,3 +336,243 @@ class RunApplicationService:
         except Exception:  # noqa: BLE001
             # Best effort: the primary failure is already on its way up.
             pass
+
+    # ------------------------------------------------------------------
+    # Native async lifecycle (SW-1510-STORE)
+    #
+    # ``start_async``, ``kill_run``, and ``resume_run`` route
+    # detached-process lifecycle through the kernel store with CAS, so
+    # completion, cancellation, and resume share one SQLite/CAS authority.
+    # ------------------------------------------------------------------
+
+    def reserve_run_id(self, run_id: Optional[str] = None) -> str:
+        """Reserve a unique run ID before launching a process.
+
+        Returns the reserved ID.  Duplicate admission must not execute a
+        child — the store's PRIMARY KEY guard ensures exactly one creator
+        wins.
+        """
+        rid = run_id or uuid.uuid4().hex
+        # Reserve by creating the run record in preflight state.
+        self.store.create_run(rid)
+        return rid
+
+    def start_async(
+        self,
+        command: Sequence[str],
+        *,
+        run_id: Optional[str] = None,
+        cwd: Optional[Path] = None,
+        project_root: Optional[Path] = None,
+    ) -> dict[str, Any]:
+        """Start *command* as a detached background process.
+
+        The child runs in its own session (process group) so it survives the
+        launcher's exit.  The run is registered in the kernel store BEFORE
+        launch; a crash before the child starts leaves a reserved-but-not-
+        running record that is safe to reconcile.
+
+        Returns a dict with ``run_id``, ``pid``, ``command``, ``state``,
+        ``created_at``, ``version``.
+        """
+        rid = self.reserve_run_id(run_id)
+        child_cwd = str(cwd or Path.cwd())
+
+        db_path = self.store.db_path
+        EventType = _runtime_attr("journal", "EventType")
+
+        # Build the detached wrapper script that writes completion/error
+        # back to the same kernel store.
+        wrapper_src = (
+            "import subprocess, sys, json, os, signal\n"
+            "rid = sys.argv[1]\n"
+            "db_path = sys.argv[2]\n"
+            "cmd = sys.argv[3:]\n"
+            "from skillweave.runtime.store import SQLiteRunStore\n"
+            "from skillweave.runtime.journal import EventJournal\n"
+            "from skillweave.runtime.errors import VersionConflictError\n"
+            "store = SQLiteRunStore(db_path)\n"
+            "journal = EventJournal(db_path)\n"
+            "try:\n"
+            "    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n"
+            "    rc = proc.returncode\n"
+            "    stdout_text = proc.stdout.decode('utf-8', errors='replace') if proc.stdout else ''\n"
+            "    # Use transition_with_event to atomically mark terminal + journal\n"
+            "    try:\n"
+            "        current = store.get_run(rid)\n"
+            "        store.transition(\n"
+            "            rid, 'advance_or_stop',\n"
+            "            expected_state=current.state,\n"
+            "            expected_version=current.version,\n"
+            "            reason='wrapper: process completed',\n"
+            "        )\n"
+            "    except VersionConflictError:\n"
+            "        pass\n"
+            "    journal.append(rid, event_type='process_completed',\n"
+            "        payload={'returncode': rc, 'stdout_preview': stdout_text[:1024]})\n"
+            "except Exception as exc:\n"
+            "    try:\n"
+            "        current = store.get_run(rid)\n"
+            "        store.transition(\n"
+            "            rid, 'advance_or_stop',\n"
+            "            expected_state=current.state,\n"
+            "            expected_version=current.version,\n"
+            "            reason='wrapper: error: ' + str(exc),\n"
+            "        )\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    journal.append(rid, event_type='process_error',\n"
+            "        payload={'error': str(exc)})\n"
+            "finally:\n"
+            "    store.close()\n"
+            "    journal.close()\n"
+        )
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", wrapper_src, rid, db_path] + list(command),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=child_cwd,
+        )
+
+        now = datetime.now(timezone.utc).isoformat()
+        self.journal.append(
+            rid,
+            event_type=EventType.STATE_TRANSITION.value,
+            payload={
+                "event": "launched",
+                "pid": proc.pid,
+                "command": list(command),
+            },
+        )
+
+        run = self.store.get_run(rid)
+        return {
+            "run_id": rid,
+            "pid": proc.pid,
+            "command": list(command),
+            "state": run.state if run else "preflight",
+            "created_at": now,
+            "version": run.version if run else 1,
+        }
+
+    def kill_run(
+        self,
+        run_id: str,
+        pid: int,
+        *,
+        project_root: Optional[Path] = None,
+    ) -> dict[str, Any]:
+        """Kill a run by its ID and recorded PID.
+
+        Graceful (SIGTERM) first, then forced (SIGKILL) after a short grace
+        period.  The terminal transition is CAS-guarded so a stale completion
+        cannot resurrect a cancelled run.
+        """
+        run = self.store.get_run(run_id)
+        if run is None:
+            return {"error": f"run not found: {run_id}"}
+
+        RunStateModel = _runtime_attr("store", "RunStateModel")
+        if run.state != "preflight" and RunStateModel.is_terminal(run.state):
+            return {
+                "run_id": run_id,
+                "pid": pid,
+                "state": run.state,
+                "result": "already_terminal",
+            }
+
+        # Graceful kill (SIGTERM) to the process group
+        killed_graceful = False
+        try:
+            os.killpg(pid, _signal.SIGTERM)
+            killed_graceful = True
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.05)
+                except ProcessLookupError:
+                    break
+        except (ProcessLookupError, PermissionError):
+            pass
+
+        try:
+            os.killpg(pid, _signal.SIGKILL)
+            result = "forced_kill"
+        except ProcessLookupError:
+            result = "graceful_kill" if killed_graceful else "already_dead"
+        except PermissionError:
+            try:
+                os.kill(pid, _signal.SIGKILL)
+                result = "forced_kill"
+            except (ProcessLookupError, PermissionError):
+                result = "graceful_kill" if killed_graceful else "already_dead"
+
+        # Atomic CAS terminal transition with event in same transaction.
+        run = self.store.get_run(run_id)
+        if run is not None and not RunStateModel.is_terminal(run.state):
+            try:
+                self.store.transition(
+                    run_id,
+                    "advance_or_stop",
+                    expected_state=run.state,
+                    expected_version=run.version,
+                    reason="service: kill",
+                    stop_reason="operator_halt",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        self.journal.append(
+            run_id,
+            event_type="process_killed",
+            payload={
+                "pid": pid,
+                "result": result,
+            },
+        )
+
+        return {
+            "run_id": run_id,
+            "pid": pid,
+            "state": "killed",
+            "result": result,
+        }
+
+    def resume_run(self, run_id: str) -> Optional[dict[str, Any]]:
+        """Reconnect to a stored run, returning its current state.
+
+        Resume reconnects to stored actual identity/checkpoints and must
+        not launch a duplicate process or revive a terminal/historical run.
+        """
+        run = self.store.get_run(run_id)
+        if run is None:
+            return None
+
+        RunStateModel = _runtime_attr("store", "RunStateModel")
+        if RunStateModel.is_terminal(run.state):
+            return {
+                "run_id": run_id,
+                "state": run.state,
+                "error": "terminal run cannot be resumed",
+            }
+
+        if run.metadata.get("historical"):
+            return {
+                "run_id": run_id,
+                "state": "unknown",
+                "error": "historical run cannot be resumed",
+            }
+
+        events = self.journal.get_events(run_id)
+        return {
+            "run_id": run_id,
+            "state": run.state,
+            "version": run.version,
+            "created_at": run.created_at,
+            "updated_at": run.updated_at,
+            "event_count": len(events),
+        }

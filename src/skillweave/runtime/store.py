@@ -1056,5 +1056,160 @@ class SQLiteRunStore(RunStore):
         )
         return self.save_run(record)
 
+    def update_metadata(
+        self,
+        run_id: str,
+        expected_version: Optional[int] = None,
+        **changes: Any,
+    ) -> RunRecord:
+        """Atomic CAS metadata update.
+
+        When *expected_version* is provided, the update succeeds only if the
+        persisted version matches (``WHERE version = ?``).  When omitted, the
+        update is still an atomic current-row operation — never an unlocked
+        read-modify-write.
+
+        Raises
+        ------
+        VersionConflictError
+            When *expected_version* is provided but does not match the
+            persisted version.
+        InvalidTransitionError
+            When the run does not exist or is in a terminal state (terminal
+            records cannot be resurrected).
+        """
+        import json
+        from datetime import datetime, timezone
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                self._conn.rollback()
+                raise InvalidTransitionError(
+                    "nonexistent", "update", run_id,
+                    extra={"reason": "run does not exist"},
+                )
+
+            if expected_version is not None and row["version"] != expected_version:
+                self._conn.rollback()
+                raise VersionConflictError(run_id, expected_version, row["version"])
+
+            # Terminal records cannot be resurrected by any caller.
+            if RunStateModel.is_terminal(row["state"]):
+                self._conn.rollback()
+                raise InvalidTransitionError(
+                    row["state"], "update", run_id,
+                    extra={"reason": "terminal record cannot be resurrected"},
+                )
+
+            # Merge changes.  Recognised top-level fields are set directly;
+            # everything else is stored in metadata.
+            now = datetime.now(timezone.utc).isoformat()
+            new_state = changes.pop("state", row["state"])
+            new_role = changes.pop("role", row["role"])
+            new_ended_at = changes.pop("ended_at", row["ended_at"])
+            merged_meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            for k, v in changes.items():
+                if k == "metadata" and isinstance(v, dict):
+                    merged_meta.update(v)
+                else:
+                    merged_meta[k] = v
+
+            # Determine the version to guard on: the caller's expected_version
+            # if given, otherwise the current persisted version (atomic).
+            guard_version = expected_version if expected_version is not None else row["version"]
+            new_version = row["version"] + 1
+
+            cur = self._conn.execute(
+                """UPDATE runs SET state = ?, version = ?, updated_at = ?,
+                   ended_at = ?, role = ?, metadata = ?
+                   WHERE run_id = ? AND version = ?""",
+                (new_state, new_version, now, new_ended_at, new_role,
+                 json.dumps(merged_meta), run_id, guard_version),
+            )
+            if cur.rowcount == 0:
+                self._conn.rollback()
+                persisted = self._conn.execute(
+                    "SELECT version FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                actual = persisted["version"] if persisted else row["version"]
+                raise VersionConflictError(run_id, guard_version, actual)
+
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+        return self.get_run(run_id)
+
+    def import_legacy(
+        self,
+        run_id: str,
+        source_bytes: bytes,
+        source_path: Optional[str] = None,
+    ) -> RunRecord:
+        """Import a legacy JSON run record as historical data.
+
+        The imported record is assigned state ``unknown`` and metadata
+        ``{"historical": true, "provenance": ...}``.  The exact source bytes
+        are preserved in metadata.  This method never infers execution,
+        success, review approval, or live PID ownership from the old bytes.
+
+        Idempotent: a second call with the same *run_id* returns the existing
+        row unchanged.  Existing SQLite rows always win — if *run_id* already
+        exists in the store, this method returns the existing row without
+        modifying it.
+
+        Parameters
+        ----------
+        run_id:
+            The run ID to import as.
+        source_bytes:
+            The raw bytes of the legacy JSON file.
+        source_path:
+            Optional path to the source file (recorded in provenance).
+
+        Returns
+        -------
+        RunRecord
+            The imported or existing record.
+        """
+        import json
+        from datetime import datetime, timezone
+
+        existing = self.get_run(run_id)
+        if existing is not None:
+            return existing
+
+        provenance: dict[str, Any] = {
+            "source": "legacy_import",
+            "byte_length": len(source_bytes),
+            "sha256": __import__("hashlib").sha256(source_bytes).hexdigest(),
+        }
+        if source_path:
+            provenance["source_path"] = source_path
+
+        now = datetime.now(timezone.utc).isoformat()
+        record = RunRecord(
+            run_id=run_id,
+            root_run_id=run_id,
+            parent_run_id=None,
+            state="unknown",
+            version=1,
+            created_at=now,
+            updated_at=now,
+            ended_at=None,
+            role="ops",
+            metadata={
+                "historical": True,
+                "provenance": provenance,
+                "raw_bytes_b64": __import__("base64").b64encode(source_bytes).decode("ascii"),
+            },
+        )
+        return self.save_run(record)
+
     def close(self):
         self._conn.close()
