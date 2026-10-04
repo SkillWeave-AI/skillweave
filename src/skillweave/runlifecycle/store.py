@@ -188,13 +188,24 @@ class RunStateStore:
             return None
         return self._record_to_meta(record)
 
-    def update_metadata(self, run_id: str, **changes: Any) -> RunMetadata:
+    def update_metadata(self, run_id: str, expected_version=None, **changes: Any) -> RunMetadata:
         """Update metadata with atomic CAS via the kernel store.
+
+        Parameters
+        ----------
+        run_id:
+            The run ID to update.
+        expected_version:
+            When provided, the update succeeds only if the persisted version
+            matches (CAS guard).  When omitted, the update reads the current
+            version and uses it as the guard — still an atomic operation,
+            never an unlocked read-modify-write.
 
         Raises
         ------
         VersionConflictError
-            When the persisted version has changed since the caller's snapshot.
+            When *expected_version* is provided but does not match the
+            persisted version.
         RunStateError
             When the run does not exist.
         """
@@ -203,7 +214,8 @@ class RunStateStore:
         if record is None:
             raise RunStateError(f"no metadata for run {run_id}")
 
-        expected_version = record.version
+        # Use caller-provided expected_version, or snapshot current as guard.
+        guard_version = expected_version if expected_version is not None else record.version
 
         # Extract recognised top-level lifecycle fields.
         state = changes.pop("state", None)
@@ -225,9 +237,43 @@ class RunStateStore:
         if meta_update:
             self._kernel.update_metadata(
                 run_id,
-                expected_version=expected_version,
+                expected_version=guard_version,
                 metadata={"runlifecycle": {**record.metadata.get("runlifecycle", {}), **meta_update}},
             )
+
+        # If the caller requests a terminal lifecycle state (killed), also
+        # drive the kernel lane state to a terminal state so the wrapper
+        # cannot resurrect the run after cancellation.
+        #
+        # The lane state machine does not permit a direct transition from
+        # "preflight" to "advance_or_stop".  We must advance through legal
+        # intermediate states first.
+        if state == "killed":
+            current = self._kernel.get_run(run_id)
+            if current is not None and not current.state in ("advance_or_stop", "failed"):
+                try:
+                    # Advance from preflight through batch_selection first.
+                    if current.state == "preflight":
+                        self._kernel.transition(
+                            run_id,
+                            "batch_selection",
+                            expected_state=current.state,
+                            expected_version=current.version,
+                            reason="lifecycle: kill advance",
+                        )
+                        current = self._kernel.get_run(run_id)
+                    # Now transition to the terminal state.
+                    self._kernel.transition(
+                        run_id,
+                        "advance_or_stop",
+                        expected_state=current.state,
+                        expected_version=current.version,
+                        reason="lifecycle: kill",
+                        stop_reason="operator_halt",
+                    )
+                except Exception:
+                    # CAS race — another writer already transitioned.
+                    pass
 
         return self.read_metadata(run_id)
 
@@ -284,6 +330,55 @@ class RunStateStore:
         # Read from kernel store.
         records = self._kernel.list_runs(limit=1000)
         return [r.run_id for r in records]
+
+    # -- legacy import -------------------------------------------------------
+
+    def import_legacy(
+        self,
+        run_id: str,
+        source_bytes: Optional[bytes] = None,
+        source_path: Optional[Path] = None,
+    ) -> RunMetadata:
+        """Import a legacy JSON run record as historical data.
+
+        Delegates to the kernel's ``import_legacy``, which assigns state
+        ``unknown`` and metadata ``{"historical": true, "provenance": ...}``.
+        The exact source bytes are preserved.  This method never infers
+        execution, success, review approval, or live PID ownership from old
+        strings.
+
+        Idempotent: a second call with the same *run_id* returns the existing
+        row unchanged.  Existing SQLite rows always win — if *run_id* already
+        exists in the store, this method returns the existing metadata without
+        modifying it.
+
+        Parameters
+        ----------
+        run_id:
+            The run ID to import as.
+        source_bytes:
+            The raw bytes of the legacy JSON file.  If omitted, *source_path*
+            is read.
+        source_path:
+            Optional path to the source file (recorded in provenance).
+
+        Returns
+        -------
+        RunMetadata
+            The imported or existing metadata.
+        """
+        if source_bytes is None and source_path is not None:
+            source_bytes = source_path.read_bytes()
+
+        if source_bytes is None:
+            raise RunStateError("import_legacy requires source_bytes or source_path")
+
+        record = self._kernel.import_legacy(
+            run_id,
+            source_bytes=source_bytes,
+            source_path=str(source_path) if source_path else None,
+        )
+        return self._record_to_meta(record)
 
 
 # ---------------------------------------------------------------------------

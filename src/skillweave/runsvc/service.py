@@ -364,6 +364,7 @@ class RunApplicationService:
         run_id: Optional[str] = None,
         cwd: Optional[Path] = None,
         project_root: Optional[Path] = None,
+        _env: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         """Start *command* as a detached background process.
 
@@ -372,7 +373,23 @@ class RunApplicationService:
         launch; a crash before the child starts leaves a reserved-but-not-
         running record that is safe to reconcile.
 
-        Returns a dict with ``run_id``, ``pid``, ``command``, ``state``,
+        Parameters
+        ----------
+        command:
+            The command and arguments to execute.
+        run_id:
+            Explicit run ID (default: auto-generated uuid hex).
+        cwd:
+            Working directory for the child (default: current dir).
+        project_root:
+            Project root path (for store.db location).
+        _env:
+            Optional environment dict for the child subprocess.  Used by the
+            native lifecycle facade to propagate PYTHONPATH.
+
+        Returns
+        -------
+        dict with ``run_id``, ``pid``, ``command``, ``state``,
         ``created_at``, ``version``.
         """
         rid = self.reserve_run_id(run_id)
@@ -393,6 +410,8 @@ class RunApplicationService:
             "from skillweave.runtime.errors import VersionConflictError\n"
             "store = SQLiteRunStore(db_path)\n"
             "journal = EventJournal(db_path)\n"
+            "journal.append(rid, event_type='started',\n"
+            "    payload={'command': cmd})\n"
             "try:\n"
             "    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n"
             "    rc = proc.returncode\n"
@@ -408,6 +427,13 @@ class RunApplicationService:
             "                reason='wrapper: advance',\n"
             "            )\n"
             "            current = store.get_run(rid)\n"
+            "        # Set lifecycle metadata BEFORE terminal transition.\n"
+            "        lifecycle = dict(current.metadata.get('runlifecycle', {}))\n"
+            "        lifecycle.update({'lifecycle_state': 'succeeded' if rc == 0 else 'failed', 'exit_code': rc})\n"
+            "        store.update_metadata(rid,\n"
+            "            expected_version=current.version,\n"
+            "            metadata={'runlifecycle': lifecycle})\n"
+            "        current = store.get_run(rid)\n"
             "        store.transition(\n"
             "            rid, 'advance_or_stop',\n"
             "            expected_state=current.state,\n"
@@ -416,7 +442,7 @@ class RunApplicationService:
             "        )\n"
             "    except VersionConflictError:\n"
             "        pass\n"
-            "    journal.append(rid, event_type='process_completed',\n"
+            "    journal.append(rid, event_type='finished',\n"
             "        payload={'returncode': rc, 'stdout_preview': stdout_text[:1024]})\n"
             "except Exception as exc:\n"
             "    try:\n"
@@ -429,6 +455,12 @@ class RunApplicationService:
             "                reason='wrapper: advance',\n"
             "            )\n"
             "            current = store.get_run(rid)\n"
+            "        lifecycle = dict(current.metadata.get('runlifecycle', {}))\n"
+            "        lifecycle.update({'lifecycle_state': 'failed', 'exit_code': -1})\n"
+            "        store.update_metadata(rid,\n"
+            "            expected_version=current.version,\n"
+            "            metadata={'runlifecycle': lifecycle})\n"
+            "        current = store.get_run(rid)\n"
             "        store.transition(\n"
             "            rid, 'advance_or_stop',\n"
             "            expected_state=current.state,\n"
@@ -437,7 +469,7 @@ class RunApplicationService:
             "        )\n"
             "    except Exception:\n"
             "        pass\n"
-            "    journal.append(rid, event_type='process_error',\n"
+            "    journal.append(rid, event_type='error',\n"
             "        payload={'error': str(exc)})\n"
             "finally:\n"
             "    store.close()\n"
@@ -451,12 +483,13 @@ class RunApplicationService:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
             cwd=child_cwd,
+            env=_env,
         )
 
         now = datetime.now(timezone.utc).isoformat()
         self.journal.append(
             rid,
-            event_type=EventType.STATE_TRANSITION.value,
+            event_type="launched",
             payload={
                 "event": "launched",
                 "pid": proc.pid,

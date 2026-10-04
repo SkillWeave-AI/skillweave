@@ -162,9 +162,11 @@ def start_async(
 ) -> RunHandle:
     """Start *command* as a detached background process.
 
-    Uses the kernel-backed ``RunStateStore`` so the run is registered in the
-    kernel SQLite store before launch, and the detached child writes completion
-    through the same store.
+    Routes through ``RunApplicationService.start_async`` so the run is
+    registered in the kernel SQLite store before launch, and the detached
+    child writes completion through the same store.  The service owns
+    native start, completion, cancellation, and reattachment/resume
+    decisions.
 
     The child runs in its own session (process group) so it survives the
     launcher's exit.  A structured RunHandle is returned immediately.
@@ -185,58 +187,43 @@ def start_async(
     RunHandle
         The versioned handle for the newly started run.
     """
+    from skillweave.runtime.store import SQLiteRunStore
+    from skillweave.runtime.journal import EventJournal
+    from skillweave.runtime.registry import RawArtifactStore
+    from skillweave.runsvc.service import RunApplicationService
+
     root = Path(project_root or Path.cwd()).resolve()
-    rid = run_id or uuid.uuid4().hex
     child_cwd = str(cwd or root)
 
-    store = RunStateStore(root)
-    db_path = store._db_path
+    db_path = str(root / ".skillweave" / "store.db")
+    (root / ".skillweave").mkdir(parents=True, exist_ok=True)
 
-    # Create the run record in the kernel store.
-    meta = RunMetadata.create(
-        run_id=rid,
-        command=list(command),
-        pid=0,  # placeholder, will be updated after launch
-    )
-    store.write_metadata(meta)
+    kernel_store = SQLiteRunStore(db_path)
+    journal = EventJournal(kernel_store)
+    raw_artifacts = RawArtifactStore()
+    service = RunApplicationService(kernel_store, journal, raw_artifacts)
 
     # Build env with PYTHONPATH for the child.
-    # handle.py is at src/skillweave/runlifecycle/handle.py, so
-    # .parent.parent.parent resolves to the src/ directory.
     src_path = str(Path(__file__).resolve().parent.parent.parent)
     env = os.environ.copy()
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{src_path}:{existing}" if existing else src_path
 
-    # Launch detached wrapper that writes completion to the kernel store.
-    proc = subprocess.Popen(
-        [sys.executable, "-c", _WRAPPER_SRC, rid, db_path, *list(command)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        cwd=child_cwd,
-        env=env,
+    result = service.start_async(
+        command,
+        run_id=run_id,
+        cwd=Path(child_cwd),
+        project_root=root,
+        _env=env,
     )
 
-    # Update metadata with actual PID.
-    store.update_metadata(rid, pid=proc.pid)
-
-    # Write the launch event through the kernel journal.
-    store.append_event(rid, {
-        "event": "launched",
-        "run_id": rid,
-        "pid": proc.pid,
-        "command": list(command),
-    })
-
     return RunHandle(
-        run_id=rid,
-        pid=proc.pid,
-        command=list(command),
+        run_id=result["run_id"],
+        pid=result["pid"],
+        command=result["command"],
         state="running",
-        created_at=meta.created_at,
-        version=meta.version,
+        created_at=result["created_at"],
+        version=result["version"],
     )
 
 
@@ -430,7 +417,9 @@ def kill_run(
             result = "graceful_kill" if killed_graceful else "already_dead"
 
     # Use the kernel-backed store for CAS-guarded terminal transition.
-    store.update_metadata(run_id, state="killed", finished_at=_now())
+    # Drive the kernel lane state to terminal so the wrapper cannot
+    # resurrect the run after cancellation.
+    store.update_metadata(run_id, expected_version=meta.version, state="killed", finished_at=_now())
 
     store.append_event(run_id, {
         "event": "killed",
