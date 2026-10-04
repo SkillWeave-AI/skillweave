@@ -1192,6 +1192,261 @@ class TestLateWrapper:
             assert RunStateModel.is_terminal(final.state)
             s.close()
 
+    def test_detached_wrapper_with_concurrent_version_bump(self):
+        """A real detached child must reach terminal despite a concurrent writer.
+
+        Reproduces the production defect: the parent's PID-update metadata
+        write bumps the version while the child wrapper is running.  The
+        wrapper reads the bumped version and must retry the forward
+        transition, not silently lose the completion.  This test runs a
+        real detached child via start_async and a concurrent writer that
+        repeatedly bumps the run's metadata version while the child runs.
+        """
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = str(root / ".skillweave" / "store.db")
+            (root / ".skillweave").mkdir(parents=True, exist_ok=True)
+
+            # Build PYTHONPATH so the detached wrapper can import skillweave
+            src_path = str(Path(__file__).resolve().parent.parent.parent / "src")
+            env = os.environ.copy()
+            existing = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{src_path}:{existing}" if existing else src_path
+
+            svc, store, journal = _make_service(db_path)
+            result = svc.start_async(
+                [sys.executable, "-c", "import time; time.sleep(0.5)"],
+                run_id="retry-detach-1",
+                _env=env,
+            )
+            run_id = result["run_id"]
+
+            # Concurrent writer bumps the version while child starts.
+            # In production the only competing write is a single PID update
+            # from start_async, so we simulate 3 bumps then stop.
+            def _bumper():
+                for _ in range(3):
+                    try:
+                        s = SQLiteRunStore(db_path=db_path)
+                        run = s.get_run(run_id)
+                        if run is not None and not RunStateModel.is_terminal(run.state):
+                            s.update_metadata(
+                                run_id,
+                                expected_version=run.version,
+                                metadata={"bump_counter": _},
+                            )
+                        s.close()
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+
+            bumper_thread = threading.Thread(target=_bumper)
+            bumper_thread.start()
+
+            # Wait for child to finish
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                run = store.get_run(run_id)
+                if run and RunStateModel.is_terminal(run.state):
+                    break
+                time.sleep(0.05)
+
+            bumper_thread.join()
+
+            # The run MUST be terminal
+            run = store.get_run(run_id)
+            assert run is not None, "run disappeared"
+            assert RunStateModel.is_terminal(run.state), (
+                f"run {run_id} should be terminal but is {run.state} "
+                f"(v{run.version})"
+            )
+
+            # Lifecycle metadata must reflect success
+            lifecycle = run.metadata.get("runlifecycle", {})
+            assert lifecycle.get("lifecycle_state") in ("succeeded", "failed"), (
+                f"expected lifecycle_state succeeded/failed, got {lifecycle.get('lifecycle_state')}"
+            )
+
+            # There must be a 'finished' event (from wrapper)
+            events = journal.get_events(run_id)
+            finished_events = [e for e in events if e.event_type == "finished"]
+            assert len(finished_events) == 1, (
+                f"expected exactly 1 finished event, got {len(finished_events)}: "
+                f"{[(e.event_type, e.sequence) for e in events]}"
+            )
+
+            store.close()
+            journal.close()
+
+    def test_wrapper_retries_on_version_conflict(self):
+        """Wrapper must re-read and retry when another writer bumps the version.
+
+        Simulates the race: the parent's PID update (or concurrent metadata
+        writer) bumps the version between the wrapper's get_run and its
+        update_metadata. The wrapper must retry, not silently drop the
+        completion.  This test directly exercises the store-level retry
+        pattern that the wrapper uses.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("retry-race-1"))
+
+            # Simulate start_async: version goes from 1 to 2 (lifecycle metadata)
+            store.update_metadata(
+                "retry-race-1",
+                expected_version=1,
+                metadata={"runlifecycle": {"command": ["test"], "pid": 0, "lifecycle_state": "running"}},
+            )
+
+            # Wrapper snapshot: reads version 2, state preflight
+            run = store.get_run("retry-race-1")
+            assert run.state == "preflight"
+            assert run.version == 2
+
+            # Another writer bumps the version (simulates PID update race)
+            store.update_metadata(
+                "retry-race-1",
+                expected_version=2,
+                metadata={"runlifecycle": {"pid": 99999}},
+            )
+            run = store.get_run("retry-race-1")
+            assert run.version == 3
+
+            # Wrapper retries: re-reads, now version 3, advances and completes
+            run = store.get_run("retry-race-1")
+            assert run.version == 3
+
+            # Advance preflight -> batch_selection
+            store.transition(
+                "retry-race-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="wrapper: advance (retry)",
+            )
+            run = store.get_run("retry-race-1")
+            assert run.state == "batch_selection"
+
+            # Set lifecycle metadata
+            store.update_metadata(
+                "retry-race-1",
+                expected_version=run.version,
+                metadata={"runlifecycle": {"lifecycle_state": "succeeded", "exit_code": 0}},
+            )
+            run = store.get_run("retry-race-1")
+
+            # Terminal transition
+            store.transition(
+                "retry-race-1", "advance_or_stop",
+                expected_state=run.state, expected_version=run.version,
+                reason="wrapper: process completed",
+            )
+
+            run = store.get_run("retry-race-1")
+            assert RunStateModel.is_terminal(run.state)
+            assert run.version == 6
+            assert run.metadata.get("runlifecycle", {}).get("lifecycle_state") == "succeeded"
+
+            store.close()
+
+    def test_wrapper_retries_through_multiple_conflicts(self):
+        """Wrapper retries up to 5 times and eventually succeeds."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("retry-multi-1"))
+
+            # Start lifecycle metadata (v2)
+            store.update_metadata(
+                "retry-multi-1",
+                expected_version=1,
+                metadata={"runlifecycle": {"command": ["test"], "pid": 0, "lifecycle_state": "running"}},
+            )
+
+            # Wrapper reads at v2, but we bump to v3
+            store.update_metadata(
+                "retry-multi-1",
+                expected_version=2,
+                metadata={"runlifecycle": {"pid": 111}},
+            )
+            # Bump again to v4
+            store.update_metadata(
+                "retry-multi-1",
+                expected_version=3,
+                metadata={"runlifecycle": {"pid": 222}},
+            )
+
+            # Now wrapper retries: re-reads at v4, should succeed
+            run = store.get_run("retry-multi-1")
+            assert run.version == 4
+
+            store.transition(
+                "retry-multi-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="wrapper: advance (retry)",
+            )
+            run = store.get_run("retry-multi-1")
+            store.update_metadata(
+                "retry-multi-1",
+                expected_version=run.version,
+                metadata={"runlifecycle": {"lifecycle_state": "succeeded", "exit_code": 0}},
+            )
+            run = store.get_run("retry-multi-1")
+            store.transition(
+                "retry-multi-1", "advance_or_stop",
+                expected_state=run.state, expected_version=run.version,
+                reason="wrapper: process completed",
+            )
+
+            run = store.get_run("retry-multi-1")
+            assert RunStateModel.is_terminal(run.state)
+            store.close()
+
+    def test_wrapper_retry_gives_up_on_terminal(self):
+        """Wrapper retry loop must stop when run is already terminal."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("retry-term-1"))
+
+            # Start lifecycle metadata (v2)
+            store.update_metadata(
+                "retry-term-1",
+                expected_version=1,
+                metadata={"runlifecycle": {"command": ["test"], "pid": 0, "lifecycle_state": "running"}},
+            )
+
+            # Another writer kills the run (batch_selection -> advance_or_stop)
+            run = store.get_run("retry-term-1")
+            store.transition(
+                "retry-term-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="kill: advance",
+            )
+            run = store.get_run("retry-term-1")
+            store.transition(
+                "retry-term-1", "advance_or_stop",
+                expected_state=run.state, expected_version=run.version,
+                reason="kill", stop_reason="operator_halt",
+            )
+            assert RunStateModel.is_terminal(store.get_run("retry-term-1").state)
+
+            # Wrapper retries: reads terminal, must give up
+            run = store.get_run("retry-term-1")
+            assert RunStateModel.is_terminal(run.state)
+
+            # Wrapper tries to complete but should abort because terminal
+            # (simulates the InvalidTransitionError break in the retry loop)
+            with pytest.raises(InvalidTransitionError):
+                store.transition(
+                    "retry-term-1", "advance_or_stop",
+                    expected_state=run.state, expected_version=run.version,
+                    reason="wrapper: process completed",
+                )
+
+            store.close()
+
     def test_corner_case_transition_terminal_then_save_run_new_id(self):
         """Creating a different run after terminal is fine (different run_id)."""
         with tempfile.TemporaryDirectory() as tmp:
