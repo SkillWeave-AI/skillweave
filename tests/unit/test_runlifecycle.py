@@ -155,11 +155,11 @@ class TestRunStateStore:
         store = RunStateStore(tmp_path)
         assert store.latest_event_sequence("abc123") == 0
 
-        store.append_event("abc123", {"event": "launched", "sequence": 1})
+        store.append_event("abc123", {"event": "launched"})
         assert store.latest_event_sequence("abc123") == 1
 
-        store.append_event("abc123", {"event": "started", "sequence": 5})
-        assert store.latest_event_sequence("abc123") == 5
+        store.append_event("abc123", {"event": "started"})
+        assert store.latest_event_sequence("abc123") == 2
 
     def test_verify_pid_matches(self, tmp_path):
         store = RunStateStore(tmp_path)

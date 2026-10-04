@@ -397,9 +397,17 @@ class RunApplicationService:
             "    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n"
             "    rc = proc.returncode\n"
             "    stdout_text = proc.stdout.decode('utf-8', errors='replace') if proc.stdout else ''\n"
-            "    # Use transition_with_event to atomically mark terminal + journal\n"
+            "    # Advance preflight -> batch_selection (v2) then -> advance_or_stop (v3)\n"
             "    try:\n"
             "        current = store.get_run(rid)\n"
+            "        if current and current.state == 'preflight':\n"
+            "            store.transition(\n"
+            "                rid, 'batch_selection',\n"
+            "                expected_state=current.state,\n"
+            "                expected_version=current.version,\n"
+            "                reason='wrapper: advance',\n"
+            "            )\n"
+            "            current = store.get_run(rid)\n"
             "        store.transition(\n"
             "            rid, 'advance_or_stop',\n"
             "            expected_state=current.state,\n"
@@ -413,6 +421,14 @@ class RunApplicationService:
             "except Exception as exc:\n"
             "    try:\n"
             "        current = store.get_run(rid)\n"
+            "        if current and current.state == 'preflight':\n"
+            "            store.transition(\n"
+            "                rid, 'batch_selection',\n"
+            "                expected_state=current.state,\n"
+            "                expected_version=current.version,\n"
+            "                reason='wrapper: advance',\n"
+            "            )\n"
+            "            current = store.get_run(rid)\n"
             "        store.transition(\n"
             "            rid, 'advance_or_stop',\n"
             "            expected_state=current.state,\n"
@@ -445,6 +461,19 @@ class RunApplicationService:
                 "event": "launched",
                 "pid": proc.pid,
                 "command": list(command),
+            },
+        )
+
+        # Store lifecycle metadata (PID, command) in the kernel record.
+        self.store.update_metadata(
+            rid,
+            expected_version=1,
+            metadata={
+                "runlifecycle": {
+                    "command": list(command),
+                    "pid": proc.pid,
+                    "lifecycle_state": "running",
+                },
             },
         )
 

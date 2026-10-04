@@ -1,8 +1,9 @@
 """Async run lifecycle: start, inspect, and kill durable background runs.
 
-Reuses the existing ``subprocess`` and process-group patterns from
-``runner_adapter`` but writes structured state to
-``.skillweave/runs/<run-id>/`` instead of a bare tracking-log.
+Routes through ``RunApplicationService`` and the kernel SQLite store so that
+start, completion, cancellation and resume share one SQLite/CAS authority.
+The public API (``RunHandle``, ``start_async``, ``kill_run``, ``inspect_run``)
+is preserved as a compatibility facade.
 """
 
 from __future__ import annotations
@@ -69,56 +70,82 @@ class InspectMode:
 
 
 # ---------------------------------------------------------------------------
-# Detached wrapper script (similar to observe.py's wrapper but more robust)
+# Detached wrapper script — writes completion through the kernel store
 # ---------------------------------------------------------------------------
 
 _WRAPPER_SRC = (
     "import subprocess, sys, json, os, signal\n"
     "run_id = sys.argv[1]\n"
-    "store_path = sys.argv[2]\n"
-    "start_seq = int(sys.argv[3])\n"
-    "cmd = sys.argv[4:]\n"
-    "from pathlib import Path\n"
-    "store_dir = Path(store_path)\n"
-    "store_dir.mkdir(parents=True, exist_ok=True)\n"
-    "events = store_dir / 'events.jsonl'\n"
-    "meta = store_dir / 'run.json'\n"
-    "\n"
-    "def _write_event(ev):\n"
-    "    with open(events, 'a') as f:\n"
-    "        f.write(json.dumps(ev, sort_keys=True) + '\\n')\n"
-    "        f.flush()\n"
-    "\n"
-    "seq = start_seq\n"
-    "def _next_seq():\n"
-    "    global seq\n"
-    "    seq += 1\n"
-    "    return seq\n"
-    "\n"
-    "_write_event({'event': 'started', 'sequence': _next_seq(), 'command': list(cmd), 'run_id': run_id})\n"
+    "db_path = sys.argv[2]\n"
+    "cmd = sys.argv[3:]\n"
+    "from skillweave.runtime.store import SQLiteRunStore\n"
+    "from skillweave.runtime.journal import EventJournal\n"
+    "from skillweave.runtime.errors import VersionConflictError\n"
+    "store = SQLiteRunStore(db_path)\n"
+    "journal = EventJournal(db_path)\n"
+    "journal.append(run_id, event_type='started',\n"
+    "    payload={'command': cmd})\n"
     "try:\n"
     "    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n"
     "    rc = proc.returncode\n"
     "    stdout_text = proc.stdout.decode('utf-8', errors='replace') if proc.stdout else ''\n"
-    "    _write_event({'event': 'finished', 'sequence': _next_seq(), 'returncode': rc, 'stdout_preview': stdout_text[:1024]})\n"
-    "    # Update run.json state\n"
-    "    import json\n"
-    "    if meta.exists():\n"
-    "        d = json.loads(meta.read_text('utf-8'))\n"
-    "        d['state'] = 'succeeded' if rc == 0 else 'failed'\n"
-    "        d['exit_code'] = rc\n"
-    "        d['finished_at'] = __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()\n"
-    "        d['version'] = d.get('version', 1) + 1\n"
-    "        meta.write_text(json.dumps(d, sort_keys=True) + '\\n', encoding='utf-8')\n"
+    "    try:\n"
+    "        current = store.get_run(run_id)\n"
+    "        if current and current.state == 'preflight':\n"
+    "            store.transition(\n"
+    "                run_id, 'batch_selection',\n"
+    "                expected_state=current.state,\n"
+    "                expected_version=current.version,\n"
+    "                reason='wrapper: advance',\n"
+    "            )\n"
+    "            current = store.get_run(run_id)\n"
+    "        # Set lifecycle metadata BEFORE terminal transition (can't update terminal records).\n"
+    "        lifecycle = dict(current.metadata.get('runlifecycle', {}))\n"
+    "        lifecycle.update({'lifecycle_state': 'succeeded' if rc == 0 else 'failed', 'exit_code': rc})\n"
+    "        store.update_metadata(run_id,\n"
+    "            expected_version=current.version,\n"
+    "            metadata={'runlifecycle': lifecycle})\n"
+    "        current = store.get_run(run_id)\n"
+    "        store.transition(\n"
+    "            run_id, 'advance_or_stop',\n"
+    "            expected_state=current.state,\n"
+    "            expected_version=current.version,\n"
+    "            reason='wrapper: process completed',\n"
+    "        )\n"
+    "    except VersionConflictError:\n"
+    "        pass\n"
+    "    journal.append(run_id, event_type='finished',\n"
+    "        payload={'returncode': rc, 'stdout_preview': stdout_text[:1024]})\n"
     "except Exception as exc:\n"
-    "    _write_event({'event': 'error', 'sequence': _next_seq(), 'error': str(exc)})\n"
-    "    if meta.exists():\n"
-    "        d = json.loads(meta.read_text('utf-8'))\n"
-    "        d['state'] = 'failed'\n"
-    "        d['exit_code'] = -1\n"
-    "        d['version'] = d.get('version', 1) + 1\n"
-    "        meta.write_text(json.dumps(d, sort_keys=True) + '\\n', encoding='utf-8')\n"
-    "    sys.exit(1)\n"
+    "    try:\n"
+    "        current = store.get_run(run_id)\n"
+    "        if current and current.state == 'preflight':\n"
+    "            store.transition(\n"
+    "                run_id, 'batch_selection',\n"
+    "                expected_state=current.state,\n"
+    "                expected_version=current.version,\n"
+    "                reason='wrapper: advance',\n"
+    "            )\n"
+    "            current = store.get_run(run_id)\n"
+    "        lifecycle = dict(current.metadata.get('runlifecycle', {}))\n"
+    "        lifecycle.update({'lifecycle_state': 'failed', 'exit_code': -1})\n"
+    "        store.update_metadata(run_id,\n"
+    "            expected_version=current.version,\n"
+    "            metadata={'runlifecycle': lifecycle})\n"
+    "        current = store.get_run(run_id)\n"
+    "        store.transition(\n"
+    "            run_id, 'advance_or_stop',\n"
+    "            expected_state=current.state,\n"
+    "            expected_version=current.version,\n"
+    "            reason='wrapper: error: ' + str(exc),\n"
+    "        )\n"
+    "    except Exception:\n"
+    "        pass\n"
+    "    journal.append(run_id, event_type='error',\n"
+    "        payload={'error': str(exc)})\n"
+    "finally:\n"
+    "    store.close()\n"
+    "    journal.close()\n"
 )
 
 
@@ -135,9 +162,12 @@ def start_async(
 ) -> RunHandle:
     """Start *command* as a detached background process.
 
+    Uses the kernel-backed ``RunStateStore`` so the run is registered in the
+    kernel SQLite store before launch, and the detached child writes completion
+    through the same store.
+
     The child runs in its own session (process group) so it survives the
-    launcher's exit.  A structured RunHandle is returned immediately; the
-    handle is also persisted under ``.skillweave/runs/<run-id>/run.json``.
+    launcher's exit.  A structured RunHandle is returned immediately.
 
     Parameters
     ----------
@@ -160,30 +190,41 @@ def start_async(
     child_cwd = str(cwd or root)
 
     store = RunStateStore(root)
-    store_dir = store.run_dir(rid)
+    db_path = store._db_path
 
-    # Launch detached wrapper; pass start_seq=1 so the wrapper's first event
-    # gets sequence 2 (after the host's "launched" event at seq=1).
+    # Create the run record in the kernel store.
+    meta = RunMetadata.create(
+        run_id=rid,
+        command=list(command),
+        pid=0,  # placeholder, will be updated after launch
+    )
+    store.write_metadata(meta)
+
+    # Build env with PYTHONPATH for the child.
+    # handle.py is at src/skillweave/runlifecycle/handle.py, so
+    # .parent.parent.parent resolves to the src/ directory.
+    src_path = str(Path(__file__).resolve().parent.parent.parent)
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{src_path}:{existing}" if existing else src_path
+
+    # Launch detached wrapper that writes completion to the kernel store.
     proc = subprocess.Popen(
-        [sys.executable, "-c", _WRAPPER_SRC, rid, str(store_dir), "1", *list(command)],
+        [sys.executable, "-c", _WRAPPER_SRC, rid, db_path, *list(command)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         cwd=child_cwd,
+        env=env,
     )
 
-    meta = RunMetadata.create(
-        run_id=rid,
-        command=list(command),
-        pid=proc.pid,
-    )
-    store.write_metadata(meta)
+    # Update metadata with actual PID.
+    store.update_metadata(rid, pid=proc.pid)
 
-    # Write the launch event
+    # Write the launch event through the kernel journal.
     store.append_event(rid, {
         "event": "launched",
-        "sequence": 1,
         "run_id": rid,
         "pid": proc.pid,
         "command": list(command),
@@ -311,9 +352,10 @@ def kill_run(
 ) -> dict[str, Any]:
     """Kill a run by its ID and recorded PID.
 
-    Graceful (SIGTERM) first, then forced (SIGKILL) after a short grace
-    period.  Verifies the *pid* matches the recorded PID to prevent killing
-    a stale/reused process.
+    Uses the kernel-backed ``RunStateStore`` for CAS-guarded terminal
+    transitions.  Graceful (SIGTERM) first, then forced (SIGKILL) after
+    a short grace period.  Verifies the *pid* matches the recorded PID
+    to prevent killing a stale/reused process.
 
     Parameters
     ----------
@@ -387,11 +429,11 @@ def kill_run(
         except (ProcessLookupError, PermissionError):
             result = "graceful_kill" if killed_graceful else "already_dead"
 
+    # Use the kernel-backed store for CAS-guarded terminal transition.
     store.update_metadata(run_id, state="killed", finished_at=_now())
 
     store.append_event(run_id, {
         "event": "killed",
-        "sequence": store.latest_event_sequence(run_id) + 1,
         "run_id": run_id,
         "pid": pid,
         "result": result,
