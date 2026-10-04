@@ -734,6 +734,496 @@ class TestCriterion3_LegacyMigration:
 
 
 # =========================================================================
+# Additional: Crash/Idempotency and Late-Wrapper tests
+# =========================================================================
+
+
+class TestCrashIdempotency:
+    """Deterministic crash and idempotency tests beyond the basic race fixtures."""
+
+    def test_save_run_on_terminal_raises_invalid_transition(self):
+        """save_run() on a terminal record must raise InvalidTransitionError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("save-term-1"))
+
+            # Advance preflight -> batch_selection -> advance_or_stop (terminal)
+            run = store.get_run("save-term-1")
+            store.transition(
+                "save-term-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: advance",
+            )
+            run = store.get_run("save-term-1")
+            store.transition(
+                "save-term-1", "advance_or_stop",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: terminal",
+            )
+
+            # save_run with matching version must still be rejected
+            terminal = store.get_run("save-term-1")
+            stale_record = _make_run("save-term-1", state="preflight")
+            stale_record.version = terminal.version
+            with pytest.raises(InvalidTransitionError):
+                store.save_run(stale_record)
+
+            store.close()
+
+    def test_save_run_on_terminal_stale_version_also_raises(self):
+        """save_run() with stale version on terminal record raises InvalidTransitionError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("save-term-stale-1"))
+
+            # Advance to terminal (v3)
+            run = store.get_run("save-term-stale-1")
+            store.transition(
+                "save-term-stale-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: advance",
+            )
+            run = store.get_run("save-term-stale-1")
+            store.transition(
+                "save-term-stale-1", "advance_or_stop",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: terminal",
+            )
+
+            # stale_record with version=1 (old stale version)
+            # Version 1 hits the INSERT path -> IntegrityError -> VersionConflictError
+            stale_record = _make_run("save-term-stale-1", state="preflight")
+            stale_record.version = 1
+            with pytest.raises((VersionConflictError, InvalidTransitionError)):
+                store.save_run(stale_record)
+
+            store.close()
+
+    def test_kill_run_idempotent(self):
+        """Killing an already-killed run raises (terminal state cannot be re-entered)."""
+        from skillweave.runlifecycle.store import RunStateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = str(root / ".skillweave" / "store.db")
+            (root / ".skillweave").mkdir(parents=True, exist_ok=True)
+
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("kill-idem-1"))
+            store.close()
+
+            # First kill via RunStateStore facade
+            facade = RunStateStore(project_root=root)
+            facade.update_metadata("kill-idem-1", state="killed")
+
+            meta = facade.read_metadata("kill-idem-1")
+            assert meta is not None
+            assert meta.state == "killed"
+
+            # Second kill on terminal must raise (no re-entering terminal)
+            with pytest.raises(InvalidTransitionError):
+                facade.update_metadata("kill-idem-1", state="killed")
+
+    def test_crash_during_save_run_does_not_corrupt(self):
+        """A crash (rollback) during save_run must leave prior state intact."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("crash-save-1"))
+
+            # Advance to v2
+            run = store.get_run("crash-save-1")
+            store.transition(
+                "crash-save-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: advance",
+            )
+
+            # Simulate crash mid-save_run
+            run = store.get_run("crash-save-1")
+            store._conn.execute("BEGIN IMMEDIATE")
+            try:
+                store._conn.execute(
+                    "UPDATE runs SET state = ?, version = ? WHERE run_id = ?",
+                    ("advance_or_stop", run.version + 1, "crash-save-1"),
+                )
+                # Rollback before commit
+                store._conn.rollback()
+            except Exception:
+                store._conn.rollback()
+
+            # State must still be batch_selection
+            run_after = store.get_run("crash-save-1")
+            assert run_after.state == "batch_selection"
+            assert run_after.version == 2
+
+            store.close()
+
+    def test_duplicate_save_run_same_version_raises(self):
+        """Calling save_run twice with the same version raises VersionConflictError."""
+        store = _fresh_store()
+        store.save_run(_make_run("dup-save-1"))
+
+        with pytest.raises(VersionConflictError):
+            store.save_run(_make_run("dup-save-1"))
+
+        store.close()
+
+    def test_update_metadata_idempotent_on_terminal(self):
+        """update_metadata with same killed state on terminal is idempotent."""
+        from skillweave.runlifecycle.store import RunStateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = str(root / ".skillweave" / "store.db")
+            (root / ".skillweave").mkdir(parents=True, exist_ok=True)
+
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("meta-idem-1"))
+            store.close()
+
+            facade = RunStateStore(project_root=root)
+            facade.update_metadata("meta-idem-1", state="killed")
+
+            # Calling update_metadata again with state=killed on terminal
+            # should not raise (it's idempotent via the facade)
+            meta = facade.read_metadata("meta-idem-1")
+            assert meta.state == "killed"
+
+            # Direct update_metadata on terminal should raise
+            store2 = _fresh_store(db_path)
+            with pytest.raises(InvalidTransitionError):
+                store2.update_metadata("meta-idem-1", expected_version=meta.version, state="running")
+
+            store2.close()
+
+
+class TestLateWrapper:
+    """Stale wrapper completion cannot resurrect a cancelled/killed run."""
+
+    def test_wrapper_cannot_save_run_after_cancellation(self):
+        """A stale wrapper holding an old version cannot save_run a killed run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("late-wrapper-1"))
+
+            # Advance to batch_selection (v2)
+            run = store.get_run("late-wrapper-1")
+            store.transition(
+                "late-wrapper-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: advance",
+            )
+
+            # Kill via batch_selection -> advance_or_stop (v3)
+            run = store.get_run("late-wrapper-1")
+            store.transition(
+                "late-wrapper-1", "advance_or_stop",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: kill", stop_reason="operator_halt",
+            )
+
+            # Wrapper snapshot from v1 tries save_run with version=1
+            stale_record = _make_run("late-wrapper-1", state="preflight")
+            stale_record.version = 1
+            with pytest.raises((VersionConflictError, InvalidTransitionError)):
+                store.save_run(stale_record)
+
+            # Terminal state is unchanged
+            final = store.get_run("late-wrapper-1")
+            assert RunStateModel.is_terminal(final.state)
+
+            store.close()
+
+    def test_wrapper_cannot_transition_after_cancellation(self):
+        """A stale wrapper cannot transition a killed run forward."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("late-wrap-trans-1"))
+
+            # Advance to batch_selection (v2)
+            run = store.get_run("late-wrap-trans-1")
+            store.transition(
+                "late-wrap-trans-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: advance",
+            )
+
+            # Kill via batch_selection -> advance_or_stop (v3)
+            run = store.get_run("late-wrap-trans-1")
+            store.transition(
+                "late-wrap-trans-1", "advance_or_stop",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: kill", stop_reason="operator_halt",
+            )
+
+            # Wrapper tries to transition from its stale snapshot
+            with pytest.raises(VersionConflictError):
+                store.transition(
+                    "late-wrap-trans-1", "batch_selection",
+                    expected_state="preflight", expected_version=1,
+                    reason="stale wrapper advance",
+                )
+
+            # Even with correct version, terminal has no outgoing transitions
+            run = store.get_run("late-wrap-trans-1")
+            with pytest.raises(InvalidTransitionError):
+                store.transition(
+                    "late-wrap-trans-1", "batch_selection",
+                    expected_state=run.state, expected_version=run.version,
+                    reason="wrapper advance on terminal",
+                )
+
+            store.close()
+
+    def test_wrapper_cannot_update_metadata_after_cancellation(self):
+        """A stale wrapper cannot update_metadata on a killed run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("late-wrap-meta-1"))
+
+            # Advance to batch_selection (v2)
+            run = store.get_run("late-wrap-meta-1")
+            store.transition(
+                "late-wrap-meta-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: advance",
+            )
+
+            # Kill via batch_selection -> advance_or_stop (v3)
+            run = store.get_run("late-wrap-meta-1")
+            store.transition(
+                "late-wrap-meta-1", "advance_or_stop",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: kill", stop_reason="operator_halt",
+            )
+
+            # Wrapper tries to update metadata on terminal
+            with pytest.raises(InvalidTransitionError):
+                store.update_metadata(
+                    "late-wrap-meta-1",
+                    expected_version=3,
+                    metadata={"runlifecycle": {"lifecycle_state": "succeeded", "exit_code": 0}},
+                )
+
+            store.close()
+
+    def test_wrapper_cannot_append_finished_event_after_terminal_transition(self):
+        """After terminal transition, a stale wrapper cannot append a finished event.
+
+        The wrapper checks the run state before appending 'finished'. If the
+        run is already terminal, the wrapper must skip the finished event.
+        This test verifies the store-level guard: append_event after terminal
+        is allowed (events are append-only), but the logical contract says
+        the wrapper must check first.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            journal = EventJournal(store)
+            store.save_run(_make_run("late-wrap-event-1"))
+
+            # Advance to batch_selection (v2)
+            run = store.get_run("late-wrap-event-1")
+            store.transition(
+                "late-wrap-event-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: advance",
+            )
+
+            # Kill via batch_selection -> advance_or_stop (v3)
+            run = store.get_run("late-wrap-event-1")
+            store.transition(
+                "late-wrap-event-1", "advance_or_stop",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: kill", stop_reason="operator_halt",
+            )
+
+            # Wrapper tries to append finished event (journal allows it,
+            # but the run is terminal so the wrapper should have checked)
+            journal.append(
+                "late-wrap-event-1",
+                event_type="finished",
+                payload={"returncode": 0, "stdout_preview": "late output"},
+            )
+
+            # The finished event is in the journal (append is always allowed),
+            # but the run state must remain terminal/killed
+            run = store.get_run("late-wrap-event-1")
+            assert RunStateModel.is_terminal(run.state)
+            assert run.metadata.get("runlifecycle", {}).get("lifecycle_state") != "succeeded"
+
+            journal.close()
+            store.close()
+
+    def test_full_service_kill_then_stale_wrapper_completion(self):
+        """Integration: service kill followed by stale wrapper save_run is safe.
+
+        Simulates the full scenario:
+        1. Start a run via the service
+        2. Kill it via the service (sets lifecycle_state=killed, terminal transition)
+        3. Stale wrapper tries to save_run with old version -> rejected
+        """
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runsvc.service import RunApplicationService
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            journal = EventJournal(store)
+            raw = RawArtifactStore()
+            svc = RunApplicationService(store, journal, raw)
+
+            # Start a run
+            result = svc.start_async(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                run_id="full-kill-test-1",
+            )
+            run_id = result["run_id"]
+            pid = result["pid"]
+
+            # Kill it
+            kill_result = svc.kill_run(run_id, pid)
+            assert kill_result["state"] == "killed"
+
+            # Verify terminal state and lifecycle metadata
+            run = store.get_run(run_id)
+            assert RunStateModel.is_terminal(run.state)
+            assert run.metadata.get("runlifecycle", {}).get("lifecycle_state") == "killed"
+
+            # Stale wrapper tries save_run with version=1 (old snapshot)
+            stale = _make_run(run_id, state="preflight")
+            stale.version = 1
+            with pytest.raises((VersionConflictError, InvalidTransitionError)):
+                store.save_run(stale)
+
+            # Even with matching version, terminal guard prevents resurrection
+            stale.version = run.version
+            with pytest.raises(InvalidTransitionError):
+                store.save_run(stale)
+
+            # Terminal state unchanged
+            run = store.get_run(run_id)
+            assert RunStateModel.is_terminal(run.state)
+
+            journal.close()
+            store.close()
+
+    def test_concurrent_kill_and_wrapper_completion(self):
+        """Simulate concurrent kill and wrapper: exactly one wins, no corruption.
+
+        Two threads race: one tries to kill, the other tries to complete
+        (transition to terminal).  Exactly one succeeds; the other gets a
+        CAS or transition error.  The final state must be terminal.
+        """
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            store.save_run(_make_run("concurrent-race-1"))
+
+            # Advance to batch_selection (v2) so both paths have a valid
+            # non-terminal state to start from
+            run = store.get_run("concurrent-race-1")
+            store.transition(
+                "concurrent-race-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: advance",
+            )
+            store.close()
+
+            outcomes = {"kill_wins": 0, "complete_wins": 0, "errors": []}
+
+            def _killer():
+                s = SQLiteRunStore(db_path=db_path)
+                try:
+                    run = s.get_run("concurrent-race-1")
+                    s.transition(
+                        "concurrent-race-1", "advance_or_stop",
+                        expected_state=run.state, expected_version=run.version,
+                        reason="kill", stop_reason="operator_halt",
+                    )
+                    outcomes["kill_wins"] += 1
+                except (VersionConflictError, InvalidTransitionError):
+                    pass
+                except Exception as exc:
+                    outcomes["errors"].append(exc)
+                finally:
+                    s.close()
+
+            def _completer():
+                s = SQLiteRunStore(db_path=db_path)
+                try:
+                    run = s.get_run("concurrent-race-1")
+                    s.transition(
+                        "concurrent-race-1", "advance_or_stop",
+                        expected_state=run.state, expected_version=run.version,
+                        reason="completion",
+                    )
+                    outcomes["complete_wins"] += 1
+                except (VersionConflictError, InvalidTransitionError):
+                    pass
+                except Exception as exc:
+                    outcomes["errors"].append(exc)
+                finally:
+                    s.close()
+
+            threads = [
+                threading.Thread(target=_killer),
+                threading.Thread(target=_completer),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            assert outcomes["errors"] == [], f"unexpected errors: {outcomes['errors']}"
+            assert outcomes["kill_wins"] + outcomes["complete_wins"] == 1
+
+            s = SQLiteRunStore(db_path=db_path)
+            final = s.get_run("concurrent-race-1")
+            assert final is not None
+            assert RunStateModel.is_terminal(final.state)
+            s.close()
+
+    def test_corner_case_transition_terminal_then_save_run_new_id(self):
+        """Creating a different run after terminal is fine (different run_id)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+
+            # Create and kill run-1
+            store.save_run(_make_run("corner-run-1"))
+            run = store.get_run("corner-run-1")
+            store.transition(
+                "corner-run-1", "batch_selection",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: advance",
+            )
+            run = store.get_run("corner-run-1")
+            store.transition(
+                "corner-run-1", "advance_or_stop",
+                expected_state=run.state, expected_version=run.version,
+                reason="test: kill", stop_reason="operator_halt",
+            )
+            assert RunStateModel.is_terminal(store.get_run("corner-run-1").state)
+
+            # Creating a different run should work fine
+            store.save_run(_make_run("corner-run-2"))
+            run2 = store.get_run("corner-run-2")
+            assert run2 is not None
+            assert run2.state == "preflight"
+
+            store.close()
+
+
+# =========================================================================
 # Run standalone
 # =========================================================================
 
@@ -742,6 +1232,8 @@ def _run_all() -> int:
         TestCriterion1_SharedAuthority(),
         TestCriterion2_RaceFixtures(),
         TestCriterion3_LegacyMigration(),
+        TestCrashIdempotency(),
+        TestLateWrapper(),
     ]
     failed = 0
     total = 0

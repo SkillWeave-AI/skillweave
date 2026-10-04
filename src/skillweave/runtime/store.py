@@ -334,6 +334,11 @@ class SQLiteRunStore(RunStore):
         #   means the persisted version no longer equals the writer's snapshot,
         #   so exactly one of N concurrent same-snapshot writers wins and the
         #   other N-1 raise VersionConflictError.
+        # Read the existing row BEFORE BEGIN IMMEDIATE so we can check
+        # terminal state.  The version CAS inside the transaction is still
+        # the real authority; the terminal check is an additional guard.
+        existing = self.get_run(record.run_id)
+
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             if record.version <= 1:
@@ -360,6 +365,14 @@ class SQLiteRunStore(RunStore):
                     raise VersionConflictError(record.run_id, 1, actual)
                 new_version = 1
             else:
+                # Terminal records cannot be resurrected by any caller,
+                # even one holding the matching version.
+                if existing is not None and RunStateModel.is_terminal(existing.state):
+                    self._conn.rollback()
+                    raise InvalidTransitionError(
+                        existing.state, record.state, record.run_id,
+                        extra={"reason": "terminal record cannot be resurrected"},
+                    )
                 new_version = record.version + 1
                 cur = self._conn.execute(
                     """UPDATE runs SET
