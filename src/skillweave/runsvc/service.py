@@ -595,11 +595,14 @@ class RunApplicationService:
                 result = "graceful_kill" if killed_graceful else "already_dead"
 
         # CAS-guarded terminal transition: advance through legal lane states,
-        # set lifecycle metadata to killed, then transition to terminal.
-        # After the terminal state is durably committed, append the kill event
-        # to the journal.  The terminal transition is separate from the event
-        # append, but because the run is already terminal, a stale wrapper
-        # cannot resurrect the run or append a second terminal event.
+        # set lifecycle metadata to killed, then transition to terminal and
+        # co-commit the kill event in a single atomic transaction (outbox).
+        # The lifecycle metadata must be set before the terminal transition
+        # because update_metadata rejects terminal records.
+        #
+        # Using transition_with_event ensures the terminal state change and
+        # the kill outbox event are in the same BEGIN IMMEDIATE transaction:
+        # a crash before commit rolls back both; after commit both are visible.
         run = self.store.get_run(run_id)
         if run is not None and not RunStateModel.is_terminal(run.state):
             try:
@@ -623,26 +626,21 @@ class RunApplicationService:
                 )
                 run = self.store.get_run(run_id)
 
-                # Terminal transition (CAS-guarded).
-                self.store.transition(
+                # Atomic terminal transition + kill outbox event.
+                self.store.transition_with_event(
                     run_id,
                     "advance_or_stop",
                     expected_state=run.state,
                     expected_version=run.version,
+                    event_type="process_killed",
+                    event_payload={"pid": pid, "result": result},
                     reason="service: kill",
                     stop_reason="operator_halt",
-                )
-
-                # Append kill event to the journal (events table).
-                self.journal.append(
-                    run_id,
-                    event_type="process_killed",
-                    payload={"pid": pid, "result": result},
                 )
             except Exception:  # noqa: BLE001
                 pass
         else:
-            # Run already terminal — still write the kill event.
+            # Run already terminal — still write the kill event to the journal.
             self.journal.append(
                 run_id,
                 event_type="process_killed",
