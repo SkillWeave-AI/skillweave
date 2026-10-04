@@ -413,6 +413,7 @@ class SQLiteRunStore(RunStore):
         reason: str = "",
         role: Optional[str] = None,
         stop_reason: Optional[str] = None,
+        metadata_update: Optional[dict] = None,
     ) -> RunRecord:
         return self._transition_impl(
             run_id=run_id,
@@ -422,6 +423,7 @@ class SQLiteRunStore(RunStore):
             reason=reason,
             role=role,
             stop_reason=stop_reason,
+            metadata_update=metadata_update,
             event_type=None,
             event_payload=None,
             idempotency_key=None,
@@ -439,6 +441,7 @@ class SQLiteRunStore(RunStore):
         role: Optional[str] = None,
         stop_reason: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        metadata_update: Optional[dict] = None,
     ) -> RunRecord:
         """Atomically transition a run AND enqueue one journal outbox event.
 
@@ -447,6 +450,11 @@ class SQLiteRunStore(RunStore):
         ``BEGIN IMMEDIATE`` transaction. A crash before commit rolls back all
         three; after commit all three are durably present. This is the
         unit-of-work/outbox contract: state and event never diverge.
+
+        When *metadata_update* is provided, its key-value pairs are merged
+        into the run's metadata inside the same transaction (deep-merged for
+        the ``runlifecycle`` key). This allows lifecycle state changes and
+        the terminal transition to commit atomically.
         """
         return self._transition_impl(
             run_id=run_id,
@@ -459,6 +467,7 @@ class SQLiteRunStore(RunStore):
             event_type=event_type,
             event_payload=event_payload,
             idempotency_key=idempotency_key,
+            metadata_update=metadata_update,
         )
 
     def _transition_impl(
@@ -473,6 +482,7 @@ class SQLiteRunStore(RunStore):
         event_type: Optional[str] = None,
         event_payload: Optional[dict] = None,
         idempotency_key: Optional[str] = None,
+        metadata_update: Optional[dict] = None,
     ) -> RunRecord:
         existing = self.get_run(run_id)
         if existing is None:
@@ -519,10 +529,20 @@ class SQLiteRunStore(RunStore):
 
         # A terminal transition may carry a persistent stop reason. Record it
         # in metadata (the vocabulary itself stays flat; the reason is data).
+        # When *metadata_update* is provided, merge its values into metadata
+        # inside the same transaction (deep-merge runlifecycle).
         import json
         merged_metadata = dict(existing.metadata or {})
         if stop_reason is not None:
             merged_metadata["stop_reason"] = stop_reason
+        if metadata_update is not None:
+            for k, v in metadata_update.items():
+                if k == "runlifecycle" and isinstance(v, dict):
+                    existing_lifecycle = dict(merged_metadata.get("runlifecycle", {}))
+                    existing_lifecycle.update(v)
+                    merged_metadata["runlifecycle"] = existing_lifecycle
+                else:
+                    merged_metadata[k] = v
 
         # One transaction: the run-state UPDATE, its transitions_log row, and
         # (when requested) a pending outbox event commit together. A crash at

@@ -234,46 +234,61 @@ class RunStateStore:
         for k, v in changes.items():
             meta_update[k] = v
 
+        # If the caller requests a terminal lifecycle state (killed), skip
+        # the separate metadata update and instead atomically co-commit the
+        # lifecycle state, terminal lane transition, and kill outbox event
+        # via transition_with_event with metadata_update.  This eliminates
+        # the crash window between metadata update and terminal transition.
+        if state == "killed":
+            current = record
+            if current is not None and current.state in ("advance_or_stop", "failed"):
+                # Already terminal — raise to prevent re-entering terminal.
+                from skillweave.runtime.errors import InvalidTransitionError
+                raise InvalidTransitionError(
+                    current.state, "advance_or_stop", run_id,
+                    extra={"reason": "terminal record cannot be re-entered"},
+                )
+            if current is not None and current.state not in ("advance_or_stop", "failed"):
+                try:
+                    # Advance through intermediate states (each in its own
+                    # transaction) until advance_or_stop is legal.
+                    path = _kill_advance_path(current.state)
+                    for to_state in path:
+                        self._kernel.transition(
+                            run_id, to_state,
+                            expected_state=current.state,
+                            expected_version=current.version,
+                            reason="lifecycle: kill advance",
+                        )
+                        current = self._kernel.get_run(run_id)
+
+                    # Atomic terminal transition + lifecycle metadata +
+                    # kill outbox event in one transaction.
+                    self._kernel.transition_with_event(
+                        run_id, "advance_or_stop",
+                        expected_state=current.state,
+                        expected_version=current.version,
+                        event_type="process_killed",
+                        event_payload={"lifecycle_state": "killed"},
+                        reason="lifecycle: kill",
+                        stop_reason="operator_halt",
+                        metadata_update={
+                            "runlifecycle": meta_update,
+                        },
+                    )
+                except Exception:
+                    # CAS race — another writer already transitioned.
+                    pass
+            return self.read_metadata(run_id)
+
+        # Non-terminal metadata update: atomically merge changes into the
+        # kernel store with version CAS.
         if meta_update:
             self._kernel.update_metadata(
                 run_id,
                 expected_version=guard_version,
                 metadata={"runlifecycle": {**record.metadata.get("runlifecycle", {}), **meta_update}},
             )
-
-        # If the caller requests a terminal lifecycle state (killed), also
-        # drive the kernel lane state to a terminal state so the wrapper
-        # cannot resurrect the run after cancellation.
-        #
-        # The lane state machine does not permit a direct transition from
-        # "preflight" to "advance_or_stop".  We must advance through legal
-        # intermediate states first.
-        if state == "killed":
-            current = self._kernel.get_run(run_id)
-            if current is not None and not current.state in ("advance_or_stop", "failed"):
-                try:
-                    # Advance from preflight through batch_selection first.
-                    if current.state == "preflight":
-                        self._kernel.transition(
-                            run_id,
-                            "batch_selection",
-                            expected_state=current.state,
-                            expected_version=current.version,
-                            reason="lifecycle: kill advance",
-                        )
-                        current = self._kernel.get_run(run_id)
-                    # Now transition to the terminal state.
-                    self._kernel.transition(
-                        run_id,
-                        "advance_or_stop",
-                        expected_state=current.state,
-                        expected_version=current.version,
-                        reason="lifecycle: kill",
-                        stop_reason="operator_halt",
-                    )
-                except Exception:
-                    # CAS race — another writer already transitioned.
-                    pass
 
         return self.read_metadata(run_id)
 
@@ -391,6 +406,38 @@ class RunStateStore:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _kill_advance_path(current_state: str) -> list[str]:
+    """Return intermediate states to advance through before a terminal transition.
+
+    From any non-terminal lane state, compute the legal path to a state
+    from which ``advance_or_stop`` is a legal outgoing transition.
+    Returns an empty list when ``advance_or_stop`` is already legal from
+    *current_state*.
+    """
+    from skillweave.runtime.store import RunStateModel
+    allowed = [s.value if isinstance(s, RunStateModel) else s
+               for s in RunStateModel.legal_transitions(current_state)]
+    if "advance_or_stop" in allowed:
+        return []
+    if current_state == "preflight":
+        return ["batch_selection"]
+    if current_state == "lane_plan":
+        return ["implement", "verify", "fix_retry"]
+    if current_state == "implement":
+        return ["verify", "fix_retry"]
+    if current_state == "verify":
+        return ["fix_retry"]
+    if current_state == "review_gate":
+        return ["fix_retry"]
+    if current_state == "integrate":
+        return ["verify", "fix_retry"]
+    if current_state == "batch_selection":
+        return []
+    raise RuntimeError(
+        f"no legal path from {current_state} to terminal for kill"
+    )
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()

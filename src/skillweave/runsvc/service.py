@@ -433,7 +433,7 @@ class RunApplicationService:
             "    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n"
             "    rc = proc.returncode\n"
             "    stdout_text = proc.stdout.decode('utf-8', errors='replace') if proc.stdout else ''\n"
-            "    # Advance preflight -> batch_selection (v2) then -> advance_or_stop (v3)\n"
+            "    terminal_success = False\n"
             "    try:\n"
             "        current = store.get_run(rid)\n"
             "        if current and current.state == 'preflight':\n"
@@ -444,7 +444,6 @@ class RunApplicationService:
             "                reason='wrapper: advance',\n"
             "            )\n"
             "            current = store.get_run(rid)\n"
-            "        # Set lifecycle metadata BEFORE terminal transition.\n"
             "        lifecycle = dict(current.metadata.get('runlifecycle', {}))\n"
             "        lifecycle.update({'lifecycle_state': 'succeeded' if rc == 0 else 'failed', 'exit_code': rc})\n"
             "        store.update_metadata(rid,\n"
@@ -457,11 +456,15 @@ class RunApplicationService:
             "            expected_version=current.version,\n"
             "            reason='wrapper: process completed',\n"
             "        )\n"
+            "        terminal_success = True\n"
             "    except VersionConflictError:\n"
             "        pass\n"
-            "    journal.append(rid, event_type='finished',\n"
-            "        payload={'returncode': rc, 'stdout_preview': stdout_text[:1024]})\n"
+            "    if terminal_success:\n"
+            "        journal.append(rid, event_type='finished',\n"
+            "            payload={'returncode': rc, 'stdout_preview': stdout_text[:1024]},\n"
+            "            idempotency_key='wrapper:finish:' + rid + ':' + str(rc))\n"
             "except Exception as exc:\n"
+            "    terminal_success = False\n"
             "    try:\n"
             "        current = store.get_run(rid)\n"
             "        if current and current.state == 'preflight':\n"
@@ -484,10 +487,13 @@ class RunApplicationService:
             "            expected_version=current.version,\n"
             "            reason='wrapper: error: ' + str(exc),\n"
             "        )\n"
+            "        terminal_success = True\n"
             "    except Exception:\n"
             "        pass\n"
-            "    journal.append(rid, event_type='error',\n"
-            "        payload={'error': str(exc)})\n"
+            "    if terminal_success:\n"
+            "        journal.append(rid, event_type='error',\n"
+            "            payload={'error': str(exc)},\n"
+            "            idempotency_key='wrapper:error:' + rid)\n"
             "finally:\n"
             "    store.close()\n"
             "    journal.close()\n"
@@ -540,6 +546,49 @@ class RunApplicationService:
             "created_at": now,
             "version": run.version if run else 1,
         }
+
+    # ------------------------------------------------------------------
+    # Kill-path helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _kill_advance_path(current_state: str) -> list[str]:
+        """Return intermediate states to advance through before a terminal transition.
+
+        From any non-terminal lane state, compute the legal path to a state
+        from which ``advance_or_stop`` is a legal outgoing transition.
+        Returns an empty list when ``advance_or_stop`` is already legal from
+        *current_state*.
+        """
+        RunStateModel = _runtime_attr("store", "RunStateModel")
+        InvalidTransitionError = _runtime_attr("errors", "InvalidTransitionError")
+        allowed = [s.value if isinstance(s, RunStateModel) else s
+                   for s in RunStateModel.legal_transitions(current_state)]
+        if "advance_or_stop" in allowed:
+            return []
+        # Build a simple path through the lane: preflight -> batch_selection,
+        # or through the longer loop.
+        if current_state == "preflight":
+            return ["batch_selection"]
+        # lane_plan -> implement -> verify -> fix_retry
+        if current_state == "lane_plan":
+            return ["implement", "verify", "fix_retry"]
+        if current_state == "implement":
+            return ["verify", "fix_retry"]
+        if current_state == "verify":
+            return ["fix_retry"]
+        if current_state == "review_gate":
+            return ["fix_retry"]
+        if current_state == "integrate":
+            return ["verify", "fix_retry"]
+        # batch_selection can go directly to advance_or_stop
+        if current_state == "batch_selection":
+            return []
+        # Fallback: raise — this state has no path to terminal.
+        raise InvalidTransitionError(
+            current_state, "advance_or_stop", "kill",
+            extra={"reason": f"no legal path from {current_state} to terminal"},
+        )
 
     def kill_run(
         self,
@@ -594,63 +643,87 @@ class RunApplicationService:
             except (ProcessLookupError, PermissionError):
                 result = "graceful_kill" if killed_graceful else "already_dead"
 
-        # CAS-guarded terminal transition: advance through legal lane states,
-        # set lifecycle metadata to killed, then transition to terminal and
-        # co-commit the kill event in a single atomic transaction (outbox).
-        # The lifecycle metadata must be set before the terminal transition
-        # because update_metadata rejects terminal records.
+        # Drive the run to terminal via the legal lane path, co-committing
+        # lifecycle_state='killed' and the kill outbox event in the final
+        # atomic transaction.  This ensures:
+        # 1. Every non-terminal lane state reaches terminal via legal transitions.
+        # 2. Lifecycle metadata, terminal state, and kill event are one atomic
+        #    durable unit (no crash window where lifecycle says killed but lane
+        #    is still non-terminal or the outbox is empty).
+        # 3. A stale wrapper cannot append a second terminal transition.
         #
-        # Using transition_with_event ensures the terminal state change and
-        # the kill outbox event are in the same BEGIN IMMEDIATE transaction:
-        # a crash before commit rolls back both; after commit both are visible.
+        # Intermediate advances (preflight->batch_selection,
+        # lane_plan->implement->verify->fix_retry, etc.) are in separate
+        # transactions but always move forward; only the final
+        # transition_with_event sets lifecycle_state='killed', so a crash
+        # during an intermediate step never leaves a resurrectable "killed" run.
         run = self.store.get_run(run_id)
         if run is not None and not RunStateModel.is_terminal(run.state):
             try:
-                if run.state == "preflight":
+                current_state = run.state
+                current_version = run.version
+
+                # Walk through legal intermediate states to reach a state from
+                # which advance_or_stop is a legal transition.
+                path = self._kill_advance_path(current_state)
+                for to_state in path:
                     self.store.transition(
-                        run_id,
-                        "batch_selection",
-                        expected_state=run.state,
-                        expected_version=run.version,
+                        run_id, to_state,
+                        expected_state=current_state,
+                        expected_version=current_version,
                         reason="service: kill advance",
                     )
                     run = self.store.get_run(run_id)
+                    current_state = run.state
+                    current_version = run.version
 
-                # Set lifecycle metadata BEFORE terminal transition.
-                lifecycle = dict(run.metadata.get("runlifecycle", {}))
-                lifecycle["lifecycle_state"] = "killed"
-                self.store.update_metadata(
-                    run_id,
-                    expected_version=run.version,
-                    metadata={"runlifecycle": lifecycle},
-                )
-                run = self.store.get_run(run_id)
-
-                # Atomic terminal transition + kill outbox event.
+                # Atomic terminal transition + lifecycle metadata + kill outbox
+                # event — all in one BEGIN IMMEDIATE transaction.
                 self.store.transition_with_event(
-                    run_id,
-                    "advance_or_stop",
-                    expected_state=run.state,
-                    expected_version=run.version,
+                    run_id, "advance_or_stop",
+                    expected_state=current_state,
+                    expected_version=current_version,
                     event_type="process_killed",
                     event_payload={"pid": pid, "result": result},
                     reason="service: kill",
                     stop_reason="operator_halt",
+                    metadata_update={
+                        "runlifecycle": {"lifecycle_state": "killed"},
+                    },
                 )
-            except Exception:  # noqa: BLE001
-                pass
-        else:
-            # Run already terminal — still write the kill event to the journal.
-            self.journal.append(
-                run_id,
-                event_type="process_killed",
-                payload={"pid": pid, "result": result},
-            )
 
+                # Read the final state to return the actual persisted state.
+                run = self.store.get_run(run_id)
+                return {
+                    "run_id": run_id,
+                    "pid": pid,
+                    "state": "killed",
+                    "result": result,
+                }
+            except Exception:  # noqa: BLE001
+                # CAS race: another writer moved the run. Return the current
+                # persisted state, not a hardcoded "killed".
+                final = self.store.get_run(run_id)
+                final_state = final.state if final else "unknown"
+                return {
+                    "run_id": run_id,
+                    "pid": pid,
+                    "state": final_state,
+                    "result": result,
+                }
+
+        # Run already terminal — still write the kill event to the journal.
+        self.journal.append(
+            run_id,
+            event_type="process_killed",
+            payload={"pid": pid, "result": result},
+        )
+
+        run = self.store.get_run(run_id)
         return {
             "run_id": run_id,
             "pid": pid,
-            "state": "killed",
+            "state": run.state if run else "unknown",
             "result": result,
         }
 
