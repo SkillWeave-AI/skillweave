@@ -367,6 +367,13 @@ class RunStateStore:
         RunMetadata
             The imported or existing metadata.
         """
+        # Auto-discover legacy file when neither source_bytes nor source_path
+        # is given: look for .skillweave/runs/{run_id}/run.json.
+        if source_bytes is None and source_path is None:
+            legacy_path = self.metadata_path(run_id)
+            if legacy_path.exists():
+                source_path = legacy_path
+
         if source_bytes is None and source_path is not None:
             source_bytes = source_path.read_bytes()
 
