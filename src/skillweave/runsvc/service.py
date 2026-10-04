@@ -516,49 +516,6 @@ class RunApplicationService:
             "version": run.version if run else 1,
         }
 
-    # ------------------------------------------------------------------
-    # Kill-path helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _kill_advance_path(current_state: str) -> list[str]:
-        """Return intermediate states to advance through before a terminal transition.
-
-        From any non-terminal lane state, compute the legal path to a state
-        from which ``advance_or_stop`` is a legal outgoing transition.
-        Returns an empty list when ``advance_or_stop`` is already legal from
-        *current_state*.
-        """
-        RunStateModel = _runtime_attr("store", "RunStateModel")
-        InvalidTransitionError = _runtime_attr("errors", "InvalidTransitionError")
-        allowed = [s.value if isinstance(s, RunStateModel) else s
-                   for s in RunStateModel.legal_transitions(current_state)]
-        if "advance_or_stop" in allowed:
-            return []
-        # Build a simple path through the lane: preflight -> batch_selection,
-        # or through the longer loop.
-        if current_state == "preflight":
-            return ["batch_selection"]
-        # lane_plan -> implement -> verify -> fix_retry
-        if current_state == "lane_plan":
-            return ["implement", "verify", "fix_retry"]
-        if current_state == "implement":
-            return ["verify", "fix_retry"]
-        if current_state == "verify":
-            return ["fix_retry"]
-        if current_state == "review_gate":
-            return ["fix_retry"]
-        if current_state == "integrate":
-            return ["verify", "fix_retry"]
-        # batch_selection can go directly to advance_or_stop
-        if current_state == "batch_selection":
-            return []
-        # Fallback: raise — this state has no path to terminal.
-        raise InvalidTransitionError(
-            current_state, "advance_or_stop", "kill",
-            extra={"reason": f"no legal path from {current_state} to terminal"},
-        )
-
     def kill_run(
         self,
         run_id: str,
@@ -612,87 +569,119 @@ class RunApplicationService:
             except (ProcessLookupError, PermissionError):
                 result = "graceful_kill" if killed_graceful else "already_dead"
 
-        # Drive the run to terminal via the legal lane path, co-committing
-        # lifecycle_state='killed' and the kill outbox event in the final
-        # atomic transaction.  This ensures:
-        # 1. Every non-terminal lane state reaches terminal via legal transitions.
-        # 2. Lifecycle metadata, terminal state, and kill event are one atomic
-        #    durable unit (no crash window where lifecycle says killed but lane
-        #    is still non-terminal or the outbox is empty).
-        # 3. A stale wrapper cannot append a second terminal transition.
-        #
-        # Intermediate advances (preflight->batch_selection,
-        # lane_plan->implement->verify->fix_retry, etc.) are in separate
-        # transactions but always move forward; only the final
-        # transition_with_event sets lifecycle_state='killed', so a crash
-        # during an intermediate step never leaves a resurrectable "killed" run.
+        # Drive the run to terminal via the canonical durable reconciliation
+        # primitive, co-committing lifecycle_state='killed' and exactly one
+        # kill outbox/journal event in the terminal unit of work.  This
+        # ensures:
+        # 1. Every non-terminal lane state reaches terminal via legal
+        #    forward-only transitions (resolved from RunStateModel, not a
+        #    hand-maintained table that can drift).
+        # 2. Lifecycle metadata, terminal state, and the kill event are one
+        #    atomic durable unit (no crash window where lifecycle says killed
+        #    while the lane is still non-terminal or the outbox is empty).
+        # 3. A genuine pre-existing terminal winner (a committed completion or
+        #    an earlier cancellation) is preserved unchanged and never
+        #    resurrected.
+        # 4. A finite burst of competing legal writers cannot exhaust a fixed
+        #    retry budget and lose the cancellation: reconcile_terminal retries
+        #    on VersionConflictError without a finite bound.
+        # 5. A non-CAS storage failure propagates (never a successful-looking
+        #    ``already_dead``/``running`` result with the exception swallowed).
         run = self.store.get_run(run_id)
-        if run is not None and not RunStateModel.is_terminal(run.state):
+        cancelling = run is not None and not RunStateModel.is_terminal(run.state)
+        if cancelling:
+            VersionConflictError = _runtime_attr("errors", "VersionConflictError")
+            InvalidTransitionError = _runtime_attr("errors", "InvalidTransitionError")
+            KillOutcomeError = _runtime_attr("errors", "KillOutcomeError")
             try:
-                current_state = run.state
-                current_version = run.version
-
-                # Walk through legal intermediate states to reach a state from
-                # which advance_or_stop is a legal transition.
-                path = self._kill_advance_path(current_state)
-                for to_state in path:
-                    self.store.transition(
-                        run_id, to_state,
-                        expected_state=current_state,
-                        expected_version=current_version,
-                        reason="service: kill advance",
+                reconcile_terminal = getattr(self.store, "reconcile_terminal", None)
+                if reconcile_terminal is not None:
+                    # Canonical durable path: records a recoverable intent, walks
+                    # the state-machine path, and retries past CAS contention.
+                    record = reconcile_terminal(
+                        run_id,
+                        target_state="advance_or_stop",
+                        lifecycle_update={"lifecycle_state": "killed"},
+                        event_type="process_killed",
+                        event_payload={"pid": pid, "result": result},
+                        idempotency_key="kill:" + run_id,
+                        reason="service: kill",
+                        stop_reason="operator_halt",
                     )
-                    run = self.store.get_run(run_id)
-                    current_state = run.state
-                    current_version = run.version
+                else:
+                    # Minimal duck-typed store fallback (tests that provide a
+                    # thin store double without the reconciliation primitive):
+                    # a single atomic unit of work, with a genuine terminal
+                    # winner preserved.
+                    current = run
+                    path = RunStateModel.canonical_path_to_terminal(
+                        current.state, "advance_or_stop")
+                    if path is None:
+                        raise InvalidTransitionError(
+                            current.state, "advance_or_stop", run_id,
+                            extra={"reason": f"no legal path from {current.state} to terminal"},
+                        )
+                    for to_state in path:
+                        self.store.transition(
+                            run_id, to_state,
+                            expected_state=current.state,
+                            expected_version=current.version,
+                            reason="service: kill advance",
+                        )
+                        current = self.store.get_run(run_id)
+                    record = self.store.transition_with_event(
+                        run_id, "advance_or_stop",
+                        expected_state=current.state,
+                        expected_version=current.version,
+                        event_type="process_killed",
+                        event_payload={"pid": pid, "result": result},
+                        idempotency_key="kill:" + run_id,
+                        reason="service: kill",
+                        stop_reason="operator_halt",
+                        metadata_update={"runlifecycle": {"lifecycle_state": "killed"}},
+                    )
+            except (VersionConflictError, InvalidTransitionError):
+                # Structurally meaningful store errors (illegal transition, no
+                # path, terminal resurrection) surface unchanged.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # A non-CAS storage failure (e.g. a SQLite I/O error) must not
+                # be swallowed into a successful-looking ``already_dead`` /
+                # ``running`` result.  Surface it as the explicit typed error
+                # for an unreconcilable cancellation, preserving the cause.
+                raise KillOutcomeError(
+                    run_id,
+                    {"reason": "storage failure during cancellation terminal commit",
+                     "error": type(exc).__name__, "detail": str(exc)},
+                    result=result,
+                    cause=exc,
+                ) from exc
+        else:
+            # The run is already terminal.  A committed terminal winner stands
+            # unchanged; no lifecycle or state is fabricated.  The kill event
+            # is only recorded on the readable journal so an idempotent re-kill
+            # is observable without a second terminal transition.
+            self.journal.append(
+                run_id,
+                event_type="process_killed",
+                payload={"pid": pid, "result": result},
+                idempotency_key="kill:" + run_id,
+            )
+            record = self.store.get_run(run_id)
 
-                # Atomic terminal transition + lifecycle metadata + kill outbox
-                # event — all in one BEGIN IMMEDIATE transaction.
-                self.store.transition_with_event(
-                    run_id, "advance_or_stop",
-                    expected_state=current_state,
-                    expected_version=current_version,
-                    event_type="process_killed",
-                    event_payload={"pid": pid, "result": result},
-                    reason="service: kill",
-                    stop_reason="operator_halt",
-                    metadata_update={
-                        "runlifecycle": {"lifecycle_state": "killed"},
-                    },
-                )
-
-                # Read the final state to return the actual persisted state.
-                run = self.store.get_run(run_id)
-                return {
-                    "run_id": run_id,
-                    "pid": pid,
-                    "state": "killed",
-                    "result": result,
-                }
-            except Exception:  # noqa: BLE001
-                # CAS race: another writer moved the run. Return the current
-                # persisted state, not a hardcoded "killed".
-                final = self.store.get_run(run_id)
-                final_state = final.state if final else "unknown"
-                return {
-                    "run_id": run_id,
-                    "pid": pid,
-                    "state": final_state,
-                    "result": result,
-                }
-
-        # Run already terminal — still write the kill event to the journal.
-        self.journal.append(
-            run_id,
-            event_type="process_killed",
-            payload={"pid": pid, "result": result},
-        )
-
-        run = self.store.get_run(run_id)
+        final_lifecycle = (record.metadata or {}).get("runlifecycle", {}).get("lifecycle_state")
+        # Report the lifecycle vocabulary ("killed") only when this call
+        # actually committed a genuine cancellation.  If a *different* terminal
+        # winner already stood (a committed completion the reconciler preserved),
+        # the operator sees its real lane state — never a fabricated "killed".
+        reported_state = "killed" if (cancelling and final_lifecycle == "killed") else (
+            record.state if record is not None else "unknown")
         return {
             "run_id": run_id,
             "pid": pid,
-            "state": run.state if run else "unknown",
+            "state": reported_state,
+            "lane_state": record.state if record is not None else "unknown",
+            "lifecycle_state": final_lifecycle,
             "result": result,
         }
 

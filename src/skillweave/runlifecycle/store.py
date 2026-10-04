@@ -249,36 +249,21 @@ class RunStateStore:
                     extra={"reason": "terminal record cannot be re-entered"},
                 )
             if current is not None and current.state not in ("advance_or_stop", "failed"):
-                try:
-                    # Advance through intermediate states (each in its own
-                    # transaction) until advance_or_stop is legal.
-                    path = _kill_advance_path(current.state)
-                    for to_state in path:
-                        self._kernel.transition(
-                            run_id, to_state,
-                            expected_state=current.state,
-                            expected_version=current.version,
-                            reason="lifecycle: kill advance",
-                        )
-                        current = self._kernel.get_run(run_id)
-
-                    # Atomic terminal transition + lifecycle metadata +
-                    # kill outbox event in one transaction.
-                    self._kernel.transition_with_event(
-                        run_id, "advance_or_stop",
-                        expected_state=current.state,
-                        expected_version=current.version,
-                        event_type="process_killed",
-                        event_payload={"lifecycle_state": "killed"},
-                        reason="lifecycle: kill",
-                        stop_reason="operator_halt",
-                        metadata_update={
-                            "runlifecycle": meta_update,
-                        },
-                    )
-                except Exception:
-                    # CAS race — another writer already transitioned.
-                    pass
+                # Advance through intermediate states and commit the terminal
+                # unit of work via canonical durable reconciliation: a finite
+                # burst of legal competing writers must not be able to discard
+                # the cancellation, and a non-CAS storage failure must surface
+                # rather than be swallowed as an apparent success.
+                self._kernel.reconcile_terminal(
+                    run_id,
+                    target_state="advance_or_stop",
+                    lifecycle_update=dict(meta_update),
+                    event_type="process_killed",
+                    event_payload={"lifecycle_state": "killed"},
+                    idempotency_key="lifecycle-kill:" + run_id,
+                    reason="lifecycle: kill",
+                    stop_reason="operator_halt",
+                )
             return self.read_metadata(run_id)
 
         # Non-terminal metadata update: atomically merge changes into the
@@ -406,38 +391,6 @@ class RunStateStore:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _kill_advance_path(current_state: str) -> list[str]:
-    """Return intermediate states to advance through before a terminal transition.
-
-    From any non-terminal lane state, compute the legal path to a state
-    from which ``advance_or_stop`` is a legal outgoing transition.
-    Returns an empty list when ``advance_or_stop`` is already legal from
-    *current_state*.
-    """
-    from skillweave.runtime.store import RunStateModel
-    allowed = [s.value if isinstance(s, RunStateModel) else s
-               for s in RunStateModel.legal_transitions(current_state)]
-    if "advance_or_stop" in allowed:
-        return []
-    if current_state == "preflight":
-        return ["batch_selection"]
-    if current_state == "lane_plan":
-        return ["implement", "verify", "fix_retry"]
-    if current_state == "implement":
-        return ["verify", "fix_retry"]
-    if current_state == "verify":
-        return ["fix_retry"]
-    if current_state == "review_gate":
-        return ["fix_retry"]
-    if current_state == "integrate":
-        return ["verify", "fix_retry"]
-    if current_state == "batch_selection":
-        return []
-    raise RuntimeError(
-        f"no legal path from {current_state} to terminal for kill"
-    )
-
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()

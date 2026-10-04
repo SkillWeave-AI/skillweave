@@ -32,11 +32,13 @@ from skillweave.runtime.store import (
     RunRecord,
     RunStateModel,
     CompletionReconciler,
+    CancellationReconciler,
 )
 from skillweave.runtime.journal import EventJournal
 from skillweave.runtime.errors import (
     VersionConflictError,
     InvalidTransitionError,
+    KillOutcomeError,
     StoreError,
 )
 from skillweave.runsvc import RunApplicationService
@@ -1661,6 +1663,202 @@ class TestDurableCompletionReconciliation:
             reopened.close()
 
 
+# ---------------------------------------------------------------------------
+# Cancellation durability (controller counterproof)
+# ---------------------------------------------------------------------------
+
+
+def _terminal_event_count(store, run_id):
+    """Count distinct logical terminal events across journal and outbox."""
+    rows = store._conn.execute(
+        "SELECT event_type, idempotency_key FROM events WHERE run_id = ?",
+        (run_id,),
+    ).fetchall()
+    seen = {r["idempotency_key"] for r in rows
+            if r["event_type"] in ("process_killed", "killed", "finished", "error")}
+    outbox = store._conn.execute(
+        "SELECT event_type, idempotency_key FROM outbox WHERE run_id = ?",
+        (run_id,),
+    ).fetchall()
+    for r in outbox:
+        if r["event_type"] in ("process_killed", "killed", "finished", "error"):
+            seen.add(r["idempotency_key"] or ("outbox:", r["event_type"]))
+    journal_only = [r for r in rows
+                    if r["event_type"] in ("process_killed", "killed", "finished", "error")
+                    and r["idempotency_key"] is None]
+    return len(seen) + len(journal_only)
+
+
+class TestDurableCancellationReconciliation:
+    """A cancellation must not be lost under CAS contention or I/O failure.
+
+    The controller reproduced a lost cancellation against the previous
+    candidate: ``RunApplicationService.kill_run`` caught every exception after
+    signalling and returned a successful-looking ``already_dead``/``running``
+    result with **no** cancellation event.  These tests pin the corrected
+    semantics: one durable terminal cancellation under a finite burst of real
+    competing writers, a typed error (not a swallowed success) on a non-CAS
+    storage failure, and preservation of a genuine terminal winner.
+    """
+
+    def _service_run(self, store):
+        from skillweave.runsvc.service import RunApplicationService
+        return RunApplicationService(store, EventJournal(store), RawArtifactStore())
+
+    def test_service_cancellation_is_durable_under_cas_contention(self):
+        """A real competing writer immediately before the terminal commit.
+
+        A finite burst of legal metadata writes bumps the run version; the kill
+        must still leave a terminal ``killed`` lifecycle and exactly one
+        cancellation outbox event, not a lost ``running`` run.
+        """
+        import skillweave.runsvc.service as service_module
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            other = SQLiteRunStore(db_path)
+            run_id = "cancel-durable-cas"
+            store.create_run(run_id, runlifecycle={
+                "pid": 313372, "command": ["offline"], "lifecycle_state": "running"})
+            svc = self._service_run(store)
+
+            original = store.transition_with_event
+            state = {"injected": False}
+
+            def at_commit(*args, **kwargs):
+                if not state["injected"]:
+                    state["injected"] = True
+                    snap = other.get_run(run_id)
+                    other.update_metadata(run_id, expected_version=snap.version,
+                                          metadata={"fixture_writer": "real bump"})
+                return original(*args, **kwargs)
+
+            def absent(*_a):
+                raise ProcessLookupError("offline fixture: no signal")
+
+            store.transition_with_event = at_commit
+            old = service_module.os.kill, service_module.os.killpg
+            try:
+                service_module.os.kill = service_module.os.killpg = absent
+                svc.kill_run(run_id, 313372)
+            finally:
+                service_module.os.kill, service_module.os.killpg = old
+                store.transition_with_event = original
+
+            actual = other.get_run(run_id)
+            assert state["injected"], "the terminal commit seam was not exercised"
+            assert RunStateModel.is_terminal(actual.state)
+            assert actual.metadata.get("runlifecycle", {}).get("lifecycle_state") == "killed"
+            assert _terminal_event_count(other, run_id) == 1
+            store.close()
+            other.close()
+
+    def test_service_cancellation_surfaces_typed_error_on_io_failure(self):
+        """A non-CAS storage failure must raise, never look like a success."""
+        import sqlite3
+        import skillweave.runsvc.service as service_module
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            run_id = "cancel-durable-io"
+            store.create_run(run_id, runlifecycle={
+                "pid": 313372, "command": ["offline"], "lifecycle_state": "running"})
+            svc = self._service_run(store)
+
+            original = store.transition_with_event
+
+            def explode(*args, **kwargs):
+                raise sqlite3.OperationalError("injected terminal storage failure")
+
+            def absent(*_a):
+                raise ProcessLookupError("offline fixture: no signal")
+
+            store.transition_with_event = explode
+            old = service_module.os.kill, service_module.os.killpg
+            try:
+                service_module.os.kill = service_module.os.killpg = absent
+                with pytest.raises(KillOutcomeError) as info:
+                    svc.kill_run(run_id, 313372)
+            finally:
+                service_module.os.kill, service_module.os.killpg = old
+                store.transition_with_event = original
+
+            assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+            # No false terminal state or lifecycle claim was persisted.
+            stored = store.get_run(run_id)
+            assert not RunStateModel.is_terminal(stored.state)
+            assert stored.metadata.get("runlifecycle", {}).get("lifecycle_state") == "running"
+            assert _terminal_event_count(store, run_id) == 0
+            store.close()
+
+    def test_service_cancellation_preserves_genuine_terminal_winner(self):
+        """A committed completion is never overturned by a late kill."""
+        import skillweave.runsvc.service as service_module
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            run_id = "cancel-winner"
+            store.create_run(run_id, runlifecycle={
+                "pid": 313372, "command": ["offline"], "lifecycle_state": "running"})
+            winner = CompletionReconciler(
+                store, run_id,
+                target_state="advance_or_stop",
+                lifecycle_update={"lifecycle_state": "succeeded", "exit_code": 0},
+                event_type="finished",
+                event_payload={"returncode": 0},
+                idempotency_key="wrapper:finish:" + run_id + ":0",
+                reason="wrapper: process completed",
+            ).reconcile()
+            assert RunStateModel.is_terminal(winner.state)
+
+            svc = self._service_run(store)
+
+            def absent(*_a):
+                raise ProcessLookupError("offline fixture: no signal")
+
+            old = service_module.os.kill, service_module.os.killpg
+            try:
+                service_module.os.kill = service_module.os.killpg = absent
+                returned = svc.kill_run(run_id, 313372)
+            finally:
+                service_module.os.kill, service_module.os.killpg = old
+
+            after = store.get_run(run_id)
+            assert after.version == winner.version
+            assert after.metadata["runlifecycle"]["lifecycle_state"] == "succeeded"
+            assert returned["state"] != "killed", (
+                "a late kill must not claim killed over a completed winner")
+            assert returned["state"] == "advance_or_stop"
+            store.close()
+
+    def test_cancellation_intent_resumes_after_crash(self):
+        """A recorded cancellation intent is finished on a later pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            run_id = "cancel-resume"
+            store.save_run(_make_run(run_id))
+            reconciler = CancellationReconciler(
+                store, run_id, pid=4242, result="forced_kill",
+                event_type="process_killed", event_payload={"pid": 4242},
+                idempotency_key="kill:" + run_id,
+            )
+            reconciler.record_intent()
+            pending = store.get_run(run_id).metadata.get("_pending_cancellation")
+            assert isinstance(pending, dict)
+            assert not RunStateModel.is_terminal(store.get_run(run_id).state)
+            store.close()
+
+            reopened = SQLiteRunStore(db_path)
+            finished = CancellationReconciler.resume_pending(reopened, run_id)
+            assert finished is not None and RunStateModel.is_terminal(finished.state)
+            assert finished.metadata["runlifecycle"]["lifecycle_state"] == "killed"
+            assert _terminal_event_count(reopened, run_id) == 1
+            # Idempotent: a second resume finds a terminal run and does nothing.
+            assert CancellationReconciler.resume_pending(reopened, run_id) is None
+            reopened.close()
+
+
 # =========================================================================
 # Run standalone
 # =========================================================================
@@ -1673,6 +1871,7 @@ def _run_all() -> int:
         TestCrashIdempotency(),
         TestLateWrapper(),
         TestDurableCompletionReconciliation(),
+        TestDurableCancellationReconciliation(),
     ]
     failed = 0
     total = 0

@@ -126,20 +126,22 @@ table and is immediately readable via `get_events()`.
 
 **Downstream limit:** there is currently **no outbox relay/drain** in the
 source tree — nothing moves undelivered `outbox` rows into `events` and calls
-`mark_outbox_delivered()`.  Events written only to the outbox (e.g. the kill
-path's `process_killed`, which uses `transition_with_event` without
-`journal_event`) are durable and readable via `list_outbox()`, but they are
-**not** visible through the `events` journal (`read_events()` /
-`get_events()`) until a relay exists.  Downstream consumers that read only the
-journal will therefore not see outbox-only events.
+`mark_outbox_delivered()`.  Events written only to the outbox (i.e. a bare
+`transition_with_event()` call without `journal_event=True`) are durable and
+readable via `list_outbox()`, but they are **not** visible through the
+`events` journal (`read_events()` / `get_events()`) until a relay exists.
+Downstream consumers that read only the journal will therefore not see
+outbox-only events.
 
-The kill path in `RunApplicationService` advances the lane through legal
-intermediate states and then commits the terminal state,
-`lifecycle_state="killed"` and the `process_killed` intent in one
-`transition_with_event()` transaction.  A kill event is *also* appended to the
-journal only on the already-terminal branch (idempotent re-kill), so a normal
-cancellation's event lives in the outbox while the run's terminal state and
-lifecycle are immediately durable.
+The kill path in `RunApplicationService` drives the lane to terminal through
+the canonical durable reconciliation primitive, `reconcile_terminal()`, which
+passes `journal_event=True`.  The terminal lane transition,
+`lifecycle_state="killed"` and the `process_killed` event are therefore
+co-committed — into **both** the outbox and the readable `events` journal — in
+one `BEGIN IMMEDIATE` transaction.  The same is true of the façade kill path
+(`RunStateStore.update_metadata(state="killed")`).  A re-kill of an
+already-terminal run only appends an idempotent journal event via
+`journal.append()`; it does not fabricate a second terminal transition.
 
 ## Lifecycle facade
 
@@ -170,17 +172,56 @@ startup bookkeeping.
 
 ## Cancellation atomicity
 
-`kill_run` in `RunApplicationService` advances the lane through legal
-intermediate states (separate forward-only transactions), then commits the
-**terminal transition, `lifecycle_state="killed"` and the `process_killed`
-outbox intent in a single `transition_with_event()` transaction**.  Because
-the terminal state and its lifecycle are co-committed, there is no crash
-window in which lifecycle says killed while the lane is still non-terminal.
-Once the run is terminal, a stale wrapper cannot resurrect it or append a
-second terminal event.  If the final transaction fails (CAS conflict), the
-operation returns the current persisted state rather than a hardcoded
-"killed"; the intermediate advances always move forward, so a crash during
-them never leaves a resurrectable "killed" run.
+`kill_run` in `RunApplicationService` drives the run to terminal through the
+canonical durable reconciliation primitive, `reconcile_terminal()`.  That
+primitive walks the legal forward-only lane transitions (resolved from
+`RunStateModel`, not a hand-maintained table) and then commits the **terminal
+transition, `lifecycle_state="killed"` and the `process_killed` event in a
+single transaction** — so there is no crash window in which lifecycle says
+killed while the lane is still non-terminal or the outbox is empty.  Once the
+run is terminal, a stale wrapper cannot resurrect it or append a second
+terminal event.
+
+### Durable cancellation under contention
+
+A single CAS attempt is not enough.  Any competing metadata writer bumps the
+run version, so a **fixed** retry budget can be exhausted and a cancellation
+silently lost — the run would remain `running` with no cancellation event.
+`reconcile_terminal()` therefore retries **without a finite bound** on each
+`VersionConflictError`: it re-reads the current non-terminal snapshot and
+tries again.  A finite burst of legal competing writes (for example 20 version
+bumps from an independent SQLite connection) can therefore never discard the
+cancellation.  The loop terminates as soon as a terminal state is observed, so
+exactly one cancellation event is written however many writers race.
+
+A genuine pre-existing terminal winner (a committed completion, or an earlier
+cancellation) is returned unchanged and **never** overwritten: `kill_run`
+reports the winner's real state, and does not fabricate `killed`.
+
+### Typed failure, never a swallowed success
+
+Only `VersionConflictError` is retried.  Any other storage failure (for
+example a SQLite I/O error during the terminal commit) is **not** swallowed:
+`kill_run` raises `KillOutcomeError` (a `StoreError`) with the original
+exception chained as `__cause__`, so a caller can tell a durable cancellation
+from a storage failure.  A kill is never reported as an apparent success
+(``already_dead``/``running``) when its terminal unit of work did not commit.
+
+### Cancellation intent recovery
+
+`CancellationReconciler` (returned by
+`SQLiteRunStore.reconcile_cancellation_intent()`) records the cancellation
+intent (`_pending_cancellation` metadata) **before** the terminal commit.  A
+crash between the intent and the commit leaves the intent readable, so
+`CancellationReconciler.resume_pending()` finishes the recorded cancellation
+on a later pass instead of leaving a non-terminal `running` run behind.
+
+The service kill path itself (`RunApplicationService.kill_run`) commits
+through `reconcile_terminal()`, which retries CAS contention without a finite
+bound, so a finite burst of competing writers cannot drop the cancellation
+without needing a durable intent.  `RunStateStore.update_metadata(state="killed")`
+uses the same canonical reconciliation, so a façade-level cancellation cannot
+swallow a CAS conflict either.
 
 ## Detached wrapper completion
 

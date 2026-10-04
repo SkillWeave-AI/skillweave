@@ -78,6 +78,45 @@ class RunStateModel(str, Enum):
         from_state = cls(from_state) if isinstance(from_state, str) else from_state
         return transition_map.get(from_state, [])
 
+    @classmethod
+    def canonical_path_to_terminal(cls, from_state, target_state: str = "advance_or_stop"):
+        """Return forward-only lane states to advance through so that
+        *target_state* becomes a legal outgoing transition.
+
+        Returns an empty list when *target_state* is already legal from
+        *from_state*, or ``None`` when no forward path reaches it.  The path is
+        resolved from the state machine rather than a hand-maintained table, so
+        it cannot drift from :meth:`legal_transitions`.
+        """
+        def _values(states):
+            return [s.value if isinstance(s, RunStateModel) else s for s in states]
+
+        start = from_state.value if isinstance(from_state, RunStateModel) else from_state
+        if target_state in _values(cls.legal_transitions(start)):
+            return []
+        prev: dict = {start: None}
+        queue = [start]
+        found = None
+        while queue:
+            node = queue.pop(0)
+            if target_state in _values(cls.legal_transitions(node)):
+                found = node
+                break
+            for nxt in cls.legal_transitions(node):
+                nv = nxt.value if isinstance(nxt, RunStateModel) else nxt
+                if nv not in prev:
+                    prev[nv] = node
+                    queue.append(nv)
+        if found is None:
+            return None
+        path = []
+        node = found
+        while node is not None and node != start:
+            path.append(node)
+            node = prev.get(node)
+        path.reverse()
+        return path
+
 
 #: Persistent stop reasons (recorded in ``metadata["stop_reason"]``, never as
 #: a dedicated state) that explain why a run entered a terminal state.
@@ -1383,6 +1422,39 @@ class SQLiteRunStore(RunStore):
             intent_metadata_key=intent_metadata_key,
         )
 
+    def reconcile_cancellation_intent(
+        self,
+        run_id: str,
+        *,
+        pid: Optional[int] = None,
+        result: str = "unknown",
+        event_type: str = "process_killed",
+        event_payload: Optional[dict] = None,
+        idempotency_key: Optional[str] = None,
+        stop_reason: str = "operator_halt",
+        reason: str = "service: kill",
+        intent_metadata_key: str = "_pending_cancellation",
+    ) -> "CancellationReconciler":
+        """Return a reconciler that durably records a cancellation intent.
+
+        The intent (the terminal outcome plus its one logical event) is stored
+        in run metadata, so if the process crashes between the intent and the
+        terminal commit a later pass can still finish the cancellation instead
+        of leaving a non-terminal ``running`` run behind.
+        """
+        return CancellationReconciler(
+            self,
+            run_id,
+            pid=pid,
+            result=result,
+            event_type=event_type,
+            event_payload=event_payload,
+            idempotency_key=idempotency_key,
+            stop_reason=stop_reason,
+            reason=reason,
+            intent_metadata_key=intent_metadata_key,
+        )
+
     def import_legacy(
         self,
         run_id: str,
@@ -1563,4 +1635,115 @@ class CompletionReconciler:
             idempotency_key=intent.get("idempotency_key"),
             reason=intent.get("reason", ""),
             stop_reason=intent.get("stop_reason"),
+        )
+
+
+class CancellationReconciler:
+    """Durable cancellation-intent recorder and reconciler.
+
+    Mirrors :class:`CompletionReconciler` for the kill path.  A cancellation
+    request must leave one durable terminal outcome, or surface a typed error —
+    never a successful-looking ``already_dead``/``running`` result with the
+    exception swallowed.  A genuine pre-existing terminal winner is preserved
+    and never overwritten.
+    """
+
+    def __init__(
+        self,
+        store: "SQLiteRunStore",
+        run_id: str,
+        *,
+        pid: Optional[int] = None,
+        result: str = "unknown",
+        event_type: str = "process_killed",
+        event_payload: Optional[dict] = None,
+        idempotency_key: Optional[str] = None,
+        stop_reason: str = "operator_halt",
+        reason: str = "service: kill",
+        intent_metadata_key: str = "_pending_cancellation",
+    ) -> None:
+        self._store = store
+        self.run_id = run_id
+        self.pid = pid
+        self.result = result
+        self.event_type = event_type
+        self.event_payload = dict(event_payload or {})
+        self.idempotency_key = idempotency_key
+        self.stop_reason = stop_reason
+        self.reason = reason
+        self.intent_metadata_key = intent_metadata_key
+
+    def _intent(self) -> dict:
+        return {
+            "pid": self.pid,
+            "result": self.result,
+            "event_type": self.event_type,
+            "event_payload": self.event_payload,
+            "idempotency_key": self.idempotency_key,
+            "stop_reason": self.stop_reason,
+            "reason": self.reason,
+        }
+
+    def record_intent(self) -> None:
+        """Durably write the cancellation intent, retrying past CAS conflicts.
+
+        A genuine terminal winner is left untouched and no intent is written.
+        """
+        RunStateModel = globals()["RunStateModel"]
+        intent = self._intent()
+        while True:
+            current = self._store.get_run(self.run_id)
+            if current is None or RunStateModel.is_terminal(current.state):
+                return
+            try:
+                self._store.update_metadata(
+                    self.run_id,
+                    expected_version=current.version,
+                    metadata={self.intent_metadata_key: intent},
+                )
+                return
+            except VersionConflictError:
+                continue
+            except InvalidTransitionError:
+                # Terminal winner appeared between read and write.
+                return
+
+    def reconcile(self) -> RunRecord:
+        self.record_intent()
+        return self._store.reconcile_terminal(
+            self.run_id,
+            target_state="advance_or_stop",
+            lifecycle_update={"lifecycle_state": "killed"},
+            event_type=self.event_type,
+            event_payload=self.event_payload,
+            idempotency_key=self.idempotency_key,
+            reason=self.reason,
+            stop_reason=self.stop_reason,
+        )
+
+    @classmethod
+    def resume_pending(
+        cls,
+        store: "SQLiteRunStore",
+        run_id: str,
+        *,
+        intent_metadata_key: str = "_pending_cancellation",
+    ) -> Optional[RunRecord]:
+        """Finish a recorded-but-uncommitted cancellation intent, if any."""
+        RunStateModel = globals()["RunStateModel"]
+        current = store.get_run(run_id)
+        if current is None or RunStateModel.is_terminal(current.state):
+            return None
+        intent = (current.metadata or {}).get(intent_metadata_key)
+        if not isinstance(intent, dict):
+            return None
+        return store.reconcile_terminal(
+            run_id,
+            target_state="advance_or_stop",
+            lifecycle_update={"lifecycle_state": "killed"},
+            event_type=intent.get("event_type", "process_killed"),
+            event_payload=intent.get("event_payload"),
+            idempotency_key=intent.get("idempotency_key"),
+            reason=intent.get("reason", "service: kill"),
+            stop_reason=intent.get("stop_reason", "operator_halt"),
         )
