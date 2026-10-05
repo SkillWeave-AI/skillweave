@@ -1680,6 +1680,96 @@ class TestDurableCompletionReconciliation:
             assert CompletionReconciler.resume_pending(reopened, run_id) is None
             reopened.close()
 
+    def test_production_resume_run_finishes_recorded_completion_intent(self):
+        """The production restart path reconciles a recorded completion intent.
+
+        A wrapper lost between ``record_intent()`` and the terminal commit
+        leaves ``_pending_completion`` on a non-terminal run.  The real
+        production resume path (``RunApplicationService.resume_run``) must
+        finish it — terminal state, recorded lifecycle, exactly one logical
+        ``finished`` event — rather than return the stuck record unchanged.
+        """
+        from skillweave.runsvc.service import RunApplicationService
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            run_id = "resume-completion-1"
+            store.create_run(run_id, runlifecycle={
+                "pid": 313372, "command": ["offline"], "lifecycle_state": "running"})
+
+            reconciler = CompletionReconciler(
+                store, run_id,
+                target_state="advance_or_stop",
+                lifecycle_update={"lifecycle_state": "succeeded", "exit_code": 0},
+                event_type="finished",
+                event_payload={"returncode": 0},
+                idempotency_key="wrapper:finish:" + run_id + ":0",
+                reason="wrapper: process completed",
+            )
+            reconciler.record_intent()
+            assert isinstance(
+                store.get_run(run_id).metadata.get("_pending_completion"), dict)
+            assert not RunStateModel.is_terminal(store.get_run(run_id).state)
+            store.close()
+
+            # Restart with a fresh connection; resume through the production path.
+            reopened = SQLiteRunStore(db_path)
+            svc = RunApplicationService(reopened, EventJournal(reopened), RawArtifactStore())
+            resumed = svc.resume_run(run_id)
+            assert resumed is not None
+            after = reopened.get_run(run_id)
+            assert RunStateModel.is_terminal(after.state)
+            assert after.metadata["runlifecycle"]["lifecycle_state"] == "succeeded"
+            assert _terminal_event_count(reopened, run_id) == 1
+            # Idempotent: a second production resume is a no-op.
+            before_version = reopened.get_run(run_id).version
+            svc.resume_run(run_id)
+            assert reopened.get_run(run_id).version == before_version
+            reopened.close()
+
+    def test_production_resume_run_preserves_terminal_winner_over_intent(self):
+        """A recorded intent never overturns a genuine terminal winner.
+
+        If a cancellation (or completion) already committed while a stale
+        ``_pending_completion`` intent lingers, production resume returns the
+        real terminal state unchanged and appends no second terminal event.
+        """
+        from skillweave.runsvc.service import RunApplicationService
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            run_id = "resume-completion-winner"
+            store.create_run(run_id, runlifecycle={
+                "pid": 313372, "command": ["offline"], "lifecycle_state": "running"})
+            # Record a completion intent without committing it ...
+            CompletionReconciler(
+                store, run_id,
+                target_state="advance_or_stop",
+                lifecycle_update={"lifecycle_state": "succeeded", "exit_code": 0},
+                event_type="finished",
+                event_payload={"returncode": 0},
+                idempotency_key="wrapper:finish:" + run_id + ":0",
+                reason="wrapper: process completed",
+            ).record_intent()
+            # ... then a cancellation commits a genuine terminal winner.
+            winner = CancellationReconciler(
+                store, run_id, pid=313372, result="forced_kill",
+                idempotency_key="kill:" + run_id,
+            ).reconcile()
+            assert RunStateModel.is_terminal(winner.state)
+            store.close()
+
+            reopened = SQLiteRunStore(db_path)
+            svc = RunApplicationService(reopened, EventJournal(reopened), RawArtifactStore())
+            resumed = svc.resume_run(run_id)
+            assert resumed is not None
+            after = reopened.get_run(run_id)
+            assert after.state == winner.state
+            assert after.metadata["runlifecycle"]["lifecycle_state"] == "killed"
+            # Only the cancellation's single logical terminal event exists.
+            assert _terminal_event_count(reopened, run_id) == 1
+            reopened.close()
+
 
 # ---------------------------------------------------------------------------
 # Cancellation durability (controller counterproof)

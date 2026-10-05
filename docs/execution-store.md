@@ -281,8 +281,15 @@ exactly one terminal event is written however many writers race.
 
 The intent (`_pending_completion` metadata) is written *before* the terminal
 commit.  A crash between the intent and the commit leaves the intent
-readable, so `CompletionReconciler.resume_pending()` finishes the recorded
-outcome on a later pass instead of losing it.
+readable.  The production restart path reconciles it:
+`RunApplicationService.resume_run` calls
+`CompletionReconciler.resume_pending()` after the terminal/historical checks,
+so a completed child whose wrapper was lost before the commit is finished —
+terminal `advance_or_stop` with the recorded lifecycle and exactly one logical
+`finished`/`error` event — instead of being left as a stuck non-terminal run.
+A genuine terminal winner (including a cancellation committed first) is
+preserved unchanged, so the resume reconcile is idempotent and never writes a
+second terminal event.
 
 Only `VersionConflictError` is retried.  Any other storage failure (for
 example a SQLite I/O error) propagates to the caller, so an I/O failure is
@@ -323,6 +330,12 @@ file at `.skillweave/runs/{run_id}/run.json`.
 - Reconciles a recorded-but-uncommitted `_pending_cancellation` intent (a
   crash at the signal boundary) through `CancellationReconciler.resume_pending()`
   before returning, so a lost cancellation becomes a terminal `killed` run.
+- Reconciles a recorded-but-uncommitted `_pending_completion` intent (a crash
+  between the wrapper's intent write and its terminal commit) through
+  `CompletionReconciler.resume_pending()`, so a completed child is not left as
+  a stuck non-terminal run.  Ordering (cancellation first, then completion)
+  and terminal-winner preservation mean exactly one terminal event is ever
+  written.
 - Returns the current run state for active runs.
 - Does **not** launch a duplicate process or revive a terminal/historical run.
 

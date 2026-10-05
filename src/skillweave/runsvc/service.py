@@ -752,6 +752,18 @@ class RunApplicationService:
         if finished is not None:
             run = finished
 
+        # A completion intent recorded by the detached wrapper but never
+        # committed (the wrapper/host was lost between ``record_intent`` and the
+        # terminal commit) is finished here too, so the completed child's
+        # outcome is not permanently lost as a stuck non-terminal run.  A
+        # genuine terminal winner was already returned above; if the
+        # cancellation reconcile just committed, this is a no-op.  Exactly one
+        # logical terminal event is written by the canonical reconciliation.
+        CompletionReconciler = _runtime_attr("store", "CompletionReconciler")
+        completed = CompletionReconciler.resume_pending(self.store, run_id)
+        if completed is not None:
+            run = completed
+
         events = self.journal.get_events(run_id)
         return {
             "run_id": run_id,
