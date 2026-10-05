@@ -1776,3 +1776,453 @@ class TestExecutionEnvelopeBridge:
         )
         rs.close()
         s.close()
+
+
+# ===================================================================
+# BLOCKING (finding 1): Ingress honours existing owner envelope
+# ===================================================================
+
+class TestIngressHonoursOwnerEnvelope:
+    """Prove that installed ingress does NOT overwrite an existing finite
+    owner envelope with an unlimited one."""
+
+    def test_ingress_does_not_overwrite_existing_envelope(self, monkeypatch):
+        """Ingress does not overwrite existing finite envelope — the
+        persisted owner envelope is retained across runs."""
+        from skillweave.cli import run as cli_run
+
+        db_path = str(_SCRATCH / f"ingress_retain_{uuid.uuid4().hex}.db")
+
+        # Pre-set a finite envelope for this task scope
+        from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope
+        rs = ReservationStore(db_path)
+        task_id = "retain-task"
+        rs.set_envelope(
+            "existing-run",
+            f"{task_id}/attempt-1",
+            ReservationEnvelope(max_requests=5, max_bytes=10000, max_in_flight=5),
+        )
+        rs.close()
+
+        written: list[str] = []
+        monkeypatch.setattr(sys.stdout, "write", lambda s: written.append(s))
+        exit_codes: list[int] = []
+        monkeypatch.setattr(sys, "exit", lambda code: exit_codes.append(code))
+
+        try:
+            cli_run.main([
+                "--tool", "opencode",
+                "--model", "budget-test",
+                "--subject-repo", "skillweave",
+                "--subject-commit", "deadbeef",
+                "--db-path", db_path,
+                "--task-id", task_id,
+                "--attempt", "2",
+                "--artifacts-path", str(_SCRATCH / f"cli_art3_{uuid.uuid4().hex}"),
+                "--", sys.executable, "-c", "print('retain-test')",
+            ])
+            # Verify the envelope was NOT overwritten — the finite owner
+            # envelope should still be authoritative
+            rs2 = ReservationStore(db_path)
+            env = rs2.get_envelope_for_task_scope(task_id)
+            assert env is not None
+            assert env.max_requests == 5, (
+                f"expected max_requests=5 (preserved), got {env.max_requests}"
+            )
+            assert env.max_bytes == 10000, (
+                f"expected max_bytes=10000 (preserved), got {env.max_bytes}"
+            )
+            rs2.close()
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(db_path + suffix)
+                except OSError:
+                    pass
+
+    def test_reserve_task_usage_aggregate_across_runs(self, store):
+        """Task-scoped cumulative usage is tracked across different run_ids."""
+        task_id = "agg-task"
+        scope_id = f"{task_id}/attempt-1"
+        owner_env = ReservationEnvelope(max_requests=2, max_in_flight=5)
+        store.set_envelope("agg-run-1", scope_id, owner_env)
+
+        # First reservation on run-1 — succeeds
+        store.reserve(
+            run_id="agg-run-1", task_id=task_id, attempt=1,
+            scope_id=scope_id,
+        )
+        task_usage = store.get_task_usage(task_id, scope_id)
+        assert task_usage is not None
+        assert task_usage["cumulative_requests"] == 1
+
+        # Second reservation on run-2 (different run_id), same scope — succeeds
+        store.reserve(
+            run_id="agg-run-2", task_id=task_id, attempt=1,
+            scope_id=scope_id,
+        )
+        task_usage = store.get_task_usage(task_id, scope_id)
+        assert task_usage is not None
+        assert task_usage["cumulative_requests"] == 2
+
+        # Third reservation for same scope should fail (max_requests=2)
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(
+                run_id="agg-run-3", task_id=task_id, attempt=1,
+                scope_id=scope_id,
+            )
+        assert "requests" in str(exc.value)
+
+    def test_task_usage_across_attempts_same_scope(self, store):
+        """Task-scoped cumulative usage for same scope accumulates across runs."""
+        task_id = "same-scope-task"
+        scope_id = f"{task_id}/attempt-1"
+        owner_env = ReservationEnvelope(max_requests=3, max_in_flight=5)
+        store.set_envelope("ss-run-1", scope_id, owner_env)
+
+        store.reserve(run_id="ss-run-1", task_id=task_id, attempt=1, scope_id=scope_id)
+        store.reserve(run_id="ss-run-2", task_id=task_id, attempt=1, scope_id=scope_id)
+        store.reserve(run_id="ss-run-3", task_id=task_id, attempt=1, scope_id=scope_id)
+
+        task_usage = store.get_task_usage(task_id, scope_id)
+        assert task_usage is not None
+        assert task_usage["cumulative_requests"] == 3
+
+        with pytest.raises(AdmissionRefused):
+            store.reserve(run_id="ss-run-4", task_id=task_id, attempt=1, scope_id=scope_id)
+
+    def test_task_usage_complete_updates_counters(self, store):
+        """complete() updates task-scoped cumulative counters."""
+        task_id = "comp-task"
+        scope_id = f"{task_id}/attempt-1"
+        owner_env = ReservationEnvelope(max_requests=5, max_in_flight=5)
+        store.set_envelope("comp-run", scope_id, owner_env)
+
+        rec = store.reserve(
+            run_id="comp-run", task_id=task_id, attempt=1,
+            scope_id=scope_id,
+            reserved_bytes=1000, reserved_tokens=500.0, cost=10.0,
+        )
+        store.complete(rec.reservation_id, observed_bytes=800, observed_tokens=400.0, cost=8.0)
+
+        task_usage = store.get_task_usage(task_id, scope_id)
+        assert task_usage is not None
+        assert task_usage["cumulative_bytes"] == 800
+        assert task_usage["cumulative_tokens"] == 400
+        assert task_usage["cumulative_cost"] == 8.0
+        assert task_usage["cumulative_requests"] == 1
+
+    def test_task_usage_cancel_reverses_counters(self, store):
+        """cancel() reverses task-scoped cumulative counters."""
+        task_id = "cancel-task"
+        scope_id = f"{task_id}/attempt-1"
+        owner_env = ReservationEnvelope(max_requests=5, max_in_flight=5)
+        store.set_envelope("cancel-run", scope_id, owner_env)
+
+        rec = store.reserve(
+            run_id="cancel-run", task_id=task_id, attempt=1,
+            scope_id=scope_id,
+            reserved_bytes=1000, reserved_tokens=500.0, cost=10.0,
+        )
+        store.cancel(rec.reservation_id)
+
+        task_usage = store.get_task_usage(task_id, scope_id)
+        assert task_usage is not None
+        assert task_usage["cumulative_requests"] == 0
+        assert task_usage["cumulative_bytes"] == 0
+        assert task_usage["cumulative_tokens"] == 0
+        assert task_usage["cumulative_cost"] == 0.0
+
+    def test_task_usage_reconcile_updates_counters(self, store):
+        """reconcile() updates task-scoped cumulative counters."""
+        task_id = "reconcile-task"
+        scope_id = f"{task_id}/attempt-1"
+        owner_env = ReservationEnvelope(max_requests=5, max_in_flight=5)
+        store.set_envelope("reconcile-run", scope_id, owner_env)
+
+        rec = store.reserve(
+            run_id="reconcile-run", task_id=task_id, attempt=1,
+            scope_id=scope_id,
+            reserved_bytes=1000, reserved_tokens=500.0, cost=10.0,
+        )
+        store.complete(rec.reservation_id)
+
+        task_usage = store.get_task_usage(task_id, scope_id)
+        assert task_usage is not None
+        assert task_usage["cumulative_bytes"] == 1000
+
+        store.reconcile(rec.reservation_id, actual_bytes=600)
+        task_usage = store.get_task_usage(task_id, scope_id)
+        assert task_usage["cumulative_bytes"] == 600
+        assert task_usage["cumulative_tokens"] == 500
+        assert task_usage["cumulative_cost"] == 10.0
+
+    def test_mcp_create_run_honours_existing_envelope(self):
+        """MCP create_run honours pre-set finite owner envelope."""
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope
+        from skillweave.runsvc.service import RunApplicationService
+
+        db_path = str(_SCRATCH / f"mcp_honour_{uuid.uuid4().hex}.db")
+        try:
+            rs = ReservationStore(db_path)
+            task_id = "mcp-honour-task"
+            rs.set_envelope(
+                "pre-mcp-run",
+                f"{task_id}/attempt-1",
+                ReservationEnvelope(max_requests=3, max_bytes=50000, max_in_flight=5),
+            )
+            rs.close()
+
+            s = SQLiteRunStore(db_path)
+            j = EventJournal(db_path)
+            raw = RawArtifactStore()
+            stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+            stream_store = DurableStreamStore(root=stream_root)
+            rs2 = ReservationStore(db_path)
+            svc = RunApplicationService(s, j, raw, stream_store, reservation_store=rs2)
+
+            run_id = "mcp-honour-run"
+            existing = rs2.get_envelope_for_task_scope(task_id)
+            assert existing is not None
+            assert existing.max_requests == 3
+            assert existing.max_bytes == 50000
+
+            owner_env = existing
+            execution = svc.execute_streaming_native(
+                [sys.executable, "-c", "print('mcp-honour')"],
+                run_id=run_id,
+                tool="opencode",
+                model="test",
+                subject_repo="skillweave",
+                subject_commit="deadbeef",
+                attempt=1,
+                task_id=task_id,
+                reservation_envelope=owner_env,
+            )
+            assert execution["run_id"] == run_id
+
+            still_there = rs2.get_envelope_for_task_scope(task_id)
+            assert still_there is not None
+            assert still_there.max_requests == 3
+            assert still_there.max_bytes == 50000
+
+            rs2.close()
+            s.close()
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(db_path + suffix)
+                except OSError:
+                    pass
+
+    def test_ingress_preserves_owner_envelope_across_attempts(self, monkeypatch):
+        """Ingress preserves owner envelope across attempts for same task."""
+        from skillweave.cli import run as cli_run
+
+        db_path = str(_SCRATCH / f"ingress_attempts_{uuid.uuid4().hex}.db")
+
+        from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope
+        rs = ReservationStore(db_path)
+        task_id = "attempts-task"
+        rs.set_envelope(
+            "orig-run",
+            f"{task_id}/attempt-1",
+            ReservationEnvelope(max_requests=10, max_bytes=5000, max_in_flight=5),
+        )
+        rs.close()
+
+        written: list[str] = []
+        monkeypatch.setattr(sys.stdout, "write", lambda s: written.append(s))
+        exit_codes: list[int] = []
+        monkeypatch.setattr(sys, "exit", lambda code: exit_codes.append(code))
+
+        try:
+            cli_run.main([
+                "--tool", "opencode",
+                "--model", "budget-test",
+                "--subject-repo", "skillweave",
+                "--subject-commit", "deadbeef",
+                "--db-path", db_path,
+                "--task-id", task_id,
+                "--attempt", "1",
+                "--artifacts-path", str(_SCRATCH / f"ia_art1_{uuid.uuid4().hex}"),
+                "--", sys.executable, "-c", "print('attempt-1')",
+            ])
+            cli_run.main([
+                "--tool", "opencode",
+                "--model", "budget-test",
+                "--subject-repo", "skillweave",
+                "--subject-commit", "deadbeef",
+                "--db-path", db_path,
+                "--task-id", task_id,
+                "--attempt", "2",
+                "--artifacts-path", str(_SCRATCH / f"ia_art2_{uuid.uuid4().hex}"),
+                "--", sys.executable, "-c", "print('attempt-2')",
+            ])
+            rs2 = ReservationStore(db_path)
+            env = rs2.get_envelope_for_task_scope(task_id)
+            assert env is not None
+            assert env.max_requests == 10, (
+                f"expected max_requests=10, got {env.max_requests}"
+            )
+            assert env.max_bytes == 5000, (
+                f"expected max_bytes=5000, got {env.max_bytes}"
+            )
+            rs2.close()
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(db_path + suffix)
+                except OSError:
+                    pass
+
+
+# ===================================================================
+# BLOCKING (finding 2/3): Task-scoped cumulative enforcement across runs
+# ===================================================================
+
+class TestTaskScopedCumulativeEnforcement:
+    """Prove that cumulative budget enforcement works across ALL runs for the
+    same task scope, not just per-run."""
+
+    def test_max_requests_across_runs_refused(self, store):
+        """max_requests enforced across different run_ids."""
+        task_id = "cross-run-task"
+        scope_id = f"{task_id}/attempt-1"
+        store.set_envelope("run-a", scope_id,
+                           ReservationEnvelope(max_requests=2, max_in_flight=5))
+
+        store.reserve(run_id="run-a", task_id=task_id, attempt=1, scope_id=scope_id)
+        store.reserve(run_id="run-b", task_id=task_id, attempt=1, scope_id=scope_id)
+
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(run_id="run-c", task_id=task_id, attempt=1, scope_id=scope_id)
+        assert "requests" in str(exc.value)
+
+    def test_max_bytes_across_runs_refused(self, store):
+        """max_bytes enforced across different run_ids."""
+        task_id = "cross-byte-task"
+        scope_id = f"{task_id}/attempt-1"
+        store.set_envelope("byte-run-a", scope_id,
+                           ReservationEnvelope(max_bytes=2000, max_in_flight=5))
+
+        store.reserve(run_id="byte-run-a", task_id=task_id, attempt=1,
+                      scope_id=scope_id, reserved_bytes=1500)
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(run_id="byte-run-b", task_id=task_id, attempt=1,
+                          scope_id=scope_id, reserved_bytes=1000)
+        assert "bytes" in str(exc.value)
+
+    def test_max_tokens_across_runs_refused(self, store):
+        """max_tokens enforced across different run_ids."""
+        task_id = "cross-token-task"
+        scope_id = f"{task_id}/attempt-1"
+        store.set_envelope("tok-run-a", scope_id,
+                           ReservationEnvelope(max_tokens=5000, max_in_flight=5))
+
+        store.reserve(run_id="tok-run-a", task_id=task_id, attempt=1,
+                      scope_id=scope_id, reserved_tokens=3000.0)
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(run_id="tok-run-b", task_id=task_id, attempt=1,
+                          scope_id=scope_id, reserved_tokens=3000.0)
+        assert "tokens" in str(exc.value)
+
+    def test_max_cost_across_runs_refused(self, store):
+        """max_cost enforced across different run_ids."""
+        task_id = "cross-cost-task"
+        scope_id = f"{task_id}/attempt-1"
+        store.set_envelope("cost-run-a", scope_id,
+                           ReservationEnvelope(max_cost=25.0, max_in_flight=5))
+
+        store.reserve(run_id="cost-run-a", task_id=task_id, attempt=1,
+                      scope_id=scope_id, cost=15.0)
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(run_id="cost-run-b", task_id=task_id, attempt=1,
+                          scope_id=scope_id, cost=15.0)
+        assert "cost" in str(exc.value)
+
+    def test_per_run_limits_are_independent(self, store):
+        """Per-run limits are independent of task-scoped limits."""
+        task_id = "independent-task"
+        scope_id = f"{task_id}/attempt-1"
+        store.set_envelope("indep-run-a", scope_id,
+                           ReservationEnvelope(max_requests=5, max_in_flight=5))
+
+        store.reserve(run_id="indep-run-a", task_id=task_id, attempt=1, scope_id=scope_id)
+        store.reserve(run_id="indep-run-a", task_id=task_id, attempt=1, scope_id=scope_id)
+
+        run_usage = store.get_run_usage("indep-run-a")
+        assert run_usage["cumulative_requests"] == 2
+
+        store.reserve(run_id="indep-run-b", task_id=task_id, attempt=1, scope_id=scope_id)
+        store.reserve(run_id="indep-run-b", task_id=task_id, attempt=1, scope_id=scope_id)
+
+        run_usage_b = store.get_run_usage("indep-run-b")
+        assert run_usage_b["cumulative_requests"] == 2
+
+        task_usage = store.get_task_usage(task_id, scope_id)
+        assert task_usage["cumulative_requests"] == 4
+
+        store.reserve(run_id="indep-run-c", task_id=task_id, attempt=1, scope_id=scope_id)
+
+        with pytest.raises(AdmissionRefused):
+            store.reserve(run_id="indep-run-d", task_id=task_id, attempt=1, scope_id=scope_id)
+
+    def test_get_envelope_for_task_scope_returns_existing(self, store):
+        """get_envelope_for_task_scope returns existing envelope for task."""
+        task_id = "lookup-task"
+        store.set_envelope("lookup-run-1", f"{task_id}/attempt-1",
+                           ReservationEnvelope(max_requests=5, max_in_flight=5))
+
+        env = store.get_envelope_for_task_scope(task_id)
+        assert env is not None
+        assert env.max_requests == 5
+
+    def test_get_envelope_for_task_scope_returns_none(self, store):
+        """get_envelope_for_task_scope returns None when no envelope exists."""
+        env = store.get_envelope_for_task_scope("nonexistent-task")
+        assert env is None
+
+    def test_get_envelope_for_task_scope_finds_any_attempt(self, store):
+        """get_envelope_for_task_scope finds envelope regardless of attempt number."""
+        task_id = "any-attempt-task"
+        store.set_envelope("any-run", f"{task_id}/attempt-2",
+                           ReservationEnvelope(max_requests=3, max_in_flight=5))
+
+        env = store.get_envelope_for_task_scope(task_id)
+        assert env is not None
+        assert env.max_requests == 3
+
+    def test_get_task_usage_returns_none(self, store):
+        """get_task_usage returns None when no usage exists."""
+        usage = store.get_task_usage("nonexistent", "nonexistent")
+        assert usage is None
+
+    def test_get_task_usage_after_reserve(self, store):
+        """get_task_usage returns correct data after reserve."""
+        task_id = "usage-check-task"
+        scope_id = f"{task_id}/attempt-1"
+        store.set_envelope("usage-run", scope_id,
+                           ReservationEnvelope(max_requests=10, max_in_flight=5))
+
+        store.reserve(run_id="usage-run", task_id=task_id, attempt=1,
+                      scope_id=scope_id, reserved_bytes=500, reserved_tokens=200.0, cost=5.0)
+
+        usage = store.get_task_usage(task_id, scope_id)
+        assert usage is not None
+        assert usage["cumulative_requests"] == 1
+        assert usage["cumulative_bytes"] == 500
+        assert usage["cumulative_tokens"] == 200
+        assert usage["cumulative_cost"] == 5.0
+
+
+# ===================================================================
+# Run entry point
+# ===================================================================
+
+if __name__ == "__main__":
+    pytest.main(["-xvs", __file__])

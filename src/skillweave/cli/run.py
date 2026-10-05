@@ -173,11 +173,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stream_store = DurableStreamStore(root=stream_root)
 
     # SW-1510-BUDGET: wire the atomic reservation store explicitly so the
-    # installed `skillweave run` entry is bound to the budget guard.  The owner
-    # envelope is set with explicit unlimited (all None = authorized unlimited),
-    # so the ingress is not silently unguarded: every run acquires a reservation
-    # slot, cumulative usage is tracked, and a finite owner envelope can be
-    # pre-configured by the host to cap usage.
+    # installed `skillweave run` entry is bound to the budget guard.
     reservation_store = ReservationStore(args.db_path)
     svc = RunApplicationService(
         store, journal, raw_artifacts, stream_store,
@@ -185,13 +181,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     run_id = generate_run_id()
 
-    # Set the explicit owner-authorized unlimited envelope so the reservation
-    # store has a persisted owner policy.  All-None means "no hard cumulative
-    # caps" — the authorized owner-unlimited mode.  A host that wants finite
-    # bounds pre-configures the envelope before calling this entry.
-    scope_id = f"{args.task_id or run_id}/attempt-{args.attempt}"
-    owner_env = ReservationEnvelope()
-    reservation_store.set_envelope(run_id, scope_id, owner_env)
+    # SW-1510-BUDGET: Check for an existing owner envelope for this task scope
+    # across ALL runs first.  If the host has pre-configured a finite envelope
+    # (e.g. max_requests=1), honour it — never overwrite with unlimited.
+    # Only create the explicit owner-authorized unlimited envelope when no
+    # owner envelope exists for this task scope.
+    task_id = args.task_id or run_id
+    scope_id = f"{task_id}/attempt-{args.attempt}"
+    existing = reservation_store.get_envelope_for_task_scope(task_id)
+    if existing is not None:
+        owner_env = existing
+    else:
+        owner_env = ReservationEnvelope()
+        reservation_store.set_envelope(run_id, scope_id, owner_env)
 
     try:
         # The native streaming entry authenticates the worker at ingress and,
@@ -208,7 +210,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             subject_commit=args.subject_commit,
             methodology=args.methodology,
             autonomy_policy=args.autonomy_policy,
-            task_id=args.task_id or run_id,
+            task_id=task_id,
             attempt=args.attempt,
             output_root=args.output_root,
             reservation_envelope=owner_env,

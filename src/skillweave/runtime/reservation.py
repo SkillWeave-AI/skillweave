@@ -448,6 +448,18 @@ class ReservationStore:
                 version INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS reservation_task_usage (
+                task_id TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                cumulative_requests INTEGER NOT NULL DEFAULT 0,
+                cumulative_bytes INTEGER NOT NULL DEFAULT 0,
+                cumulative_tokens REAL NOT NULL DEFAULT 0,
+                cumulative_cost REAL NOT NULL DEFAULT 0.0,
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (task_id, scope_id)
+            );
         """)
         self._conn.commit()
 
@@ -591,6 +603,28 @@ class ReservationStore:
                 data = json.loads(row["envelope_json"])
                 return ReservationEnvelope.from_dict(data)
 
+        return None
+
+    def get_envelope_for_task_scope(
+        self,
+        task_id: str,
+    ) -> Optional[ReservationEnvelope]:
+        """Return the first persisted envelope whose scope matches a task scope.
+
+        Searches for any envelope whose scope_id starts with
+        ``{task_id}/attempt-`` across ALL run_ids.  This is used by the
+        installed ingress (cli/run.py, mcp/server.py) to honour an existing
+        owner-set finite envelope before creating a new unlimited one.
+        """
+        prefix = f"{task_id}/attempt-"
+        row = self._conn.execute(
+            "SELECT envelope_json FROM reservation_envelopes "
+            "WHERE scope_id LIKE ?",
+            (prefix + "%",),
+        ).fetchone()
+        if row is not None:
+            data = json.loads(row["envelope_json"])
+            return ReservationEnvelope.from_dict(data)
         return None
 
     # ── Reservation operations ───────────────────────────────────────
@@ -749,6 +783,58 @@ class ReservationStore:
                                 "max": env.max_cost},
                     )
 
+            # 10b. Check cumulative budgets against task-scoped usage too.
+            # This enforces aggregate budgets across ALL runs for the same
+            # task scope (not just per-run), so a retry with a new run_id
+            # cannot escape the owner's cumulative budget.
+            task_usage = self._get_or_create_task_usage(task_id, scope_id, now)
+            if env.max_requests is not None:
+                if task_usage["cumulative_requests"] >= env.max_requests:
+                    self._conn.rollback()
+                    raise AdmissionRefused(
+                        "requests",
+                        f"task-scoped cumulative requests {task_usage['cumulative_requests']} >= max {env.max_requests}",
+                        run_id=run_id, envelope=env,
+                        detail={"cumulative": task_usage["cumulative_requests"],
+                                "max": env.max_requests},
+                    )
+            if env.max_bytes is not None:
+                projected = task_usage["cumulative_bytes"] + (reserved_bytes or 0)
+                if projected > env.max_bytes:
+                    self._conn.rollback()
+                    raise AdmissionRefused(
+                        "bytes",
+                        f"task-scoped cumulative bytes {projected} would exceed max {env.max_bytes}",
+                        run_id=run_id, envelope=env,
+                        detail={"cumulative": task_usage["cumulative_bytes"],
+                                "reserved": reserved_bytes,
+                                "max": env.max_bytes},
+                    )
+            if env.max_tokens is not None:
+                projected_tokens = task_usage["cumulative_tokens"] + int(reserved_tokens or 0)
+                if projected_tokens > env.max_tokens:
+                    self._conn.rollback()
+                    raise AdmissionRefused(
+                        "tokens",
+                        f"task-scoped cumulative tokens {projected_tokens} would exceed max {env.max_tokens}",
+                        run_id=run_id, envelope=env,
+                        detail={"cumulative": task_usage["cumulative_tokens"],
+                                "reserved": reserved_tokens,
+                                "max": env.max_tokens},
+                    )
+            if env.max_cost is not None:
+                projected_cost = task_usage["cumulative_cost"] + (cost or 0.0)
+                if projected_cost > env.max_cost:
+                    self._conn.rollback()
+                    raise AdmissionRefused(
+                        "cost",
+                        f"task-scoped cumulative cost {projected_cost} would exceed max {env.max_cost}",
+                        run_id=run_id, envelope=env,
+                        detail={"cumulative": task_usage["cumulative_cost"],
+                                "reserved": cost,
+                                "max": env.max_cost},
+                    )
+
             # 11. Check per-request bounds (if finite)
             if env.max_per_request_bytes is not None:
                 if (reserved_bytes or 0) > env.max_per_request_bytes:
@@ -819,6 +905,26 @@ class ReservationStore:
                 self._conn.rollback()
                 raise ReservationConflict(
                     f"usage CAS conflict for ({run_id}, {scope_id})"
+                )
+
+            # 15. Update task-scoped cumulative usage (aggregate across runs)
+            new_tv = task_usage["version"] + 1
+            cur3 = self._conn.execute(
+                """UPDATE reservation_task_usage
+                   SET cumulative_requests = cumulative_requests + 1,
+                       cumulative_bytes = cumulative_bytes + ?,
+                       cumulative_tokens = cumulative_tokens + ?,
+                       cumulative_cost = cumulative_cost + ?,
+                       version = ?,
+                       updated_at = ?
+                   WHERE task_id = ? AND scope_id = ? AND version = ?""",
+                (reserved_bytes or 0, int(reserved_tokens or 0), cost or 0.0,
+                 new_tv, now, task_id, scope_id, task_usage["version"]),
+            )
+            if cur3.rowcount == 0:
+                self._conn.rollback()
+                raise ReservationConflict(
+                    f"task usage CAS conflict for ({task_id}, {scope_id})"
                 )
 
             self._conn.commit()
@@ -977,6 +1083,36 @@ class ReservationStore:
                     f"usage CAS conflict during complete for ({rec.run_id}, {rec.scope_id})"
                 )
 
+            # Update task-scoped cumulative counters — same per-dimension logic
+            task_usage = self._get_or_create_task_usage(rec.task_id, rec.scope_id, now)
+            new_tv = task_usage["version"] + 1
+            if any_observed:
+                cur3 = self._conn.execute(
+                    """UPDATE reservation_task_usage
+                       SET cumulative_bytes = cumulative_bytes + ?,
+                           cumulative_tokens = cumulative_tokens + ?,
+                           cumulative_cost = cumulative_cost + ?,
+                           version = ?,
+                           updated_at = ?
+                       WHERE task_id = ? AND scope_id = ? AND version = ?""",
+                    (delta_bytes, delta_tokens, delta_cost,
+                     new_tv, now, rec.task_id, rec.scope_id, task_usage["version"]),
+                )
+            else:
+                cur3 = self._conn.execute(
+                    """UPDATE reservation_task_usage
+                       SET cumulative_requests = cumulative_requests,
+                           version = ?,
+                           updated_at = ?
+                       WHERE task_id = ? AND scope_id = ? AND version = ?""",
+                    (new_tv, now, rec.task_id, rec.scope_id, task_usage["version"]),
+                )
+            if cur3.rowcount == 0:
+                self._conn.rollback()
+                raise ReservationConflict(
+                    f"task usage CAS conflict during complete for ({rec.task_id}, {rec.scope_id})"
+                )
+
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -1074,6 +1210,28 @@ class ReservationStore:
                 self._conn.rollback()
                 raise ReservationConflict(
                     f"usage CAS conflict during cancel for ({rec.run_id}, {rec.scope_id})"
+                )
+
+            # Reverse task-scoped cumulative counters (aggregate across runs)
+            task_usage = self._get_or_create_task_usage(rec.task_id, rec.scope_id, now)
+            new_tv = task_usage["version"] + 1
+            cur3 = self._conn.execute(
+                """UPDATE reservation_task_usage
+                   SET cumulative_requests = MAX(0, cumulative_requests - 1),
+                       cumulative_bytes = MAX(0, cumulative_bytes - ?),
+                       cumulative_tokens = MAX(0, cumulative_tokens - ?),
+                       cumulative_cost = MAX(0, cumulative_cost - ?),
+                       version = ?,
+                       updated_at = ?
+                   WHERE task_id = ? AND scope_id = ? AND version = ?""",
+                (rec.reserved_bytes or 0, int(rec.reserved_tokens or 0),
+                 rec.cost or 0.0, new_tv, now,
+                 rec.task_id, rec.scope_id, task_usage["version"]),
+            )
+            if cur3.rowcount == 0:
+                self._conn.rollback()
+                raise ReservationConflict(
+                    f"task usage CAS conflict during cancel for ({rec.task_id}, {rec.scope_id})"
                 )
 
             self._conn.commit()
@@ -1197,6 +1355,36 @@ class ReservationStore:
                 self._conn.rollback()
                 raise ReservationConflict(
                     f"run usage CAS conflict during reconcile for {rec.run_id}"
+                )
+
+            # Apply delta to task-scoped cumulative totals — per-dimension
+            task_usage = self._get_or_create_task_usage(rec.task_id, rec.scope_id, now)
+            new_tv = task_usage["version"] + 1
+            if any_actual:
+                cur_t = self._conn.execute(
+                    """UPDATE reservation_task_usage
+                       SET cumulative_bytes = MAX(0, cumulative_bytes + ?),
+                           cumulative_tokens = MAX(0, cumulative_tokens + ?),
+                           cumulative_cost = MAX(0, cumulative_cost + ?),
+                           version = ?,
+                           updated_at = ?
+                       WHERE task_id = ? AND scope_id = ? AND version = ?""",
+                    (delta_bytes, delta_tokens, delta_cost,
+                     new_tv, now, rec.task_id, rec.scope_id, task_usage["version"]),
+                )
+            else:
+                cur_t = self._conn.execute(
+                    """UPDATE reservation_task_usage
+                       SET cumulative_requests = cumulative_requests,
+                           version = ?,
+                           updated_at = ?
+                       WHERE task_id = ? AND scope_id = ? AND version = ?""",
+                    (new_tv, now, rec.task_id, rec.scope_id, task_usage["version"]),
+                )
+            if cur_t.rowcount == 0:
+                self._conn.rollback()
+                raise ReservationConflict(
+                    f"task usage CAS conflict during reconcile for ({rec.task_id}, {rec.scope_id})"
                 )
 
             self._conn.commit()
@@ -1402,6 +1590,48 @@ class ReservationStore:
             "version": 1,
             "updated_at": now,
         }
+
+    def _get_or_create_task_usage(
+        self, task_id: str, scope_id: str, now: str
+    ) -> dict[str, Any]:
+        """Get existing task-scoped usage row or create one (inside active transaction)."""
+        row = self._conn.execute(
+            "SELECT * FROM reservation_task_usage WHERE task_id = ? AND scope_id = ?",
+            (task_id, scope_id),
+        ).fetchone()
+        if row is not None:
+            return dict(row)
+        self._conn.execute(
+            """INSERT INTO reservation_task_usage
+               (task_id, scope_id, cumulative_requests, cumulative_bytes,
+                cumulative_tokens, cumulative_cost, version, updated_at)
+               VALUES (?, ?, 0, 0, 0, 0.0, 1, ?)""",
+            (task_id, scope_id, now),
+        )
+        return {
+            "task_id": task_id,
+            "scope_id": scope_id,
+            "cumulative_requests": 0,
+            "cumulative_bytes": 0,
+            "cumulative_tokens": 0,
+            "cumulative_cost": 0.0,
+            "version": 1,
+            "updated_at": now,
+        }
+
+    def get_task_usage(
+        self,
+        task_id: str,
+        scope_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """Return cumulative task-scoped usage for (task_id, scope_id) or None."""
+        row = self._conn.execute(
+            "SELECT * FROM reservation_task_usage WHERE task_id = ? AND scope_id = ?",
+            (task_id, scope_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
 
     def _check_deadline(self, env: ReservationEnvelope, now_str: str) -> None:
         """Refuse admission if the envelope's deadline has passed."""
