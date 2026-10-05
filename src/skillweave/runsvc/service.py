@@ -199,6 +199,7 @@ class RunApplicationService:
         attempt: int = 1,
         declared_writes: Optional[Sequence[str]] = None,
         work_contract: Optional[Any] = None,
+        output_root: Optional[str] = None,
         assay_actor_token: Optional[str] = None,
         assay_envelope: Optional[Any] = None,
     ) -> RunExecution:
@@ -372,7 +373,9 @@ class RunApplicationService:
             )
         try:
             try:
-                protection = self._open_worker_protection(credential, run_id)
+                protection = self._open_worker_protection(
+                    credential, run_id, output_root
+                )
             except Exception as exc:  # noqa: BLE001
                 # The launcher fails closed when no real isolation mechanism is
                 # available. For a scope-enforced launch surface that as the
@@ -392,6 +395,8 @@ class RunApplicationService:
                 credential, protection, run_id, declared_writes, work_contract
             )
             argv = list(command)
+            child_cwd: Optional[str] = None
+            child_env: Optional[dict[str, str]] = None
             if enforcement is not None:
                 # Authorize every declared write against the resolved checkout
                 # and the protected store roots before spawning: a traversal or
@@ -407,6 +412,15 @@ class RunApplicationService:
                 # here, so an unisolated launch never happens (criterion 2).
                 enforcement.attest()
                 argv = enforcement.wrap_command(argv)
+                # Run the real child inside the host-assigned owned scope the
+                # host mapped for this attempt: its working directory *is* the
+                # attempt checkout, and the declared output root is exported so
+                # a tool can resolve a legitimate relative output without a
+                # caller-side guess. This is the mapping that binds an
+                # authorized mutation to a real owned tree instead of leaving
+                # the checkout unnamed.
+                child_cwd = enforcement.checkout_root
+                child_env = {"SKILLWEAVE_ATTEMPT_CHECKOUT": str(enforcement.checkout_root)}
             elif protection is not None:
                 argv = protection.wrap_command(argv, writable_scope=protection.writable_scope)
             result = run_command(
@@ -417,6 +431,8 @@ class RunApplicationService:
                 tool=tool,
                 model=model,
                 created_at=created_at,
+                cwd=child_cwd,
+                env=child_env,
             )
         except scope_refusals:
             # A write-scope refusal (traversal/symlink/protected-store escape)
@@ -659,7 +675,9 @@ class RunApplicationService:
 
     # -- real protected worker launch (SW-1510-IDENTITY criterion 1) -------
 
-    def _open_worker_protection(self, credential: Any, run_id: str) -> Any:
+    def _open_worker_protection(
+        self, credential: Any, run_id: str, output_root: Optional[str] = None
+    ) -> Any:
         """Open a real isolation window over the protected stores, or fail closed.
 
         Returns a live :class:`StoreProtection` on the protected (identity)
@@ -685,7 +703,9 @@ class RunApplicationService:
         protected.ensure()
         self._precreate_protected_entries(protected, run_id)
         protection = protection_cls(protected)
-        protection.writable_scope = self._worker_writable_scope(credential, run_id)
+        protection.writable_scope = self._worker_writable_scope(
+            credential, run_id, output_root
+        )
         # Enter the window now: this seals the stores (or fails closed if no
         # real adapter is available) before the wrapped child is spawned. The
         # matching __exit__ runs in the caller's finally.
@@ -737,18 +757,33 @@ class RunApplicationService:
             except OSError:
                 pass
 
-    def _worker_writable_scope(self, credential: Any, run_id: str) -> Path:
-        """A private directory that is the only tree the wrapped worker may write.
+    def _worker_writable_scope(
+        self, credential: Any, run_id: str, output_root: Optional[str] = None
+    ) -> Path:
+        """The one tree the wrapped worker may write: the host-mapped checkout.
 
-        The worker's credential binds a scope *digest*, not a path; the host
-        materializes one real writable directory for the run so a scope-
-        enforcing adapter (Seatbelt) has a concrete tree to allow, and the
-        protected stores stay sealed for every other path.
+        The worker's credential binds a scope *digest*, not a path; naming an
+        allowed path inside that digest does not by itself bind a *legitimate*
+        mutation to a real owned tree. So the host supplies the mapping: for the
+        protected native path the caller names the attempt checkout/output root
+        it owns (``output_root``), and the host materializes that real tree,
+        confines the scope boundary to it, and launches the child with it as its
+        working directory — so a declared output resolves against the actual
+        assigned checkout rather than an unnamed digest entry.
+
+        When no mapping is supplied the host falls back to a private per-run
+        directory, so the identity-only guarantee (the protected authority
+        stores stay sealed) still holds for a launch that declares no write
+        scope.
         """
-        import tempfile
+        if output_root is not None:
+            root = Path(output_root)
+        else:
+            import tempfile
 
-        base = tempfile.mkdtemp(prefix=f"sw1510-worker-{run_id}-")
-        return Path(base).resolve()
+            root = Path(tempfile.mkdtemp(prefix=f"sw1510-worker-{run_id}-"))
+        root.mkdir(parents=True, exist_ok=True)
+        return Path(root).resolve()
 
     def _open_scope_enforcement(
         self,
@@ -775,8 +810,9 @@ class RunApplicationService:
         checkout_root = (
             protection.writable_scope if protection is not None else None
         )
+        scope_requested = declared_writes is not None or work_contract is not None
         if checkout_root is None:
-            if declared_writes is None and work_contract is None:
+            if not scope_requested:
                 return None, None
             # Auth-scoped execution was requested but there is no real checkout
             # to confine to: fail closed rather than enforcing against an
@@ -1843,6 +1879,7 @@ class RunApplicationService:
         autonomy_policy: str = "",
         declared_writes: Optional[Sequence[str]] = None,
         work_contract: Optional[Any] = None,
+        output_root: Optional[str] = None,
         assay_actor_token: Optional[str] = None,
         assay_envelope: Optional[Any] = None,
     ) -> dict[str, Any]:
@@ -1992,7 +2029,9 @@ class RunApplicationService:
             )
         try:
             try:
-                protection = self._open_worker_protection(credential, run_id)
+                protection = self._open_worker_protection(
+                    credential, run_id, output_root
+                )
             except Exception as exc:  # noqa: BLE001
                 if (
                     scope_requested
@@ -2008,6 +2047,8 @@ class RunApplicationService:
                 credential, protection, run_id, declared_writes, work_contract
             )
             wrap = None
+            child_cwd: Optional[str] = None
+            child_env: Optional[dict[str, str]] = None
             if enforcement is not None:
                 # Authorize every declared write against the resolved checkout
                 # and the protected store roots before spawning (criterion 1),
@@ -2019,6 +2060,16 @@ class RunApplicationService:
                 enforcement.attest()
                 def wrap(argv, _e=enforcement):
                     return _e.wrap_command(argv)
+                # Run the real child inside the host-assigned owned scope: its
+                # working directory *is* the attempt checkout the host mapped
+                # for this attempt, and that root is exported so a tool resolves
+                # a legitimate relative output without a caller-side guess. This
+                # is the mapping that binds an authorized mutation to a real
+                # owned tree instead of leaving the checkout unnamed.
+                child_cwd = enforcement.checkout_root
+                child_env = {
+                    "SKILLWEAVE_ATTEMPT_CHECKOUT": str(enforcement.checkout_root)
+                }
             elif protection is not None:
                 def wrap(argv, _p=protection):
                     return _p.wrap_command(
@@ -2034,6 +2085,8 @@ class RunApplicationService:
                 secrets=list(secrets) if secrets else None,
                 stdout_retain_limit=stdout_retain_limit,
                 stderr_retain_limit=stderr_retain_limit,
+                cwd=child_cwd,
+                extra_env=child_env,
                 wrap_command=wrap,
             )
         except scope_refusals:
@@ -2083,9 +2136,14 @@ class RunApplicationService:
             },
         )
 
-        # Stage 5: the receipt bound to the run and the raw bytes.
+        # Stage 5: the receipt bound to the run and the raw bytes. It uses the
+        # *same canonical producer artifact id* as the bounded path
+        # (``runsvc-{run_id}``) so the shared snapshot/replay view resolved by
+        # CLI, MCP and replay is coherent across the two execution siblings: a
+        # reader cannot tell (nor need to guess) which surface produced it. The
+        # stream-specific detail lives in the metadata below, not the id.
         receipt = ArtifactReceipt(
-            artifact_id=f"runsvc-stream-{run_id}",
+            artifact_id=f"runsvc-{run_id}",
             sha256=raw_digest,
             schema_version="1",
             producer_command=" ".join(command),
@@ -2094,7 +2152,7 @@ class RunApplicationService:
             created_at=created_at,
             evidence_type=EvidenceType.RUNTIME_TRACE.value,
             purpose=f"streamed attempt {attempt} output for run '{run_id}'",
-            method="runsvc-stream",
+            method="runsvc",
             system_source="runsvc",
             quality=EvidenceQuality(),
             metadata={
@@ -2136,6 +2194,37 @@ class RunApplicationService:
         ).encode("utf-8")
         verification_digest = hashlib.sha256(verdict_body).hexdigest()
         verdict_receipt = verdict.to_receipt(digest=verification_digest)
+        # Persist the verifier's own receipt as a separate, addressable record,
+        # exactly as the bounded path does, so the shared snapshot reads the
+        # same ``verify-runsvc-{run_id}`` verdict (grade/gate_state/verified_by)
+        # for either execution sibling rather than from returned memory only.
+        try:
+            verify_receipt = ArtifactReceipt(
+                artifact_id=verdict_receipt["artifact_id"],
+                sha256=verification_digest,
+                schema_version="1",
+                producer_command="verifier",
+                subject_repo=subject_repo,
+                subject_commit=subject_commit,
+                created_at=verdict.created_at,
+                evidence_type=EvidenceType.ARTIFACT.value,
+                purpose=f"independent verification of run '{run_id}'",
+                method="verifier",
+                system_source="runsvc",
+                quality=EvidenceQuality(),
+                metadata={
+                    "run_id": run_id,
+                    "task_id": task_id or run_id,
+                    "attempt": int(attempt),
+                    "grade": verdict.grade,
+                    "gate_state": verdict.gate_state,
+                    "verified_by": verdict.verified_by,
+                    "subject_artifact_id": verdict.subject_artifact_id,
+                },
+            )
+            self.store.save_evidence(verify_receipt)
+        except Exception:  # noqa: BLE001 - verdict receipt is best-effort durability
+            pass
 
         contract = CompletionContract()
         gate_state = contract.evaluate(

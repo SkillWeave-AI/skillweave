@@ -1,4 +1,5 @@
 import json
+import os
 import shlex
 import sys
 
@@ -23,27 +24,54 @@ def _get_store(db_path=".skillweave/store.db"):
     from skillweave.runtime.store import SQLiteRunStore
     return SQLiteRunStore(db_path)
 
-def _get_run_svc(db_path=".skillweave/store.db", artifacts_path=".skillweave/artifacts"):
+def _default_stream_root(db_path):
+    """The durable stream root used when the caller does not name one.
+
+    Keep the stream evidence for a disk-backed run store beside it
+    (``<db dir>/streams``); an in-memory store gets a private per-process
+    directory. Either way the MCP entry persists real frames/facts/cursor
+    rather than a memory-only collector.
+    """
+    if db_path in ("", ":memory:"):
+        import tempfile
+        return os.path.join(tempfile.mkdtemp(prefix="skillweave-stream-"), "streams")
+    db_dir = os.path.dirname(os.path.abspath(db_path)) or "."
+    return os.path.join(db_dir, "streams")
+
+def _get_run_svc(db_path=".skillweave/store.db", artifacts_path=".skillweave/artifacts", stream_root=None):
     from skillweave.runtime.journal import EventJournal
     from skillweave.runtime.registry import RawArtifactStore
+    from skillweave.runtime.stream import DurableStreamStore
     from skillweave.runsvc.service import RunApplicationService
     store = _get_store(db_path)
     journal = EventJournal(db_path)
     raw_artifacts = RawArtifactStore(artifacts_path)
-    return RunApplicationService(store, journal, raw_artifacts)
+    # The MCP surface drives the same durable streaming collector as the CLI, so
+    # the two native entries persist identical per-attempt stream evidence. A
+    # read-only surface (status/replay) that names no stream root gets the
+    # memory-only store and therefore creates no files as a side effect.
+    stream_store = DurableStreamStore(root=stream_root) if stream_root else None
+    return RunApplicationService(store, journal, raw_artifacts, stream_store)
 
 @mcp.tool()
-def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, command: str, db_path: str = ".skillweave/store.db", artifacts_path: str = ".skillweave/artifacts", methodology: str = "ralph", autonomy_policy: str = "", task_id: str = "", attempt: int = 1) -> str:
+def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, command: str, db_path: str = ".skillweave/store.db", artifacts_path: str = ".skillweave/artifacts", methodology: str = "ralph", autonomy_policy: str = "", task_id: str = "", attempt: int = 1, output_root: str = "", stream_root: str = "") -> str:
     """Create and execute a new SkillWeave run.
 
     ``methodology`` is the declared methodology binding (default ``ralph``).
     ``assay`` runs the native Assay drill and is never silently downgraded.
+
+    The run executes through the durable streaming entry: its per-attempt
+    frames/facts/cursor are persisted under ``stream_root`` (default beside the
+    run store). ``output_root`` names the trusted attempt checkout the host
+    assigns when a scope-enforced launch is requested.
     """
-    svc = _get_run_svc(db_path, artifacts_path)
+    svc = _get_run_svc(
+        db_path, artifacts_path, stream_root or _default_stream_root(db_path)
+    )
     run_id = generate_run_id()
 
     cmd_list = shlex.split(command)
-    execution = svc.execute(
+    execution = svc.execute_streaming_native(
         command=cmd_list,
         run_id=run_id,
         tool=tool,
@@ -52,19 +80,27 @@ def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, co
         subject_commit=subject_commit,
         methodology=methodology,
         autonomy_policy=autonomy_policy,
-        task_id=task_id or None,
+        task_id=task_id or run_id,
         attempt=attempt,
+        output_root=output_root or None,
     )
 
+    result_obj = execution["result"]
     payload = {
-        "run_id": execution.run.run_id,
-        "state": execution.run.state,
-        "gate_state": execution.gate_state,
-        "raw_digest": execution.raw_digest,
-        "methodology": execution.methodology,
+        "run_id": execution["run_id"],
+        "state": svc.store.get_run(run_id).state,
+        "gate_state": execution["gate_state"],
+        "raw_digest": execution["raw_digest"],
+        "methodology": execution["methodology"],
+        "stream": {
+            "durable": execution.get("durable", True),
+            "cursor": svc.stream_store.cursor,
+            "stdout_digest": result_obj.stdout_digest,
+            "stderr_digest": result_obj.stderr_digest,
+        },
     }
-    if execution.assay is not None:
-        payload["assay"] = execution.assay
+    if "assay" in execution:
+        payload["assay"] = execution["assay"]
     return json.dumps(payload)
 
 @mcp.tool()
