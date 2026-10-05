@@ -155,11 +155,11 @@ class TestRunStateStore:
         store = RunStateStore(tmp_path)
         assert store.latest_event_sequence("abc123") == 0
 
-        store.append_event("abc123", {"event": "launched", "sequence": 1})
+        store.append_event("abc123", {"event": "launched"})
         assert store.latest_event_sequence("abc123") == 1
 
-        store.append_event("abc123", {"event": "started", "sequence": 5})
-        assert store.latest_event_sequence("abc123") == 5
+        store.append_event("abc123", {"event": "started"})
+        assert store.latest_event_sequence("abc123") == 2
 
     def test_verify_pid_matches(self, tmp_path):
         store = RunStateStore(tmp_path)
@@ -397,6 +397,33 @@ class TestKillRun:
     def test_kill_no_such_run(self, tmp_path):
         with pytest.raises(RunStateError, match="no run found"):
             kill_run(run_id="no-such-id", pid=42, project_root=tmp_path)
+
+    def test_kill_records_durable_intent_before_signal(self, tmp_path, monkeypatch):
+        """The facade records a cancellation intent before the signal boundary.
+
+        If the facade is lost at the signal call, the intent survives so a
+        later production resume can finish the cancellation.
+        """
+        import skillweave.runlifecycle.handle as handle_module
+
+        handle = start_async(command=_child_sleep_command(30), project_root=tmp_path)
+        store = RunStateStore(tmp_path)
+
+        seen: dict = {}
+
+        def crash_at_signal(*_a, **_k):
+            record = store._kernel.get_run(handle.run_id)
+            seen["pending"] = record.metadata.get("_pending_cancellation")
+            raise KeyboardInterrupt("facade lost at the signal boundary")
+
+        monkeypatch.setattr(handle_module.os, "killpg", crash_at_signal)
+        monkeypatch.setattr(handle_module.os, "kill", crash_at_signal)
+        with pytest.raises(KeyboardInterrupt):
+            kill_run(run_id=handle.run_id, pid=handle.pid, project_root=tmp_path)
+
+        assert isinstance(seen.get("pending"), dict), (
+            "no durable cancellation intent existed before the facade signal")
+        assert seen["pending"].get("idempotency_key") == "kill:" + handle.run_id
 
 
 # ---------------------------------------------------------------------------

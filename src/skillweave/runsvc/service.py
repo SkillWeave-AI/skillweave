@@ -31,8 +31,16 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json as _json
+import os
+import signal as _signal
+import subprocess
+import sys
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 
@@ -385,3 +393,440 @@ class RunApplicationService:
         except Exception:  # noqa: BLE001
             # Best effort: the primary failure is already on its way up.
             pass
+
+    # ------------------------------------------------------------------
+    # Native async lifecycle (SW-1510-STORE)
+    #
+    # ``start_async``, ``kill_run``, and ``resume_run`` route
+    # detached-process lifecycle through the kernel store with CAS, so
+    # completion, cancellation, and resume share one SQLite/CAS authority.
+    # ------------------------------------------------------------------
+
+    def reserve_run_id(self, run_id: Optional[str] = None) -> str:
+        """Reserve a unique run ID before launching a process.
+
+        Returns the reserved ID.  Duplicate admission must not execute a
+        child — the store's PRIMARY KEY guard ensures exactly one creator
+        wins.
+        """
+        rid = run_id or uuid.uuid4().hex
+        # Reserve by creating the run record in preflight state.
+        self.store.create_run(rid)
+        return rid
+
+    def start_async(
+        self,
+        command: Sequence[str],
+        *,
+        run_id: Optional[str] = None,
+        cwd: Optional[Path] = None,
+        project_root: Optional[Path] = None,
+        _env: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        """Start *command* as a detached background process.
+
+        The child runs in its own session (process group) so it survives the
+        launcher's exit.  The run is registered in the kernel store BEFORE
+        launch; a crash before the child starts leaves a reserved-but-not-
+        running record that is safe to reconcile.
+
+        Parameters
+        ----------
+        command:
+            The command and arguments to execute.
+        run_id:
+            Explicit run ID (default: auto-generated uuid hex).
+        cwd:
+            Working directory for the child (default: current dir).
+        project_root:
+            Project root path (for store.db location).
+        _env:
+            Optional environment dict for the child subprocess.  Used by the
+            native lifecycle facade to propagate PYTHONPATH.
+
+        Returns
+        -------
+        dict with ``run_id``, ``pid``, ``command``, ``state``,
+        ``created_at``, ``version``.
+        """
+        rid = self.reserve_run_id(run_id)
+        child_cwd = str(cwd or Path.cwd())
+
+        db_path = self.store.db_path
+        EventType = _runtime_attr("journal", "EventType")
+
+        # Store initial lifecycle metadata BEFORE launching the child, so the
+        # wrapper starts at version 2 (not version 1).  This prevents a race
+        # where a fast child completes before the parent gets to write its
+        # own lifecycle metadata: the parent would see VersionConflictError
+        # because the wrapper already bumped the version.
+        self.store.update_metadata(
+            rid,
+            expected_version=1,
+            metadata={
+                "runlifecycle": {
+                    "command": list(command),
+                    "pid": 0,
+                    "lifecycle_state": "running",
+                },
+            },
+        )
+
+        # Build the detached wrapper script that writes completion/error
+        # back to the same kernel store.
+        wrapper_src = (
+            "import subprocess, sys, json, os, signal\n"
+            "rid = sys.argv[1]\n"
+            "db_path = sys.argv[2]\n"
+            "cmd = sys.argv[3:]\n"
+            "from skillweave.runtime.store import SQLiteRunStore, RunStateModel, CompletionReconciler\n"
+            "from skillweave.runtime.journal import EventJournal\n"
+            "store = SQLiteRunStore(db_path)\n"
+            "journal = EventJournal(db_path)\n"
+            "journal.append(rid, event_type='started',\n"
+            "    payload={'command': cmd})\n"
+            "def _complete(lifecycle, event_type, payload, key, reason):\n"
+            "    CompletionReconciler(\n"
+            "        store, rid,\n"
+            "        target_state='advance_or_stop',\n"
+            "        lifecycle_update=lifecycle,\n"
+            "        event_type=event_type,\n"
+            "        event_payload=payload,\n"
+            "        idempotency_key=key,\n"
+            "        reason=reason,\n"
+            "    ).reconcile()\n"
+            "try:\n"
+            "    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n"
+            "    rc = proc.returncode\n"
+            "    stdout_text = proc.stdout.decode('utf-8', errors='replace') if proc.stdout else ''\n"
+            "    _complete(\n"
+            "        {'lifecycle_state': 'succeeded' if rc == 0 else 'failed', 'exit_code': rc},\n"
+            "        'finished', {'returncode': rc, 'stdout_preview': stdout_text[:1024]},\n"
+            "        'wrapper:finish:' + rid + ':' + str(rc), 'wrapper: process completed')\n"
+            "except Exception as exc:\n"
+            "    _complete(\n"
+            "        {'lifecycle_state': 'failed', 'exit_code': -1},\n"
+            "        'error', {'error': str(exc)},\n"
+            "        'wrapper:error:' + rid, 'wrapper: error: ' + str(exc))\n"
+            "finally:\n"
+            "    store.close()\n"
+            "    journal.close()\n"
+        )
+
+        # Ensure the child can always load third-party packages (e.g. yaml).
+        # Python 3.14: putting a directory with sitecustomize.py first in
+        # PYTHONPATH causes the site module to skip normal site-packages
+        # discovery.  Appending the system site-packages path defensively
+        # prevents the wrapper from failing to import dependencies.
+        if _env is not None:
+            import site as _site
+            _sp = _site.getsitepackages()[0]
+            _pp = _env.get("PYTHONPATH", "")
+            if _sp not in _pp:
+                _env["PYTHONPATH"] = _pp + ":" + _sp if _pp else _sp
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", wrapper_src, rid, db_path] + list(command),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=child_cwd,
+            env=_env,
+        )
+
+        now = datetime.now(timezone.utc).isoformat()
+        self.journal.append(
+            rid,
+            event_type="launched",
+            payload={
+                "event": "launched",
+                "pid": proc.pid,
+                "command": list(command),
+            },
+        )
+
+        # Update the PID (placeholder was 0) at the current version.
+        # If the wrapper already completed, this CAS will fail harmlessly —
+        # the PID is already in the journal event and the lifecycle metadata.
+        current = self.store.get_run(rid)
+        if current is not None:
+            try:
+                lifecycle = dict(current.metadata.get("runlifecycle", {}))
+                lifecycle["pid"] = proc.pid
+                self.store.update_metadata(
+                    rid,
+                    expected_version=current.version,
+                    metadata={"runlifecycle": lifecycle},
+                )
+            except Exception:
+                # Race with wrapper completion — PID was best-effort.
+                pass
+
+        run = self.store.get_run(rid)
+        return {
+            "run_id": rid,
+            "pid": proc.pid,
+            "command": list(command),
+            "state": run.state if run else "preflight",
+            "created_at": now,
+            "version": run.version if run else 1,
+        }
+
+    def kill_run(
+        self,
+        run_id: str,
+        pid: int,
+        *,
+        project_root: Optional[Path] = None,
+    ) -> dict[str, Any]:
+        """Kill a run by its ID and recorded PID.
+
+        Graceful (SIGTERM) first, then forced (SIGKILL) after a short grace
+        period.  The terminal transition is CAS-guarded so a stale completion
+        cannot resurrect a cancelled run.
+        """
+        run = self.store.get_run(run_id)
+        if run is None:
+            return {"error": f"run not found: {run_id}"}
+
+        RunStateModel = _runtime_attr("store", "RunStateModel")
+        if run.state != "preflight" and RunStateModel.is_terminal(run.state):
+            return {
+                "run_id": run_id,
+                "pid": pid,
+                "state": run.state,
+                "result": "already_terminal",
+            }
+
+        # Record a durable cancellation intent BEFORE the irreversible signal
+        # boundary.  If the supervisor is lost after signalling (or dies *at*
+        # the signal call itself), the intent stays readable, so a later
+        # production resume (``resume_run``) finishes the cancellation instead
+        # of leaving a non-terminal ``running`` run with no restart authority.
+        # The real signal outcome is still committed below; the intent is only
+        # the recoverable fallback.  A genuine terminal winner was already
+        # returned above, and ``record_intent`` leaves one untouched.
+        KillOutcomeError = _runtime_attr("errors", "KillOutcomeError")
+        reconcile_cancellation_intent = getattr(
+            self.store, "reconcile_cancellation_intent", None)
+        if reconcile_cancellation_intent is not None:
+            try:
+                reconcile_cancellation_intent(
+                    run_id,
+                    pid=pid,
+                    result="pending",
+                    event_payload={"pid": pid, "result": "pending"},
+                    idempotency_key="kill:" + run_id,
+                    reason="service: kill",
+                ).record_intent()
+            except Exception as exc:  # noqa: BLE001
+                # A cancellation whose intent cannot be durably recorded must
+                # not proceed to the irreversible signal as if it were safe.
+                raise KillOutcomeError(
+                    run_id,
+                    {"reason": "cancellation intent could not be durably recorded",
+                     "error": type(exc).__name__, "detail": str(exc)},
+                    result="unknown",
+                    cause=exc,
+                ) from exc
+
+        # Graceful kill (SIGTERM) to the process group
+        killed_graceful = False
+        try:
+            os.killpg(pid, _signal.SIGTERM)
+            killed_graceful = True
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.05)
+                except ProcessLookupError:
+                    break
+        except (ProcessLookupError, PermissionError):
+            pass
+
+        try:
+            os.killpg(pid, _signal.SIGKILL)
+            result = "forced_kill"
+        except ProcessLookupError:
+            result = "graceful_kill" if killed_graceful else "already_dead"
+        except PermissionError:
+            try:
+                os.kill(pid, _signal.SIGKILL)
+                result = "forced_kill"
+            except (ProcessLookupError, PermissionError):
+                result = "graceful_kill" if killed_graceful else "already_dead"
+
+        # Drive the run to terminal via the canonical durable reconciliation
+        # primitive, co-committing lifecycle_state='killed' and exactly one
+        # kill outbox/journal event in the terminal unit of work.  This
+        # ensures:
+        # 1. Every non-terminal lane state reaches terminal via legal
+        #    forward-only transitions (resolved from RunStateModel, not a
+        #    hand-maintained table that can drift).
+        # 2. Lifecycle metadata, terminal state, and the kill event are one
+        #    atomic durable unit (no crash window where lifecycle says killed
+        #    while the lane is still non-terminal or the outbox is empty).
+        # 3. A genuine pre-existing terminal winner (a committed completion or
+        #    an earlier cancellation) is preserved unchanged and never
+        #    resurrected.
+        # 4. A finite burst of competing legal writers cannot exhaust a fixed
+        #    retry budget and lose the cancellation: reconcile_terminal retries
+        #    on VersionConflictError without a finite bound.
+        # 5. A non-CAS storage failure propagates (never a successful-looking
+        #    ``already_dead``/``running`` result with the exception swallowed).
+        run = self.store.get_run(run_id)
+        cancelling = run is not None and not RunStateModel.is_terminal(run.state)
+        if cancelling:
+            VersionConflictError = _runtime_attr("errors", "VersionConflictError")
+            InvalidTransitionError = _runtime_attr("errors", "InvalidTransitionError")
+            KillOutcomeError = _runtime_attr("errors", "KillOutcomeError")
+            try:
+                reconcile_terminal = getattr(self.store, "reconcile_terminal", None)
+                if reconcile_terminal is not None:
+                    # Canonical durable path: records a recoverable intent, walks
+                    # the state-machine path, and retries past CAS contention.
+                    record = reconcile_terminal(
+                        run_id,
+                        target_state="advance_or_stop",
+                        lifecycle_update={"lifecycle_state": "killed"},
+                        event_type="process_killed",
+                        event_payload={"pid": pid, "result": result},
+                        idempotency_key="kill:" + run_id,
+                        reason="service: kill",
+                        stop_reason="operator_halt",
+                    )
+                else:
+                    # Minimal duck-typed store fallback (tests that provide a
+                    # thin store double without the reconciliation primitive):
+                    # a single atomic unit of work, with a genuine terminal
+                    # winner preserved.
+                    current = run
+                    path = RunStateModel.canonical_path_to_terminal(
+                        current.state, "advance_or_stop")
+                    if path is None:
+                        raise InvalidTransitionError(
+                            current.state, "advance_or_stop", run_id,
+                            extra={"reason": f"no legal path from {current.state} to terminal"},
+                        )
+                    for to_state in path:
+                        self.store.transition(
+                            run_id, to_state,
+                            expected_state=current.state,
+                            expected_version=current.version,
+                            reason="service: kill advance",
+                        )
+                        current = self.store.get_run(run_id)
+                    record = self.store.transition_with_event(
+                        run_id, "advance_or_stop",
+                        expected_state=current.state,
+                        expected_version=current.version,
+                        event_type="process_killed",
+                        event_payload={"pid": pid, "result": result},
+                        idempotency_key="kill:" + run_id,
+                        reason="service: kill",
+                        stop_reason="operator_halt",
+                        metadata_update={"runlifecycle": {"lifecycle_state": "killed"}},
+                    )
+            except (VersionConflictError, InvalidTransitionError):
+                # Structurally meaningful store errors (illegal transition, no
+                # path, terminal resurrection) surface unchanged.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # A non-CAS storage failure (e.g. a SQLite I/O error) must not
+                # be swallowed into a successful-looking ``already_dead`` /
+                # ``running`` result.  Surface it as the explicit typed error
+                # for an unreconcilable cancellation, preserving the cause.
+                raise KillOutcomeError(
+                    run_id,
+                    {"reason": "storage failure during cancellation terminal commit",
+                     "error": type(exc).__name__, "detail": str(exc)},
+                    result=result,
+                    cause=exc,
+                ) from exc
+        else:
+            # The run is already terminal.  A committed terminal winner stands
+            # unchanged; no lifecycle or state is fabricated.  The kill event
+            # is only recorded on the readable journal so an idempotent re-kill
+            # is observable without a second terminal transition.
+            self.journal.append(
+                run_id,
+                event_type="process_killed",
+                payload={"pid": pid, "result": result},
+                idempotency_key="kill:" + run_id,
+            )
+            record = self.store.get_run(run_id)
+
+        final_lifecycle = (record.metadata or {}).get("runlifecycle", {}).get("lifecycle_state")
+        # Report the lifecycle vocabulary ("killed") only when this call
+        # actually committed a genuine cancellation.  If a *different* terminal
+        # winner already stood (a committed completion the reconciler preserved),
+        # the operator sees its real lane state — never a fabricated "killed".
+        reported_state = "killed" if (cancelling and final_lifecycle == "killed") else (
+            record.state if record is not None else "unknown")
+        return {
+            "run_id": run_id,
+            "pid": pid,
+            "state": reported_state,
+            "lane_state": record.state if record is not None else "unknown",
+            "lifecycle_state": final_lifecycle,
+            "result": result,
+        }
+
+    def resume_run(self, run_id: str) -> Optional[dict[str, Any]]:
+        """Reconnect to a stored run, returning its current state.
+
+        Resume reconnects to stored actual identity/checkpoints and must
+        not launch a duplicate process or revive a terminal/historical run.
+        """
+        run = self.store.get_run(run_id)
+        if run is None:
+            return None
+
+        RunStateModel = _runtime_attr("store", "RunStateModel")
+        if RunStateModel.is_terminal(run.state):
+            return {
+                "run_id": run_id,
+                "state": run.state,
+                "error": "terminal run cannot be resumed",
+            }
+
+        if run.metadata.get("historical"):
+            return {
+                "run_id": run_id,
+                "state": "unknown",
+                "error": "historical run cannot be resumed",
+            }
+
+        # A cancellation intent recorded before the signal boundary but never
+        # committed (the supervisor died at/after the signal) is finished here,
+        # on the actual production restart/resume path, so the run reaches a
+        # terminal ``killed`` lifecycle with exactly one logical event instead
+        # of being left non-terminal ``running``.
+        CancellationReconciler = _runtime_attr("store", "CancellationReconciler")
+        finished = CancellationReconciler.resume_pending(self.store, run_id)
+        if finished is not None:
+            run = finished
+
+        # A completion intent recorded by the detached wrapper but never
+        # committed (the wrapper/host was lost between ``record_intent`` and the
+        # terminal commit) is finished here too, so the completed child's
+        # outcome is not permanently lost as a stuck non-terminal run.  A
+        # genuine terminal winner was already returned above; if the
+        # cancellation reconcile just committed, this is a no-op.  Exactly one
+        # logical terminal event is written by the canonical reconciliation.
+        CompletionReconciler = _runtime_attr("store", "CompletionReconciler")
+        completed = CompletionReconciler.resume_pending(self.store, run_id)
+        if completed is not None:
+            run = completed
+
+        events = self.journal.get_events(run_id)
+        return {
+            "run_id": run_id,
+            "state": run.state,
+            "version": run.version,
+            "created_at": run.created_at,
+            "updated_at": run.updated_at,
+            "event_count": len(events),
+        }
