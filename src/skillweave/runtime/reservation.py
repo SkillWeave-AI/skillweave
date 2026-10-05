@@ -101,6 +101,19 @@ class EnvelopeRejected(ReservationError):
     """The envelope itself is malformed, negative or otherwise invalid."""
 
 
+class QuotaRefused(ReservationError):
+    """A reservation was refused because of a quota or route restriction."""
+
+    def __init__(self, axis: str, reason: str, *,
+                 run_id: str = "",
+                 detail: Optional[dict] = None):
+        self.axis = axis
+        self.reason = reason
+        self.run_id = run_id
+        self.detail = detail or {}
+        super().__init__(f"quota refused ({axis}): {reason}")
+
+
 # ── Reservation state ───────────────────────────────────────────────────────
 
 
@@ -146,6 +159,8 @@ class ReservationEnvelope:
     * ``max_in_flight`` — simultaneous in-flight slot limit per-run (int, positive).
     * ``max_per_request_bytes`` — per-request byte ceiling (int, non-negative).
     * ``max_per_request_tokens`` — per-request token ceiling (int, non-negative).
+    * ``allowed_routes`` — optional list of permitted provider route names;
+      if set, only these routes may be used (``None`` means all routes permitted).
     """
 
     max_cost: Optional[float] = None
@@ -156,6 +171,7 @@ class ReservationEnvelope:
     max_in_flight: Optional[int] = 3  # default: 3 simultaneous slots
     max_per_request_bytes: Optional[int] = None
     max_per_request_tokens: Optional[int] = None
+    allowed_routes: Optional[list[str]] = None
 
     def __post_init__(self) -> None:
         _validate_finite_limits(self)
@@ -170,6 +186,7 @@ class ReservationEnvelope:
             "max_in_flight": self.max_in_flight,
             "max_per_request_bytes": self.max_per_request_bytes,
             "max_per_request_tokens": self.max_per_request_tokens,
+            "allowed_routes": self.allowed_routes,
         }
 
     @classmethod
@@ -183,6 +200,7 @@ class ReservationEnvelope:
             max_in_flight=_safe_int(data, "max_in_flight", default=3),
             max_per_request_bytes=_safe_int(data, "max_per_request_bytes"),
             max_per_request_tokens=_safe_int(data, "max_per_request_tokens"),
+            allowed_routes=data.get("allowed_routes"),
         )
 
 
@@ -460,6 +478,16 @@ class ReservationStore:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (task_id, scope_id)
             );
+
+            CREATE TABLE IF NOT EXISTS reservation_task_aggregate (
+                task_id TEXT PRIMARY KEY,
+                cumulative_requests INTEGER NOT NULL DEFAULT 0,
+                cumulative_bytes INTEGER NOT NULL DEFAULT 0,
+                cumulative_tokens REAL NOT NULL DEFAULT 0,
+                cumulative_cost REAL NOT NULL DEFAULT 0.0,
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
         """)
         self._conn.commit()
 
@@ -482,13 +510,19 @@ class ReservationStore:
             ("max_in_flight", existing.max_in_flight, proposed.max_in_flight),
             ("max_per_request_bytes", existing.max_per_request_bytes, proposed.max_per_request_bytes),
             ("max_per_request_tokens", existing.max_per_request_tokens, proposed.max_per_request_tokens),
+            ("allowed_routes", existing.allowed_routes, proposed.allowed_routes),
         ]
         for name, owner_val, caller_val in dimensions:
             if owner_val is None:
                 continue  # owner explicitly unlimited — caller cannot tighten either, but widening is irrelevant
             if caller_val is None:
                 return name  # caller sets unlimited over owner's finite value = widening
-            if caller_val > owner_val:
+            if isinstance(owner_val, list) and isinstance(caller_val, list):
+                # For allowed_routes, widening means adding routes not in owner's list
+                extra = [r for r in caller_val if r not in owner_val]
+                if extra:
+                    return name
+            elif caller_val > owner_val:
                 return name  # caller relaxes owner's bound
         # Deadline check
         if existing.max_deadline is not None:
@@ -626,6 +660,138 @@ class ReservationStore:
             data = json.loads(row["envelope_json"])
             return ReservationEnvelope.from_dict(data)
         return None
+
+    def check_route_allowed(
+        self,
+        route: str,
+        envelope: ReservationEnvelope,
+    ) -> None:
+        """Raise :class:`QuotaRefused` if *route* is not in the envelope's
+        ``allowed_routes`` (when set).  An empty or ``None`` list permits all.
+        """
+        if envelope.allowed_routes is not None:
+            if route not in envelope.allowed_routes:
+                raise QuotaRefused(
+                    "route",
+                    f"route {route!r} is not in allowed_routes {envelope.allowed_routes}",
+                    detail={"route": route, "allowed_routes": envelope.allowed_routes},
+                )
+
+    def _check_parent_nested_budget(
+        self,
+        env: ReservationEnvelope,
+        parent_scope_id: str,
+        reserved_bytes: Optional[int],
+        reserved_tokens: Optional[float],
+        cost: Optional[float],
+        run_id: str,
+        now: str,
+    ) -> None:
+        """Enforce nested-scope budget constraints against the parent scope.
+
+        When ``parent_scope_id`` is set, the child reservation's cumulative
+        usage is charged against the parent's envelope and cumulative usage.
+        This prevents nested requests from escaping the owner's aggregate
+        budget.
+
+        The parent's envelope (not the child's) is used for budget checks,
+        because the child typically has no explicit envelope and defaults to
+        unlimited.
+        """
+        if not parent_scope_id:
+            return
+        # Look up the parent's reservation to find the parent's task_id and run_id
+        parent_row = self._conn.execute(
+            "SELECT task_id, run_id FROM reservations WHERE scope_id = ? AND run_id = ?",
+            (parent_scope_id, run_id),
+        ).fetchone()
+        if parent_row is None:
+            return  # no parent found -- skip nested enforcement
+        parent_task_id = parent_row["task_id"]
+        parent_run_id = parent_row["run_id"]
+
+        # Look up the parent's envelope to get the authoritative budget limits
+        parent_env = self.get_envelope(parent_run_id, parent_scope_id)
+        if parent_env is None:
+            return  # no parent envelope -- no budget to enforce
+
+        # Check parent task-scoped cumulative usage against PARENT envelope
+        parent_usage = self._get_or_create_task_usage(parent_task_id, parent_scope_id, now)
+        if parent_env.max_requests is not None:
+            if parent_usage["cumulative_requests"] >= parent_env.max_requests:
+                self._conn.rollback()
+                raise AdmissionRefused(
+                    "requests",
+                    f"nested-scope cumulative requests {parent_usage['cumulative_requests']} >= max {parent_env.max_requests}",
+                    run_id=run_id, envelope=parent_env,
+                    detail={"cumulative": parent_usage["cumulative_requests"],
+                            "max": parent_env.max_requests},
+                )
+        if parent_env.max_bytes is not None:
+            projected = parent_usage["cumulative_bytes"] + (reserved_bytes or 0)
+            if projected > parent_env.max_bytes:
+                self._conn.rollback()
+                raise AdmissionRefused(
+                    "bytes",
+                    f"nested-scope cumulative bytes {projected} would exceed max {parent_env.max_bytes}",
+                    run_id=run_id, envelope=parent_env,
+                )
+        if parent_env.max_tokens is not None:
+            projected_tokens = parent_usage["cumulative_tokens"] + int(reserved_tokens or 0)
+            if projected_tokens > parent_env.max_tokens:
+                self._conn.rollback()
+                raise AdmissionRefused(
+                    "tokens",
+                    f"nested-scope cumulative tokens {projected_tokens} would exceed max {parent_env.max_tokens}",
+                    run_id=run_id, envelope=parent_env,
+                )
+        if parent_env.max_cost is not None:
+            projected_cost = parent_usage["cumulative_cost"] + (cost or 0.0)
+            if projected_cost > parent_env.max_cost:
+                self._conn.rollback()
+                raise AdmissionRefused(
+                    "cost",
+                    f"nested-scope cumulative cost {projected_cost} would exceed max {parent_env.max_cost}",
+                    run_id=run_id, envelope=parent_env,
+                )
+
+    def _get_or_create_task_aggregate(self, task_id: str, now: str) -> dict[str, Any]:
+        """Get existing task aggregate row or create one (inside active transaction)."""
+        row = self._conn.execute(
+            "SELECT * FROM reservation_task_aggregate WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is not None:
+            return dict(row)
+        self._conn.execute(
+            """INSERT INTO reservation_task_aggregate
+               (task_id, cumulative_requests, cumulative_bytes,
+                cumulative_tokens, cumulative_cost, version, updated_at)
+               VALUES (?, 0, 0, 0, 0.0, 1, ?)""",
+            (task_id, now),
+        )
+        return {
+            "task_id": task_id,
+            "cumulative_requests": 0,
+            "cumulative_bytes": 0,
+            "cumulative_tokens": 0,
+            "cumulative_cost": 0.0,
+            "version": 1,
+            "updated_at": now,
+        }
+
+    def get_task_aggregate(
+        self,
+        task_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """Return cumulative task aggregate (across ALL attempts) or None."""
+        row = self._conn.execute(
+            "SELECT * FROM reservation_task_aggregate WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
 
     # ── Reservation operations ───────────────────────────────────────
 
@@ -835,6 +1001,56 @@ class ReservationStore:
                                 "max": env.max_cost},
                     )
 
+            # 10c. Check nested-scope cumulative budgets when parent_scope_id is set.
+            # This ensures a nested request is constrained by its parent's budget.
+            if parent_scope_id is not None:
+                self._check_parent_nested_budget(
+                    env, parent_scope_id, reserved_bytes, reserved_tokens,
+                    cost, run_id, now,
+                )
+
+            # 10d. Check cumulative budgets against task aggregate (across ALL
+            # attempts for this task).  This ensures the total across all attempts
+            # does not exceed the owner's envelope.
+            task_agg = self._get_or_create_task_aggregate(task_id, now)
+            if env.max_requests is not None:
+                if task_agg["cumulative_requests"] >= env.max_requests:
+                    self._conn.rollback()
+                    raise AdmissionRefused(
+                        "requests",
+                        f"task aggregate cumulative requests {task_agg['cumulative_requests']} >= max {env.max_requests}",
+                        run_id=run_id, envelope=env,
+                        detail={"cumulative": task_agg["cumulative_requests"],
+                                "max": env.max_requests},
+                    )
+            if env.max_bytes is not None:
+                projected = task_agg["cumulative_bytes"] + (reserved_bytes or 0)
+                if projected > env.max_bytes:
+                    self._conn.rollback()
+                    raise AdmissionRefused(
+                        "bytes",
+                        f"task aggregate cumulative bytes {projected} would exceed max {env.max_bytes}",
+                        run_id=run_id, envelope=env,
+                    )
+            if env.max_tokens is not None:
+                projected_tokens = task_agg["cumulative_tokens"] + int(reserved_tokens or 0)
+                if projected_tokens > env.max_tokens:
+                    self._conn.rollback()
+                    raise AdmissionRefused(
+                        "tokens",
+                        f"task aggregate cumulative tokens {projected_tokens} would exceed max {env.max_tokens}",
+                        run_id=run_id, envelope=env,
+                    )
+            if env.max_cost is not None:
+                projected_cost = task_agg["cumulative_cost"] + (cost or 0.0)
+                if projected_cost > env.max_cost:
+                    self._conn.rollback()
+                    raise AdmissionRefused(
+                        "cost",
+                        f"task aggregate cumulative cost {projected_cost} would exceed max {env.max_cost}",
+                        run_id=run_id, envelope=env,
+                    )
+
             # 11. Check per-request bounds (if finite)
             if env.max_per_request_bytes is not None:
                 if (reserved_bytes or 0) > env.max_per_request_bytes:
@@ -925,6 +1141,26 @@ class ReservationStore:
                 self._conn.rollback()
                 raise ReservationConflict(
                     f"task usage CAS conflict for ({task_id}, {scope_id})"
+                )
+
+            # 16. Update task aggregate cumulative usage (across ALL attempts)
+            new_av = task_agg["version"] + 1
+            cur4 = self._conn.execute(
+                """UPDATE reservation_task_aggregate
+                   SET cumulative_requests = cumulative_requests + 1,
+                       cumulative_bytes = cumulative_bytes + ?,
+                       cumulative_tokens = cumulative_tokens + ?,
+                       cumulative_cost = cumulative_cost + ?,
+                       version = ?,
+                       updated_at = ?
+                   WHERE task_id = ? AND version = ?""",
+                (reserved_bytes or 0, int(reserved_tokens or 0), cost or 0.0,
+                 new_av, now, task_id, task_agg["version"]),
+            )
+            if cur4.rowcount == 0:
+                self._conn.rollback()
+                raise ReservationConflict(
+                    f"task aggregate CAS conflict for {task_id}"
                 )
 
             self._conn.commit()
@@ -1113,6 +1349,36 @@ class ReservationStore:
                     f"task usage CAS conflict during complete for ({rec.task_id}, {rec.scope_id})"
                 )
 
+            # Update task aggregate cumulative counters — across ALL attempts
+            task_agg = self._get_or_create_task_aggregate(rec.task_id, now)
+            new_av = task_agg["version"] + 1
+            if any_observed:
+                cur4 = self._conn.execute(
+                    """UPDATE reservation_task_aggregate
+                       SET cumulative_bytes = MAX(0, cumulative_bytes + ?),
+                           cumulative_tokens = MAX(0, cumulative_tokens + ?),
+                           cumulative_cost = MAX(0, cumulative_cost + ?),
+                           version = ?,
+                           updated_at = ?
+                       WHERE task_id = ? AND version = ?""",
+                    (delta_bytes, delta_tokens, delta_cost,
+                     new_av, now, rec.task_id, task_agg["version"]),
+                )
+            else:
+                cur4 = self._conn.execute(
+                    """UPDATE reservation_task_aggregate
+                       SET cumulative_requests = cumulative_requests,
+                           version = ?,
+                           updated_at = ?
+                       WHERE task_id = ? AND version = ?""",
+                    (new_av, now, rec.task_id, task_agg["version"]),
+                )
+            if cur4.rowcount == 0:
+                self._conn.rollback()
+                raise ReservationConflict(
+                    f"task aggregate CAS conflict during complete for {rec.task_id}"
+                )
+
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -1232,6 +1498,28 @@ class ReservationStore:
                 self._conn.rollback()
                 raise ReservationConflict(
                     f"task usage CAS conflict during cancel for ({rec.task_id}, {rec.scope_id})"
+                )
+
+            # Reverse task aggregate cumulative counters (across ALL attempts)
+            task_agg = self._get_or_create_task_aggregate(rec.task_id, now)
+            new_av = task_agg["version"] + 1
+            cur4 = self._conn.execute(
+                """UPDATE reservation_task_aggregate
+                   SET cumulative_requests = MAX(0, cumulative_requests - 1),
+                       cumulative_bytes = MAX(0, cumulative_bytes - ?),
+                       cumulative_tokens = MAX(0, cumulative_tokens - ?),
+                       cumulative_cost = MAX(0, cumulative_cost - ?),
+                       version = ?,
+                       updated_at = ?
+                   WHERE task_id = ? AND version = ?""",
+                (rec.reserved_bytes or 0, int(rec.reserved_tokens or 0),
+                 rec.cost or 0.0, new_av, now,
+                 rec.task_id, task_agg["version"]),
+            )
+            if cur4.rowcount == 0:
+                self._conn.rollback()
+                raise ReservationConflict(
+                    f"task aggregate CAS conflict during cancel for {rec.task_id}"
                 )
 
             self._conn.commit()
@@ -1385,6 +1673,36 @@ class ReservationStore:
                 self._conn.rollback()
                 raise ReservationConflict(
                     f"task usage CAS conflict during reconcile for ({rec.task_id}, {rec.scope_id})"
+                )
+
+            # Apply delta to task aggregate cumulative counters (across ALL attempts)
+            task_agg = self._get_or_create_task_aggregate(rec.task_id, now)
+            new_av = task_agg["version"] + 1
+            if any_actual:
+                cur_a = self._conn.execute(
+                    """UPDATE reservation_task_aggregate
+                       SET cumulative_bytes = MAX(0, cumulative_bytes + ?),
+                           cumulative_tokens = MAX(0, cumulative_tokens + ?),
+                           cumulative_cost = MAX(0, cumulative_cost + ?),
+                           version = ?,
+                           updated_at = ?
+                       WHERE task_id = ? AND version = ?""",
+                    (delta_bytes, delta_tokens, delta_cost,
+                     new_av, now, rec.task_id, task_agg["version"]),
+                )
+            else:
+                cur_a = self._conn.execute(
+                    """UPDATE reservation_task_aggregate
+                       SET cumulative_requests = cumulative_requests,
+                           version = ?,
+                           updated_at = ?
+                       WHERE task_id = ? AND version = ?""",
+                    (new_av, now, rec.task_id, task_agg["version"]),
+                )
+            if cur_a.rowcount == 0:
+                self._conn.rollback()
+                raise ReservationConflict(
+                    f"task aggregate CAS conflict during reconcile for {rec.task_id}"
                 )
 
             self._conn.commit()

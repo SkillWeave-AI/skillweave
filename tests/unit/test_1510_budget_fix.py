@@ -34,6 +34,7 @@ from skillweave.runtime.reservation import (
     ReservationConflict,
     EnvelopeRejected,
     ReservationError,
+    QuotaRefused,
 )
 from skillweave.runsvc.service import (
     RunApplicationService,
@@ -2218,6 +2219,382 @@ class TestTaskScopedCumulativeEnforcement:
         assert usage["cumulative_bytes"] == 500
         assert usage["cumulative_tokens"] == 200
         assert usage["cumulative_cost"] == 5.0
+
+
+# ===================================================================
+# BLOCKING: QuotaRefused error and route enforcement
+# ===================================================================
+
+class TestCheckRouteAllowed:
+    """Prove check_route_allowed raises QuotaRefused for disallowed routes."""
+
+    def test_route_allowed_passes(self, store):
+        """Route in allowed_routes passes without error."""
+        env = ReservationEnvelope(allowed_routes=["openai/gpt-4", "anthropic/claude-3"])
+        # Should not raise
+        store.check_route_allowed("openai/gpt-4", env)
+
+    def test_route_not_allowed_raises(self, store):
+        """Route not in allowed_routes raises QuotaRefused."""
+        env = ReservationEnvelope(allowed_routes=["openai/gpt-4"])
+        with pytest.raises(QuotaRefused) as exc:
+            store.check_route_allowed("anthropic/claude-3", env)
+        assert "route" in str(exc.value)
+        assert "anthropic/claude-3" in str(exc.value)
+
+    def test_allowed_routes_none_permits_all(self, store):
+        """allowed_routes=None permits any route."""
+        env = ReservationEnvelope()
+        # Should not raise
+        store.check_route_allowed("any/route", env)
+
+    def test_allowed_routes_empty_rejects_all(self, store):
+        """allowed_routes=[] (explicitly set) rejects all routes."""
+        env = ReservationEnvelope(allowed_routes=[])
+        with pytest.raises(QuotaRefused) as exc:
+            store.check_route_allowed("any/route", env)
+        assert "route" in str(exc.value)
+
+    def test_reserve_with_allowed_routes_envelope(self, store):
+        """A reservation can be created with an allowed_routes envelope."""
+        env = ReservationEnvelope(allowed_routes=["route-a"], max_in_flight=5)
+        store.set_envelope("route-run", "route-scope", env)
+        rec = store.reserve(
+            run_id="route-run", task_id="route-task", attempt=1,
+            scope_id="route-scope",
+        )
+        assert rec is not None
+
+    def test_allowed_routes_envelope_widening_rejected(self, store):
+        """Caller cannot widen allowed_routes beyond owner-set list."""
+        owner_env = ReservationEnvelope(allowed_routes=["route-a"])
+        store.set_envelope("widen-run", "widen-scope", owner_env)
+        # Caller tries to add a route
+        with pytest.raises(EnvelopeRejected) as exc:
+            store.set_envelope(
+                "widen-run", "widen-scope",
+                ReservationEnvelope(allowed_routes=["route-a", "route-b"]),
+            )
+        assert "allowed_routes" in str(exc.value)
+
+    def test_allowed_routes_tightening_allowed(self, store):
+        """Caller can tighten allowed_routes (subset of owner list)."""
+        owner_env = ReservationEnvelope(allowed_routes=["route-a", "route-b", "route-c"])
+        store.set_envelope("tight-run", "tight-scope", owner_env)
+        # Tighten to subset
+        store.set_envelope(
+            "tight-run", "tight-scope",
+            ReservationEnvelope(allowed_routes=["route-a"]),
+        )
+        env = store.get_envelope("tight-run", "tight-scope")
+        assert env.allowed_routes == ["route-a"]
+
+
+class TestQuotaRefused:
+    """Prove QuotaRefused error type works correctly."""
+
+    def test_quota_refused_attributes(self):
+        """QuotaRefused stores axis, reason, run_id, detail."""
+        err = QuotaRefused(
+            "tokens", "token quota exceeded",
+            run_id="qr-run",
+            detail={"limit": 1000, "used": 1001},
+        )
+        assert err.axis == "tokens"
+        assert err.reason == "token quota exceeded"
+        assert err.run_id == "qr-run"
+        assert err.detail == {"limit": 1000, "used": 1001}
+        assert "tokens" in str(err)
+
+    def test_quota_refused_minimal(self):
+        """QuotaRefused can be created with minimal args."""
+        err = QuotaRefused("route", "route not permitted")
+        assert err.axis == "route"
+        assert err.run_id == ""
+        assert err.detail == {}
+
+
+# ===================================================================
+# BLOCKING: Nested-scope budget enforcement (parent_scope_id)
+# ===================================================================
+
+class TestNestedScopeBudgetEnforcement:
+    """Prove nested-scope budget enforcement works when parent_scope_id is set."""
+
+    def test_nested_scope_requests_refused(self, store):
+        """Nested scope respects parent's max_requests.
+
+        The nested-scope check reads the parent's OWN scope usage (cumulative
+        requests for the parent_scope_id).  The parent reservation itself
+        counts as one request in that scope, so max_requests=1 means no
+        child can be admitted.
+        """
+        parent_env = ReservationEnvelope(max_requests=1, max_in_flight=10)
+        store.set_envelope("parent-run", "parent-scope", parent_env)
+
+        # Parent reservation — this consumes the single request slot
+        parent_rec = store.reserve(
+            run_id="parent-run", task_id="parent-task", attempt=1,
+            scope_id="parent-scope",
+        )
+        # First child should be refused (parent scope already has 1 request)
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(
+                run_id="parent-run", task_id="parent-task", attempt=1,
+                scope_id="child-scope-1",
+                parent_scope_id="parent-scope",
+            )
+        assert "requests" in str(exc.value)
+
+    def test_nested_scope_bytes_refused(self, store):
+        """Nested scope respects parent's max_bytes."""
+        parent_env = ReservationEnvelope(max_bytes=500, max_in_flight=5)
+        store.set_envelope("bytes-parent-run", "bytes-parent-scope", parent_env)
+
+        store.reserve(
+            run_id="bytes-parent-run", task_id="bytes-task", attempt=1,
+            scope_id="bytes-parent-scope",
+        )
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(
+                run_id="bytes-parent-run", task_id="bytes-task", attempt=1,
+                scope_id="bytes-child-scope",
+                parent_scope_id="bytes-parent-scope",
+                reserved_bytes=1000,
+            )
+        assert "bytes" in str(exc.value)
+
+    def test_nested_scope_tokens_refused(self, store):
+        """Nested scope respects parent's max_tokens."""
+        parent_env = ReservationEnvelope(max_tokens=1000, max_in_flight=5)
+        store.set_envelope("tok-parent-run", "tok-parent-scope", parent_env)
+
+        store.reserve(
+            run_id="tok-parent-run", task_id="tok-task", attempt=1,
+            scope_id="tok-parent-scope",
+        )
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(
+                run_id="tok-parent-run", task_id="tok-task", attempt=1,
+                scope_id="tok-child-scope",
+                parent_scope_id="tok-parent-scope",
+                reserved_tokens=1500.0,
+            )
+        assert "tokens" in str(exc.value)
+
+    def test_nested_scope_cost_refused(self, store):
+        """Nested scope respects parent's max_cost."""
+        parent_env = ReservationEnvelope(max_cost=10.0, max_in_flight=5)
+        store.set_envelope("cost-parent-run", "cost-parent-scope", parent_env)
+
+        store.reserve(
+            run_id="cost-parent-run", task_id="cost-task", attempt=1,
+            scope_id="cost-parent-scope",
+        )
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(
+                run_id="cost-parent-run", task_id="cost-task", attempt=1,
+                scope_id="cost-child-scope",
+                parent_scope_id="cost-parent-scope",
+                cost=20.0,
+            )
+        assert "cost" in str(exc.value)
+
+    def test_nested_scope_no_parent_skips_check(self, store):
+        """No parent_scope_id skips nested-scope enforcement."""
+        env = ReservationEnvelope(max_requests=1, max_in_flight=5)
+        store.set_envelope("no-parent-run", "no-parent-scope", env)
+
+        store.reserve(
+            run_id="no-parent-run", task_id="no-parent-task", attempt=1,
+            scope_id="no-parent-scope",
+        )
+        # Different scope without parent_scope_id should not be blocked
+        rec2 = store.reserve(
+            run_id="no-parent-run", task_id="no-parent-task", attempt=1,
+            scope_id="other-scope",
+        )
+        assert rec2 is not None
+
+    def test_nested_scope_with_existing_parent(self, store):
+        """Nested scope checks exist when parent reservation already exists."""
+        parent_env = ReservationEnvelope(max_bytes=2000, max_in_flight=5)
+        store.set_envelope("nest-exist-run", "nest-exist-parent", parent_env)
+
+        # First parent reservation
+        parent_rec = store.reserve(
+            run_id="nest-exist-run", task_id="nest-task", attempt=1,
+            scope_id="nest-exist-parent",
+            reserved_bytes=800,
+        )
+        # Child within remaining budget
+        child = store.reserve(
+            run_id="nest-exist-run", task_id="nest-task", attempt=1,
+            scope_id="nest-exist-child",
+            parent_scope_id="nest-exist-parent",
+            reserved_bytes=500,
+        )
+        assert child is not None
+
+        # Another child exceeding budget (parent scope has 800 bytes, 800 + 1500 > 2000)
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(
+                run_id="nest-exist-run", task_id="nest-task", attempt=1,
+                scope_id="nest-exist-child2",
+                parent_scope_id="nest-exist-parent",
+                reserved_bytes=1500,
+            )
+        assert "bytes" in str(exc.value)
+
+
+# ===================================================================
+# BLOCKING: Task aggregate enforcement across ALL attempts
+# ===================================================================
+
+class TestTaskAggregateEnforcement:
+    """Prove task aggregate budget enforcement works across ALL attempts."""
+
+    def test_task_aggregate_requests_across_attempts(self, store):
+        """Task aggregate max_requests enforced across different attempts."""
+        task_id = "agg-attempts-task"
+        env = ReservationEnvelope(max_requests=3, max_in_flight=5)
+        store.set_envelope("agg-att-run-1", f"{task_id}/attempt-1", env)
+
+        # attempt-1: first request
+        store.reserve(run_id="agg-att-run-1", task_id=task_id, attempt=1,
+                      scope_id=f"{task_id}/attempt-1")
+        # attempt-2 (different attempt, same task): second request
+        store.reserve(run_id="agg-att-run-2", task_id=task_id, attempt=2,
+                      scope_id=f"{task_id}/attempt-2")
+        # attempt-3: third request
+        store.reserve(run_id="agg-att-run-3", task_id=task_id, attempt=3,
+                      scope_id=f"{task_id}/attempt-3")
+
+        # Fourth should be refused (max_requests=3 across ALL attempts)
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(run_id="agg-att-run-4", task_id=task_id, attempt=4,
+                          scope_id=f"{task_id}/attempt-4")
+        assert "requests" in str(exc.value)
+
+    def test_task_aggregate_bytes_across_attempts(self, store):
+        """Task aggregate max_bytes enforced across different attempts."""
+        task_id = "agg-bytes-task"
+        env = ReservationEnvelope(max_bytes=2000, max_in_flight=5)
+        store.set_envelope("agg-by-run-1", f"{task_id}/attempt-1", env)
+
+        store.reserve(run_id="agg-by-run-1", task_id=task_id, attempt=1,
+                      scope_id=f"{task_id}/attempt-1", reserved_bytes=1200)
+
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(run_id="agg-by-run-2", task_id=task_id, attempt=2,
+                          scope_id=f"{task_id}/attempt-2", reserved_bytes=1200)
+        assert "bytes" in str(exc.value)
+
+    def test_task_aggregate_tokens_across_attempts(self, store):
+        """Task aggregate max_tokens enforced across different attempts."""
+        task_id = "agg-tok-task"
+        env = ReservationEnvelope(max_tokens=5000, max_in_flight=5)
+        store.set_envelope("agg-tok-run-1", f"{task_id}/attempt-1", env)
+
+        store.reserve(run_id="agg-tok-run-1", task_id=task_id, attempt=1,
+                      scope_id=f"{task_id}/attempt-1", reserved_tokens=3000.0)
+
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(run_id="agg-tok-run-2", task_id=task_id, attempt=2,
+                          scope_id=f"{task_id}/attempt-2", reserved_tokens=3000.0)
+        assert "tokens" in str(exc.value)
+
+    def test_task_aggregate_cost_across_attempts(self, store):
+        """Task aggregate max_cost enforced across different attempts."""
+        task_id = "agg-cost-task"
+        env = ReservationEnvelope(max_cost=25.0, max_in_flight=5)
+        store.set_envelope("agg-cost-run-1", f"{task_id}/attempt-1", env)
+
+        store.reserve(run_id="agg-cost-run-1", task_id=task_id, attempt=1,
+                      scope_id=f"{task_id}/attempt-1", cost=15.0)
+
+        with pytest.raises(AdmissionRefused) as exc:
+            store.reserve(run_id="agg-cost-run-2", task_id=task_id, attempt=2,
+                          scope_id=f"{task_id}/attempt-2", cost=15.0)
+        assert "cost" in str(exc.value)
+
+    def test_get_task_aggregate_returns_none(self, store):
+        """get_task_aggregate returns None when no aggregate exists."""
+        agg = store.get_task_aggregate("nonexistent-agg-task")
+        assert agg is None
+
+    def test_get_task_aggregate_after_reserve(self, store):
+        """get_task_aggregate returns correct data after reserve."""
+        task_id = "agg-get-task"
+        env = ReservationEnvelope(max_requests=10, max_in_flight=5)
+        store.set_envelope("agg-get-run-1", f"{task_id}/attempt-1", env)
+
+        store.reserve(run_id="agg-get-run-1", task_id=task_id, attempt=1,
+                      scope_id=f"{task_id}/attempt-1",
+                      reserved_bytes=500, reserved_tokens=200.0, cost=5.0)
+
+        agg = store.get_task_aggregate(task_id)
+        assert agg is not None
+        assert agg["cumulative_requests"] == 1
+        assert agg["cumulative_bytes"] == 500
+        assert agg["cumulative_tokens"] == 200
+        assert agg["cumulative_cost"] == 5.0
+
+    def test_task_aggregate_complete_updates(self, store):
+        """complete() updates task aggregate counters."""
+        task_id = "agg-comp-task"
+        env = ReservationEnvelope(max_requests=5, max_in_flight=5)
+        store.set_envelope("agg-comp-run", f"{task_id}/attempt-1", env)
+
+        rec = store.reserve(run_id="agg-comp-run", task_id=task_id, attempt=1,
+                            scope_id=f"{task_id}/attempt-1",
+                            reserved_bytes=1000, reserved_tokens=500.0, cost=10.0)
+        store.complete(rec.reservation_id, observed_bytes=800, observed_tokens=400.0, cost=8.0)
+
+        agg = store.get_task_aggregate(task_id)
+        assert agg is not None
+        assert agg["cumulative_bytes"] == 800
+        assert agg["cumulative_tokens"] == 400
+        assert agg["cumulative_cost"] == 8.0
+
+    def test_task_aggregate_cancel_reverses(self, store):
+        """cancel() reverses task aggregate counters."""
+        task_id = "agg-cancel-task"
+        env = ReservationEnvelope(max_requests=5, max_in_flight=5)
+        store.set_envelope("agg-cancel-run", f"{task_id}/attempt-1", env)
+
+        rec = store.reserve(run_id="agg-cancel-run", task_id=task_id, attempt=1,
+                            scope_id=f"{task_id}/attempt-1",
+                            reserved_bytes=1000, reserved_tokens=500.0, cost=10.0)
+        store.cancel(rec.reservation_id)
+
+        agg = store.get_task_aggregate(task_id)
+        assert agg is not None
+        assert agg["cumulative_requests"] == 0
+        assert agg["cumulative_bytes"] == 0
+        assert agg["cumulative_tokens"] == 0
+        assert agg["cumulative_cost"] == 0.0
+
+    def test_task_aggregate_reconcile_updates(self, store):
+        """reconcile() updates task aggregate counters."""
+        task_id = "agg-reconcile-task"
+        env = ReservationEnvelope(max_requests=5, max_in_flight=5)
+        store.set_envelope("agg-reconcile-run", f"{task_id}/attempt-1", env)
+
+        rec = store.reserve(run_id="agg-reconcile-run", task_id=task_id, attempt=1,
+                            scope_id=f"{task_id}/attempt-1",
+                            reserved_bytes=1000, reserved_tokens=500.0, cost=10.0)
+        store.complete(rec.reservation_id)
+
+        agg = store.get_task_aggregate(task_id)
+        assert agg is not None
+        assert agg["cumulative_bytes"] == 1000
+
+        store.reconcile(rec.reservation_id, actual_bytes=600)
+        agg = store.get_task_aggregate(task_id)
+        assert agg["cumulative_bytes"] == 600
+        assert agg["cumulative_tokens"] == 500
+        assert agg["cumulative_cost"] == 10.0
 
 
 # ===================================================================
