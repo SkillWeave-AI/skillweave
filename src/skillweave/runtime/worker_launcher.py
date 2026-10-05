@@ -1,0 +1,422 @@
+"""Real process isolation for delegated workers (SW-1510-IDENTITY).
+
+Worker scope cannot write terminal receipts, gate state, observer signing
+material, authority records or gateway telemetry. An in-memory role matrix, or a
+``chmod`` against a same-user child, is not enough: an owner can simply
+``chmod`` a file it owns. This module therefore enforces the boundary with real
+OS mechanisms and *fails closed* when none is available.
+
+Two real mechanisms are modeled:
+
+* :class:`SandboxExecAdapter` — macOS Seatbelt (``sandbox-exec``) denies both
+  reads of observer signing material and writes to every protected store. It is
+  selected when the host permits Seatbelt, and its ``available()`` is a real
+  probe, not a platform guess.
+* :class:`ImmutableStoreAdapter` — sets the BSD/Mach immutable flag (``uchg``)
+  on each protected store for the lifetime of the child. This is
+  kernel-enforced: a same-user child's write/overwrite/unlink inside a sealed
+  store fails with ``EPERM``, independently observable after the child exits.
+  It does not deny reads, so it advertises ``denies_reads = False`` honestly;
+  observer signing material is read-protected by design instead
+  (:class:`ObserverSigningVault`, kept only in host memory).
+
+If neither adapter is available, :func:`protect_stores` raises
+:class:`IsolationUnavailableError`: the protected native path fails closed with
+an honest capability limitation rather than launching an unsandboxed worker.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Mapping, Optional, Sequence
+
+#: The protected store families a worker must never write.
+PROTECTED_STORE_NAMES: tuple[str, ...] = (
+    "terminal_receipts",
+    "gate_state",
+    "authority_records",
+    "gateway_telemetry",
+    "observer_signing",
+)
+
+#: Protected stores whose *contents* are also withheld from a worker.
+READ_PROTECTED_STORE_NAMES: frozenset[str] = frozenset({"observer_signing"})
+
+
+class IsolationUnavailableError(RuntimeError):
+    """No real isolation adapter is available; the protected path fails closed.
+
+    Callers that see this must treat the protected path as unavailable, never
+    retry with containment disabled.
+    """
+
+
+class WorkerIsolationAdapter:
+    """Abstract real-isolation adapter. Subclasses own one OS mechanism."""
+
+    name: str = "abstract"
+
+    #: Advertised, honest capabilities. Never True unless actually enforced.
+    denies_writes: bool = False
+    denies_reads: bool = False
+
+    def available(self) -> bool:
+        raise NotImplementedError
+
+    def seal(self, protected: "ProtectedStores") -> None:
+        raise NotImplementedError
+
+    def unseal(self, protected: "ProtectedStores") -> None:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class ProtectedStores:
+    """Concrete filesystem roots for each protected store family."""
+
+    roots: Mapping[str, Path]
+
+    def __post_init__(self) -> None:
+        missing = [name for name in PROTECTED_STORE_NAMES if name not in self.roots]
+        if missing:
+            raise ValueError(f"protected stores missing roots for {missing}")
+
+    def paths(self) -> list[Path]:
+        return [Path(self.roots[name]) for name in PROTECTED_STORE_NAMES]
+
+    def write_protected_paths(self) -> list[Path]:
+        return self.paths()
+
+    def read_protected_paths(self) -> list[Path]:
+        return [Path(self.roots[name]) for name in sorted(READ_PROTECTED_STORE_NAMES)]
+
+    def ensure(self, mode: int = 0o755) -> None:
+        """Create each protected root as a host-owned directory.
+
+        The mode is only a same-user convenience layer; the isolation guarantee
+        comes from the adapter, not from this mode.
+        """
+        for path in self.paths():
+            path.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(path, mode)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Observer signing material: host-memory vault
+# ---------------------------------------------------------------------------
+
+
+class ObserverSigningVault:
+    """Host-only observer signing material, kept in memory, never on disk.
+
+    A worker holds no reference to a vault instance, and the key is never
+    written to any filesystem path, so there is no plaintext file a child can
+    open. :meth:`read_attempt_paths` returns the paths a worker might *guess*;
+    a worker's read attempt of them fails because nothing exists there. This is
+    read protection by construction, complementary to a read-denying sandbox.
+    """
+
+    def __init__(self) -> None:
+        import secrets
+
+        self._key = secrets.token_bytes(32)
+
+    @property
+    def key_ref(self) -> str:
+        """An opaque reference to the in-memory key (not the key itself)."""
+        import hashlib
+
+        return "vault:" + hashlib.sha256(self._key).hexdigest()[:16]
+
+    def sign(self, material: bytes) -> bytes:
+        import hashlib
+        import hmac
+
+        return hmac.new(self._key, material, hashlib.sha256).digest()
+
+    def read_attempt_paths(self, signing_root: Path) -> list[Path]:
+        """Paths a worker is likely to probe; none carries the key material."""
+        return [
+            Path(signing_root) / "observer.key",
+            Path(signing_root) / "signing.key",
+            Path(signing_root) / "key.pem",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Adapters
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SandboxExecAdapter(WorkerIsolationAdapter):
+    """macOS ``sandbox-exec`` (Seatbelt): denies reads and writes at the OS boundary."""
+
+    name: str = "darwin-sandbox-exec"
+    denies_writes: bool = True
+    denies_reads: bool = True
+
+    def available(self) -> bool:
+        sandbox_exec = shutil.which("sandbox-exec")
+        if not sandbox_exec or sys.platform != "darwin":
+            return False
+        try:
+            probe = subprocess.run(
+                [sandbox_exec, "-p", "(version 1)(allow default)", "/bin/echo", "ok"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        return probe.returncode == 0 and probe.stdout.strip() == b"ok"
+
+    def build_profile(self, writable_scope: Path, protected: ProtectedStores) -> str:
+        lines = ["(version 1)", "(deny default)", "(allow process*)"]
+        lines.append("(allow sysctl-read)")
+        lines.append("(allow mach-lookup)")
+        lines.append("(allow file-read*)")
+        for path in protected.read_protected_paths():
+            lines.append(f'(deny file-read* (subpath "{path}"))')
+        lines.append(f'(allow file-write* (subpath "{writable_scope}"))')
+        for literal in ('"/dev/null"', '"/dev/stdout"', '"/dev/stderr"'):
+            lines.append(f"(allow file-write-data (literal {literal}))")
+        return "\n".join(lines)
+
+    def wrap_command(
+        self,
+        command: Sequence[str],
+        *,
+        writable_scope: Path,
+        protected: ProtectedStores,
+    ) -> list[str]:
+        sandbox_exec = shutil.which("sandbox-exec")
+        if not sandbox_exec:
+            raise IsolationUnavailableError("sandbox-exec is not installed")
+        return [
+            sandbox_exec,
+            "-p",
+            self.build_profile(Path(writable_scope), protected),
+            *[str(c) for c in command],
+        ]
+
+    def seal(self, protected: ProtectedStores) -> None:
+        # Seatbelt applies per-launch; nothing persistent to seal here.
+        return None
+
+    def unseal(self, protected: ProtectedStores) -> None:
+        return None
+
+
+@dataclass
+class ImmutableStoreAdapter(WorkerIsolationAdapter):
+    """BSD/Mach immutable-flag (``uchg``) write isolation.
+
+    Sealing a protected store sets ``uchg`` on the directory and its entries;
+    the kernel then rejects any create/overwrite/unlink inside it from any
+    process, including a same-user child. ``unseal`` clears the flag after the
+    child exits. Reads are unaffected, so ``denies_reads`` is honestly False.
+    """
+
+    name: str = "bsd-immutable-flag"
+    denies_writes: bool = True
+    denies_reads: bool = False
+    #: Optional directory for the availability probe. When None the ambient
+    #: temp dir is used; tests pin it to their own basetemp so the probe never
+    #: depends on the host's TMPDIR.
+    probe_dir: Optional[Path] = None
+
+    def available(self) -> bool:
+        chflags = shutil.which("chflags")
+        if not chflags or sys.platform not in ("darwin", "freebsd", "netbsd", "openbsd"):
+            return False
+        import tempfile
+
+        parent = str(self.probe_dir) if self.probe_dir is not None else None
+        try:
+            probe_dir = Path(tempfile.mkdtemp(prefix="iso-probe-", dir=parent))
+        except OSError:
+            return False
+        try:
+            marker = probe_dir / "marker"
+            marker.write_text("x")
+            if not self._chflags(chflags, ["-R", "uchg", str(probe_dir)]):
+                return False
+            try:
+                marker.write_text("y")
+                wrote = True
+            except OSError:
+                wrote = False
+            finally:
+                self._chflags(chflags, ["-R", "nouchg", str(probe_dir)])
+            return not wrote
+        finally:
+            shutil.rmtree(probe_dir, ignore_errors=True)
+
+    def _chflags(self, chflags: str, args: list[str]) -> bool:
+        try:
+            return subprocess.run(
+                [chflags, *args],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            ).returncode == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    def seal(self, protected: ProtectedStores) -> None:
+        chflags = shutil.which("chflags")
+        if not chflags:
+            raise IsolationUnavailableError("chflags is not installed")
+        for path in protected.write_protected_paths():
+            path.mkdir(parents=True, exist_ok=True)
+            if not self._chflags(chflags, ["-R", "uchg", str(path)]):
+                raise IsolationUnavailableError(f"could not seal protected store {path}")
+
+    def unseal(self, protected: ProtectedStores) -> None:
+        chflags = shutil.which("chflags")
+        if not chflags:
+            return
+        for path in protected.write_protected_paths():
+            self._chflags(chflags, ["-R", "nouchg", str(path)])
+
+
+@dataclass
+class FailClosedAdapter(WorkerIsolationAdapter):
+    """The adapter used when no real isolation mechanism is available."""
+
+    name: str = "fail-closed"
+    reason: str = ""
+
+    def available(self) -> bool:
+        return False
+
+    def seal(self, protected: ProtectedStores) -> None:
+        raise IsolationUnavailableError(self._message())
+
+    def unseal(self, protected: ProtectedStores) -> None:
+        return None
+
+    def _message(self) -> str:
+        base = "no real worker isolation adapter is available on this host"
+        if self.reason:
+            base += f": {self.reason}"
+        return base + "; refusing to launch an unsandboxed worker (fail closed)"
+
+
+def select_adapter(preferred: Optional[str] = None) -> WorkerIsolationAdapter:
+    """Return the strongest available real adapter, else a fail-closed adapter."""
+    candidates: list[WorkerIsolationAdapter] = []
+    order = preferred or "auto"
+    if order in ("auto", "sandbox-exec"):
+        candidates.append(SandboxExecAdapter())
+    if order in ("auto", "immutable"):
+        candidates.append(ImmutableStoreAdapter())
+    for candidate in candidates:
+        if candidate.available():
+            return candidate
+    return FailClosedAdapter(reason="no writable-store isolation mechanism available")
+
+
+# ---------------------------------------------------------------------------
+# Protection context manager
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StoreProtection:
+    """A live protection window around one real worker subprocess.
+
+    ``adapter_name``, ``denies_writes`` and ``denies_reads`` are the *observed*
+    capabilities of the chosen adapter. ``read_isolation_available`` is False
+    when only write isolation is enforced — an honest limitation the caller can
+    assert on rather than assume away.
+    """
+
+    adapter: WorkerIsolationAdapter
+    protected: ProtectedStores
+    require_read_isolation: bool = False
+    sealed: bool = False
+
+    @property
+    def adapter_name(self) -> str:
+        return self.adapter.name
+
+    @property
+    def denies_writes(self) -> bool:
+        return self.adapter.denies_writes
+
+    @property
+    def denies_reads(self) -> bool:
+        return self.adapter.denies_reads
+
+    @property
+    def read_isolation_available(self) -> bool:
+        return self.adapter.denies_reads
+
+    def __enter__(self) -> "StoreProtection":
+        if not self.adapter.available():
+            raise IsolationUnavailableError(
+                f"isolation adapter {self.adapter.name!r} is not available; "
+                "refusing to launch an unsandboxed worker (fail closed)"
+            )
+        if self.require_read_isolation and not self.adapter.denies_reads:
+            raise IsolationUnavailableError(
+                "read isolation of observer signing material was required but "
+                f"adapter {self.adapter.name!r} does not deny reads; fail closed"
+            )
+        self.adapter.seal(self.protected)
+        self.sealed = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self.sealed:
+            self.adapter.unseal(self.protected)
+            self.sealed = False
+        return False
+
+    def wrap_command(self, command: Sequence[str], *, writable_scope: Path) -> list[str]:
+        """Return the argv to actually spawn (adapter may wrap it)."""
+        if isinstance(self.adapter, SandboxExecAdapter):
+            return self.adapter.wrap_command(
+                command, writable_scope=writable_scope, protected=self.protected
+            )
+        return [str(c) for c in command]
+
+
+def protect_stores(
+    protected: ProtectedStores,
+    *,
+    adapter: Optional[WorkerIsolationAdapter] = None,
+    require_read_isolation: bool = False,
+) -> StoreProtection:
+    """Open a protection window over *protected* stores for one worker launch."""
+    return StoreProtection(
+        adapter=adapter or select_adapter(),
+        protected=protected,
+        require_read_isolation=require_read_isolation,
+    )
+
+
+__all__ = [
+    "PROTECTED_STORE_NAMES",
+    "READ_PROTECTED_STORE_NAMES",
+    "IsolationUnavailableError",
+    "ProtectedStores",
+    "ObserverSigningVault",
+    "WorkerIsolationAdapter",
+    "SandboxExecAdapter",
+    "ImmutableStoreAdapter",
+    "FailClosedAdapter",
+    "select_adapter",
+    "StoreProtection",
+    "protect_stores",
+]

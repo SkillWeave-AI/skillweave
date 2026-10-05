@@ -127,14 +127,37 @@ class RunApplicationService:
         subject_commit: str,
         created_at: Optional[str] = None,
         check_output: Optional[Any] = None,
+        authority_service: Optional[Any] = None,
+        worker_token: Optional[str] = None,
+        require_identity: bool = False,
     ) -> RunExecution:
         """Run ``command`` through the six-stage integration path.
 
         The six record kinds are produced in a single, gap-free sequence, and
         the gate state is derived from the verifier's verdict over the bound
         receipt — never from a raw exit code alone.
+
+        When ``authority_service`` is supplied, the host authenticates the
+        worker at *ingress*: ``worker_token`` must verify against the host
+        credential registry and bind to this exact ``run_id``, and the worker
+        credential must carry no approving role. This is the actual integration
+        point for the SW-1510 identity boundary; without it the run path is the
+        unchanged legacy path.
+
+        ``require_identity=True`` makes a missing authority service a hard
+        failure, so a protected caller cannot accidentally run the legacy path.
         """
         created_at = created_at or datetime.now(timezone.utc).isoformat()
+
+        if authority_service is None and require_identity:
+            raise RunIntegrationError(
+                "identity",
+                "require_identity=True but no authority_service was supplied",
+            )
+        if authority_service is not None:
+            self._authenticate_worker(
+                authority_service, worker_token=worker_token, run_id=run_id
+            )
 
         run_command = _runtime_attr("runner_adapter", "run_command")
         EventType = _runtime_attr("journal", "EventType")
@@ -292,6 +315,40 @@ class RunApplicationService:
             verification=verdict_receipt,
             gate_state=gate_state,
         )
+
+    def _authenticate_worker(
+        self,
+        authority_service: Any,
+        *,
+        worker_token: Optional[str],
+        run_id: str,
+    ) -> None:
+        """Authenticate the worker credential at run ingress (SW-1510-IDENTITY).
+
+        The host service verifies the presented token against its credential
+        registry. A missing/forged/revoked/expired token, or one bound to a
+        different run, fails before any run state is written. The credential
+        must be a worker credential: it must carry no approving role, so a
+        worker can never reach a reviewer/observer/controller decision.
+        """
+        if not worker_token:
+            raise RunIntegrationError("identity", "no worker credential presented")
+        try:
+            credential = authority_service.verify_credential(worker_token)
+        except Exception as exc:  # noqa: BLE001 - re-raised as integration error
+            raise RunIntegrationError("identity", f"worker credential rejected: {exc}") from exc
+        approving = credential.roles & {"reviewer", "observer", "controller", "integrator"}
+        if approving:
+            raise RunIntegrationError(
+                "identity",
+                f"worker credential carries approving role(s) {sorted(approving)}",
+            )
+        attempt_key = getattr(credential, "attempt_key", None)
+        if attempt_key is not None and attempt_key[0] != run_id:
+            raise RunIntegrationError(
+                "identity",
+                "worker credential is bound to a different run",
+            )
 
     def _fail_run(self, run_id: str, reason: str) -> None:
         """Mark a run terminal with a stop reason when a stage raises.

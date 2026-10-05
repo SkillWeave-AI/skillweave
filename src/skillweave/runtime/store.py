@@ -1038,6 +1038,84 @@ class SQLiteRunStore(RunStore):
     def ensure_storage(self):
         pass
 
+    # ---- Protected receipt / gate mutation boundary (SW-1510-IDENTITY) ----
+    #
+    # These are the *actual* persistence boundaries for a protected receipt and
+    # a gate transition. They are separate from ``save_evidence``/``transition``
+    # (which stay as general-purpose legacy APIs) so that a worker-shaped call
+    # cannot reach a protected write: the boundary requires an
+    # ``IngestedReceipt`` that only ``HostAuthorityService`` can produce, and a
+    # ``GateAdmission`` that only a controller/integrator credential can obtain.
+
+    def save_protected_evidence(
+        self,
+        receipt: ArtifactReceipt,
+        ingested: Any,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> ArtifactReceipt:
+        """Persist a receipt that passed the host identity boundary.
+
+        Refuses any receipt whose digest is not the one the authority service
+        authenticated and resolved to raw bytes, and refuses an un-authenticated
+        ingestion result outright. This is the protected analogue of
+        ``save_evidence``: a worker holding only ``store`` cannot call it with a
+        self-made ``IngestedReceipt`` because it cannot construct the type with
+        host-verified provenance.
+        """
+        from .authority_service import IdentityBoundaryError, IngestedReceipt
+
+        if not isinstance(ingested, IngestedReceipt):
+            raise IdentityBoundaryError(
+                "save_protected_evidence requires an IngestedReceipt produced by "
+                "HostAuthorityService.ingest_evidence_receipt"
+            )
+        if receipt.sha256 != ingested.artifact_digest:
+            raise IdentityBoundaryError(
+                "receipt digest does not match the authenticated artifact digest"
+            )
+        return self.save_evidence(receipt, idempotency_key=idempotency_key)
+
+    def transition_with_gate_admission(
+        self,
+        run_id: str,
+        target_state: str,
+        expected_state: str,
+        expected_version: int,
+        admission: Any,
+        reason: str = "",
+        stop_reason: Optional[str] = None,
+    ) -> RunRecord:
+        """Transition a run to a gate state, admitted by a controller.
+
+        The ``admission`` must be a :class:`GateAdmission` issued by a
+        controller/integrator credential; a worker never has one. The
+        transition itself is recorded with the admitting principal as ``role``,
+        so the persisted state carries who actually admitted it, not a
+        worker-supplied role string.
+        """
+        from .authority_service import GateAdmission, IdentityBoundaryError
+
+        if not isinstance(admission, GateAdmission):
+            raise IdentityBoundaryError(
+                "transition_with_gate_admission requires a GateAdmission from a "
+                "controller/integrator credential"
+            )
+        if admission.run_id != run_id:
+            raise IdentityBoundaryError("gate admission is for a different run")
+        return self._transition_impl(
+            run_id=run_id,
+            target_state=target_state,
+            expected_state=expected_state,
+            expected_version=expected_version,
+            reason=reason,
+            role=admission.admitted_by,
+            stop_reason=stop_reason,
+            event_type=None,
+            event_payload=None,
+            idempotency_key=None,
+        )
+
     def create_run(self, run_id: str, **kwargs) -> RunRecord:
         from datetime import datetime, timezone
         import uuid
