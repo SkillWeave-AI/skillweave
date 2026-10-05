@@ -553,17 +553,45 @@ class ReservationStore:
             self._conn.rollback()
             raise
 
-    def get_envelope(self, run_id: str, scope_id: str) -> Optional[ReservationEnvelope]:
-        """Return the envelope for (run_id, scope_id) or None."""
+    def get_envelope(
+        self,
+        run_id: str,
+        scope_id: str,
+        *,
+        fallback_task_scope: Optional[str] = None,
+    ) -> Optional[ReservationEnvelope]:
+        """Return the envelope for (run_id, scope_id) or None.
+
+        When ``fallback_task_scope`` is provided and no exact match is found,
+        search for any envelope (across ALL run_ids) whose scope_id starts
+        with ``{fallback_task_scope}/attempt-``.  This ensures that a finite
+        owner envelope set on ``attempt-1`` is also authoritative for a retry
+        at ``attempt-2`` — a retry cannot escape the owner's budget by moving
+        to a new run_id or an unbound scope.
+        """
         row = self._conn.execute(
             "SELECT envelope_json FROM reservation_envelopes "
             "WHERE run_id = ? AND scope_id = ?",
             (run_id, scope_id),
         ).fetchone()
-        if row is None:
-            return None
-        data = json.loads(row["envelope_json"])
-        return ReservationEnvelope.from_dict(data)
+        if row is not None:
+            data = json.loads(row["envelope_json"])
+            return ReservationEnvelope.from_dict(data)
+
+        # Fall back: any envelope across ALL runs whose scope starts with
+        # the task scope prefix (covers retry attempts with new run_ids).
+        if fallback_task_scope is not None:
+            prefix = f"{fallback_task_scope}/attempt-"
+            row = self._conn.execute(
+                "SELECT envelope_json FROM reservation_envelopes "
+                "WHERE scope_id LIKE ?",
+                (prefix + "%",),
+            ).fetchone()
+            if row is not None:
+                data = json.loads(row["envelope_json"])
+                return ReservationEnvelope.from_dict(data)
+
+        return None
 
     # ── Reservation operations ───────────────────────────────────────
 
@@ -606,7 +634,12 @@ class ReservationStore:
                            scope_id=scope_id, parent_scope_id=parent_scope_id)
 
         # 1. Resolve envelope: persisted owner envelope is ALWAYS authoritative.
-        persisted = self.get_envelope(run_id, scope_id)
+        #    When the exact scope has no envelope, fall back to any envelope for
+        #    the same task (e.g. attempt-1's envelope covers attempt-2 retries).
+        persisted = self.get_envelope(
+            run_id, scope_id,
+            fallback_task_scope=task_id,
+        )
         if persisted is not None:
             env = persisted
         elif envelope is not None:

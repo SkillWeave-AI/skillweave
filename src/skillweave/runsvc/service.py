@@ -378,8 +378,12 @@ class RunApplicationService:
             scope_id = f"{task_id or run_id}/attempt-{attempt}"
             # Resolve the envelope: use caller-supplied or persist a default
             env = reservation_envelope
-            if env is not None:
-                self.reservation_store.set_envelope(run_id, scope_id, env)
+            # Do NOT persist the envelope here — the ingress (cli/run.py,
+            # mcp/server.py) is responsible for persisting the owner envelope
+            # via set_envelope BEFORE calling execute().  The reserve() call
+            # below resolves the effective envelope through get_envelope(),
+            # which inherits via fallback_task_scope when the exact scope has
+            # no persisted envelope (e.g. a retry at a new attempt scope).
             try:
                 reservation_rec = self.reservation_store.reserve(
                     run_id=run_id,
@@ -2094,8 +2098,13 @@ class RunApplicationService:
         if self.reservation_store is not None:
             scope_id = f"{task_id or run_id}/attempt-{attempt}"
             env = reservation_envelope
-            if env is not None:
-                self.reservation_store.set_envelope(run_id, scope_id, env)
+            # Do NOT persist the envelope here — the ingress (cli/run.py,
+            # mcp/server.py) is responsible for persisting the owner envelope
+            # via set_envelope BEFORE calling execute_streaming_native().
+            # The reserve() call below resolves the effective envelope through
+            # get_envelope(), which inherits via fallback_task_scope when the
+            # exact scope has no persisted envelope (e.g. a retry at a new
+            # attempt scope).
             try:
                 reservation_rec = self.reservation_store.reserve(
                     run_id=run_id,
