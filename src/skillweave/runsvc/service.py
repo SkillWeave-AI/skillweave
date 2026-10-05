@@ -2128,6 +2128,7 @@ class RunApplicationService:
                     scope_id=scope_id,
                     idempotency_key=f"execute_streaming:{run_id}:{scope_id}",
                     envelope=env,
+                    route=model,
                 )
             except Exception as exc:  # noqa: BLE001
                 self._fail_run(run_id, f"reservation refused: {exc}")
