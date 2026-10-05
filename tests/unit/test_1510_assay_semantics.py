@@ -383,13 +383,27 @@ def _accepted_sdk_dir() -> Path | None:
     """The accepted ``skillweave_sdk`` package dir, or ``None``.
 
     Only an SDK whose ``validator.py`` exports ``AuthenticatedServiceContext``
-    is the accepted authority -- the ambient 0.2.0 lacks it. The directory is
-    found via ``PYTHONPATH`` (the accepted-SDK site-packages the lane runs
-    under), the interpreter's own site-packages, or the ambient install. The
+    is the accepted authority -- the ambient 0.2.0 lacks it. The accepted
+    location may be pinned explicitly with ``SKILLWEAVE_ACCEPTED_SDK`` (the
+    package dir or its parent ``site-packages``) for a deterministic
+    independent-host recipe; otherwise it is discovered via ``PYTHONPATH``
+    (the accepted-SDK site-packages the lane runs under), the interpreter's
+    own site-packages, or the sequence-relative ``core-execution`` venv. The
     installed venv bundles these files so the verifier validates against the
     pinned SDK rather than silently degrading to the structural fallback.
     """
     cands: list[Path] = []
+
+    def _consider(raw: str | os.PathLike[str]) -> None:
+        p = Path(raw)
+        if p.name == "skillweave_sdk":
+            cands.append(p.parent)
+        else:
+            cands.append(p)
+
+    override = os.environ.get("SKILLWEAVE_ACCEPTED_SDK")
+    if override:
+        _consider(override)
     for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
         if entry:
             cands.append(Path(entry))
@@ -422,6 +436,30 @@ def _accepted_sdk_dir() -> Path | None:
         except OSError:
             continue
     return None
+
+
+def _require_accepted_sdk() -> Path:
+    """The accepted SDK, or a *skip* when this host genuinely lacks it.
+
+    These installed-wheel tests cannot fabricate a native PASS without the
+    pinned SDK authority; a host without it (ambient 0.2.0 only) must skip
+    rather than fail, matching ``pytest.importorskip`` used for the other
+    native paths. An explicit ``SKILLWEAVE_ACCEPTED_SDK`` that is set but
+    invalid is a hard error, not a silent skip.
+    """
+    accepted = _accepted_sdk_dir()
+    if accepted is None:
+        if os.environ.get("SKILLWEAVE_ACCEPTED_SDK"):
+            pytest.fail(
+                "SKILLWEAVE_ACCEPTED_SDK is set but does not resolve to an SDK "
+                "whose validator exports AuthenticatedServiceContext"
+            )
+        pytest.skip(
+            "no accepted skillweave_sdk (validator exporting "
+            "AuthenticatedServiceContext) on this host; set "
+            "SKILLWEAVE_ACCEPTED_SDK to run the installed-wheel native proofs"
+        )
+    return accepted
 
 
 def _build_wheel(work: Path) -> Path:
@@ -462,11 +500,7 @@ def _install_into_fresh_venv(work: Path, wheel: Path) -> Path:
         shutil.copytree(extra, site / "_yaml")
     # Bundle the accepted SDK so the installed verifier validates against the
     # pinned schema authority (never the structural fallback, never ambient).
-    accepted = _accepted_sdk_dir()
-    assert accepted is not None, (
-        "no accepted skillweave_sdk (validator exporting "
-        "AuthenticatedServiceContext) is resolvable"
-    )
+    accepted = _require_accepted_sdk()
     shutil.copytree(accepted, site / "skillweave_sdk")
     return venv_dir
 
