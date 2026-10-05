@@ -2289,6 +2289,55 @@ class TestCheckRouteAllowed:
         env = store.get_envelope("tight-run", "tight-scope")
         assert env.allowed_routes == ["route-a"]
 
+    def test_reserve_refuses_disallowed_route(self, store):
+        """reserve() with route not in envelope allowed_routes raises QuotaRefused."""
+        env = ReservationEnvelope(allowed_routes=["openai/gpt-4"], max_in_flight=5)
+        store.set_envelope("route-admit-run", "route-admit-scope", env)
+        with pytest.raises(QuotaRefused) as exc:
+            store.reserve(
+                run_id="route-admit-run", task_id="route-admit-task", attempt=1,
+                scope_id="route-admit-scope",
+                route="anthropic/claude-3",
+            )
+        assert "route" in str(exc.value)
+
+    def test_reserve_allows_approved_route(self, store):
+        """reserve() with route in envelope allowed_routes succeeds."""
+        env = ReservationEnvelope(allowed_routes=["openai/gpt-4"], max_in_flight=5)
+        store.set_envelope("route-ok-run", "route-ok-scope", env)
+        rec = store.reserve(
+            run_id="route-ok-run", task_id="route-ok-task", attempt=1,
+            scope_id="route-ok-scope",
+            route="openai/gpt-4",
+        )
+        assert rec is not None
+
+    def test_reserve_with_route_none_skips_check(self, store):
+        """reserve() with route=None skips route enforcement."""
+        env = ReservationEnvelope(allowed_routes=["approved"], max_in_flight=5)
+        store.set_envelope("route-none-run", "route-none-scope", env)
+        # route=None should not raise even if allowed_routes is set
+        rec = store.reserve(
+            run_id="route-none-run", task_id="route-none-task", attempt=1,
+            scope_id="route-none-scope",
+            route=None,
+        )
+        assert rec is not None
+
+    def test_reserve_refused_by_persisted_envelope_route(self, store):
+        """Persisted envelope with allowed_routes blocks disallowed route."""
+        owner_env = ReservationEnvelope(allowed_routes=["route-a"], max_in_flight=5)
+        store.set_envelope("pers-route-run", "pers-route-scope", owner_env)
+        # Caller passes unlimited envelope + disallowed route -> refused
+        with pytest.raises(QuotaRefused) as exc:
+            store.reserve(
+                run_id="pers-route-run", task_id="pers-route-task", attempt=1,
+                scope_id="pers-route-scope",
+                envelope=ReservationEnvelope(),  # unlimited, but persisted has allowed_routes
+                route="route-b",
+            )
+        assert "route" in str(exc.value)
+
 
 class TestQuotaRefused:
     """Prove QuotaRefused error type works correctly."""

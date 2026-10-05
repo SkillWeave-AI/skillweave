@@ -808,6 +808,7 @@ class ReservationStore:
         cost: Optional[float] = None,
         idempotency_key: Optional[str] = None,
         envelope: Optional[ReservationEnvelope] = None,
+        route: Optional[str] = None,
     ) -> ReservationRecord:
         """Atomically acquire a reservation slot.
 
@@ -857,6 +858,12 @@ class ReservationStore:
             reserved_bytes = env.max_per_request_bytes
         if reserved_tokens is None and env.max_per_request_tokens is not None:
             reserved_tokens = float(env.max_per_request_tokens)
+
+        # 1b. Check route is allowed by the resolved envelope's allowed_routes.
+        # This prevents a request from reaching an unapproved route even when
+        # the envelope is otherwise unlimited.
+        if route is not None:
+            self.check_route_allowed(route, env)
 
         now = datetime.now(timezone.utc).isoformat()
         reservation_id = str(uuid.uuid4())
