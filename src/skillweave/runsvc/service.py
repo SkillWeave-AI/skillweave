@@ -157,13 +157,14 @@ class RunApplicationService:
         """
         created_at = created_at or datetime.now(timezone.utc).isoformat()
 
+        credential = None
         if authority_service is None and require_identity:
             raise RunIntegrationError(
                 "identity",
                 "require_identity=True but no authority_service was supplied",
             )
         if authority_service is not None:
-            self._authenticate_worker(
+            credential = self._authenticate_worker(
                 authority_service, worker_token=worker_token, run_id=run_id
             )
 
@@ -196,17 +197,36 @@ class RunApplicationService:
                 role="ops",
             )
 
-        # Stage 2: launch the worker as a real subprocess.
+        # Stage 2: launch the worker as a real subprocess. On the protected
+        # (identity-authenticated) path the worker is launched inside a real
+        # process-protection window: the protected stores are sealed (and, where
+        # the adapter supports it, reads of observer signing material denied)
+        # for the lifetime of the child, and the run authority DB/WAL/SHM and
+        # output directories are pre-created as host-owned entries so the
+        # adapter seals them. If no real isolation adapter is available the
+        # protected path fails closed here, before the child is spawned — never
+        # a quiet unsandboxed launch.
+        protection = None
         try:
-            result = run_command(
-                list(command),
-                run_id=run_id,
-                subject_repo=subject_repo,
-                subject_commit=subject_commit,
-                tool=tool,
-                model=model,
-                created_at=created_at,
-            )
+            protection = self._open_worker_protection(credential, run_id)
+            argv = list(command)
+            if protection is not None:
+                argv = protection.wrap_command(argv, writable_scope=protection.writable_scope)
+            try:
+                result = run_command(
+                    argv,
+                    run_id=run_id,
+                    subject_repo=subject_repo,
+                    subject_commit=subject_commit,
+                    tool=tool,
+                    model=model,
+                    created_at=created_at,
+                )
+            finally:
+                if protection is not None:
+                    protection.__exit__(None, None, None)
+        except RunIntegrationError:
+            raise
         except Exception as exc:  # noqa: BLE001
             self._fail_run(run_id, f"launch raised {exc}")
             raise RunIntegrationError("launch", str(exc)) from exc
@@ -330,7 +350,7 @@ class RunApplicationService:
         *,
         worker_token: Optional[str],
         run_id: str,
-    ) -> None:
+    ) -> Any:
         """Authenticate the worker credential at run ingress (SW-1510-IDENTITY).
 
         The host service verifies the presented token against its credential
@@ -338,6 +358,9 @@ class RunApplicationService:
         different run, fails before any run state is written. The credential
         must be a worker credential: it must carry no approving role, so a
         worker can never reach a reviewer/observer/controller decision.
+
+        Returns the authenticated credential so the caller can derive the
+        worker's real writable scope for the protected launch.
         """
         if not worker_token:
             raise RunIntegrationError("identity", "no worker credential presented")
@@ -357,6 +380,100 @@ class RunApplicationService:
                 "identity",
                 "worker credential is bound to a different run",
             )
+        return credential
+
+    # -- real protected worker launch (SW-1510-IDENTITY criterion 1) -------
+
+    def _open_worker_protection(self, credential: Any, run_id: str) -> Any:
+        """Open a real isolation window over the protected stores, or fail closed.
+
+        Returns a live :class:`StoreProtection` on the protected (identity)
+        path, or ``None`` on the legacy unprotected path. It binds the concrete
+        store directories: the run authority DB (and its WAL/SHM sidecars),
+        and the terminal-receipt / gate-state / authority-record / telemetry
+        stores. Every protected entry is pre-created host-owned so the adapter
+        seals a real filesystem object; a worker can neither add nor replace an
+        entry inside a sealed store. ``select_adapter`` returns a fail-closed
+        adapter when no real mechanism exists, so ``__enter__`` raises rather
+        than spawning an unsandboxed child.
+        """
+        if credential is None:
+            return None
+        protection_cls = _runtime_attr("worker_launcher", "protect_stores")
+        ProtectedStores = _runtime_attr("worker_launcher", "ProtectedStores")
+        PROTECTED_STORE_NAMES = _runtime_attr("worker_launcher", "PROTECTED_STORE_NAMES")
+
+        roots = self._protected_store_roots()
+        protected = ProtectedStores(
+            {name: roots[name] for name in PROTECTED_STORE_NAMES}
+        )
+        protected.ensure()
+        self._precreate_protected_entries(protected, run_id)
+        protection = protection_cls(protected)
+        protection.writable_scope = self._worker_writable_scope(credential, run_id)
+        # Enter the window now: this seals the stores (or fails closed if no
+        # real adapter is available) before the wrapped child is spawned. The
+        # matching __exit__ runs in the caller's finally.
+        protection.__enter__()
+        return protection
+
+    def _protected_store_roots(self) -> dict[str, Path]:
+        """The concrete roots of the protected stores, keyed by family name.
+
+        The run authority store is the run DB itself: the protected root for
+        ``authority_records`` is the *directory containing the run DB*, so
+        sealing it makes the child's SQLite open/write (and its ``-wal``/``-shm``
+        creation inside that directory) fail at the kernel boundary. The host
+        performs no writes during the child window, so sealing the directory is
+        safe; the host's own post-window writes happen after unseal.
+        """
+        names = _runtime_attr("worker_launcher", "PROTECTED_STORE_NAMES")
+        db_path = getattr(self.store, "db_path", None)
+        sealable = (
+            isinstance(db_path, str)
+            and db_path not in ("", ":memory:")
+            and not db_path.startswith("file:")
+        )
+        if sealable:
+            base = Path(db_path).resolve().parent
+        else:
+            import tempfile
+
+            base = Path(tempfile.mkdtemp(prefix="sw1510-protected-")).resolve()
+        roots: dict[str, Path] = {}
+        for name in names:
+            if name == "authority_records":
+                roots[name] = base
+            else:
+                roots[name] = (base / name).resolve()
+        return roots
+
+    def _precreate_protected_entries(self, protected: Any, run_id: str) -> None:
+        """Materialize host-owned entries under each protected store.
+
+        Pre-creating the run's own entries gives the sealed store real content:
+        a sealed empty directory cannot be turned into a store by a child
+        either, but concrete host-owned files make the denial and the child's
+        failure independently observable.
+        """
+        for name in ("terminal_receipts", "gate_state", "gateway_telemetry"):
+            try:
+                (protected.roots[name] / f"{run_id}.host").write_text("host-owned")
+            except OSError:
+                pass
+
+    def _worker_writable_scope(self, credential: Any, run_id: str) -> Path:
+        """A private directory that is the only tree the wrapped worker may write.
+
+        The worker's credential binds a scope *digest*, not a path; the host
+        materializes one real writable directory for the run so a scope-
+        enforcing adapter (Seatbelt) has a concrete tree to allow, and the
+        protected stores stay sealed for every other path.
+        """
+        import tempfile
+
+        base = tempfile.mkdtemp(prefix=f"sw1510-worker-{run_id}-")
+        return Path(base).resolve()
 
     def _fail_run(self, run_id: str, reason: str) -> None:
         """Mark a run terminal with a stop reason when a stage raises.

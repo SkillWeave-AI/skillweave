@@ -199,6 +199,13 @@ class CredentialRegistry:
         self._issued_handle_ids: set[str] = set()
         self._admitted_decisions: set[str] = set()
         self._attempt_credentials: dict[tuple[str, str, int], set[str]] = {}
+        #: Live, one-shot capabilities for the protected write boundaries. An
+        #: ``IngestedReceipt``/``GateAdmission`` *dataclass instance* is not
+        #: authority: only a service-issued live token, bound to the exact
+        #: attempt/receipt/target and consumed once, authorizes a protected
+        #: mutation. These maps are never serialized and never on the wire.
+        self._receipt_ingestions: dict[str, tuple[tuple[str, str, int], str]] = {}
+        self._gate_admissions: dict[str, dict[str, Any]] = {}
 
     # -- issuing ------------------------------------------------------------
 
@@ -346,6 +353,84 @@ class CredentialRegistry:
     def attempt_credential_digests(self, attempt_key: tuple[str, str, int]) -> frozenset[str]:
         return frozenset(self._attempt_credentials.get(attempt_key, set()))
 
+    # -- live protected-write capabilities ----------------------------------
+    #
+    # A typed object (``IngestedReceipt``/``GateAdmission``) is a *claim*: a
+    # caller can construct one because the type is importable. Authorization is
+    # instead a live, one-shot token the service issues at the genuine boundary
+    # (``ingest_evidence_receipt``/``admit_gate``) and that the protected store
+    # *consumes* exactly once against the exact target. A copied, forged or
+    # replayed token, or a token minted for a different attempt/receipt/target,
+    # is refused before any mutation.
+
+    def issue_receipt_ingestion(
+        self, *, attempt_key: tuple[str, str, int], artifact_digest: str
+    ) -> str:
+        _require_sha(artifact_digest, "artifact_digest")
+        token = secrets.token_urlsafe(24)
+        self._receipt_ingestions[token] = (attempt_key, artifact_digest)
+        return token
+
+    def consume_receipt_ingestion(
+        self, token: str, *, attempt_key: tuple[str, str, int], artifact_digest: str
+    ) -> bool:
+        active = self._receipt_ingestions.pop(token, None)  # one-shot
+        if active is None:
+            return False
+        bound_attempt, bound_digest = active
+        return bound_attempt == attempt_key and bound_digest == artifact_digest
+
+    def issue_gate_admission(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        admitted_by: str,
+        decision_digest: str,
+        receipt_artifact_digest: str,
+    ) -> str:
+        _require_sha(decision_digest, "authority decision digest")
+        _require_sha(receipt_artifact_digest, "receipt artifact digest")
+        token = secrets.token_urlsafe(24)
+        self._gate_admissions[token] = {
+            "run_id": run_id,
+            "task_id": task_id,
+            "attempt": attempt,
+            "admitted_by": admitted_by,
+            "decision_digest": decision_digest,
+            "receipt_artifact_digest": receipt_artifact_digest,
+        }
+        return token
+
+    def consume_gate_admission(
+        self,
+        token: str,
+        *,
+        run_id: str,
+        receipt_artifact_digest: str,
+    ) -> Optional[dict[str, Any]]:
+        """Consume a live gate capability against the exact run and receipt.
+
+        Fails (returning ``None``) if the token was never issued, was already
+        consumed (one-shot), targets a different run, claims different admitted
+        receipt bytes, or whose underlying authority decision is no longer live.
+        The run ``target_state``/``expected_state``/``expected_version`` are the
+        store's own CAS guard and are deliberately *not* bound here: a gate
+        verdict (``"pass"``) and a run's next state are different concepts, and
+        the issuing call cannot know the caller's CAS version.
+        """
+        active = self._gate_admissions.pop(token, None)  # one-shot
+        if active is None:
+            return None
+        if active["run_id"] != run_id:
+            return None
+        if active["receipt_artifact_digest"] != receipt_artifact_digest:
+            return None
+        if active["decision_digest"] not in self._admitted_decisions:
+            return None
+        return active
+
 
 def _record_fields(record: _CredentialRecord) -> dict[str, Any]:
     return {
@@ -439,6 +524,15 @@ class HostAuthorityService:
 
     registry: CredentialRegistry = field(default_factory=CredentialRegistry)
     isolation: Any = None  # optional WorkerIsolationAdapter (see worker_launcher.py)
+
+    def serve_live(self) -> bool:
+        """A cheap liveness probe the store uses to reject a look-alike object.
+
+        A caller can construct an object with the right attribute names; only
+        this genuine service class answers this probe, so a store's protected
+        boundaries refuse to treat an arbitrary object as the authority service.
+        """
+        return True
 
     # -- credential verification -------------------------------------------
 
@@ -727,6 +821,14 @@ class HostAuthorityService:
                     "candidate SHA map is stale or substituted"
                 )
 
+        # Mint the live, one-shot capability that alone authorizes the protected
+        # receipt write. It is bound to the exact attempt and the authenticated
+        # artifact digest, lives only in the service registry, and is never on
+        # the wire — so a caller that merely constructs an ``IngestedReceipt``
+        # has no token to present and the protected store refuses the write.
+        ingestion_token = self.registry.issue_receipt_ingestion(
+            attempt_key=attempt_key, artifact_digest=claimed_artifact
+        )
         return IngestedReceipt(
             receipt=dict(receipt),
             reviewer_principal=credential.principal,
@@ -735,6 +837,7 @@ class HostAuthorityService:
             expected_signature=expected_signature,
             observed_review=observed_review,
             received_at=_now(),
+            ingestion_token=ingestion_token,
         )
 
 
@@ -796,7 +899,13 @@ class ObservedReview:
 
 @dataclass(frozen=True)
 class IngestedReceipt:
-    """The admissible result of :meth:`ingest_evidence_receipt`."""
+    """The admissible result of :meth:`ingest_evidence_receipt`.
+
+    ``ingestion_token`` is a live, one-shot capability minted by the authority
+    service. It is *not* sufficient on its own: the protected store consumes it
+    through the owning service, so a copied or forged ``IngestedReceipt`` (whose
+    token was never issued, or was already consumed) is refused.
+    """
 
     receipt: dict[str, Any]
     reviewer_principal: str
@@ -805,11 +914,17 @@ class IngestedReceipt:
     expected_signature: str
     observed_review: ObservedReview
     received_at: str
+    ingestion_token: str = field(default="", repr=False, compare=False)
 
 
 @dataclass
 class GateAdmission:
-    """The result of admitting a gate: a controller decision, not a worker claim."""
+    """The result of admitting a gate: a controller decision, not a worker claim.
+
+    Like :class:`IngestedReceipt`, the fields are descriptive; the live
+    ``admission_token`` consumed through ``authority_service`` is what actually
+    authorizes a protected gate transition.
+    """
 
     run_id: str
     task_id: str
@@ -819,6 +934,8 @@ class GateAdmission:
     decision_digest: str
     receipt_artifact_digest: str
     admitted_at: str
+    authority_service: Any = field(default=None, repr=False, compare=False)
+    admission_token: str = field(default="", repr=False, compare=False)
 
 
 def admit_gate(
@@ -835,6 +952,12 @@ def admit_gate(
     service-issued decision matches this exact attempt and the ingested
     receipt's artifact. A worker cannot reach here: its credential lacks the
     gate capability and no decision was issued to it.
+
+    On success the service mints a live, one-shot ``admission_token`` bound to
+    the exact run, the admitted receipt bytes, and a decision the service
+    actually issued. The protected store consumes it through this same service,
+    so a caller that hand-builds a ``GateAdmission`` has no consumable token and
+    cannot mutate a run.
     """
     credential = service.verify_credential(controller_token)
     if not (credential.roles & GATE_CAPABLE_ROLES):
@@ -845,6 +968,16 @@ def admit_gate(
         raise IdentityBoundaryError("gate decision was not issued by this service")
     if (decision.run_id, decision.task_id, decision.attempt) != ingested.attempt_key:
         raise IdentityBoundaryError("gate decision is bound to a different attempt")
+    if not gate_state or not isinstance(gate_state, str):
+        raise IdentityBoundaryError("gate state must be a non-empty state name")
+    admission_token = service.registry.issue_gate_admission(
+        run_id=ingested.attempt_key[0],
+        task_id=ingested.attempt_key[1],
+        attempt=ingested.attempt_key[2],
+        admitted_by=credential.principal,
+        decision_digest=decision.decision_digest,
+        receipt_artifact_digest=ingested.artifact_digest,
+    )
     return GateAdmission(
         run_id=ingested.attempt_key[0],
         task_id=ingested.attempt_key[1],
@@ -854,6 +987,8 @@ def admit_gate(
         decision_digest=decision.decision_digest,
         receipt_artifact_digest=ingested.artifact_digest,
         admitted_at=_now(),
+        authority_service=service,
+        admission_token=admission_token,
     )
 
 

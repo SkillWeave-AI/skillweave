@@ -182,6 +182,12 @@ class RunStore(ABC):
 class SQLiteRunStore(RunStore):
     def __init__(self, db_path: str = ":memory:"):
         self.db_path = db_path
+        #: The live host authority service this store is bound to for protected
+        #: writes (SW-1510-IDENTITY). ``None`` means the protected boundaries
+        #: (:meth:`save_protected_evidence`,
+        #: :meth:`transition_with_gate_admission`) fail closed — a store reached
+        #: by a delegated worker is never bound to the service.
+        self._authority_service: Any = None
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -1164,6 +1170,25 @@ class SQLiteRunStore(RunStore):
     def ensure_storage(self):
         pass
 
+    def with_authority_service(self, authority_service: Any) -> "SQLiteRunStore":
+        """Bind this store to the live host authority service (protected writes).
+
+        Only the host process that owns the :class:`HostAuthorityService` binds
+        it, and only a genuine service (one that answers :meth:`serve_live`) is
+        accepted. The store object reachable by a delegated worker is never
+        bound, so its protected boundaries fail closed.
+        """
+        if authority_service is None or not callable(
+            getattr(authority_service, "serve_live", None)
+        ):
+            from .authority_service import IdentityBoundaryError
+
+            raise IdentityBoundaryError(
+                "with_authority_service requires a live HostAuthorityService"
+            )
+        self._authority_service = authority_service
+        return self
+
     # ---- Protected receipt / gate mutation boundary (SW-1510-IDENTITY) ----
     #
     # These are the *actual* persistence boundaries for a protected receipt and
@@ -1182,12 +1207,14 @@ class SQLiteRunStore(RunStore):
     ) -> ArtifactReceipt:
         """Persist a receipt that passed the host identity boundary.
 
-        Refuses any receipt whose digest is not the one the authority service
-        authenticated and resolved to raw bytes, and refuses an un-authenticated
-        ingestion result outright. This is the protected analogue of
-        ``save_evidence``: a worker holding only ``store`` cannot call it with a
-        self-made ``IngestedReceipt`` because it cannot construct the type with
-        host-verified provenance.
+        A typed ``IngestedReceipt`` is only a *claim*: the class is importable,
+        so a caller can construct one. Authorization is a live, one-shot
+        capability that the genuine :class:`HostAuthorityService` mints at
+        ingestion and that this boundary *consumes through that same service*
+        against the exact attempt and artifact digest. A forged/copied
+        ``IngestedReceipt`` (no issued token), a replayed token, a token minted
+        for a different attempt/artifact, or a look-alike service object is
+        refused before any mutation.
         """
         from .authority_service import IdentityBoundaryError, IngestedReceipt
 
@@ -1196,9 +1223,24 @@ class SQLiteRunStore(RunStore):
                 "save_protected_evidence requires an IngestedReceipt produced by "
                 "HostAuthorityService.ingest_evidence_receipt"
             )
+        service = self._authority_service
+        if service is None or not callable(getattr(service, "serve_live", None)):
+            raise IdentityBoundaryError(
+                "save_protected_evidence requires the store to be bound to the "
+                "live authority service; bind with with_authority_service(...)"
+            )
         if receipt.sha256 != ingested.artifact_digest:
             raise IdentityBoundaryError(
                 "receipt digest does not match the authenticated artifact digest"
+            )
+        if not service.registry.consume_receipt_ingestion(
+            ingested.ingestion_token,
+            attempt_key=ingested.attempt_key,
+            artifact_digest=ingested.artifact_digest,
+        ):
+            raise IdentityBoundaryError(
+                "ingestion capability was not issued by the live authority service "
+                "for this attempt/artifact (forged, replayed or mismatched)"
             )
         return self.save_evidence(receipt, idempotency_key=idempotency_key)
 
@@ -1212,13 +1254,16 @@ class SQLiteRunStore(RunStore):
         reason: str = "",
         stop_reason: Optional[str] = None,
     ) -> RunRecord:
-        """Transition a run to a gate state, admitted by a controller.
+        """Transition a run to a gate state, admitted by a live controller decision.
 
-        The ``admission`` must be a :class:`GateAdmission` issued by a
-        controller/integrator credential; a worker never has one. The
-        transition itself is recorded with the admitting principal as ``role``,
-        so the persisted state carries who actually admitted it, not a
-        worker-supplied role string.
+        A typed ``GateAdmission`` is again only a claim. This boundary consumes
+        the live, one-shot capability the authority service minted at
+        :func:`admit_gate`, bound to the exact run and admitted receipt bytes and
+        to a decision the service actually issued. A copied/forged
+        ``GateAdmission``, a replay, a token for a different run/receipt, or a
+        withdrawn authority decision is refused before any run state changes.
+        The admitted principal is recorded as ``role``, so the persisted state
+        carries who actually admitted it.
         """
         from .authority_service import GateAdmission, IdentityBoundaryError
 
@@ -1227,15 +1272,31 @@ class SQLiteRunStore(RunStore):
                 "transition_with_gate_admission requires a GateAdmission from a "
                 "controller/integrator credential"
             )
+        service = admission.authority_service
+        if service is None or not callable(getattr(service, "serve_live", None)):
+            raise IdentityBoundaryError(
+                "gate admission is not bound to a live authority service"
+            )
         if admission.run_id != run_id:
             raise IdentityBoundaryError("gate admission is for a different run")
+        active = service.registry.consume_gate_admission(
+            admission.admission_token,
+            run_id=run_id,
+            receipt_artifact_digest=admission.receipt_artifact_digest,
+        )
+        if active is None:
+            raise IdentityBoundaryError(
+                "gate admission capability was not issued by the live authority "
+                "service for this run/target/receipt (forged, replayed, expired or "
+                "mismatched)"
+            )
         return self._transition_impl(
             run_id=run_id,
             target_state=target_state,
             expected_state=expected_state,
             expected_version=expected_version,
             reason=reason,
-            role=admission.admitted_by,
+            role=active["admitted_by"],
             stop_reason=stop_reason,
             event_type=None,
             event_payload=None,

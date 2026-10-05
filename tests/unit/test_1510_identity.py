@@ -27,8 +27,10 @@ import pytest  # noqa: E402
 
 from skillweave.runtime.authority_service import (  # noqa: E402
     GATE_CAPABLE_ROLES,
+    GateAdmission,
     HostAuthorityService,
     IdentityBoundaryError,
+    IngestedReceipt,
     ObservedReview,
     admit_gate,
     digest_candidate_map,
@@ -434,12 +436,137 @@ def test_protected_store_admits_a_host_ingested_receipt():
     ingested = service.ingest_evidence_receipt(
         receipt, worker_token=reviewer_token, raw_artifacts=raw, observed_review=observed
     )
-    store = SQLiteRunStore()
+    store = SQLiteRunStore().with_authority_service(service)
     saved = store.save_protected_evidence(
         _receipt(artifact_id="attested-receipt-1", sha=artifact_digest), ingested
     )
     assert saved.sha256 == artifact_digest
     assert store.get_evidence("attested-receipt-1") is not None
+
+
+def _host_ingest(service, run_id="run-1", task_id="task-1", attempt=1):
+    worker_token, reviewer_token, decision = _issue(service, run_id, task_id, attempt)
+    raw = RawArtifactStore()
+    receipt, observed, artifact_digest = _signed_receipt(
+        service, reviewer_token, decision, raw
+    )
+    ingested = service.ingest_evidence_receipt(
+        receipt, worker_token=reviewer_token, raw_artifacts=raw, observed_review=observed
+    )
+    return service, ingested, decision, artifact_digest, run_id
+
+
+def test_caller_constructed_ingested_receipt_cannot_authorize_a_protected_write():
+    """A typed dataclass is a claim, not a capability (controller repro).
+
+    Constructing an ``IngestedReceipt`` by hand (as a caller can, the type is
+    importable) does not authorize a protected write: the store consumes the
+    live token through the bound service and refuses a token that was never
+    issued.
+    """
+    service = _service()
+    forged = IngestedReceipt(
+        receipt={"verdict": "pass"},
+        reviewer_principal="reviewer-1",
+        attempt_key=("run-1", "task-1", 1),
+        artifact_digest="a" * 64,
+        expected_signature="deadbeef",
+        observed_review=ObservedReview(
+            reviewer_principal="reviewer-1",
+            attempt_key=("run-1", "task-1", 1),
+            artifact_digest="a" * 64,
+            verdict="pass",
+            independent=True,
+            observed_at="t",
+        ),
+        received_at="t",
+        ingestion_token="forged-token-never-issued",
+    )
+    store = SQLiteRunStore().with_authority_service(service)
+    with pytest.raises(IdentityBoundaryError):
+        store.save_protected_evidence(_receipt(sha="a" * 64), forged)
+    assert store.get_evidence("a1") is None
+
+
+def test_unbound_store_refuses_even_a_genuine_ingestion():
+    """A worker-reachable store is unbound, so its protected write fails closed."""
+    service = _service()
+    _, ingested, _, artifact_digest, _ = _host_ingest(service)
+    unbound = SQLiteRunStore()  # never bound to the live service
+    with pytest.raises(IdentityBoundaryError):
+        unbound.save_protected_evidence(
+            _receipt(artifact_id="attested-unbound", sha=artifact_digest), ingested
+        )
+    assert unbound.get_evidence("attested-unbound") is None
+
+
+def test_live_ingestion_token_is_one_shot():
+    service = _service()
+    _, ingested, _, artifact_digest, _ = _host_ingest(service)
+    store = SQLiteRunStore().with_authority_service(service)
+    store.save_protected_evidence(
+        _receipt(artifact_id="attested-once", sha=artifact_digest), ingested
+    )
+    # Replaying the same ingested capability (second protected write) fails:
+    # the token was consumed once.
+    with pytest.raises(IdentityBoundaryError):
+        store.save_protected_evidence(
+            _receipt(artifact_id="attested-replay", sha=artifact_digest), ingested
+        )
+    assert store.get_evidence("attested-replay") is None
+
+
+def test_caller_constructed_gate_admission_cannot_mutate_a_run():
+    """Hand-building a ``GateAdmission`` with fake strings does not mutate (repro)."""
+    service = _service()
+    store = SQLiteRunStore().with_authority_service(service)
+    store.create_run("run-1")
+    forged = GateAdmission(
+        run_id="run-1",
+        task_id="task-1",
+        attempt=1,
+        gate_state="implement",
+        admitted_by="controller-1",
+        decision_digest="b" * 64,
+        receipt_artifact_digest="c" * 64,
+        admitted_at="t",
+        authority_service=service,
+        admission_token="forged",
+    )
+    with pytest.raises(IdentityBoundaryError):
+        store.transition_with_gate_admission("run-1", "batch_selection", "preflight", 1, forged)
+    # The run did not move.
+    assert store.get_run("run-1").state == "preflight"
+
+
+def test_live_gate_admission_is_bound_to_run_and_receipt_and_is_one_shot():
+    service = _service()
+    _, ingested, decision, artifact_digest, _ = _host_ingest(service)
+    controller_token = service.registry.issue(
+        principal="controller-1", roles={"controller"},
+        attempt_key=("run-1", "task-1", 1), capability="admit-gate",
+    )
+    admission = admit_gate(
+        service, controller_token=controller_token, ingested=ingested,
+        decision=decision, gate_state="pass",
+    )
+    store = SQLiteRunStore().with_authority_service(service)
+    store.create_run("run-1")
+    store.create_run("run-2")
+    # The capability is bound to run-1, so using it to mutate run-2 is refused.
+    with pytest.raises(IdentityBoundaryError):
+        store.transition_with_gate_admission("run-2", "batch_selection", "preflight", 1, admission)
+    assert store.get_run("run-2").state == "preflight"
+    # Correct use succeeds and is attributed to the admitting controller.
+    record = store.transition_with_gate_admission("run-1", "batch_selection", "preflight", 1, admission)
+    assert record.role == "controller-1"
+    assert store.get_run("run-1").state == "batch_selection"
+    # The capability is one-shot: a second use (e.g. the next gate the operator
+    # intended the same admission to drive) is refused, so a leaked admission
+    # cannot be replayed.
+    store.create_run("run-1b")
+    with pytest.raises(IdentityBoundaryError):
+        store.transition_with_gate_admission("run-1b", "batch_selection", "preflight", 1, admission)
 
 
 # ---------------------------------------------------------------------------

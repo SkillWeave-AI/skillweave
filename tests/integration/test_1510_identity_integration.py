@@ -261,6 +261,66 @@ def test_real_child_process_cannot_read_observer_signing_material(tmp_path):
     assert all(str(v).startswith("denied") for v in result.values()), result
 
 
+def test_real_execute_protects_the_authority_store_from_the_worker(tmp_path):
+    """The actual ``RunApplicationService.execute`` launches a real protected child.
+
+    This is the production path the controller reproduced: a valid worker
+    credential whose only writable scope is a private output dir is launched by
+    ``execute``; the child tries to (a) mutate the run authority store (the
+    on-disk SQLite DB two directories up) and (b) write into the host-owned
+    protected stores. Both must fail, observed after the child exits, while the
+    run itself still succeeds.
+    """
+    db = tmp_path / "authority" / "runsvc.sqlite"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    store = SQLiteRunStore(str(db))
+    journal = EventJournal(store)
+    raw = RawArtifactStore()
+    service = RunApplicationService(store, journal, raw)
+    authority = HostAuthorityService()
+    worker_token = authority.issue_attempt_credential(
+        run_id="run-protected", task_id="task-1", attempt=1, scope=_scope()
+    )
+
+    probe = tmp_path / "probe.json"
+    child = (
+        "import json, pathlib, sqlite3, sys\n"
+        "db = pathlib.Path(sys.argv[1]); out = pathlib.Path(sys.argv[2])\n"
+        "res = {}\n"
+        "try:\n"
+        "    c = sqlite3.connect(str(db)); c.execute(\"UPDATE runs SET state='pwned'\");"
+        "    c.commit(); res['sqlite'] = 'wrote'\n"
+        "except Exception as e:\n"
+        "    res['sqlite'] = 'denied:%s' % type(e).__name__\n"
+        "g = db.parent / 'gate_state'\n"
+        "try:\n"
+        "    (g / 'forged.gate').write_text('x'); res['gate'] = 'wrote'\n"
+        "except OSError as e:\n"
+        "    res['gate'] = 'denied:%s' % e.errno\n"
+        "out.write_text(json.dumps(res))\n"
+        "print('protected-worker-completed')\n"
+    )
+    result = service.execute(
+        [sys.executable, "-c", child, str(db), str(probe)],
+        run_id="run-protected",
+        tool="opencode",
+        model="m",
+        subject_repo="r",
+        subject_commit="c",
+        created_at="2026-10-05T00:00:00Z",
+        authority_service=authority,
+        worker_token=worker_token,
+    )
+    # The run itself completed and passed; the worker was still confined.
+    assert result.gate_state == "pass"
+    res = json.loads(probe.read_text())
+    assert res["sqlite"].startswith("denied"), res
+    assert res["gate"].startswith("denied"), res
+    # The host's run metadata was not replaced by the child.
+    final = SQLiteRunStore(str(db)).get_run("run-protected")
+    assert final.state == "advance_or_stop"
+
+
 def test_real_child_process_cannot_write_protected_stores(tmp_path):
     adapter = select_adapter()
     if not adapter.available():
@@ -371,7 +431,7 @@ def test_controller_admits_an_independently_reviewed_receipt_into_the_store():
     )
     assert admission.admitted_by == "controller-1"
 
-    store = SQLiteRunStore()
+    store = SQLiteRunStore().with_authority_service(authority)
     store.create_run(run_id)
     # Persist the host-ingested receipt and admit the gate via the controller.
     saved = store.save_protected_evidence(

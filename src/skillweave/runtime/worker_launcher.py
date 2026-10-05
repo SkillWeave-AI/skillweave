@@ -345,6 +345,10 @@ class StoreProtection:
     protected: ProtectedStores
     require_read_isolation: bool = False
     sealed: bool = False
+    #: The one directory tree the wrapped worker may write, used by adapters
+    #: (e.g. Seatbelt) that translate a writable scope into their sandbox
+    #: profile. It is set by the caller that opens the window.
+    writable_scope: Optional[Path] = None
 
     @property
     def adapter_name(self) -> str:
@@ -373,7 +377,14 @@ class StoreProtection:
                 "read isolation of observer signing material was required but "
                 f"adapter {self.adapter.name!r} does not deny reads; fail closed"
             )
-        self.adapter.seal(self.protected)
+        try:
+            self.adapter.seal(self.protected)
+        except Exception:
+            # Never leave a partially-sealed window behind: a half-applied seal
+            # could lock out the host's own subsequent writes. Best-effort
+            # unseal, then fail closed.
+            self.adapter.unseal(self.protected)
+            raise
         self.sealed = True
         return self
 

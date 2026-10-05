@@ -104,13 +104,37 @@ delegated worker, a worker cannot reproduce a valid signature, and a
 worker-produced fake receipt fails its signature step even before the semantic
 checks run (the signer fails closed if a credential carries no secret).
 
-### 4. Protected store writes require a host-issued token/type
+### 4. Protected store writes require a **live, one-shot** host capability
 
-`SQLiteRunStore.save_protected_evidence(receipt, ingested)` refuses anything
-that is not an `IngestedReceipt` produced by the service, and refuses a receipt
-whose digest is not the authenticated one. `transition_with_gate_admission(...)`
-requires a `GateAdmission` from a controller/integrator credential and records
-the transition with the **admitting principal** as the role — never a
+A typed dataclass is a *claim*, not a capability: a caller can construct an
+`IngestedReceipt`/`GateAdmission` with plausible field strings. The protected
+writes therefore accept only a **service-minted, single-use token bound to the
+exact fact being written**, consumed through the bound service.
+
+* `ingest_evidence_receipt(...)` mints an *ingestion capability*
+  (`registry.issue_receipt_ingestion`) bound to the exact
+  `(run_id, task_id, attempt)` and `artifact_digest`, and returns it on the
+  `IngestedReceipt`.
+* `admit_gate(...)` mints an *admission capability*
+  (`registry.issue_gate_admission`) bound to the run, the admitting principal,
+  the authority-decision digest, and the receipt's artifact digest, and returns
+  it on the `GateAdmission`.
+
+`SQLiteRunStore.save_protected_evidence(receipt, ingested)` and
+`transition_with_gate_admission(run_id, target, expected, version, admission)`
+must be called on a store **bound to the live service**
+(`SQLiteRunStore(...).with_authority_service(service)`) and must
+`consume_*` that live token. Consumption:
+
+* **pops** the token — a second use (a replay of a leaked/observed object) is
+  refused before any write;
+* checks the token is bound to the **same run**, the **same receipt bytes** and
+  (for a gate) a decision the service actually issued;
+* refuses a **caller-constructed** typed object (its token was never issued),
+  an **unbound** store, and a **stale** decision.
+
+Nothing is written when proof is absent or mismatched. The transition is
+recorded with the **admitting principal** the live token carries — never a
 worker-supplied role string. The legacy `save_evidence`/`transition` remain
 unchanged for backward compatibility.
 
@@ -191,6 +215,30 @@ ingress: the token must verify against the registry, bind to this exact
 path is the unchanged legacy path — except that a protected caller can pass
 `require_identity=True`, which makes a missing authority service a hard failure
 so the legacy path cannot be reached by accident.
+
+### The worker is launched *inside* a real protection window
+
+On the authenticated path `execute` does not merely check roles in memory: it
+opens a real `protect_stores` window for the lifetime of the child and launches
+the worker through it.
+
+* The window binds the concrete roots: the run **authority store** is the
+  directory that contains the run's SQLite DB (the child's `open`/write and its
+  `-wal`/`-shm` creation inside that directory fail at the kernel boundary),
+  and the terminal-receipt / gate-state / authority-record / telemetry stores
+  are sealed alongside it. The run's own entries are pre-created host-owned so
+  the sealed store has real content to protect.
+* The worker's only writable tree is a freshly materialized private directory
+  derived from the run (`wrap_command(..., writable_scope=scope_dir)`); every
+  other protected path stays sealed.
+* If no real isolation adapter exists (`select_adapter` returns the fail-closed
+  adapter), `execute` raises at the protection step **before** the child is
+  spawned — never a quiet unsandboxed launch.
+
+The integration tests drive exactly this: a real `execute` with a valid worker
+credential whose child attempts an SQLite `UPDATE` on the authority DB and a
+write into the gate-state store; both are denied at the kernel boundary and the
+host's run metadata is unchanged after the child exits.
 
 ## Backward compatibility
 
