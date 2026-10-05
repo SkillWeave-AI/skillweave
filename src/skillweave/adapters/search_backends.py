@@ -1,0 +1,587 @@
+"""The six search providers, each an adapter at the same extension point.
+
+Every provider -- DuckDuckGo, Serper, SerpApi, Tavily, Brave and Perplexity --
+is registered through the *same* :class:`~skillweave.adapters.registry.
+AdapterRegistry` with a neutral descriptor. Nothing in the facade branches on a
+provider name: a provider is data plus a backend callable.
+
+Perplexity is registered **twice as alternative transport bindings**:
+
+* ``perplexity-mcp`` -- transport ``mcp-stdio``, invoking the declared MCP tool
+  over a compliant, handshake-first stdio client against an explicit (non-
+  floating) command;
+* ``perplexity-http`` -- transport ``http``, the direct API binding.
+
+The two share the Perplexity provider identity but are distinct adapters with
+distinct transports, which is exactly the axis separation the descriptor exists
+to express.
+
+Each backend produces a typed :class:`~skillweave.adapters.outcomes.SearchOutcome`
+whose ``attempts`` record the transport and how it ended, and whose
+``requested_provider`` is always the adapter's own provider -- so an outage is
+never dressed up as a retrieved source.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Optional, Sequence
+from urllib.parse import quote_plus, unquote
+
+from .descriptor import (
+    CATEGORY_SEARCH,
+    AdapterDescriptor,
+    OperationBinding,
+)
+from .mcp_client import McpClientError, McpStdioClient
+from .outcomes import (
+    SearchAttempt,
+    SearchOutcome,
+    SearchResultRecord,
+    query_digest,
+)
+from .registry import AdapterBackend, AdapterRegistry
+
+__all__ = [
+    "SEARCH_OPERATION",
+    "SEARCH_CATEGORY",
+    "BASE_SEARCH_CAPABILITIES",
+    "EGRESS_CAPABILITY",
+    "SEARCH_PROVIDER_SPECS",
+    "SearchProviderSpec",
+    "SearchAdapterBackend",
+    "build_search_registry",
+    "PROVIDER_OUTCOME_CONTRACT",
+]
+
+SEARCH_CATEGORY = CATEGORY_SEARCH
+SEARCH_OPERATION = "search.query"
+EGRESS_CAPABILITY = "network-egress"
+BASE_SEARCH_CAPABILITIES: tuple[str, ...] = ("search.query",)
+
+#: The SDK-owned domain contract a search operation binds to.
+PROVIDER_OUTCOME_CONTRACT = "search-outcome/v1"
+
+_USER_AGENT = "SkillWeave-Adapter/0.1 (https://github.com/LangeVC/skillweave)"
+
+
+class ProviderCallError(RuntimeError):
+    """A provider call ended in a non-success status.
+
+    ``status`` is one of the typed outcome statuses and ``code`` is the
+    transport error code (e.g. an HTTP status or a JSON-RPC code).
+    """
+
+    def __init__(
+        self, message: str, *, status: str = "error", code: Optional[str] = None
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+@dataclass(frozen=True)
+class SearchProviderSpec:
+    """The static facts about one search provider.
+
+    ``endpoint_host`` is the egress destination the policy allowlist is checked
+    against; it is ``None`` for the in-process MCP stdio binding (the child is
+    launched locally, and its own network egress is the server's concern).
+    """
+
+    adapter_id: str
+    provider: str
+    transport: str
+    capabilities: tuple[str, ...]
+    endpoint_host: Optional[str]
+    fetcher: Callable[..., Any]
+
+
+# ── provider fetchers (return typed records; raise ProviderCallError) ──────
+
+
+def _records_from(items: Sequence[Mapping[str, Any]], provider: str) -> list[SearchResultRecord]:
+    out: list[SearchResultRecord] = []
+    for r in items:
+        url = str(r.get("url", ""))
+        if not (url.startswith("http://") or url.startswith("https://")):
+            continue  # never promote a non-http(s) value to a source
+        out.append(
+            SearchResultRecord(
+                title=str(r.get("title", "")),
+                url=url,
+                snippet=str(r.get("snippet", "")),
+                source=str(r.get("source", "web")),
+                provider=provider,
+                date=str(r.get("date", "")),
+            )
+        )
+    return out
+
+
+def _http_json(
+    url: str, *, data: Optional[bytes] = None, headers: Mapping[str, str]
+) -> Any:
+    req = urllib.request.Request(url, data=data, headers=dict(headers))
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - explicit call
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise ProviderCallError(
+            f"HTTP {exc.code} from {url}",
+            status="blocked",
+            code=f"http_{exc.code}",
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise ProviderCallError(
+            f"network error from {url}: {exc.reason}",
+            status="unavailable",
+            code="network_error",
+        ) from exc
+
+
+async def _in_executor(fn: Callable[[], Any]) -> Any:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, fn)
+
+
+def _ddg_parse(html: str) -> list[SearchResultRecord]:
+    links = re.findall(
+        r'<a[^>]*class="[^"]*result-link[^"]*"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+        html,
+        re.DOTALL,
+    )
+    snippets = re.findall(
+        r'<td[^>]*class="[^"]*result-snippet[^"]*"[^>]*>(.*?)</td>',
+        html,
+        re.DOTALL,
+    )
+    out: list[SearchResultRecord] = []
+    for i, (href, title_html) in enumerate(links):
+        url = href
+        if "uddg=" in url:
+            m = re.search(r"uddg=([^&]+)", url)
+            if m:
+                url = unquote(m.group(1))
+        if not url.startswith("http"):
+            continue
+        title = re.sub(r"<[^>]+>", "", title_html).strip()
+        snippet = ""
+        if i < len(snippets):
+            snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip()
+        if title:
+            out.append(
+                SearchResultRecord(
+                    title=title,
+                    url=url,
+                    snippet=snippet[:500],
+                    source="web",
+                    provider="duckduckgo",
+                )
+            )
+    return out
+
+
+async def _fetch_duckduckgo(query: str, opts: Mapping[str, Any]) -> list[SearchResultRecord]:
+    encoded = quote_plus(query)
+    url = f"https://lite.duckduckgo.com/lite/?q={encoded}"
+
+    def _run() -> Any:
+        req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:  # nosec
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            raise ProviderCallError(
+                f"HTTP {exc.code}", status="blocked", code=f"http_{exc.code}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise ProviderCallError(
+                f"DuckDuckGo unavailable: {exc.reason}",
+                status="unavailable",
+                code="network_error",
+            ) from exc
+
+    html = await _in_executor(_run)
+    return _ddg_parse(html)
+
+
+async def _fetch_serper(query: str, opts: Mapping[str, Any]) -> list[SearchResultRecord]:
+    api_key = opts.get("api_key")
+    if not api_key:
+        raise ProviderCallError("SERPER_API_KEY not set", status="blocked", code="no_credential")
+    body = json.dumps({"q": query, "num": opts.get("max_results", 10)}).encode()
+    data = await _in_executor(
+        lambda: _http_json(
+            "https://google.serper.dev/search",
+            data=body,
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+        )
+    )
+    return _records_from(
+        [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("link", ""),
+                "snippet": r.get("snippet", ""),
+                "date": r.get("date", ""),
+            }
+            for r in data.get("organic", [])
+        ],
+        "serper",
+    )
+
+
+async def _fetch_serpapi(query: str, opts: Mapping[str, Any]) -> list[SearchResultRecord]:
+    api_key = opts.get("api_key")
+    if not api_key:
+        raise ProviderCallError("SERPAPI_API_KEY not set", status="blocked", code="no_credential")
+    params = {
+        "q": query,
+        "api_key": api_key,
+        "num": opts.get("max_results", 10),
+        "engine": "google",
+    }
+    qs = "&".join(f"{k}={quote_plus(str(v))}" for k, v in params.items())
+    data = await _in_executor(
+        lambda: _http_json(f"https://serpapi.com/search?{qs}", headers={})
+    )
+    return _records_from(
+        [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("link", ""),
+                "snippet": r.get("snippet", ""),
+                "date": r.get("date", ""),
+            }
+            for r in data.get("organic_results", [])
+        ],
+        "serpapi",
+    )
+
+
+async def _fetch_tavily(query: str, opts: Mapping[str, Any]) -> list[SearchResultRecord]:
+    api_key = opts.get("api_key")
+    if not api_key:
+        raise ProviderCallError("TAVILY_API_KEY not set", status="blocked", code="no_credential")
+    body = json.dumps(
+        {
+            "query": query,
+            "max_results": opts.get("max_results", 10),
+            "search_depth": "advanced",
+            "include_raw_content": False,
+        }
+    ).encode()
+    data = await _in_executor(
+        lambda: _http_json(
+            "https://api.tavily.com/search",
+            data=body,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        )
+    )
+    return _records_from(
+        [
+            {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")}
+            for r in data.get("results", [])
+        ],
+        "tavily",
+    )
+
+
+async def _fetch_brave(query: str, opts: Mapping[str, Any]) -> list[SearchResultRecord]:
+    api_key = opts.get("api_key")
+    if not api_key:
+        raise ProviderCallError("BRAVE_API_KEY not set", status="blocked", code="no_credential")
+    url = (
+        f"https://api.search.brave.com/res/v1/web/search"
+        f"?q={quote_plus(query)}&count={opts.get('max_results', 10)}"
+    )
+    data = await _in_executor(
+        lambda: _http_json(
+            url,
+            headers={"Accept": "application/json", "X-Subscription-Token": api_key},
+        )
+    )
+    return _records_from(
+        [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "snippet": r.get("description", ""),
+                "date": r.get("page_age", ""),
+            }
+            for r in data.get("web", {}).get("results", [])
+        ],
+        "brave",
+    )
+
+
+async def _fetch_perplexity_http(
+    query: str, opts: Mapping[str, Any]
+) -> tuple[list[SearchResultRecord], Optional[str]]:
+    api_key = opts.get("api_key")
+    if not api_key:
+        raise ProviderCallError(
+            "PERPLEXITY_API_KEY not set", status="blocked", code="no_credential"
+        )
+    body = {
+        "model": "sonar-pro",
+        "messages": [{"role": "user", "content": query}],
+        "max_tokens": 2000,
+        "temperature": 0.2,
+        "return_related_questions": False,
+    }
+    data = await _in_executor(
+        lambda: _http_json(
+            "https://api.perplexity.ai/chat/completions",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        )
+    )
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    citations = data.get("citations", [])
+    records = [
+        SearchResultRecord(
+            title=f"Source {i + 1}",
+            url=str(url),
+            snippet="Referenced in Perplexity search results",
+            source="web",
+            provider="perplexity",
+        )
+        for i, url in enumerate(citations[: opts.get("max_results", 10)])
+        if str(url).startswith("http")
+    ]
+    return records, (content or None)
+
+
+async def _fetch_perplexity_mcp(
+    query: str, opts: Mapping[str, Any]
+) -> tuple[list[SearchResultRecord], Optional[str]]:
+    command = opts.get("command")
+    if not command:
+        raise ProviderCallError(
+            "no MCP launcher binding supplied for perplexity", status="error", code="no_binding"
+        )
+    tool = str(opts.get("tool_name", "perplexity_search"))
+    client = McpStdioClient(
+        command,
+        env_allowlist=opts.get("env_allowlist", ()),
+        extra_env=opts.get("extra_env", {}),
+        protocol_version=str(opts.get("protocol_version", "2025-06-18")),
+    )
+    try:
+        await client.start()
+        tools = await client.list_tools()
+        if tool not in tools:
+            raise ProviderCallError(
+                f"MCP server does not expose tool {tool!r}; tools={tools}",
+                status="error",
+                code="tool_missing",
+            )
+        result = await client.call_tool(tool, {"query": query})
+    except McpClientError as exc:
+        raise ProviderCallError(
+            f"perplexity MCP call failed: {exc}",
+            status="error",
+            code=str(exc.code) if exc.code is not None else "mcp_error",
+        ) from exc
+    finally:
+        await client.close()
+
+    structured = result.get("structuredContent", {}) if isinstance(result, Mapping) else {}
+    records = _records_from(list(structured.get("results", [])), "perplexity")
+    if not records:
+        records = [
+            SearchResultRecord(
+                title=str(c.get("title", f"Source {i + 1}")),
+                url=str(c.get("url", "")),
+                snippet=str(c.get("snippet", ""))[:500],
+                source="web",
+                provider="perplexity",
+            )
+            for i, c in enumerate(structured.get("citations", []))
+            if str(c.get("url", "")).startswith("http")
+        ]
+    synthesis = None
+    blocks = result.get("content", []) if isinstance(result, Mapping) else []
+    if isinstance(blocks, list):
+        texts = [
+            b.get("text", "") for b in blocks if isinstance(b, Mapping) and b.get("type") == "text"
+        ]
+        synthesis = "\n".join(t for t in texts if t) or None
+    return records, synthesis
+
+
+SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
+    "duckduckgo": SearchProviderSpec(
+        adapter_id="duckduckgo-search",
+        provider="duckduckgo",
+        transport="http",
+        capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
+        endpoint_host="lite.duckduckgo.com",
+        fetcher=_fetch_duckduckgo,
+    ),
+    "serper": SearchProviderSpec(
+        adapter_id="serper-search",
+        provider="serper",
+        transport="http",
+        capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
+        endpoint_host="google.serper.dev",
+        fetcher=_fetch_serper,
+    ),
+    "serpapi": SearchProviderSpec(
+        adapter_id="serpapi-search",
+        provider="serpapi",
+        transport="http",
+        capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
+        endpoint_host="serpapi.com",
+        fetcher=_fetch_serpapi,
+    ),
+    "tavily": SearchProviderSpec(
+        adapter_id="tavily-search",
+        provider="tavily",
+        transport="http",
+        capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
+        endpoint_host="api.tavily.com",
+        fetcher=_fetch_tavily,
+    ),
+    "brave": SearchProviderSpec(
+        adapter_id="brave-search",
+        provider="brave",
+        transport="http",
+        capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
+        endpoint_host="api.search.brave.com",
+        fetcher=_fetch_brave,
+    ),
+    "perplexity-mcp": SearchProviderSpec(
+        adapter_id="perplexity-search-mcp",
+        provider="perplexity",
+        transport="mcp-stdio",
+        capabilities=BASE_SEARCH_CAPABILITIES,
+        endpoint_host=None,
+        fetcher=_fetch_perplexity_mcp,
+    ),
+    "perplexity-http": SearchProviderSpec(
+        adapter_id="perplexity-search-http",
+        provider="perplexity",
+        transport="http",
+        capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
+        endpoint_host="api.perplexity.ai",
+        fetcher=_fetch_perplexity_http,
+    ),
+}
+
+
+class SearchAdapterBackend(AdapterBackend):
+    """Turns one provider spec into a typed search outcome."""
+
+    def __init__(self, spec: SearchProviderSpec) -> None:
+        self.spec = spec
+
+    async def invoke(
+        self, operation: str, argument: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> SearchOutcome:
+        if operation != SEARCH_OPERATION:
+            raise ProviderCallError(
+                f"search backend serves only {SEARCH_OPERATION!r}",
+                status="error",
+                code="unsupported_operation",
+            )
+        query = str(argument.get("query", ""))
+        if not query.strip():
+            raise ProviderCallError(
+                "search requires a non-empty query", status="error", code="empty_query"
+            )
+        opts = dict(argument)
+        fetched: Any = None
+        synthesis: Optional[str] = None
+        try:
+            fetched = await self.spec.fetcher(query, opts)
+        except ProviderCallError as exc:
+            return SearchOutcome(
+                query_sha256=query_digest(query),
+                requested_provider=self.spec.provider,
+                status=exc.status,
+                attempts=(
+                    SearchAttempt(
+                        provider=self.spec.provider,
+                        transport=self.spec.transport,
+                        status=exc.status,
+                        error_code=exc.code,
+                    ),
+                ),
+                error_code=exc.code,
+            )
+        if isinstance(fetched, tuple):
+            records, synthesis = fetched
+        else:
+            records = fetched
+        if not records:
+            return SearchOutcome(
+                query_sha256=query_digest(query),
+                requested_provider=self.spec.provider,
+                status="unavailable",
+                attempts=(
+                    SearchAttempt(
+                        provider=self.spec.provider,
+                        transport=self.spec.transport,
+                        status="unavailable",
+                        error_code="no_results",
+                    ),
+                ),
+                error_code="no_results",
+            )
+        return SearchOutcome(
+            query_sha256=query_digest(query),
+            requested_provider=self.spec.provider,
+            status="success",
+            results=tuple(records),
+            attempts=(
+                SearchAttempt(
+                    provider=self.spec.provider,
+                    transport=self.spec.transport,
+                    status="success",
+                    error_code=None,
+                ),
+            ),
+            synthesis=synthesis,
+        )
+
+
+def build_search_registry(
+    registry: Optional[AdapterRegistry] = None,
+    *,
+    provider_keys: Optional[Sequence[str]] = None,
+) -> AdapterRegistry:
+    """Register every search provider through the same extension point.
+
+    Default registers all seven bindings (six providers; Perplexity has an MCP
+    and an HTTP binding). Idempotent per registry: re-registering the same id
+    raises, as a duplicate id must.
+    """
+    registry = registry if registry is not None else AdapterRegistry()
+    keys = tuple(provider_keys) if provider_keys is not None else tuple(SEARCH_PROVIDER_SPECS)
+    for key in keys:
+        spec = SEARCH_PROVIDER_SPECS[key]
+        descriptor = AdapterDescriptor(
+            id=spec.adapter_id,
+            version="1.0.0",
+            categories=(SEARCH_CATEGORY,),
+            operations=(
+                OperationBinding(
+                    name=SEARCH_OPERATION,
+                    input_contract="search-query/v1",
+                    result_contract=PROVIDER_OUTCOME_CONTRACT,
+                    required_capabilities=tuple(spec.capabilities),
+                ),
+            ),
+            transport=spec.transport,
+            capabilities=tuple(spec.capabilities),
+        )
+        registry.register(descriptor, SearchAdapterBackend(spec), source="builtin_search")
+    return registry
