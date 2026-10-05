@@ -63,6 +63,42 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _capture_settled_identity(
+    capture, pid: int, *, timeout: float = 0.3, interval: float = 0.01
+):
+    """Observe *pid* until its exec image is stable, then return the identity.
+
+    A freshly launched child can briefly still be the interpreter's thin
+    launcher stub: Homebrew's ``bin/python3.14`` is a small Mach-O that
+    immediately re-``exec``s the framework bundle (``Python.app``), so an
+    immediate capture records the *pre-exec* image while a later cancellation
+    observes the *post-exec* one.  Recording the transient image would make the
+    identity verification refuse a legitimately-owned worker, so we wait until
+    two consecutive observations agree on ``(start_time, exec_path, argv)``
+    before recording.  Returns ``None`` only when *pid* is never observable
+    (it already exited); otherwise the last observed identity is returned so a
+    bounded wait can never lose a live process.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    previous_key = None
+    last = None
+    while True:
+        current = capture(pid)
+        if current is not None:
+            last = current
+            key = (
+                current.start_time,
+                current.exec_path,
+                tuple(current.argv or ()),
+            )
+            if previous_key is not None and key == previous_key:
+                return current
+            previous_key = key
+        if time.monotonic() >= deadline:
+            return last
+        time.sleep(interval)
+
+
 @dataclass(frozen=True)
 class _MethodologyBinding:
     """A resolved, validated methodology binding for one run.
@@ -1435,6 +1471,11 @@ class RunApplicationService:
         cwd: Optional[Path] = None,
         project_root: Optional[Path] = None,
         _env: Optional[dict[str, str]] = None,
+        root_run_id: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
+        attempt: Optional[int] = None,
+        task_id: Optional[str] = None,
+        restarted_from: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Start *command* as a detached background process.
 
@@ -1468,6 +1509,19 @@ class RunApplicationService:
         db_path = self.store.db_path
         EventType = _runtime_attr("journal", "EventType")
 
+        # Lineage records the *identified attempt* this launch represents.  A
+        # resumed run is a NEW attempt chained to its predecessor by
+        # ``restarted_from`` -- it is never the same attempt "restarted" by a
+        # bare database transition.  ``root_run_id`` ties the attempt chain
+        # together; ``attempt`` is monotonically increasing within the chain.
+        lineage: dict[str, Any] = {
+            "root_run_id": root_run_id or rid,
+            "parent_run_id": parent_run_id,
+            "attempt": int(attempt) if attempt is not None else 1,
+            "task_id": task_id,
+            "restarted_from": dict(restarted_from) if restarted_from else None,
+        }
+
         # Store initial lifecycle metadata BEFORE launching the child, so the
         # wrapper starts at version 2 (not version 1).  This prevents a race
         # where a fast child completes before the parent gets to write its
@@ -1482,6 +1536,7 @@ class RunApplicationService:
                     "pid": 0,
                     "lifecycle_state": "running",
                 },
+                "lineage": lineage,
             },
         )
 
@@ -1549,6 +1604,19 @@ class RunApplicationService:
         )
 
         now = datetime.now(timezone.utc).isoformat()
+
+        # Capture the *native* identity of the just-launched child (PID,
+        # process group, creation instant, exec image and argument vector).
+        # This is the fact a later cancellation verifies against before it
+        # signals a process group; a bare recorded PID is not an identity.
+        capture_identity = _runtime_attr("process_identity", "capture")
+        identity = None
+        try:
+            identity = _capture_settled_identity(capture_identity, proc.pid)
+        except Exception:  # noqa: BLE001 - observation failure is not a fact
+            identity = None
+        identity_dict = identity.to_dict() if identity is not None else None
+
         self.journal.append(
             rid,
             event_type="launched",
@@ -1556,35 +1624,421 @@ class RunApplicationService:
                 "event": "launched",
                 "pid": proc.pid,
                 "command": list(command),
+                "process_identity": identity_dict,
+                "lineage": lineage,
             },
         )
 
-        # Update the PID (placeholder was 0) at the current version.
-        # If the wrapper already completed, this CAS will fail harmlessly —
-        # the PID is already in the journal event and the lifecycle metadata.
+        # Update the PID + recorded process identity (placeholder was 0) at the
+        # current version.  If the wrapper already completed, this CAS will
+        # fail harmlessly — the facts are already in the journal event.
         current = self.store.get_run(rid)
         if current is not None:
             try:
                 lifecycle = dict(current.metadata.get("runlifecycle", {}))
                 lifecycle["pid"] = proc.pid
+                metadata_update: dict[str, Any] = {"runlifecycle": lifecycle}
+                if identity_dict is not None:
+                    metadata_update["process_identity"] = identity_dict
+                    lifecycle["process_identity"] = identity_dict
+                    metadata_update["runlifecycle"] = lifecycle
                 self.store.update_metadata(
                     rid,
                     expected_version=current.version,
-                    metadata={"runlifecycle": lifecycle},
+                    metadata=metadata_update,
                 )
             except Exception:
-                # Race with wrapper completion — PID was best-effort.
+                # Race with wrapper completion — PID/identity were best-effort.
                 pass
 
         run = self.store.get_run(rid)
         return {
             "run_id": rid,
             "pid": proc.pid,
+            "pgid": identity.pgid if identity is not None else proc.pid,
             "command": list(command),
             "state": run.state if run else "preflight",
             "created_at": now,
             "version": run.version if run else 1,
+            "process_identity": identity_dict,
+            "lineage": lineage,
         }
+
+    def cancel_process(
+        self,
+        run_id: str,
+        pid: Optional[int] = None,
+        *,
+        project_root: Optional[Path] = None,
+        grace: float = 0.5,
+        reason: str = "operator_halt",
+    ) -> dict[str, Any]:
+        """Cancel an owned native run after proving the process identity.
+
+        Unlike :meth:`kill_run` (which trusts the caller-supplied PID), this
+        path re-verifies the *recorded* process identity against the live OS
+        facts before any signal is sent:
+
+        * only a verified ``match`` authorises a signal;
+        * a recycled PID, a stale command or a foreign worker is **refused**
+          and nothing is signalled;
+        * a process that can no longer be observed (``not_alive``) is reported
+          as *unknown* in-flight state, never fabricated as terminated.
+
+        On a verified match the owned process group is stopped: every live
+        member of the group is sent SIGTERM, then SIGKILL after *grace*.  The
+        cancellation is committed through the canonical durable reconciliation
+        primitive (one idempotent terminal event + lifecycle ``killed``), and
+        the acknowledgement — the verified identity, the members signalled, the
+        observed result — is recorded as a durable ``cancellation_ack`` event.
+
+        Parameters
+        ----------
+        run_id:
+            The run to cancel.
+        pid:
+            The PID the caller believes is the target.  Defaults to the
+            identity recorded at launch.  If supplied it must equal the
+            recorded identity's PID (any mismatch is a recycled-PID refusal).
+        grace:
+            Seconds to wait between SIGTERM and SIGKILL.
+        reason:
+            Human-readable cancellation reason recorded on the event.
+
+        Returns
+        -------
+        dict with ``run_id``, ``pid``, ``state``, ``lane_state``,
+        ``lifecycle_state``, ``result``, ``signalled``, ``identity_verified``,
+        ``unknown_inflight`` and ``verification``.
+
+        Raises
+        ------
+        ProcessIdentityError
+            When identity verification does not yield ``match``.
+        StoreError
+            When the run is not found.
+        """
+        StoreError = _runtime_attr("errors", "StoreError")
+        run = self.store.get_run(run_id)
+        if run is None:
+            raise StoreError(f"no run found: {run_id}")
+
+        RunStateModel = _runtime_attr("store", "RunStateModel")
+        recorded = (run.metadata or {}).get("process_identity")
+        recorded_identity = _runtime_attr("process_identity", "ProcessIdentity").from_dict(recorded)
+        recorded_pid = recorded_identity.pid if recorded_identity is not None else pid
+
+        # ---- durable cancellation intent before the signal boundary -------
+        # Recorded first so a crash at/after the signal is recoverable by a
+        # later ``resume_run`` pass.  A genuine terminal winner is preserved.
+        KillOutcomeError = _runtime_attr("errors", "KillOutcomeError")
+        already_terminal = (
+            run.state != "preflight" and RunStateModel.is_terminal(run.state)
+        )
+        reconcile_cancellation_intent = getattr(
+            self.store, "reconcile_cancellation_intent", None)
+        if not already_terminal and reconcile_cancellation_intent is not None:
+            try:
+                reconcile_cancellation_intent(
+                    run_id,
+                    pid=recorded_pid,
+                    result="pending",
+                    event_payload={"pid": recorded_pid, "result": "pending",
+                                   "reason": reason},
+                    idempotency_key="cancel:" + run_id,
+                    reason=reason,
+                ).record_intent()
+            except Exception as exc:  # noqa: BLE001
+                raise KillOutcomeError(
+                    run_id,
+                    {"reason": "cancellation intent could not be durably recorded",
+                     "error": type(exc).__name__, "detail": str(exc)},
+                    result="unknown",
+                    cause=exc,
+                ) from exc
+
+        # ---- identity verification: the gate before any signal ------------
+        verify = _runtime_attr("process_identity", "verify")
+        REASON_MATCH = _runtime_attr("process_identity", "REASON_MATCH")
+        REASON_NOT_ALIVE = _runtime_attr("process_identity", "REASON_NOT_ALIVE")
+        ProcessIdentityError = _runtime_attr("errors", "ProcessIdentityError")
+
+        check = verify(recorded, recorded_pid if recorded_pid is not None else (pid or 0))
+        if not check.ok and check.reason != REASON_NOT_ALIVE:
+            # Recycled / stale / foreign / no-record: refuse, signal nothing.
+            raise ProcessIdentityError(
+                run_id, recorded_pid, check.reason, verification=check.to_dict())
+
+        # ---- enumerate the owned group (members by observed pgid) ---------
+        # GROUP OWNERSHIP LEASE: a process group id is a *reusable* number.  The
+        # recorded identity's pgid is only trustworthy while the recorded
+        # creation instant still owns that number.  We therefore capture the pgid
+        # again at cancel time and use it *only* when it still equals the
+        # recorded pgid.  If the number has been recycled, members are resolved
+        # strictly from the verified current identity -- never from a stale
+        # recorded group that may now belong to an unrelated process tree.
+        list_process_group = _runtime_attr("process_identity", "list_process_group")
+        is_alive = _runtime_attr("process_identity", "is_alive")
+
+        recorded_pgid = recorded_identity.pgid if recorded_identity is not None else None
+        if check.reason == REASON_MATCH:
+            live_pgid = check.current.pgid
+            pgid = live_pgid if live_pgid == recorded_pgid else None
+        else:
+            pgid = recorded_pgid
+        members = list_process_group(pgid) if pgid else ()
+        if pgid is None and check.reason == REASON_MATCH:
+            members = (check.current.pid,)
+
+        signalled: list[int] = []
+        unknown_inflight = check.reason == REASON_NOT_ALIVE
+        result = "unknown"
+
+        if check.reason == REASON_MATCH:
+            # The leader is verified (and, when the pgid still holds, so is the
+            # whole group).  Signal every member of the owned group.
+            targets = sorted({p for p in members if p} | {recorded_pid})
+            for target in targets:
+                try:
+                    os.kill(target, _signal.SIGTERM)
+                    signalled.append(target)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            deadline = time.monotonic() + max(0.0, grace)
+            while time.monotonic() < deadline:
+                if not any(is_alive(t) for t in targets):
+                    break
+                time.sleep(0.02)
+            remaining = [t for t in targets if is_alive(t)]
+            for target in remaining:
+                try:
+                    os.kill(target, _signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            result = "forced_kill" if remaining else "graceful_kill"
+        elif check.reason == REASON_NOT_ALIVE:
+            # The recorded process can no longer be observed.  We do NOT
+            # fabricate a termination: the run's in-flight state is *unknown*,
+            # the durable cancellation intent stands, and a later resume pass
+            # reconciles it to a terminal unknown outcome.  No signal was sent.
+
+            # Record the acknowledgement before returning: the identity was
+            # missing, nothing was signalled, and the in-flight state is unknown.
+            ack_payload = {
+                "run_id": run_id,
+                "pid": recorded_pid,
+                "pgid": recorded_pgid,
+                "result": "unknown",
+                "reason": reason,
+                "identity_verified": False,
+                "verification_reason": check.reason,
+                "signalled": [],
+                "group_members": [],
+                "unknown_inflight": True,
+            }
+            try:
+                self.journal.append(
+                    run_id,
+                    event_type="cancellation_ack",
+                    payload=ack_payload,
+                    idempotency_key="cancel_ack:" + run_id,
+                )
+            except Exception:  # noqa: BLE001 - ack is additive evidence
+                pass
+            current = self.store.get_run(run_id)
+            return {
+                "run_id": run_id,
+                "pid": recorded_pid,
+                "pgid": recorded_pgid,
+                "state": "unknown",
+                "lane_state": current.state if current is not None else "unknown",
+                "lifecycle_state": (current.metadata or {}).get(
+                    "runlifecycle", {}).get("lifecycle_state") if current else None,
+                "result": "unknown",
+                "signalled": [],
+                "identity_verified": False,
+                "unknown_inflight": True,
+                "verification": check.to_dict(),
+            }
+
+        # ---- record the acknowledgement -----------------------------------
+        ack_payload = {
+            "run_id": run_id,
+            "pid": recorded_pid,
+            "pgid": pgid,
+            "result": result,
+            "reason": reason,
+            "identity_verified": True,
+            "verification_reason": check.reason,
+            "signalled": signalled,
+            "group_members": list(members),
+            "unknown_inflight": False,
+        }
+        try:
+            self.journal.append(
+                run_id,
+                event_type="cancellation_ack",
+                payload=ack_payload,
+                idempotency_key="cancel_ack:" + run_id,
+            )
+        except Exception:  # noqa: BLE001 - ack is additive evidence
+            pass
+
+        # ---- commit terminal, preserving a genuine winner -----------------
+        cancelling = not RunStateModel.is_terminal(self.store.get_run(run_id).state)
+        if cancelling:
+            reconcile_terminal = getattr(self.store, "reconcile_terminal", None)
+            if reconcile_terminal is not None:
+                record = reconcile_terminal(
+                    run_id,
+                    target_state="advance_or_stop",
+                    lifecycle_update={"lifecycle_state": "killed"},
+                    event_type="process_killed",
+                    event_payload={"pid": recorded_pid, "result": result,
+                                   "signalled": signalled},
+                    idempotency_key="cancel:" + run_id,
+                    reason=reason,
+                    stop_reason="operator_halt",
+                )
+            else:
+                record = self.store.get_run(run_id)
+        else:
+            record = self.store.get_run(run_id)
+
+        final_lifecycle = (record.metadata or {}).get("runlifecycle", {}).get(
+            "lifecycle_state")
+        reported_state = "killed" if (cancelling and final_lifecycle == "killed") else (
+            record.state if record is not None else "unknown")
+        return {
+            "run_id": run_id,
+            "pid": recorded_pid,
+            "pgid": pgid,
+            "state": reported_state,
+            "lane_state": record.state if record is not None else "unknown",
+            "lifecycle_state": final_lifecycle,
+            "result": result,
+            "signalled": signalled,
+            "identity_verified": check.reason == REASON_MATCH,
+            "unknown_inflight": unknown_inflight,
+            "verification": check.to_dict(),
+        }
+
+    def restart_attempt(
+        self,
+        run_id: str,
+        command: Sequence[str],
+        *,
+        run_id_new: Optional[str] = None,
+        task_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        project_root: Optional[Path] = None,
+        cwd: Optional[Path] = None,
+        _env: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        """Launch a NEW identified attempt that continues *run_id*.
+
+        A resume is a new process with a new PID and a new recorded identity —
+        never a database transition dressed up as "restarted".  This method:
+
+        * requires the source run to be non-terminal and launchable (a terminal
+          or historical run is refused);
+        * is idempotent on *idempotency_key*: a second call with the same key
+          returns the attempt already launched instead of spawning a duplicate;
+        * derives the attempt number from the source run's lineage;
+        * creates a fresh run record (CAS/PK-guarded by the store) and launches
+          the command through :meth:`start_async`, which captures and records
+          the new attempt's native process identity;
+        * links the new attempt to its predecessor by ``parent_run_id`` and
+          ``restarted_from`` so the attempt chain is explicit and auditable.
+
+        The returned ``restarted`` flag is ``True`` only because a *real*
+        process was launched on a *new* identity, not because a row changed.
+        """
+        StoreError = _runtime_attr("errors", "StoreError")
+        source = self.store.get_run(run_id)
+        if source is None:
+            raise StoreError(f"no run found: {run_id}")
+        RunStateModel = _runtime_attr("store", "RunStateModel")
+        if RunStateModel.is_terminal(source.state):
+            raise StoreError(
+                f"terminal run cannot be restarted: {run_id} ({source.state})")
+        if (source.metadata or {}).get("historical"):
+            raise StoreError(f"historical run cannot be restarted: {run_id}")
+
+        source_lineage = (source.metadata or {}).get("lineage") or {}
+        root_run_id = source_lineage.get("root_run_id") or source.run_id
+        next_attempt = int(source_lineage.get("attempt") or 1) + 1
+
+        idem = idempotency_key or ("restart:" + run_id)
+        attempts = dict((source.metadata or {}).get("restart_attempts") or {})
+
+        # Idempotency: if this key already launched an attempt, return it.
+        prior = attempts.get(idem)
+        if isinstance(prior, dict) and prior.get("run_id"):
+            prior_run = self.store.get_run(prior["run_id"])
+            if prior_run is None:
+                raise StoreError(
+                    f"idempotent restart recorded run {prior['run_id']} that "
+                    f"no longer exists")
+            return {
+                "run_id": prior["run_id"],
+                "parent_run_id": run_id,
+                "root_run_id": prior.get("root_run_id", root_run_id),
+                "attempt": prior.get("attempt", next_attempt),
+                "restarted": True,
+                "idempotent_replay": True,
+                "pid": (prior_run.metadata or {}).get("runlifecycle", {}).get("pid"),
+                "state": prior_run.state,
+            }
+
+        # Record the attempt mapping BEFORE launch so a crash mid-launch is
+        # itself idempotent (the reserved id is reused, never duplicated).
+        new_run_id = run_id_new or uuid.uuid4().hex
+        restarted_from = {
+            "run_id": run_id,
+            "state": source.state,
+            "version": source.version,
+            "attempt": source_lineage.get("attempt") or 1,
+        }
+        attempts[idem] = {
+            "run_id": new_run_id,
+            "root_run_id": root_run_id,
+            "attempt": next_attempt,
+            "idempotency_key": idem,
+        }
+
+        def _reserve_and_link():
+            # CAS the source row; a racing terminal transition is a hard stop.
+            cur = self.store.get_run(run_id)
+            if cur is None:
+                raise StoreError(f"no run found: {run_id}")
+            self.store.update_metadata(
+                run_id,
+                expected_version=cur.version,
+                metadata={"restart_attempts": attempts},
+            )
+
+        _reserve_and_link()
+
+        # Launch the new identified attempt (new run record + real process).
+        result = self.start_async(
+            command,
+            run_id=new_run_id,
+            cwd=cwd,
+            project_root=project_root,
+            _env=_env,
+            root_run_id=root_run_id,
+            parent_run_id=run_id,
+            attempt=next_attempt,
+            task_id=task_id,
+            restarted_from=restarted_from,
+        )
+        result["parent_run_id"] = run_id
+        result["root_run_id"] = root_run_id
+        result["attempt"] = next_attempt
+        result["restarted"] = True
+        result["idempotent_replay"] = False
+        return result
 
     def kill_run(
         self,

@@ -15,7 +15,14 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .handle import start_async, inspect_run, kill_run, InspectMode
+from .handle import (
+    start_async,
+    inspect_run,
+    kill_run,
+    cancel_process,
+    restart_attempt,
+    InspectMode,
+)
 from .store import StalePidError, RunStateError
 
 
@@ -127,6 +134,86 @@ def main_inspect(argv: Optional[Sequence[str]] = None) -> int:
         poll_interval=args.poll_interval,
         timeout=args.timeout,
     )
+
+
+def build_cancel_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="skillweave cancel",
+        description="Cancel an owned run after proving process identity. "
+                    "Refuses a recycled PID, a stale command or a foreign "
+                    "worker; an unobservable process is reported as unknown.",
+    )
+    parser.add_argument("run_id", help="The run ID to cancel.")
+    parser.add_argument(
+        "--pid",
+        type=int,
+        default=None,
+        help="Optional PID the caller believes is the target (defaults to "
+             "the recorded identity).",
+    )
+    parser.add_argument(
+        "--reason",
+        default="operator_halt",
+        help="Cancellation reason recorded on the acknowledgement event.",
+    )
+    return parser
+
+
+def build_resume_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="skillweave resume",
+        description="Resume a run by launching a NEW identified attempt.",
+    )
+    parser.add_argument("run_id", help="The run ID to resume.")
+    parser.add_argument(
+        "--command",
+        default=None,
+        help="Command for the new attempt (defaults to the recorded command).",
+    )
+    parser.add_argument(
+        "--idempotency-key",
+        default=None,
+        help="Idempotency key for the restart (defaults to restart:<run_id>).",
+    )
+    return parser
+
+
+def main_cancel(argv: Optional[Sequence[str]] = None) -> int:
+    from skillweave.runtime.errors import ProcessIdentityError, StoreError
+
+    parser = build_cancel_parser()
+    args = parser.parse_args(argv)
+    try:
+        result = cancel_process(args.run_id, args.pid)
+    except ProcessIdentityError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        # Verification refusal carries the declared reason (stale/foreign).
+        return 3
+    except StoreError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
+    sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
+    return 0
+
+
+def main_resume(argv: Optional[Sequence[str]] = None) -> int:
+    from skillweave.runtime.errors import StoreError
+
+    parser = build_resume_parser()
+    args = parser.parse_args(argv)
+    command = None
+    if args.command:
+        import shlex
+        command = shlex.split(args.command)
+    try:
+        result = restart_attempt(
+            args.run_id, command, idempotency_key=args.idempotency_key
+        )
+    except StoreError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
+    sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
+    return 0
 
 
 def main_kill(argv: Optional[Sequence[str]] = None) -> int:

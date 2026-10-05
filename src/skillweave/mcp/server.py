@@ -117,41 +117,68 @@ def status_run(run_id: str, db_path: str = ".skillweave/store.db") -> str:
     return json.dumps(snapshot)
 
 @mcp.tool()
-def cancel_run(run_id: str, reason: str, db_path: str = ".skillweave/store.db") -> str:
-    """Cancel a run. Follows proper transition path."""
-    store = _get_store(db_path)
-    record = store.get_run(run_id)
-    if not record:
+def cancel_run(run_id: str, reason: str = "operator_halt", db_path: str = ".skillweave/store.db") -> str:
+    """Cancel a run through the native lifecycle entry.
+
+    Never a bare database transition: the service re-verifies the recorded
+    process identity against the live OS facts before signalling, stops the
+    owned process group, and reports the real outcome. A recycled PID, a
+    stale command or a foreign worker is refused (nothing is signalled) and
+    an unobservable process is reported as ``unknown_inflight`` — the tool
+    never claims a termination it did not perform.
+    """
+    from skillweave.runtime.errors import ProcessIdentityError, StoreError
+
+    svc = _get_run_svc(db_path)
+    if svc.store.get_run(run_id) is None:
         return json.dumps({"error": "Run not found"})
-    
-    store.transition(
-        run_id,
-        "cancelled",
-        expected_state=record.state,
-        expected_version=record.version,
-        reason=f"User cancelled: {reason}",
-        role="ops",
-        stop_reason="cancelled_by_user"
-    )
-    return json.dumps({"status": "cancelled", "run_id": run_id})
+    try:
+        result = svc.cancel_process(run_id, reason=reason)
+    except ProcessIdentityError as exc:
+        return json.dumps({
+            "error": "process identity not verified; cancellation refused",
+            "run_id": run_id,
+            "reason": exc.reason,
+            "verification": exc.verification,
+        })
+    except StoreError as exc:
+        return json.dumps({"error": str(exc), "run_id": run_id})
+    return json.dumps({"status": "cancel_requested", **result})
 
 @mcp.tool()
-def resume_run(run_id: str, db_path: str = ".skillweave/store.db") -> str:
-    """Resume a stopped or fix_retry run. Follows proper transition path."""
-    store = _get_store(db_path)
-    record = store.get_run(run_id)
-    if not record:
-        return json.dumps({"error": "Run not found"})
+def resume_run(run_id: str, db_path: str = ".skillweave/store.db", command: str = "") -> str:
+    """Resume a run by launching a NEW identified attempt.
 
-    store.transition(
-        run_id,
-        "implement",
-        expected_state=record.state,
-        expected_version=record.version,
-        reason="Resumed by user",
-        role="ops"
-    )
-    return json.dumps({"status": "resumed", "run_id": run_id})
+    With a *command*, this launches a real new attempt (new process, new
+    recorded identity) through the native service — it never reports
+    "restarted" from a database transition alone. Without a command it
+    reconciles stored intents and returns the run's *actual* state with
+    ``restarted: false``.
+    """
+    from skillweave.runtime.errors import StoreError
+
+    svc = _get_run_svc(db_path)
+    if not command:
+        snapshot = svc.resume_run(run_id)
+        if snapshot is None:
+            return json.dumps({"error": "Run not found"})
+        return json.dumps({
+            "status": "reconciled",
+            "restarted": False,
+            "note": "no command supplied; no new attempt launched",
+            **snapshot,
+        })
+
+    cmd_list = shlex.split(command)
+    try:
+        result = svc.restart_attempt(run_id, cmd_list)
+    except StoreError as exc:
+        return json.dumps({"error": str(exc), "run_id": run_id})
+    return json.dumps({
+        "status": "restarted",
+        "restart_kind": "new_identified_attempt",
+        **result,
+    })
 
 @mcp.tool()
 def get_evidence(run_id: str, db_path: str = ".skillweave/store.db") -> str:

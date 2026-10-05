@@ -51,6 +51,8 @@ class RunHandle:
     state: str = "running"
     created_at: str = ""
     version: int = 1
+    process_identity: Optional[dict[str, Any]] = None
+    lineage: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -188,6 +190,8 @@ def start_async(
         state="running",
         created_at=result["created_at"],
         version=result["version"],
+        process_identity=result.get("process_identity"),
+        lineage=result.get("lineage"),
     )
 
 
@@ -242,6 +246,12 @@ def inspect_run(
         "finished_at": meta.finished_at,
         "version": meta.version,
     }
+    recorded_identity = (meta.metadata or {}).get("process_identity")
+    if recorded_identity is not None:
+        snapshot["process_identity"] = recorded_identity
+    lineage = (meta.metadata or {}).get("lineage")
+    if lineage is not None:
+        snapshot["lineage"] = lineage
 
     events = store.read_events(run_id)
     lane_states: dict[str, Any] = {}
@@ -412,6 +422,91 @@ def kill_run(
         "state": "killed",
         "result": result,
     }
+
+
+def cancel_process(
+    run_id: str,
+    pid: Optional[int] = None,
+    *,
+    project_root: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Cancel an owned native run after proving process identity.
+
+    Unlike :func:`kill_run` (which trusts the caller PID), this entry verifies
+    the recorded native identity against the live OS facts and refuses to
+    signal a recycled PID, a stale command or a foreign worker.  It stops the
+    owned process group and records an acknowledgement.  A recorded process
+    that is no longer observable is reported as *unknown* in-flight, never as
+    a fabricated termination.
+
+    Raises the kernel ``ProcessIdentityError`` (subclass of ``StoreError``)
+    when verification does not yield ``match``.
+    """
+    from skillweave.runsvc.service import RunApplicationService
+
+    store, service, root = _service_for(project_root)
+    return service.cancel_process(run_id, pid, project_root=root)
+
+
+def restart_attempt(
+    run_id: str,
+    command: Optional[list[str]] = None,
+    *,
+    project_root: Optional[Path] = None,
+    cwd: Optional[Path] = None,
+    idempotency_key: Optional[str] = None,
+) -> dict[str, Any]:
+    """Launch a NEW identified attempt that continues *run_id*.
+
+    A resume is a real new process with a new recorded identity, never a
+    database transition dressed up as "restarted".  Idempotent on
+    *idempotency_key*: repeating it returns the attempt already launched
+    instead of spawning a duplicate.  When *command* is omitted the source
+    run's recorded command is reused.
+    """
+    from skillweave.runsvc.service import RunApplicationService
+
+    store, service, root = _service_for(project_root)
+
+    if command is None:
+        source = store.get_run(run_id)
+        if source is None:
+            raise RunStateError(f"no run found: {run_id}")
+        command = (source.metadata or {}).get("runlifecycle", {}).get("command")
+        if not command:
+            raise RunStateError(
+                f"no recorded command for run {run_id}; pass a command")
+
+    src_path = str(Path(__file__).resolve().parent.parent.parent)
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{src_path}:{existing}" if existing else src_path
+
+    return service.restart_attempt(
+        run_id,
+        command,
+        project_root=root,
+        cwd=cwd or root,
+        idempotency_key=idempotency_key,
+        _env=env,
+    )
+
+
+def _service_for(project_root: Optional[Path]):
+    """Build (kernel_store, RunApplicationService, root) for *project_root*."""
+    from skillweave.runtime.store import SQLiteRunStore
+    from skillweave.runtime.journal import EventJournal
+    from skillweave.runtime.registry import RawArtifactStore
+    from skillweave.runsvc.service import RunApplicationService
+
+    root = Path(project_root or Path.cwd()).resolve()
+    db_path = str(root / ".skillweave" / "store.db")
+    (root / ".skillweave").mkdir(parents=True, exist_ok=True)
+    kernel_store = SQLiteRunStore(db_path)
+    service = RunApplicationService(
+        kernel_store, EventJournal(kernel_store), RawArtifactStore()
+    )
+    return kernel_store, service, root
 
 
 # ---------------------------------------------------------------------------
