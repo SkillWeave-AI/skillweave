@@ -76,6 +76,7 @@ class ReadOnlyObserver:
         *,
         after_cursor: Optional[int] = None,
         limit: Optional[int] = None,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Read ordered, cursor-based durable stream progress for ``run_id``.
 
@@ -98,8 +99,7 @@ class ReadOnlyObserver:
                 "status": "no durable stream store configured",
             }
         cursor = self._state.journal_offset if after_cursor is None else after_cursor
-        frames = stream_store.frames(cursor, limit=limit)
-        frames = [f for f in frames if f.run_id == run_id]
+        frames = stream_store.frames(cursor, limit=limit, run_id=run_id, task_id=task_id)
         latest = frames[-1].cursor if frames else cursor
         return {
             "run_id": run_id,
@@ -117,6 +117,7 @@ class ReadOnlyObserver:
         *,
         after_cursor: Optional[int] = None,
         max_bytes: int = 1024,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Return a bounded preview of progress — never the raw evidence.
 
@@ -132,7 +133,7 @@ class ReadOnlyObserver:
                 "status": "no durable stream store configured",
             }
         cursor = self._state.journal_offset if after_cursor is None else after_cursor
-        frames = [f for f in stream_store.frames(cursor) if f.run_id == run_id]
+        frames = stream_store.frames(cursor, run_id=run_id, task_id=task_id)
         text = ""
         observed = 0
         for f in frames:
@@ -150,11 +151,18 @@ class ReadOnlyObserver:
             "is_full_evidence": False,
         }
 
-    def read_attempt_fact(self, run_id: str, stream_store: Any, attempt: int) -> Optional[Dict[str, Any]]:
+    def read_attempt_fact(
+        self,
+        run_id: str,
+        stream_store: Any,
+        attempt: int,
+        *,
+        task_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Read one attempt's immutable collected fact (read-only)."""
         if stream_store is None:
             return None
-        fact = stream_store.fact(attempt)
+        fact = stream_store.fact(attempt, run_id=run_id, task_id=task_id)
         if fact is None:
             return None
         return fact.to_dict()

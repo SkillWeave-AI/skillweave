@@ -88,12 +88,14 @@ class ProgressFrame:
     data: bytes
     at: str
     detail: dict[str, Any] = field(default_factory=dict)
+    task_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "cursor": self.cursor,
             "kind": self.kind,
             "run_id": self.run_id,
+            "task_id": self.task_id,
             "attempt": self.attempt,
             "stream": self.stream,
             "digest": self.digest,
@@ -111,6 +113,7 @@ def progress_frames(
     *,
     after_cursor: int = 0,
     limit: Optional[int] = None,
+    task_id: Optional[str] = None,
 ) -> list[ProgressFrame]:
     """Return ordered progress frames for *run_id* with cursor > ``after_cursor``.
 
@@ -120,9 +123,7 @@ def progress_frames(
     is replayed in the order it actually happened.
     """
     frames: list[ProgressFrame] = []
-    for frame in store.frames(after_cursor):
-        if frame.run_id != run_id:
-            continue
+    for frame in store.frames(after_cursor, run_id=run_id, task_id=task_id):
         frames.append(_to_progress(frame))
     if limit is not None:
         frames = frames[:limit]
@@ -149,6 +150,7 @@ def _to_progress(frame: StreamFrame) -> ProgressFrame:
         data=frame.data,
         at=frame.at,
         detail=detail,
+        task_id=frame.task_id,
     )
 
 
@@ -158,6 +160,7 @@ def preview_frames(
     *,
     after_cursor: int = 0,
     max_bytes: int = 1024,
+    task_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Return a bounded *preview* over a run's progress, never the raw evidence.
 
@@ -166,7 +169,7 @@ def preview_frames(
     through :func:`progress_frames`. A preview limit therefore never replaces
     raw evidence.
     """
-    frames = progress_frames(store, run_id, after_cursor=after_cursor)
+    frames = progress_frames(store, run_id, after_cursor=after_cursor, task_id=task_id)
     retained_total = 0
     observed_total = 0
     preview_text: list[str] = []

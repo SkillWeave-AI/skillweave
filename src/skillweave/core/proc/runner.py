@@ -236,6 +236,7 @@ def run_process_streaming(
     stderr_retain_limit: Optional[int] = None,
     timeout: Optional[float] = None,
     cwd: Optional[str] = None,
+    wrap_command: Optional[Any] = None,
 ) -> StreamingResult:
     """Spawn ``cmd`` and durably stream its stdout/stderr into ``store``.
 
@@ -260,7 +261,8 @@ def run_process_streaming(
     # foundational module must import without the runtime subpackage present.
     import importlib
 
-    importlib.import_module("skillweave.runtime.stream")
+    stream_mod = importlib.import_module("skillweave.runtime.stream")
+    PersistenceError = getattr(stream_mod, "StreamPersistenceError", Exception)
 
     env = _build_env(env_allowlist, extra_env)
 
@@ -271,14 +273,21 @@ def run_process_streaming(
         retain_limit=stdout_retain_limit,
     )
     if stderr_retain_limit is not None:
-        store.set_retain_limit(attempt, "stderr", stderr_retain_limit)
+        store.set_retain_limit(attempt, "stderr", stderr_retain_limit, run_id=run_id, task_id=task_id)
+
+    argv = list(cmd)
+    if wrap_command is not None:
+        # The owning lane supplies the real isolation wrapper (e.g. StoreProtection
+        # for the protected native path); the collector applies it verbatim and
+        # never fabricates enforcement of its own.
+        argv = list(wrap_command(argv))
 
     started_at = _iso_now()
     start_monotonic = time.monotonic()
     pid = 0
     try:
         proc = subprocess.Popen(
-            list(cmd),
+            argv,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -309,6 +318,8 @@ def run_process_streaming(
     pid = proc.pid
     timed_out = False
     cancelled = False
+    storage_failed = False
+    storage_error = ""
 
     import select
 
@@ -328,7 +339,21 @@ def run_process_streaming(
                         streams = [r for r in streams if r is not proc.stderr]
                     continue
                 name = "stdout" if fd is proc.stdout else "stderr"
-                store.ingest(attempt=attempt, stream=name, chunk=chunk)
+                try:
+                    store.ingest(
+                        attempt=attempt, stream=name, chunk=chunk,
+                        run_id=run_id, task_id=task_id,
+                    )
+                except PersistenceError as exc:
+                    # The bytes could not be durably recorded. Stop collecting
+                    # and report a truthful storage failure rather than dropping
+                    # evidence silently.
+                    storage_failed = True
+                    storage_error = str(exc)
+                    _kill_group(proc)
+                    break
+            if storage_failed:
+                break
 
             if timeout is not None and (time.monotonic() - start_monotonic) > timeout:
                 timed_out = True
@@ -348,13 +373,24 @@ def run_process_streaming(
                 rest = fd.read()
             except Exception:  # noqa: BLE001
                 rest = b""
-            if rest:
-                store.ingest(attempt=attempt, stream=name, chunk=rest)
+            if rest and not storage_failed:
+                try:
+                    store.ingest(
+                        attempt=attempt, stream=name, chunk=rest,
+                        run_id=run_id, task_id=task_id,
+                    )
+                except PersistenceError as exc:
+                    storage_failed = True
+                    storage_error = str(exc)
 
     returncode = proc.returncode
     duration_ns = _elapsed_ns(start_monotonic)
 
-    if timed_out:
+    if storage_failed:
+        termination = "storage_failed"
+        exit_code, sig = None, None
+        interrupted = True
+    elif timed_out:
         termination = "timed_out"
         exit_code, sig = None, None
         interrupted = True
@@ -363,20 +399,44 @@ def run_process_streaming(
         termination = "signaled" if sig is not None else "exited"
         interrupted = False
 
-    fact = store.finish_attempt(
-        run_id=run_id,
-        attempt=attempt,
-        task_id=task_id,
-        exit_code=exit_code,
-        signal=sig,
-        termination=termination,
-        duration_ns=duration_ns,
-        pid=pid,
-        started_at=started_at,
-        interrupted=interrupted,
-    )
+    try:
+        fact = store.finish_attempt(
+            run_id=run_id,
+            attempt=attempt,
+            task_id=task_id,
+            exit_code=exit_code,
+            signal=sig,
+            termination=termination,
+            duration_ns=duration_ns,
+            pid=pid,
+            started_at=started_at,
+            interrupted=interrupted,
+        )
+    except PersistenceError as exc:
+        # Sealing/recording could not be made durable. Surface a truthful
+        # storage-failure fact that is *not* recorded (so no false durable ack)
+        # and let the caller see degraded=True/last_error on the store.
+        storage_failed = True
+        storage_error = str(exc)
+        attempt_fact_cls = getattr(stream_mod, "AttemptFact")
+        fact = attempt_fact_cls(
+            run_id=run_id,
+            task_id=task_id,
+            attempt=attempt,
+            exit_code=None,
+            signal=None,
+            result_subtype="storage_failed",
+            termination="storage_failed",
+            duration_ns=duration_ns,
+            started_at=started_at,
+            completed_at=_iso_now(),
+            pid=pid,
+        )
+    message = ""
+    if storage_failed:
+        message = f"durable stream storage failed: {storage_error}"
     return _result_from_store(
-        store, cmd, attempt, run_id, task_id, fact, secrets, message="",
+        store, cmd, attempt, run_id, task_id, fact, secrets, message=message,
     )
 
 
@@ -391,10 +451,10 @@ def _result_from_store(
     *,
     message: str,
 ) -> StreamingResult:
-    out_summary = store.summary(attempt, "stdout")
-    err_summary = store.summary(attempt, "stderr")
-    stdout_bytes = store.spool(attempt, "stdout").read_retained()
-    stderr_bytes = store.spool(attempt, "stderr").read_retained()
+    out_summary = store.summary(attempt, "stdout", run_id=run_id, task_id=task_id)
+    err_summary = store.summary(attempt, "stderr", run_id=run_id, task_id=task_id)
+    stdout_bytes = store.spool(attempt, "stdout", run_id=run_id, task_id=task_id).read_retained()
+    stderr_bytes = store.spool(attempt, "stderr", run_id=run_id, task_id=task_id).read_retained()
     if not message:
         joined = " ".join(cmd)
         if fact.termination == "signaled":
@@ -439,6 +499,10 @@ def _result_from_store(
             "attempt": attempt,
             "stdout_backpressure_events": out_summary.backpressure_events,
             "stderr_backpressure_events": err_summary.backpressure_events,
+            "stdout_metadata_limited": out_summary.metadata_limited,
+            "stderr_metadata_limited": err_summary.metadata_limited,
+            "durable": getattr(store, "is_durable", False),
+            "persistence_mode": getattr(store, "persistence_mode", "memory"),
         },
     )
 

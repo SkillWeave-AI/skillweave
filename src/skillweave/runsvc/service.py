@@ -963,15 +963,15 @@ class RunApplicationService:
     # ------------------------------------------------------------------
     # Durable stream evidence (SW-1510-STREAM)
     #
-    # These methods sit beside ``execute`` (which is unchanged) so a caller can
-    # run a worker through the production streaming collector and then bind the
-    # raw evidence, the collected facts, and the gate into the same store and
-    # journal ``execute`` uses. They add no second authority: the durable stream
-    # is a bounded, cursor-addressed evidence channel, the gate is derived by the
-    # same completion contract, and the verifier remains separate.
+    # The *actual* protected native execution path is ``execute_streaming_native``
+    # below. Like ``execute`` it authenticates the worker at ingress, opens the
+    # real process-isolation window, and requires a durable stream store — never
+    # a memory-only fallback. The read methods expose the collected evidence and
+    # a narrow, caller-supplied collector interface the owning composed
+    # Assay/Scope lane can wire without this lane reaching into that checkout.
     # ------------------------------------------------------------------
 
-    def execute_streaming(
+    def execute_streaming_native(
         self,
         command: Sequence[str],
         *,
@@ -988,22 +988,50 @@ class RunApplicationService:
         secrets: Optional[Sequence[str]] = None,
         stdout_retain_limit: Optional[int] = None,
         stderr_retain_limit: Optional[int] = None,
-        env_allowlist: Optional[Sequence[str]] = None,
-        extra_env: Optional[dict[str, str]] = None,
+        authority_service: Optional[Any] = None,
+        worker_token: Optional[str] = None,
+        require_identity: bool = False,
     ) -> dict[str, Any]:
-        """Run ``command`` streaming its output into ``self.stream_store``.
+        """Protected native execution whose output is durably streamed.
 
-        This is the streaming sibling of :meth:`execute` and reuses every
-        authoritative primitive it uses — the same ``SQLiteRunStore``, the same
-        ``EventJournal``, the same ``RawArtifactStore``, the same independent
-        ``Verifier`` and ``CompletionContract`` — but the collection is the
-        durable per-attempt stream rather than a pair of flat strings. It does
-        not fork or replace the six-record path; it records the extra stream
-        evidence and the immutable measured facts alongside it.
+        This is the streaming sibling of :meth:`execute` and shares its
+        *authenticated* admission: the worker credential is verified at ingress
+        (``worker_token`` must verify against ``authority_service`` and bind to
+        this ``run_id``, carrying no approving role), and, when a credential is
+        present, the child is launched inside the real :class:`StoreProtection`
+        window the runner applies via ``wrap_command``. An authenticated
+        request therefore cannot silently run unsandboxed, and
+        ``require_identity=True`` forbids the unprotected path outright.
+
+        Streaming is durable or it does not run: this method refuses a
+        memory-only ``stream_store``, because a protected run whose evidence
+        vanishes with the process is not evidence.
+
+        Scope/envelope enforcement and the native Assay methodology are
+        *composed independently* by the owning lane; this method exposes the
+        narrow collector interface (:meth:`stream_read`, and the store the
+        runner writes) and does not guess that lane's uncommitted code.
         """
+        from skillweave.core.proc.runner import run_process_streaming
+
         if self.stream_store is None:
+            raise RunIntegrationError("stream", "no durable stream store is configured")
+        if not getattr(self.stream_store, "is_durable", False):
             raise RunIntegrationError(
-                "stream", "no durable stream store is configured"
+                "stream",
+                "the protected native path requires a durable stream store; a "
+                "memory-only store cannot silently stand in for persisted evidence",
+            )
+
+        credential = None
+        if authority_service is None and require_identity:
+            raise RunIntegrationError(
+                "identity",
+                "require_identity=True but no authority_service was supplied",
+            )
+        if authority_service is not None:
+            credential = self._authenticate_worker(
+                authority_service, worker_token=worker_token, run_id=run_id
             )
 
         created_at = created_at or datetime.now(timezone.utc).isoformat()
@@ -1016,10 +1044,7 @@ class RunApplicationService:
         CompletionContract = _runtime_attr("verify", "CompletionContract")
         GateState = _runtime_attr("verify", "GateState")
 
-        from skillweave.core.proc.runner import run_process_streaming
-
-        # Stage 1: Run, walked through its legal states up to verify (mirrors
-        # execute(); the child is a real subprocess spawned below).
+        # Stage 1: Run — walk the lane to ``verify`` under CAS, as ``execute`` does.
         self.store.create_run(run_id)
         for from_state, to_state in (
             ("preflight", "batch_selection"),
@@ -1037,37 +1062,51 @@ class RunApplicationService:
                 role="ops",
             )
 
-        # Stage 2: the production streaming spawn/collection.
+        # Stage 2: the real protected launch + durable streaming collection.
+        protection = None
         try:
-            result = run_process_streaming(
-                list(command),
-                run_id=run_id,
-                store=self.stream_store,
-                attempt=attempt,
-                task_id=task_id,
-                timeout=timeout,
-                secrets=list(secrets) if secrets else None,
-                stdout_retain_limit=stdout_retain_limit,
-                stderr_retain_limit=stderr_retain_limit,
-                env_allowlist=list(env_allowlist) if env_allowlist else None,
-                extra_env=extra_env,
-            )
-        except Exception as exc:  # noqa: BLE001 - a launch/stage failure is explicit
+            protection = self._open_worker_protection(credential, run_id)
+            wrap = None
+            if protection is not None:
+                def wrap(argv, _p=protection):
+                    return _p.wrap_command(
+                        argv, writable_scope=_p.writable_scope
+                    )
+            try:
+                result = run_process_streaming(
+                    list(command),
+                    run_id=run_id,
+                    store=self.stream_store,
+                    attempt=attempt,
+                    task_id=task_id,
+                    timeout=timeout,
+                    secrets=list(secrets) if secrets else None,
+                    stdout_retain_limit=stdout_retain_limit,
+                    stderr_retain_limit=stderr_retain_limit,
+                    wrap_command=wrap,
+                )
+            finally:
+                if protection is not None:
+                    protection.__exit__(None, None, None)
+        except RunIntegrationError:
+            raise
+        except Exception as exc:  # noqa: BLE001
             self._fail_run(run_id, f"streaming launch raised {exc}")
             raise RunIntegrationError("launch", str(exc)) from exc
 
         fact = result.fact
-        stdout_summary = self.stream_store.summary(attempt, "stdout")
-        stderr_summary = self.stream_store.summary(attempt, "stderr")
+        out_summary = self.stream_store.summary(
+            attempt, "stdout", run_id=run_id, task_id=task_id
+        )
+        err_summary = self.stream_store.summary(
+            attempt, "stderr", run_id=run_id, task_id=task_id
+        )
 
-        # Stage 3: raw artifacts — the *redacted convenience bytes* under the
-        # run's raw-artifact digest, and each stream's exact observed digest
-        # recorded as an attempt event on the journal (metadata-only).
+        # Stage 3: raw artifact — the stored convenience bytes (redacted text).
         raw_bytes = result.stdout_text.encode("utf-8", errors="replace")
         raw_digest = self.raw_artifacts.put(raw_bytes)
 
-        # Stage 4: journal — one attempt-fact event carrying the immutable
-        # measured facts and the exact stream digests, plus the artifact event.
+        # Stage 4: journal — the immutable facts and exact stream digests.
         self.journal.append(
             run_id,
             event_type=EventType.ARTIFACT_CREATED.value,
@@ -1080,8 +1119,9 @@ class RunApplicationService:
                 "result_subtype": fact.result_subtype,
                 "duration_ns": fact.duration_ns,
                 "attempt": attempt,
-                "stdout": stdout_summary.to_dict(),
-                "stderr": stderr_summary.to_dict(),
+                "task_id": task_id,
+                "stdout": out_summary.to_dict(),
+                "stderr": err_summary.to_dict(),
             },
         )
 
@@ -1110,21 +1150,21 @@ class RunApplicationService:
                 "termination": fact.termination,
                 "result_subtype": fact.result_subtype,
                 "duration_ns": fact.duration_ns,
-                "stdout_digest": stdout_summary.digest,
-                "stderr_digest": stderr_summary.digest,
-                "stdout_observed_bytes": stdout_summary.observed_bytes,
-                "stderr_observed_bytes": stderr_summary.observed_bytes,
-                "stdout_incompleteness": stdout_summary.incompleteness,
-                "stderr_incompleteness": stderr_summary.incompleteness,
+                "stdout_digest": out_summary.digest,
+                "stderr_digest": err_summary.digest,
+                "stdout_observed_bytes": out_summary.observed_bytes,
+                "stderr_observed_bytes": err_summary.observed_bytes,
+                "stdout_incompleteness": out_summary.incompleteness,
+                "stderr_incompleteness": err_summary.incompleteness,
             },
         )
         saved_receipt = self.store.save_evidence(receipt)
 
-        # Stage 6: verification — a separate verifier over the *observed* stdout
-        # bytes (not the retained prefix), so an incomplete stream is graded on
-        # what was actually observed.
+        # Stage 6: verification — a separate verifier over the *observed* bytes.
+        observed_stdout = self.stream_store.spool(
+            attempt, "stdout", run_id=run_id, task_id=task_id
+        ).read_retained()
         verifier = Verifier()
-        observed_stdout = self.stream_store.spool(attempt, "stdout").read_retained()
         verdict = verifier.assess(
             saved_receipt.artifact_id,
             exit_code=fact.exit_code,
@@ -1148,8 +1188,7 @@ class RunApplicationService:
             check_output=check_output,
         )
 
-        # Terminal state: route through the lane's legal gate state (unchanged
-        # transition discipline from execute()).
+        # Terminal state: legal gate route (unchanged transition discipline).
         current = self.store.get_run(run_id)
         gate_stage = "review_gate" if gate_state == GateState.PASS else "fix_retry"
         stop_reason = None if gate_state == GateState.PASS else "before_gate"
@@ -1178,6 +1217,7 @@ class RunApplicationService:
 
         return {
             "run_id": run_id,
+            "task_id": task_id,
             "attempt": attempt,
             "result": result,
             "fact": fact,
@@ -1186,8 +1226,58 @@ class RunApplicationService:
             "receipt": saved_receipt,
             "verification": verdict_receipt,
             "gate_state": gate_state,
-            "stdout_summary": stdout_summary,
-            "stderr_summary": stderr_summary,
+            "stdout_summary": out_summary,
+            "stderr_summary": err_summary,
+            "durable": True,
+        }
+
+    # -- narrow collector interface for the owning composed lane ------------
+    #
+
+    def stream_read(
+        self,
+        run_id: str,
+        *,
+        attempt: int = 1,
+        task_id: str = "task-1",
+        after_cursor: int = 0,
+    ) -> dict[str, Any]:
+        """Read one attempt's durable evidence through the collector interface.
+
+        This is the narrow seam the *owning* Assay/Scope lane wires after this
+        lane's clean candidate completes: it returns the retained streams, their
+        exact digests, typed incompleteness, the immutable fact and the ordered
+        cursor. It makes no scope/envelope decision and reads no other lane's
+        code.
+        """
+        if self.stream_store is None:
+            return {"run_id": run_id, "durable": False, "status": "no stream store"}
+        store = self.stream_store
+        out = store.summary(attempt, "stdout", run_id=run_id, task_id=task_id)
+        err = store.summary(attempt, "stderr", run_id=run_id, task_id=task_id)
+        fact = store.fact(attempt, run_id=run_id, task_id=task_id)
+        frames = store.frames(
+            after_cursor, run_id=run_id, task_id=task_id
+        )
+        return {
+            "run_id": run_id,
+            "task_id": task_id,
+            "attempt": attempt,
+            "durable": getattr(store, "is_durable", False),
+            "persistence_mode": getattr(store, "persistence_mode", "memory"),
+            "degraded": getattr(store, "degraded", False),
+            "cursor": store.cursor,
+            "latest_cursor": frames[-1].cursor if frames else after_cursor,
+            "stdout": out.to_dict(),
+            "stderr": err.to_dict(),
+            "fact": fact.to_dict() if fact is not None else None,
+            "retained_stdout": store.spool(
+                attempt, "stdout", run_id=run_id, task_id=task_id
+            ).read_retained(),
+            "retained_stderr": store.spool(
+                attempt, "stderr", run_id=run_id, task_id=task_id
+            ).read_retained(),
+            "is_full_evidence": True,
         }
 
     def stream_frames(
@@ -1196,19 +1286,23 @@ class RunApplicationService:
         *,
         after_cursor: int = 0,
         limit: Optional[int] = None,
+        task_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """Ordered cursor-based progress frames for ``run_id`` (SW-1510-STREAM).
+        """Ordered cursor-based progress frames for ``run_id``.
 
         A reconnecting consumer resumes from ``after_cursor`` and receives
-        exactly the frames it has not seen. The frames are the interleaved
-        durable stream evidence (stdout/stderr/facts), never a preview.
+        exactly the frames it has not seen: the interleaved durable stream
+        evidence, never a preview.
         """
         if self.stream_store is None:
             return []
         snapshot = _runtime_attr("snapshot", "progress_frames")
         return [
             frame.to_dict()
-            for frame in snapshot(self.stream_store, run_id, after_cursor=after_cursor, limit=limit)
+            for frame in snapshot(
+                self.stream_store, run_id,
+                after_cursor=after_cursor, limit=limit, task_id=task_id,
+            )
         ]
 
     def stream_preview(
@@ -1217,6 +1311,7 @@ class RunApplicationService:
         *,
         after_cursor: int = 0,
         max_bytes: int = 1024,
+        task_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """A bounded preview over ``run_id``'s progress, never the raw evidence.
 
@@ -1231,7 +1326,8 @@ class RunApplicationService:
             }
         preview = _runtime_attr("snapshot", "preview_frames")
         return preview(
-            self.stream_store, run_id, after_cursor=after_cursor, max_bytes=max_bytes
+            self.stream_store, run_id,
+            after_cursor=after_cursor, max_bytes=max_bytes, task_id=task_id,
         )
 
     def stream_attempt_events(
