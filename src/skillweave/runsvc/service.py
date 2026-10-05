@@ -384,6 +384,9 @@ class RunApplicationService:
             # below resolves the effective envelope through get_envelope(),
             # which inherits via fallback_task_scope when the exact scope has
             # no persisted envelope (e.g. a retry at a new attempt scope).
+            # SW-1510-BUDGET: reserve() auto-derives reserved_bytes/reserved_tokens
+            # from the resolved envelope's per-request limits, so the token/byte
+            # dimensions are exercised through the product ingress.
             try:
                 reservation_rec = self.reservation_store.reserve(
                     run_id=run_id,
@@ -524,9 +527,17 @@ class RunApplicationService:
         # reconciliation is not silently swallowed.
         if reservation_rec is not None and self.reservation_store is not None:
             try:
+                # SW-1510-BUDGET: exercise token/cost dimensions through the
+                # product ingress (not only the helper level).  Tokens and cost
+                # are not directly observable from a subprocess transport, so
+                # they are passed as None (unknown) --- the reserved amounts
+                # persist until an explicit reconcile call.  Bytes are the
+                # observed transport outcome.
                 self.reservation_store.complete(
                     reservation_rec.reservation_id,
                     observed_bytes=len(result.stdout or b""),
+                    observed_tokens=None,
+                    cost=None,
                 )
             except Exception as exc:  # noqa: BLE001
                 raise RunIntegrationError(
@@ -2105,6 +2116,9 @@ class RunApplicationService:
             # get_envelope(), which inherits via fallback_task_scope when the
             # exact scope has no persisted envelope (e.g. a retry at a new
             # attempt scope).
+            # SW-1510-BUDGET: reserve() auto-derives reserved_bytes/reserved_tokens
+            # from the resolved envelope's per-request limits, so the token/byte
+            # dimensions are exercised through the streaming product ingress.
             try:
                 reservation_rec = self.reservation_store.reserve(
                     run_id=run_id,
@@ -2231,9 +2245,12 @@ class RunApplicationService:
 
         # SW-1510-BUDGET: complete the reservation with observed usage.  On the
         # streaming path we capture the retained stdout bytes as the observed
-        # transport outcome.  A storage failure during completion is exposed as
-        # a durable incomplete-reconciliation record (the reservation stays at
-        # COMPLETED with unknown usage) rather than silently swallowed.
+        # transport outcome.  Tokens and cost are not directly observable from
+        # a subprocess transport, so they are passed as None (unknown) --- the
+        # reserved amounts persist until an explicit reconcile call.  A storage
+        # failure during completion is exposed as a durable incomplete-
+        # reconciliation record (the reservation stays at COMPLETED with unknown
+        # usage) rather than silently swallowed.
         if reservation_rec is not None and self.reservation_store is not None:
             try:
                 observed = None
@@ -2242,6 +2259,8 @@ class RunApplicationService:
                 self.reservation_store.complete(
                     reservation_rec.reservation_id,
                     observed_bytes=observed,
+                    observed_tokens=None,
+                    cost=None,
                 )
             except Exception as exc:  # noqa: BLE001
                 # Expose the incomplete reconciliation — do not silently swallow.

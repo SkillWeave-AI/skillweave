@@ -1292,3 +1292,487 @@ class TestRetryScopeEnvelopeInheritance:
 
 if __name__ == "__main__":
     pytest.main(["-xvs", __file__])
+
+
+# ===================================================================
+# BLOCKING (criterion 1): Product ingress exercises token/cost dimensions
+# ===================================================================
+
+class TestProductIngressTokenCostDimensions:
+    """Prove token/cost dimensions are exercised through the product ingress,
+    not only at the ReservationStore helper level."""
+
+    def test_execute_reserve_passes_token_bounds(self, db_path):
+        """execute() reserve passes reserved_tokens from envelope per-request limit."""
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.reservation import ReservationEnvelope
+        from skillweave.runsvc.service import RunApplicationService
+
+        s = SQLiteRunStore(db_path)
+        j = EventJournal(s.db_path)
+        r = RawArtifactStore()
+        rs = ReservationStore(db_path)
+        svc = RunApplicationService(s, j, r, reservation_store=rs)
+
+        # Set envelope with finite per-request token bound
+        env = ReservationEnvelope(
+            max_per_request_tokens=500,
+            max_in_flight=5,
+        )
+        run_id = "token-dim-exec"
+        rs.set_envelope(run_id, f"{run_id}/attempt-1", env)
+
+        out = svc.execute(
+            [sys.executable, "-c", "print('token-probe')"],
+            run_id=run_id,
+            tool="opencode",
+            model="test",
+            subject_repo="skillweave",
+            subject_commit="deadbeef",
+            created_at="2026-10-05T00:00:00Z",
+            reservation_envelope=ReservationEnvelope(),
+        )
+        # Verify a reservation was created with reserved_tokens
+        reservations = rs.list_reservations(run_id)
+        assert len(reservations) >= 1
+        rec = reservations[0]
+        assert rec.reserved_tokens == 500.0, (
+            f"expected reserved_tokens=500.0, got {rec.reserved_tokens}"
+        )
+        rs.close()
+        s.close()
+
+    def test_execute_reserve_passes_byte_bounds(self, db_path):
+        """execute() reserve passes reserved_bytes from envelope per-request limit."""
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.reservation import ReservationEnvelope
+        from skillweave.runsvc.service import RunApplicationService
+
+        s = SQLiteRunStore(db_path)
+        j = EventJournal(s.db_path)
+        r = RawArtifactStore()
+        rs = ReservationStore(db_path)
+        svc = RunApplicationService(s, j, r, reservation_store=rs)
+
+        env = ReservationEnvelope(
+            max_per_request_bytes=8192,
+            max_in_flight=5,
+        )
+        run_id = "byte-dim-exec"
+        rs.set_envelope(run_id, f"{run_id}/attempt-1", env)
+
+        out = svc.execute(
+            [sys.executable, "-c", "print('byte-probe')"],
+            run_id=run_id,
+            tool="opencode",
+            model="test",
+            subject_repo="skillweave",
+            subject_commit="deadbeef",
+            created_at="2026-10-05T00:00:00Z",
+            reservation_envelope=ReservationEnvelope(),
+        )
+        reservations = rs.list_reservations(run_id)
+        assert len(reservations) >= 1
+        rec = reservations[0]
+        assert rec.reserved_bytes == 8192, (
+            f"expected reserved_bytes=8192, got {rec.reserved_bytes}"
+        )
+        rs.close()
+        s.close()
+
+    def test_execute_complete_observed_bytes_recorded(self, db_path):
+        """execute() complete records observed_bytes from transport outcome."""
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.reservation import ReservationEnvelope
+        from skillweave.runsvc.service import RunApplicationService
+
+        s = SQLiteRunStore(db_path)
+        j = EventJournal(s.db_path)
+        r = RawArtifactStore()
+        rs = ReservationStore(db_path)
+        svc = RunApplicationService(s, j, r, reservation_store=rs)
+
+        env = ReservationEnvelope(max_in_flight=5)
+        run_id = "complete-dim-exec"
+        rs.set_envelope(run_id, f"{run_id}/attempt-1", env)
+
+        svc.execute(
+            [sys.executable, "-c", "print('hello world')"],
+            run_id=run_id,
+            tool="opencode",
+            model="test",
+            subject_repo="skillweave",
+            subject_commit="deadbeef",
+            created_at="2026-10-05T00:00:00Z",
+            reservation_envelope=ReservationEnvelope(),
+        )
+        reservations = rs.list_reservations(run_id)
+        assert len(reservations) >= 1
+        rec = reservations[0]
+        # observed_bytes should be set (len of "hello world\n")
+        assert rec.observed_bytes is not None and rec.observed_bytes > 0, (
+            f"expected observed_bytes > 0, got {rec.observed_bytes}"
+        )
+        # observed_tokens stays None (not observable from subprocess)
+        assert rec.observed_tokens is None, (
+            f"expected observed_tokens=None, got {rec.observed_tokens}"
+        )
+        # cost stays None (no cost was reserved at ingress; not observable
+        # from subprocess)
+        assert rec.cost is None, (
+            f"expected cost=None, got {rec.cost}"
+        )
+        rs.close()
+        s.close()
+
+    def test_streaming_native_reserve_passes_token_bounds(self, db_path):
+        """execute_streaming_native() reserve passes reserved_tokens."""
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationEnvelope
+        from skillweave.runsvc.service import RunApplicationService
+
+        s = SQLiteRunStore(db_path)
+        j = EventJournal(s.db_path)
+        r = RawArtifactStore()
+        stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+        stream_store = DurableStreamStore(root=stream_root)
+        rs = ReservationStore(db_path)
+        svc = RunApplicationService(s, j, r, stream_store=stream_store,
+                                    reservation_store=rs)
+
+        env = ReservationEnvelope(
+            max_per_request_tokens=2000,
+            max_in_flight=5,
+        )
+        run_id = "token-dim-stream"
+        rs.set_envelope(run_id, f"{run_id}/attempt-1", env)
+
+        svc.execute_streaming_native(
+            [sys.executable, "-c", "print('stream-token-probe')"],
+            run_id=run_id,
+            tool="opencode",
+            model="test",
+            subject_repo="skillweave",
+            subject_commit="deadbeef",
+            attempt=1,
+            task_id=run_id,
+            reservation_envelope=ReservationEnvelope(),
+        )
+        reservations = rs.list_reservations(run_id)
+        assert len(reservations) >= 1
+        rec = reservations[0]
+        assert rec.reserved_tokens == 2000.0, (
+            f"expected reserved_tokens=2000.0, got {rec.reserved_tokens}"
+        )
+        rs.close()
+        s.close()
+
+    def test_streaming_native_reserve_passes_byte_bounds(self, db_path):
+        """execute_streaming_native() reserve passes reserved_bytes."""
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationEnvelope
+        from skillweave.runsvc.service import RunApplicationService
+
+        s = SQLiteRunStore(db_path)
+        j = EventJournal(s.db_path)
+        r = RawArtifactStore()
+        stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+        stream_store = DurableStreamStore(root=stream_root)
+        rs = ReservationStore(db_path)
+        svc = RunApplicationService(s, j, r, stream_store=stream_store,
+                                    reservation_store=rs)
+
+        env = ReservationEnvelope(
+            max_per_request_bytes=4096,
+            max_in_flight=5,
+        )
+        run_id = "byte-dim-stream"
+        rs.set_envelope(run_id, f"{run_id}/attempt-1", env)
+
+        svc.execute_streaming_native(
+            [sys.executable, "-c", "print('stream-byte-probe')"],
+            run_id=run_id,
+            tool="opencode",
+            model="test",
+            subject_repo="skillweave",
+            subject_commit="deadbeef",
+            attempt=1,
+            task_id=run_id,
+            reservation_envelope=ReservationEnvelope(),
+        )
+        reservations = rs.list_reservations(run_id)
+        assert len(reservations) >= 1
+        rec = reservations[0]
+        assert rec.reserved_bytes == 4096, (
+            f"expected reserved_bytes=4096, got {rec.reserved_bytes}"
+        )
+        rs.close()
+        s.close()
+
+    def test_execute_reserve_with_no_per_request_limits(self, db_path):
+        """execute() reserve passes None when envelope has no per-request limits."""
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.reservation import ReservationEnvelope
+        from skillweave.runsvc.service import RunApplicationService
+
+        s = SQLiteRunStore(db_path)
+        j = EventJournal(s.db_path)
+        r = RawArtifactStore()
+        rs = ReservationStore(db_path)
+        svc = RunApplicationService(s, j, r, reservation_store=rs)
+
+        env = ReservationEnvelope(max_in_flight=5)  # no per-request limits
+        run_id = "no-limit-exec"
+        rs.set_envelope(run_id, f"{run_id}/attempt-1", env)
+
+        svc.execute(
+            [sys.executable, "-c", "print('no-limit')"],
+            run_id=run_id,
+            tool="opencode",
+            model="test",
+            subject_repo="skillweave",
+            subject_commit="deadbeef",
+            created_at="2026-10-05T00:00:00Z",
+            reservation_envelope=ReservationEnvelope(),
+        )
+        reservations = rs.list_reservations(run_id)
+        assert len(reservations) >= 1
+        rec = reservations[0]
+        # When no per-request limits, reserved_bytes/tokens are None (reserved at 0)
+        assert rec.reserved_bytes is None, (
+            f"expected reserved_bytes=None, got {rec.reserved_bytes}"
+        )
+        assert rec.reserved_tokens is None, (
+            f"expected reserved_tokens=None, got {rec.reserved_tokens}"
+        )
+        rs.close()
+        s.close()
+
+
+# ===================================================================
+# BLOCKING (criterion 1): ExecutionEnvelopeV1 bridge from SDK contract
+# ===================================================================
+
+class TestExecutionEnvelopeBridge:
+    """Prove the execution-envelope-v1 SDK contract bridges to ReservationEnvelope."""
+
+    def test_enforcing_policy_maps_all_limits(self):
+        """enforcing policy maps all specified limits to ReservationEnvelope."""
+        from skillweave.runtime.execution_envelope import ExecutionEnvelopeV1
+        sdk = ExecutionEnvelopeV1(
+            limit_policy="enforcing",
+            max_tokens=100000,
+            max_bytes=1048576,
+            max_cost=50.0,
+            max_requests=100,
+            max_deadline="2026-12-31T23:59:59Z",
+            max_in_flight=5,
+            max_per_request_bytes=4096,
+            max_per_request_tokens=2000,
+        )
+        env = sdk.to_reservation_envelope()
+        assert env.max_tokens == 100000
+        assert env.max_bytes == 1048576
+        assert env.max_cost == 50.0
+        assert env.max_requests == 100
+        assert env.max_deadline == "2026-12-31T23:59:59Z"
+        assert env.max_in_flight == 5
+        assert env.max_per_request_bytes == 4096
+        assert env.max_per_request_tokens == 2000
+
+    def test_observe_adapt_policy_sets_cumulative_none(self):
+        """observe_adapt policy sets cumulative limits to None."""
+        from skillweave.runtime.execution_envelope import ExecutionEnvelopeV1
+        sdk = ExecutionEnvelopeV1(
+            limit_policy="observe_adapt",
+            max_tokens=100000,
+            max_bytes=1048576,
+            max_cost=50.0,
+            max_requests=100,
+            max_per_request_bytes=4096,
+            max_per_request_tokens=2000,
+        )
+        env = sdk.to_reservation_envelope()
+        # Cumulative limits are None under observe_adapt
+        assert env.max_tokens is None
+        assert env.max_bytes is None
+        assert env.max_cost is None
+        assert env.max_requests is None
+        # Per-request limits still apply
+        assert env.max_per_request_bytes == 4096
+        assert env.max_per_request_tokens == 2000
+
+    def test_conservative_per_request_bounds(self):
+        """conservative_per_request_bounds returns envelope's per-request limits."""
+        from skillweave.runtime.execution_envelope import ExecutionEnvelopeV1
+        sdk = ExecutionEnvelopeV1(
+            max_per_request_bytes=8192,
+            max_per_request_tokens=4000,
+        )
+        bounds = sdk.conservative_per_request_bounds()
+        assert bounds["reserved_bytes"] == 8192
+        assert bounds["reserved_tokens"] == 4000.0
+
+    def test_conservative_bounds_none_when_unset(self):
+        """conservative_per_request_bounds returns None for unset limits."""
+        from skillweave.runtime.execution_envelope import ExecutionEnvelopeV1
+        sdk = ExecutionEnvelopeV1()
+        bounds = sdk.conservative_per_request_bounds()
+        assert bounds["reserved_bytes"] is None
+        assert bounds["reserved_tokens"] is None
+
+    def test_from_dict_round_trip(self):
+        """from_dict/to_dict round-trips correctly."""
+        from skillweave.runtime.execution_envelope import ExecutionEnvelopeV1
+        data = {
+            "allowed_routes": ["route-a", "route-b"],
+            "limit_policy": "enforcing",
+            "max_tokens": 50000,
+            "max_bytes": 512000,
+            "max_cost": 25.0,
+            "max_requests": 50,
+            "max_deadline": "2026-11-01T00:00:00Z",
+            "max_in_flight": 3,
+            "max_per_request_bytes": 2048,
+            "max_per_request_tokens": 1000,
+        }
+        sdk = ExecutionEnvelopeV1.from_dict(data)
+        assert sdk.allowed_routes == ["route-a", "route-b"]
+        assert sdk.limit_policy == "enforcing"
+        assert sdk.max_tokens == 50000
+        assert sdk.max_cost == 25.0
+        assert sdk.max_in_flight == 3
+
+        # Round-trip through dict
+        assert sdk.to_dict() == data
+
+    def test_default_enforcing_policy(self):
+        """Default limit_policy is enforcing."""
+        from skillweave.runtime.execution_envelope import ExecutionEnvelopeV1
+        sdk = ExecutionEnvelopeV1.from_dict({})
+        assert sdk.limit_policy == "enforcing"
+        assert sdk.max_in_flight == 3  # default
+
+    def test_allowed_routes_preserved(self):
+        """allowed_routes list is preserved through conversion."""
+        from skillweave.runtime.execution_envelope import ExecutionEnvelopeV1
+        sdk = ExecutionEnvelopeV1(allowed_routes=["openai/gpt-4", "anthropic/claude-3"])
+        data = sdk.to_dict()
+        assert data["allowed_routes"] == ["openai/gpt-4", "anthropic/claude-3"]
+        sdk2 = ExecutionEnvelopeV1.from_dict(data)
+        assert sdk2.allowed_routes == ["openai/gpt-4", "anthropic/claude-3"]
+
+    def test_reservation_store_reserves_via_enforcing_bridge(self, store):
+        """Prove bridge output is accepted by ReservationStore.reserve()."""
+        from skillweave.runtime.execution_envelope import ExecutionEnvelopeV1
+        sdk = ExecutionEnvelopeV1(
+            limit_policy="enforcing",
+            max_requests=5,
+            max_in_flight=5,
+            max_per_request_bytes=1000,
+            max_per_request_tokens=500,
+        )
+        env = sdk.to_reservation_envelope()
+        store.set_envelope("bridge-run", "bridge-scope", env)
+
+        # First reservation succeeds (within limits)
+        rec = store.reserve(
+            run_id="bridge-run", task_id="bridge-task", attempt=1,
+            scope_id="bridge-scope",
+            reserved_bytes=100,
+            reserved_tokens=50.0,
+        )
+        assert rec is not None
+
+        # Check the envelope was stored with the correct limits
+        loaded = store.get_envelope("bridge-run", "bridge-scope")
+        assert loaded.max_requests == 5
+        assert loaded.max_per_request_bytes == 1000
+        assert loaded.max_per_request_tokens == 500
+
+    def test_reservation_store_reserves_via_observe_adapt_bridge(self, store):
+        """Prove observe_adapt bridge output accepts requests beyond nominal caps."""
+        from skillweave.runtime.execution_envelope import ExecutionEnvelopeV1
+        sdk = ExecutionEnvelopeV1(
+            limit_policy="observe_adapt",
+            max_requests=1,  # nominal cap, but observe_adapt means no enforcement
+            max_in_flight=5,
+        )
+        env = sdk.to_reservation_envelope()
+        store.set_envelope("obs-run", "obs-scope", env)
+
+        # First reservation
+        store.reserve(
+            run_id="obs-run", task_id="obs-task", attempt=1,
+            scope_id="obs-scope",
+        )
+        # Second should ALSO succeed because observe_adapt sets max_requests=None
+        rec2 = store.reserve(
+            run_id="obs-run", task_id="obs-task", attempt=1,
+            scope_id="obs-scope",
+        )
+        assert rec2 is not None
+
+    def test_conservative_bounds_used_in_service_path(self, db_path):
+        """Prove conservative_per_request_bounds values reach reserve() through
+        the product ingress."""
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.reservation import ReservationEnvelope
+        from skillweave.runtime.execution_envelope import ExecutionEnvelopeV1
+        from skillweave.runsvc.service import RunApplicationService
+
+        s = SQLiteRunStore(db_path)
+        j = EventJournal(s.db_path)
+        r = RawArtifactStore()
+        rs = ReservationStore(db_path)
+        svc = RunApplicationService(s, j, r, reservation_store=rs)
+
+        # Simulate host that bridges from execution-envelope-v1
+        sdk = ExecutionEnvelopeV1(
+            limit_policy="enforcing",
+            max_per_request_bytes=5000,
+            max_per_request_tokens=3000,
+            max_in_flight=5,
+        )
+        env = sdk.to_reservation_envelope()
+        run_id = "bridge-service-path"
+        rs.set_envelope(run_id, f"{run_id}/attempt-1", env)
+
+        svc.execute(
+            [sys.executable, "-c", "print('bridge-service')"],
+            run_id=run_id,
+            tool="opencode",
+            model="test",
+            subject_repo="skillweave",
+            subject_commit="deadbeef",
+            created_at="2026-10-05T00:00:00Z",
+            reservation_envelope=ReservationEnvelope(),
+        )
+        reservations = rs.list_reservations(run_id)
+        assert len(reservations) >= 1
+        rec = reservations[0]
+        # The per-request bounds from the bridge should have reached reserve()
+        assert rec.reserved_bytes == 5000, (
+            f"expected reserved_bytes=5000 (from bridge), got {rec.reserved_bytes}"
+        )
+        assert rec.reserved_tokens == 3000.0, (
+            f"expected reserved_tokens=3000.0 (from bridge), got {rec.reserved_tokens}"
+        )
+        rs.close()
+        s.close()

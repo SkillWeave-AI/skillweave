@@ -647,6 +647,17 @@ class ReservationStore:
         else:
             env = ReservationEnvelope()  # unlimited defaults
 
+        # SW-1510-BUDGET: auto-derive reserved_bytes/reserved_tokens from the
+        # resolved envelope's per-request limits when not explicitly provided.
+        # This ensures the token/byte dimensions are always exercised through
+        # the product ingress, not only at the helper level.  When the resolved
+        # envelope has no per-request limit for a dimension, the caller's
+        # explicit value (or None) is preserved.
+        if reserved_bytes is None and env.max_per_request_bytes is not None:
+            reserved_bytes = env.max_per_request_bytes
+        if reserved_tokens is None and env.max_per_request_tokens is not None:
+            reserved_tokens = float(env.max_per_request_tokens)
+
         now = datetime.now(timezone.utc).isoformat()
         reservation_id = str(uuid.uuid4())
 
