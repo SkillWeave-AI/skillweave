@@ -73,6 +73,35 @@ from skillweave.runtime.write_scope import (  # noqa: E402
     scope_from_work_contract,
 )
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _assay_evidence import (  # noqa: E402
+    genuine_artifact,
+    reader_for,
+    write_analysis_tree,
+    write_git_source_tree,
+)
+
+
+def _assay_evidence(base):
+    """A genuine artifact proof bound to a real git source tree.
+
+    SW-1510-VERIFY: the native Assay PASS consumer requires artifact-specific
+    semantics, so an assay positive control supplies a real proof graph whose
+    file/analysis digests are recomputed from the bytes on disk (and a real
+    40-hex commit from the fresh repository the resolver reads).
+    """
+    from skillweave.runtime.verify import GitSourceResolver
+
+    src = Path(base) / "assay-src"
+    ana = Path(base) / "assay-analysis"
+    files, commit = write_git_source_tree(src)
+    analysis = write_analysis_tree(ana, files)
+    return {
+        "artifact_evidence": [genuine_artifact(files, analysis, commit=commit)],
+        "source_resolver": GitSourceResolver(src, commit=commit),
+        "analysis_reader": reader_for(analysis),
+    }
+
 #: The strongest real adapter on this host. Tests that need kernel-enforced
 #: write isolation are skipped when the host offers none (the HOLD tests still
 #: run - they are exactly the "no real isolation" case).
@@ -752,10 +781,11 @@ def test_service_assay_run_enforces_admission_and_records_turn_limit(tmp_path):
         worker_token=token,
         assay_actor_token=token,
         assay_envelope=envelope,
+        **_assay_evidence(tmp_path),
     )
     assert result.assay["outcome"] == "pass"
     assert [p["phase"] for p in result.assay["phases"]] == [
-        "pin", "hypothesis", "probe", "measure", "classify", "pass"
+        "pin", "hypothesis", "probe", "measure", "classify", "artifact_verify", "pass"
     ]
 
 
@@ -834,8 +864,9 @@ def test_service_assay_run_legacy_path_needs_no_actor(tmp_path):
         subject_commit="c",
         methodology="assay",
         autonomy_policy="unicorn",
+        **_assay_evidence(tmp_path),
     )
     assert result.assay["outcome"] == "pass"
-    assert [p["phase"] for p in result.assay["phases"]][:5] == [
-        "pin", "hypothesis", "probe", "measure", "classify"
+    assert [p["phase"] for p in result.assay["phases"]][:6] == [
+        "pin", "hypothesis", "probe", "measure", "classify", "artifact_verify"
     ]
