@@ -4,7 +4,7 @@ experimental: true
 name: skillweave-promptchain-execute
 type: orchestration
 description: Execute SkillWeave sequences with dependency-aware batches, controlled parallelism, retries, evidence, and binary gates.
-argument-hint: sequence="[prompt sequence]" inputs="[JSON]" execution_mode="[auto/rex/ralph_attended/ralph_overnight]" audience_mode="[auto/humanize/machinize/mixed]" risk_mode="[conservative/medium/unicorn]" (or attach .md/.txt file)
+argument-hint: sequence="[prompt sequence]" inputs="[JSON]" methodology="[rex/ralph/gauntlet/assay]" autonomy_policy="[conservative/medium/unicorn]" session_schedule="[batch/phase/none]" execution_mode="[auto/rex/ralph_attended/ralph_overnight] (legacy adapter]" audience_mode="[auto/humanize/machinize/mixed]" risk_mode="[conservative/medium/unicorn]" (or attach .md/.txt file)
 ---
 
 # /skillweave-promptchain-execute
@@ -70,13 +70,18 @@ skillweave-promptchain-execute inputs='{"key":"value"}'
 
 - `sequence` (optional if file attached): Prompt sequence text
 - `inputs` (required): JSON object with required runtime inputs
-- `execution_mode` (optional): `auto`, `rex`, `ralph_attended`, `ralph_overnight`
+- `methodology` (optional): The native execution methodology - `rex`, `ralph`, `gauntlet`, `assay`. **Assay is preserved, never silently substituted by Ralph.** Declared separately from the two fields below.
+- `autonomy_policy` (optional): The methodology's own autonomy axis - `conservative`, `medium`, `unicorn` (`unicorn` is Assay's declared default). Separate from `methodology`.
+- `session_schedule` (optional): Session scheduling, separate again from both.
+- `execution_mode` (optional, **legacy adapter**): `auto`, `rex`, `ralph_attended`, `ralph_overnight`. Accepted only when it agrees with the declared `methodology`; refused (`legacy_would_substitute_methodology`) when it would route execution elsewhere.
 - `audience_mode` (optional): `auto`, `humanize`, `machinize`, `mixed`
 - `risk_mode` (optional): `conservative`, `medium`, `unicorn` - overrides environment variable and config files
 
 Default:
 
-- `execution_mode = auto`
+- `methodology` = the sequence's declared methodology (the legacy `execution_mode` adapter is consulted only when no native methodology is declared)
+- `autonomy_policy` = `unicorn` for Assay, empty otherwise (never invented)
+- `session_schedule` = the declared `session_boundary`, else `batch`
 - `audience_mode = auto`
 - `risk_mode = medium` (unless overridden by environment variable or config)
 
@@ -90,19 +95,44 @@ Sequence type describes the nature of the work:
 - `build`: code, config, tests, infra, docs tied to implementation
 - `mixed`: both plan and build steps are materially present
 
-### 2. Execution Mode
+### 2. Methodology, Autonomy Policy and Schedule
 
-Execution mode describes how the work should be carried out:
+The execution intent is **three separate fields**, never one conflated mode
+string (this mirrors `runtime/snapshot.py`, where `methodology`,
+`autonomy_policy` and `session_schedule` are distinct):
 
-- `rex`: fast path for small, low-risk, mostly linear work
-- `ralph_attended`: default for substantial repo work with active checkpoints
-- `ralph_overnight`: autonomous multi-batch execution for large, well-structured sequences
+- `methodology` describes how the work is carried out. It is one of `rex`,
+  `ralph`, `gauntlet`, `assay`. **Assay is a first-class methodology and is
+  never silently substituted by Ralph** — the declared value is preserved end
+  to end.
+- `autonomy_policy` is the methodology's own autonomy axis (`conservative`,
+  `medium`, `unicorn`); `unicorn` is Assay's declared default. It is not a
+  methodology.
+- `session_schedule` describes where a session may stop and resume.
 
-`mixed` is **not** an execution mode. It is only a sequence-type classification.
+### 2a. Execution Mode (legacy adapter)
+
+`execution_mode` (`rex`, `ralph_attended`, `ralph_overnight`) is retained as an
+**explicit legacy adapter** over the methodology axis:
+
+- `rex` → methodology `rex`
+- `ralph_attended` → methodology `ralph`
+- `ralph_overnight` → methodology `ralph`
+
+The adapter is **fail-closed**: a legacy `execution_mode` (or PRD
+`suggested_workflow`) that denotes a *different* methodology than the sequence
+declares is refused with a `legacy_would_substitute_methodology` error, and an
+unknown value is refused rather than coerced. A legacy mode therefore never
+silently routes execution to Ralph.
+
+`mixed` is **not** a methodology or an execution mode. It is only a
+sequence-type classification.
 
 ## Mode Resolution
 
-If `execution_mode=auto`, choose as follows:
+When no native `methodology` is declared, resolve the legacy `execution_mode`
+(`auto` = choose as follows); when a native `methodology` is declared it is
+authoritative and this legacy resolution applies only where it agrees:
 
 ### Use `rex` when:
 

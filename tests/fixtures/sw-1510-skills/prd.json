@@ -1,0 +1,133 @@
+{
+  "projectName": "SW-1510-SKILLS source-owned chain fixture",
+  "version": "1.0",
+  "status": "ready",
+  "created": "2026-10-05",
+  "sequence": {
+    "sequence_id": "sw-1510-skills-fixture",
+    "sequence_type": "build",
+    "execution_mode": "",
+    "session_boundary": "batch",
+    "methodology": "assay",
+    "autonomy_policy": "unicorn",
+    "session_schedule": "batch",
+    "worktree": "checkouts/SW-1510-SKILLS/skillweave",
+    "branch": "fix/sw1510-recovery-skills",
+    "base": "1e71266bbfd0368835f9f3e917f25c36071a2bc3",
+    "state_file": ".sw1510-skills-state.md",
+    "runner_shell": "bash -eo pipefail",
+    "phase_names": {
+      "0": "chain",
+      "1": "verify"
+    },
+    "exclusive": [
+      {
+        "surface": "schemas/prompt-sequence.schema.json",
+        "tasks": [
+          "SW-1510-SKILLS-1",
+          "SW-1510-SKILLS-X"
+        ]
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "SW-1510-SKILLS-1",
+      "title": "Preserve the three envelope fields without Ralph substitution",
+      "description": "Implement the namespaced execution-envelope-v1 surface.",
+      "acceptanceCriteria": [
+        "Schema, skill arguments, generator and executor preserve methodology=assay, autonomy_policy=unicorn and schedule separately without silent Ralph substitution.",
+        "Legacy suggested_workflow compatibility is explicit and fails if it would route execution to a different methodology."
+      ],
+      "priority": "P1",
+      "type": "feature",
+      "points": 5,
+      "dependsOn": [],
+      "repo": "skillweave/skillweave",
+      "lane": {
+        "id": "lane-sw-1510-skills-1",
+        "worktree": "checkouts/SW-1510-SKILLS/skillweave",
+        "branch": "fix/sw1510-recovery-skills",
+        "base": "1e71266bbfd0368835f9f3e917f25c36071a2bc3",
+        "creates": [
+          "tests/unit/test_1510_skills.py"
+        ],
+        "modifies": [
+          "scripts/regen-sequence.py",
+          "schemas/prompt-sequence.schema.json"
+        ],
+        "reads": [
+          "src/skillweave/runtime/methodology.py"
+        ],
+        "must_not_touch": [
+          "schemas/dispatch-sequence.schema.json"
+        ],
+        "dispatch_order": [
+          {
+            "criteria": [
+              1
+            ],
+            "focus": "three separate fields"
+          },
+          {
+            "criteria": [
+              2
+            ],
+            "focus": "explicit legacy adapter"
+          }
+        ]
+      }
+    },
+    {
+      "id": "SW-1510-SKILLS-R",
+      "title": "Review the envelope chain",
+      "description": "Independent review of the chain fixture.",
+      "acceptanceCriteria": [
+        "The chain fixture retains exact-source bindings."
+      ],
+      "priority": "P1",
+      "type": "review",
+      "points": 1,
+      "dependsOn": [
+        "SW-1510-SKILLS-1"
+      ],
+      "repo": "skillweave/skillweave",
+      "lane": {
+        "id": "lane-sw-1510-skills-r",
+        "worktree": "checkouts/SW-1510-SKILLS/skillweave",
+        "branch": "fix/sw1510-recovery-skills",
+        "base": "1e71266bbfd0368835f9f3e917f25c36071a2bc3",
+        "reads": [
+          "scripts/regen-sequence.py"
+        ]
+      }
+    },
+    {
+      "id": "SW-1510-SKILLS-X",
+      "title": "Update the shared schema surface",
+      "description": "Second lane touching the shared schema surface.",
+      "acceptanceCriteria": [
+        "The shared schema surface stays consistent."
+      ],
+      "priority": "P2",
+      "type": "task",
+      "points": 3,
+      "dependsOn": [],
+      "repo": "skillweave/skillweave",
+      "lane": {
+        "id": "lane-sw-1510-skills-x",
+        "worktree": "checkouts/SW-1510-SKILLS/skillweave",
+        "branch": "fix/sw1510-recovery-skills",
+        "base": "1e71266bbfd0368835f9f3e917f25c36071a2bc3",
+        "modifies": [
+          "schemas/prompt-sequence.schema.json"
+        ]
+      }
+    }
+  ],
+  "execution_recommendation": {
+    "mode": "complex",
+    "reason": "Legacy PRD recommendation retained as historical data.",
+    "parallel_opportunities": 2
+  }
+}

@@ -597,8 +597,42 @@ Based on analysis of your PRD tasks, the blueprint provides recommendations for 
 - **Best for**: Major features, system overhauls, new projects
 - **Tools**: Overnight execution with comprehensive verification
 
-### Automatic Recommendation
-The blueprint analyzes your PRD and includes an `execution_recommendation` in the generated `prd.json`:
+### Native Methodology Declaration
+
+The blueprint declares the execution **methodology**, its **autonomy policy** and
+its **session schedule** as three *separate* fields on the PRD's `sequence`
+block — never as one conflated mode string. This is the native surface the
+promptchain-generate, promptchain-validate, promptchain-execute and regen
+producer preserve end to end:
+
+```json
+"sequence": {
+  "sequence_id": "my-project",
+  "sequence_type": "build",
+  "methodology": "assay",
+  "autonomy_policy": "unicorn",
+  "session_schedule": "batch"
+}
+```
+
+- `methodology` is one of `rex`, `ralph`, `gauntlet`, `assay`. **Assay is never
+  silently substituted by Ralph** — the value the blueprint declares is the
+  value every downstream stage preserves.
+- `autonomy_policy` is the methodology's own policy axis (`conservative`,
+  `medium`, `unicorn`), carried separately from the methodology. `unicorn` is
+  Assay's declared default; it is not a methodology.
+- `session_schedule` is separate again from both.
+
+### Automatic Recommendation (explicit legacy compatibility)
+
+The blueprint may additionally include an `execution_recommendation` in the
+generated `prd.json`. This is **legacy compatibility only**: its
+`suggested_workflow` is an *adapter* over the legacy vocabulary, and it must be
+**consistent with the declared methodology or the producer refuses it**. A
+`suggested_workflow` that would route execution to a *different* methodology
+than the sequence declares is a hard error (`suggested_workflow_would_substitute_methodology`)
+— the compatibility path never silently rewrites a different methodology into
+the run.
 
 ```json
 "execution_recommendation": {
@@ -609,6 +643,20 @@ The blueprint analyzes your PRD and includes an `execution_recommendation` in th
   "parallel_opportunities": 2
 }
 ```
+
+The legacy `suggested_workflow` vocabulary and the methodology it denotes:
+
+| `suggested_workflow` | denotes methodology |
+|----------------------|---------------------|
+| `rex-simple`         | `rex`               |
+| `ralph-loop-attended`| `ralph`             |
+| `ralph-loop-overnight`| `ralph`            |
+| `direct-execution`   | `rex`               |
+
+An unrecognised `suggested_workflow` is refused rather than coerced, and a
+workflow denoting a different methodology than the declared one is refused with
+`legacy_would_substitute_methodology`. Omitting `execution_recommendation`
+entirely is valid: compatibility is explicit and never a silent default.
 
 ### REX vs Ralph Loop Decision Guide
 
@@ -622,7 +670,8 @@ The blueprint analyzes your PRD and includes an `execution_recommendation` in th
 | **Setup Overhead** | Minimal | Moderate (memory system) |
 | **Best For** | Quick wins, proofs of concept | Production features, systems |
 
-**Rule of thumb**: When in doubt, start with REX for speed, switch to Ralph Loop when complexity emerges.
+**Rule of thumb**: When in doubt, start with REX for speed, switch to Ralph Loop when complexity emerges. Either way, record the choice as an explicit
+`methodology` declaration — not as a workflow string a producer might re-route.
 
 ## Usage Examples
 
