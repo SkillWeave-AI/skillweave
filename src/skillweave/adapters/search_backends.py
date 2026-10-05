@@ -40,6 +40,7 @@ from .descriptor import (
 )
 from .mcp_client import McpClientError, McpStdioClient
 from .outcomes import (
+    SEARCH_OUTCOME_CONTRACT,
     SearchAttempt,
     SearchOutcome,
     SearchResultRecord,
@@ -64,8 +65,10 @@ SEARCH_OPERATION = "search.query"
 EGRESS_CAPABILITY = "network-egress"
 BASE_SEARCH_CAPABILITIES: tuple[str, ...] = ("search.query",)
 
-#: The SDK-owned domain contract a search operation binds to.
-PROVIDER_OUTCOME_CONTRACT = "search-outcome/v1"
+#: The SDK-owned domain contract a search operation binds to. It is the single
+#: constant defined next to the typed outcome it names; the facade's
+#: contract->outcome binding reads the same value, so the two can never drift.
+PROVIDER_OUTCOME_CONTRACT = SEARCH_OUTCOME_CONTRACT
 
 _USER_AGENT = "SkillWeave-Adapter/0.1 (https://github.com/LangeVC/skillweave)"
 

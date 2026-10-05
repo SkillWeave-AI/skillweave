@@ -30,6 +30,7 @@ no core edit.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional
 
@@ -55,6 +56,54 @@ ADAPTER_CATEGORIES: tuple[str, ...] = ("search", "generic")
 
 CATEGORY_SEARCH = "search"
 CATEGORY_GENERIC = "generic"
+
+#: A descriptor id is a consumer-unique, opaque handle that is written into the
+#: descriptor digest and into every receipt's provenance. It must therefore be a
+#: *plain identifier*, never a path or a smuggled tuple: the SDK contract pins the
+#: same conservative shape (``^[a-z0-9][a-z0-9._-]*$``), so this validator and the
+#: wire schema agree. An id with a path separator is refused rather than flowing
+#: into a digest, a log line or a receipt.
+_ADAPTER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+#: A transport is an invocation *binding token* (``http``, ``mcp-stdio``,
+#: ``in-process``, ...). It is open (a new transport needs no core edit and is
+#: not a closed enum), but it is still an identifier -- lowercase letters, digits
+#: and ``._-`` -- never free text that could carry code or a path.
+_TRANSPORT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+#: A credential reference is an *identifier*, never the secret value. It is
+#: written into the descriptor digest and into receipts, and it is the key the
+#: admission gate resolves availability against, so it must not be a
+#: secret-looking literal (``sk-live-...``) or an environment-variable-shaped
+#: value masquerading as an id. Lowercase is the wire shape; the available
+#: alphabet tolerates the uppercase env-style ids the fixtures use.
+_CREDENTIAL_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+#: Issuing systems prefix credential *values* with recognizable tokens. A
+#: descriptor names a reference -- a stable key the gate resolves -- never a
+#: value, so a ref carrying a known secret prefix is refused: it is a leaked
+#: secret wearing a handle's clothes, and would otherwise flow into the
+#: descriptor digest and every receipt's provenance. Matched case-insensitively.
+_SECRET_LIKE_PREFIXES: tuple[str, ...] = (
+    "sk-",
+    "pk-",
+    "rk-",
+    "xox",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "akia",
+    "asia",
+    "ya29.",
+    "bearer ",
+)
+
+#: Upper bounds: an identifier/ref/token is a name, not a payload. Generous
+#: enough for a long, namespaced id; small enough that a blob cannot pose as one.
+_MAX_IDENTIFIER_LENGTH = 128
 
 
 class AdapterDescriptorError(ValueError):
@@ -248,6 +297,13 @@ class AdapterDescriptor:
             )
         if not isinstance(self.id, str) or not self.id.strip():
             raise AdapterDescriptorError("descriptor id must be non-empty", asset="id")
+        if len(self.id) > _MAX_IDENTIFIER_LENGTH or not _ADAPTER_ID_RE.match(self.id):
+            raise AdapterDescriptorError(
+                f"descriptor id {self.id!r} must be a plain identifier matching "
+                f"{_ADAPTER_ID_RE.pattern} and at most {_MAX_IDENTIFIER_LENGTH} "
+                "characters; a path, a separator or a code fragment is not an id",
+                asset="id",
+            )
         if not isinstance(self.version, str) or not self.version.strip():
             raise AdapterDescriptorError(
                 "descriptor version must be non-empty", asset="version"
@@ -282,6 +338,17 @@ class AdapterDescriptor:
             raise AdapterDescriptorError(
                 "descriptor transport must be a non-empty string", asset="transport"
             )
+        if (
+            len(self.transport) > _MAX_IDENTIFIER_LENGTH
+            or not _TRANSPORT_RE.match(self.transport)
+        ):
+            raise AdapterDescriptorError(
+                f"descriptor transport {self.transport!r} must be a binding token "
+                f"matching {_TRANSPORT_RE.pattern} and at most "
+                f"{_MAX_IDENTIFIER_LENGTH} characters; free text (a path or a code "
+                "fragment) is refused",
+                asset="transport",
+            )
         caps = tuple(str(c) for c in self.capabilities)
         if len(set(caps)) != len(caps):
             raise AdapterDescriptorError(
@@ -293,6 +360,23 @@ class AdapterDescriptor:
                 "descriptor credential_refs contain duplicates",
                 asset="credential_refs",
             )
+        for ref in refs:
+            if len(ref) > _MAX_IDENTIFIER_LENGTH or not _CREDENTIAL_REF_RE.match(ref):
+                raise AdapterDescriptorError(
+                    f"credential reference {ref!r} must be a plain reference id "
+                    f"matching {_CREDENTIAL_REF_RE.pattern} and at most "
+                    f"{_MAX_IDENTIFIER_LENGTH} characters; a descriptor names a "
+                    "reference, never the credential value itself",
+                    asset="credential_refs",
+                )
+            lowered = ref.lower()
+            if any(lowered.startswith(prefix) for prefix in _SECRET_LIKE_PREFIXES):
+                raise AdapterDescriptorError(
+                    f"credential reference {ref!r} looks like a secret value "
+                    "(it carries a known credential-value prefix); a descriptor "
+                    "names a reference, never the credential value itself",
+                    asset="credential_refs",
+                )
         object.__setattr__(self, "categories", cats)
         object.__setattr__(self, "operations", ops)
         object.__setattr__(self, "capabilities", caps)

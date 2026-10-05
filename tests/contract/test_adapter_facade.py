@@ -396,3 +396,310 @@ def test_unknown_major_version_is_rejected():
             "schema_version": "2.0.0", "query_sha256": "d" * 64,
             "requested_provider": "x", "status": "error", "results": [], "attempts": [],
         })
+
+
+# ── finding 1: the facade refuses a non-conforming outcome ─────────────────
+#
+# A backend is *not trusted*. An operation's ``result_contract`` names the typed
+# outcome class its result must be an instance of (the binding is owned by the
+# registry/descriptor, never a facade branch on a literal). A backend that
+# returns a success object of the *wrong* type -- a generic tool's outcome for a
+# search contract, or a bare dict/None -- must be turned into a typed,
+# non-success failure, never a success receipt that claims a contract it never
+# satisfied.
+
+
+class _FixedBackend(AdapterBackend):
+    """Returns exactly what it is handed, whatever type that is."""
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    async def invoke(self, operation, argument, context):
+        self.calls += 1
+        return self.result
+
+
+class _RaisingBackend(AdapterBackend):
+    """Raises from ``invoke`` (an explicit transport outage)."""
+
+    async def invoke(self, operation, argument, context):
+        raise RuntimeError("provider is down")
+
+
+def _search_facade(backend):
+    registry = AdapterRegistry()
+    registry.register(synthetic_search_descriptor(), backend)
+    return AdapterFacade(
+        registry, _policy(["synthetic-search"], network=True, endpoints=["external.example.org"])
+    )
+
+
+def test_search_contract_refuses_a_tool_outcome_success():
+    """The original counterexample: a tool success must not satisfy search."""
+    backend = _FixedBackend(
+        ToolOutcome(status="success", tool="acme-echo-tool", payload="no sources at all")
+    )
+    outcome, receipt = asyncio.run(
+        _search_facade(backend).invoke(
+            category=CATEGORY_SEARCH, operation=SEARCH_OPERATION,
+            adapter_id="synthetic-search", argument={"query": "hello"},
+            endpoint="https://external.example.org/",
+        )
+    )
+    # The tool outcome is not a conforming search outcome -> typed failure.
+    assert isinstance(outcome, SearchOutcome), type(outcome).__name__
+    assert not isinstance(outcome, ToolOutcome)
+    assert outcome.status == "error"
+    assert outcome.error_code == "malformed_outcome"
+    assert outcome.results == ()
+    assert outcome.succeeded is False
+    # The receipt reports the failure, never a success claiming search-outcome/v1.
+    assert receipt.domain_contract == "search-outcome/v1"
+    assert receipt.status != "success"
+    assert receipt.status == "error"
+    assert backend.calls == 1
+
+
+@pytest.mark.parametrize("bad", [None, {"status": "success", "url": "https://x"}, "a string", 42])
+def test_search_contract_refuses_dict_none_and_scalar_payloads(bad):
+    backend = _FixedBackend(bad)
+    outcome, receipt = asyncio.run(
+        _search_facade(backend).invoke(
+            category=CATEGORY_SEARCH, operation=SEARCH_OPERATION,
+            adapter_id="synthetic-search", argument={"query": "hello"},
+            endpoint="https://external.example.org/",
+        )
+    )
+    assert isinstance(outcome, SearchOutcome)
+    assert outcome.status == "error"
+    assert outcome.results == ()
+    assert receipt.status == "error"
+
+
+def test_a_conforming_search_failure_is_passed_through_as_a_failure():
+    """A real typed outage is conforming: it stays a non-success, not a success."""
+    backend = _FixedBackend(
+        SearchOutcome(
+            query_sha256="e" * 64, requested_provider="synthetic",
+            status="unavailable", attempts=(SearchAttempt("synthetic", "http", "unavailable"),),
+            error_code="outage",
+        )
+    )
+    outcome, receipt = asyncio.run(
+        _search_facade(backend).invoke(
+            category=CATEGORY_SEARCH, operation=SEARCH_OPERATION,
+            adapter_id="synthetic-search", argument={"query": "hello"},
+            endpoint="https://external.example.org/",
+        )
+    )
+    assert isinstance(outcome, SearchOutcome)
+    assert outcome.status == "unavailable"
+    assert receipt.status == "unavailable"
+
+
+def test_a_backend_that_raises_on_outage_propagates_and_is_never_a_success():
+    """An explicit outage raise is surfaced, never quietly turned into success."""
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            _search_facade(_RaisingBackend()).invoke(
+                category=CATEGORY_SEARCH, operation=SEARCH_OPERATION,
+                adapter_id="synthetic-search", argument={"query": "hello"},
+                endpoint="https://external.example.org/",
+            )
+        )
+
+
+def test_generic_tool_with_a_custom_contract_still_accepts_a_typed_outcome():
+    """A generic tool's own domain contract admits any *typed* outcome."""
+    outcome, receipt = asyncio.run(
+        AdapterFacade(
+            _registry_with_generic_tool(), _policy(["acme-echo-tool"])
+        ).invoke(
+            category=CATEGORY_GENERIC, operation="tool.echo",
+            adapter_id="acme-echo-tool", argument={"value": "hi"},
+        )
+    )
+    assert isinstance(outcome, ToolOutcome)
+    assert outcome.status == "success"
+    assert receipt.domain_contract == "tool/echo-result/v1"
+
+
+def test_generic_tool_with_a_custom_contract_refuses_a_bare_dict():
+    registry = AdapterRegistry()
+    registry.register(generic_tool_descriptor(), _FixedBackend({"echo": "hi"}))
+    outcome, receipt = asyncio.run(
+        AdapterFacade(registry, _policy(["acme-echo-tool"])).invoke(
+            category=CATEGORY_GENERIC, operation="tool.echo",
+            adapter_id="acme-echo-tool", argument={"value": "hi"},
+        )
+    )
+    assert isinstance(outcome, ToolOutcome)
+    assert outcome.status == "error"
+    assert receipt.status == "error"
+
+
+def _registry_with_generic_tool():
+    registry = AdapterRegistry()
+    registry.register(generic_tool_descriptor(), CountingToolBackend())
+    return registry
+
+
+# ── finding 2: a receipt can never self-approve ────────────────────────────
+
+
+def _valid_receipt():
+    return OperationReceipt(
+        invocation_id="inv-1",
+        adapter_id="synthetic-search",
+        adapter_version="2.3.0",
+        descriptor_digest="a" * 64,
+        operation=SEARCH_OPERATION,
+        domain_contract="search-outcome/v1",
+        transport="http",
+        status="success",
+        evidence_digest="b" * 64,
+    )
+
+
+def test_receipt_self_approving_true_is_unrepresentable():
+    with pytest.raises(OutcomeError) as exc:
+        replace(_valid_receipt(), self_approving=True)
+    assert exc.value.asset == "receipt.self_approving"
+
+
+def test_receipt_loader_refuses_self_approving_true():
+    payload = _valid_receipt().to_dict()
+    payload["self_approving"] = True
+    with pytest.raises(OutcomeError) as exc:
+        OperationReceipt.from_dict(payload)
+    assert exc.value.asset == "receipt.self_approving"
+
+
+def test_a_serialized_receipt_never_carries_true():
+    constructed = _valid_receipt()
+    reloaded = OperationReceipt.from_dict(constructed.to_dict())
+    assert constructed.to_dict()["self_approving"] is False
+    assert reloaded.to_dict()["self_approving"] is False
+    assert reloaded == constructed
+
+
+# ── finding 3: malicious descriptor fields are refused ─────────────────────
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    ["../../etc/passwd", "/etc/passwd", "a/b", "a\\b", "UPPER", "-leading", "", "x" * 129],
+)
+def test_malicious_or_malformed_adapter_ids_are_refused(bad_id):
+    with pytest.raises(AdapterDescriptorError) as exc:
+        AdapterDescriptor(
+            id=bad_id, version="1", categories=(CATEGORY_GENERIC,),
+            operations=(OperationBinding("op", "in/v1", "out/v1"),),
+            transport="in-process",
+        )
+    assert exc.value.asset == "id"
+
+
+@pytest.mark.parametrize(
+    "bad_transport",
+    ['__import__("os").system("true")', "http; rm -rf /", "a b", "", "x" * 129],
+)
+def test_code_bearing_or_malformed_transports_are_refused(bad_transport):
+    with pytest.raises(AdapterDescriptorError) as exc:
+        AdapterDescriptor(
+            id="ok-id", version="1", categories=(CATEGORY_GENERIC,),
+            operations=(OperationBinding("op", "in/v1", "out/v1"),),
+            transport=bad_transport,
+        )
+    assert exc.value.asset == "transport"
+
+
+@pytest.mark.parametrize(
+    "bad_ref",
+    ["sk-live-abc123", "sk-proj-DEADBEEF", "secret value", "", "x" * 129],
+)
+def test_secret_looking_credential_values_are_refused(bad_ref):
+    with pytest.raises(AdapterDescriptorError) as exc:
+        AdapterDescriptor(
+            id="ok-id", version="1", categories=(CATEGORY_GENERIC,),
+            operations=(OperationBinding("op", "in/v1", "out/v1"),),
+            transport="in-process", credential_refs=(bad_ref,),
+        )
+    assert exc.value.asset == "credential_refs"
+
+
+def test_register_dict_refuses_a_path_escaping_id():
+    registry = AdapterRegistry()
+    with pytest.raises(AdapterDescriptorError) as exc:
+        registry.register_dict(
+            {
+                "schema_version": "1.0.0",
+                "id": "../../etc/passwd",
+                "version": "1",
+                "categories": ["generic"],
+                "operations": [{"name": "op", "input_contract": "in/v1", "result_contract": "out/v1"}],
+                "transport": "in-process",
+            },
+            CountingToolBackend(),
+        )
+    assert exc.value.asset == "id"
+    assert registry.ids() == ()
+
+
+def test_register_dict_refuses_a_code_bearing_transport():
+    registry = AdapterRegistry()
+    with pytest.raises(AdapterDescriptorError) as exc:
+        registry.register_dict(
+            {
+                "schema_version": "1.0.0",
+                "id": "ok-id",
+                "version": "1",
+                "categories": ["generic"],
+                "operations": [{"name": "op", "input_contract": "in/v1", "result_contract": "out/v1"}],
+                "transport": '__import__("os").system("true")',
+            },
+            CountingToolBackend(),
+        )
+    assert exc.value.asset == "transport"
+    assert registry.ids() == ()
+
+
+def test_register_dict_refuses_a_secret_looking_credential_ref():
+    registry = AdapterRegistry()
+    with pytest.raises(AdapterDescriptorError) as exc:
+        registry.register_dict(
+            {
+                "schema_version": "1.0.0",
+                "id": "ok-id",
+                "version": "1",
+                "categories": ["generic"],
+                "operations": [{"name": "op", "input_contract": "in/v1", "result_contract": "out/v1"}],
+                "transport": "in-process",
+                "credential_refs": ["sk-live-abc123"],
+            },
+            CountingToolBackend(),
+        )
+    assert exc.value.asset == "credential_refs"
+    assert registry.ids() == ()
+
+
+def test_legitimate_descriptor_fields_are_accepted():
+    desc = AdapterDescriptor(
+        id="perplexity-search-mcp",
+        version="1.0.0",
+        categories=(CATEGORY_SEARCH,),
+        operations=(OperationBinding(SEARCH_OPERATION, "search-query/v1", "search-outcome/v1"),),
+        transport="mcp-stdio",
+        credential_refs=("search-api-key", "DISCOVERY_SEARCH_KEY"),
+    )
+    assert desc.id == "perplexity-search-mcp"
+    assert desc.transport == "mcp-stdio"
+    assert desc.credential_refs == ("search-api-key", "DISCOVERY_SEARCH_KEY")
+
+
+def test_builtin_search_registry_survives_the_new_validation():
+    """Every shipped descriptor must still load, or the validation is too strict."""
+    registry = build_search_registry()
+    assert len(registry.ids()) == 7

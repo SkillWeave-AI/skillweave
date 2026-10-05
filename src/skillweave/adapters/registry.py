@@ -32,8 +32,11 @@ from .descriptor import (
     AdapterDescriptorError,
 )
 from .outcomes import (
+    SEARCH_OUTCOME_CONTRACT,
     OperationReceipt,
     OutcomeError,
+    SearchOutcome,
+    ToolOutcome,
     descriptor_digest,
     query_digest,
 )
@@ -49,6 +52,24 @@ __all__ = [
     "Resolution",
     "AdapterFacade",
 ]
+
+
+#: The registry-owned contract -> typed-outcome binding. An operation names a
+#: result contract; that contract is implemented by exactly one typed outcome
+#: class. The facade proves an invocation's result conforms by *reading this
+#: table* -- never by branching on a specific contract string. Adding a future
+#: contract + outcome class is one row here; no facade edit.
+_KNOWN_CONTRACT_OUTCOME_TYPES: dict[str, type] = {
+    SEARCH_OUTCOME_CONTRACT: SearchOutcome,
+    # A generic tool's own domain contract and its wire form.
+    "tool-outcome/v1": ToolOutcome,
+}
+
+#: The admissible typed-outcome family. A generic tool may declare an arbitrary
+#: domain ``result_contract`` unknown to Core; the facade still requires its
+#: result to be a *typed* outcome from this family -- never a bare ``dict``,
+#: ``None`` or ``str`` that a backend could smuggle past the contract check.
+_TYPED_OUTCOME_BASE: tuple[type, ...] = (SearchOutcome, ToolOutcome)
 
 
 class AdapterError(ValueError):
@@ -277,6 +298,15 @@ class AdapterFacade:
     ) -> tuple[Any, OperationReceipt]:
         """Resolve, admit, invoke, and return ``(outcome, receipt)``.
 
+        The facade does **not** trust the backend. The operation's
+        ``result_contract`` names a typed outcome class (the binding is
+        :data:`_KNOWN_CONTRACT_OUTCOME_TYPES`, owned here and by the descriptor,
+        never a hard-coded contract-name special case), and the object the
+        backend returns must be a conforming instance of it. When it is not, the
+        facade substitutes a typed, ``status="error"`` failure outcome and a
+        **non-success** receipt rather than returning a success that claims a
+        contract it never satisfied.
+
         The receipt binds the invocation to the adapter, its descriptor digest,
         the operation, the domain contract and the transport -- and records the
         terminal status. The receipt carries no gate authority.
@@ -301,17 +331,69 @@ class AdapterFacade:
         }
         outcome = await resolution.entry.backend.invoke(operation, argument, context)
 
+        # -- contract conformance: refuse to trust the returned object ---------
+        contract = op.result_contract
+        # A contract with an explicit registry binding admits only that typed
+        # outcome; a generic tool's own domain contract admits any typed outcome
+        # from the family (never a bare dict/None/str). Either way the contract
+        # name itself is *data* -- no facade branch on a literal.
+        accepted = _KNOWN_CONTRACT_OUTCOME_TYPES.get(contract, _TYPED_OUTCOME_BASE)
+        if not isinstance(outcome, accepted):
+            outcome, receipt = self._non_conforming(
+                descriptor=descriptor,
+                resolution=resolution,
+                operation=operation,
+                contract=contract,
+                invocation_id=invocation_id,
+                argument=argument,
+                reason=(
+                    f"backend returned {type(outcome).__name__}, which is not a "
+                    f"conforming typed outcome for contract {contract!r}"
+                ),
+            )
+            return outcome, receipt
+
+        status, evidence, query_sha = self._receipt_bits(outcome)
+        receipt = self._receipt(
+            descriptor=descriptor,
+            resolution=resolution,
+            operation=operation,
+            contract=contract,
+            status=status,
+            evidence=evidence,
+            query_sha256=query_sha,
+            invocation_id=invocation_id,
+        )
+        return outcome, receipt
+
+    # ── receipt construction ────────────────────────────────────────────────
+
+    @staticmethod
+    def _receipt_bits(outcome: Any) -> tuple[str, str, Optional[str]]:
+        """The status, evidence digest and query digest for a conforming result."""
         status = str(getattr(outcome, "status", "error"))
-        evidence = hashlib.sha256(
-            _canonical(outcome).encode("utf-8")
-        ).hexdigest()
-        receipt = OperationReceipt(
+        evidence = hashlib.sha256(_canonical(outcome).encode("utf-8")).hexdigest()
+        return status, evidence, getattr(outcome, "query_sha256", None)
+
+    @staticmethod
+    def _receipt(
+        *,
+        descriptor: AdapterDescriptor,
+        resolution: "Resolution",
+        operation: str,
+        contract: str,
+        status: str,
+        evidence: str,
+        query_sha256: Optional[str],
+        invocation_id: Optional[str],
+    ) -> OperationReceipt:
+        return OperationReceipt(
             invocation_id=invocation_id or uuid.uuid4().hex,
             adapter_id=descriptor.id,
             adapter_version=descriptor.version,
             descriptor_digest=resolution.entry.digest,
             operation=operation,
-            domain_contract=op.result_contract,
+            domain_contract=contract,
             transport=descriptor.transport,
             status=status,
             evidence_digest=evidence,
@@ -320,9 +402,80 @@ class AdapterFacade:
                 if descriptor.package_ref is not None
                 else None
             ),
-            query_sha256=getattr(outcome, "query_sha256", None),
+            query_sha256=query_sha256,
         )
-        return outcome, receipt
+
+    def _non_conforming(
+        self,
+        *,
+        descriptor: AdapterDescriptor,
+        resolution: "Resolution",
+        operation: str,
+        contract: str,
+        invocation_id: Optional[str],
+        argument: Mapping[str, Any],
+        reason: str,
+    ) -> tuple[Any, OperationReceipt]:
+        """Turn a non-conforming backend result into a typed failure.
+
+        The returned outcome is a typed ``status="error"`` object (a
+        :class:`SearchOutcome` for a search contract, else a :class:`ToolOutcome`)
+        carrying ``error_code="malformed_outcome"``; the receipt records that
+        terminal ``error`` status -- never ``success`` -- so a caller cannot be
+        handed a success that never satisfied its contract. The *reason* travels
+        in the failure outcome's ``synthesis`` (search) and its ``error_code``,
+        and the receipt carries the same non-success ``status``.
+        """
+        failure = _failure_outcome(
+            contract=contract,
+            descriptor=descriptor,
+            operation=operation,
+            argument=argument,
+            reason=reason,
+        )
+        status, evidence, query_sha = self._receipt_bits(failure)
+        receipt = self._receipt(
+            descriptor=descriptor,
+            resolution=resolution,
+            operation=operation,
+            contract=contract,
+            status=status,
+            evidence=evidence,
+            query_sha256=query_sha,
+            invocation_id=invocation_id,
+        )
+        return failure, receipt
+
+
+def _failure_outcome(
+    *,
+    contract: str,
+    descriptor: AdapterDescriptor,
+    operation: str,
+    argument: Mapping[str, Any],
+    reason: str,
+) -> Any:
+    """A typed, non-success outcome stand-in for a non-conforming result.
+
+    It is shaped by the *contract* (data), not by a caller: a search operation
+    yields a :class:`SearchOutcome` with no sources; any other operation yields a
+    :class:`ToolOutcome`. Both carry ``error_code="malformed_outcome"``.
+    """
+    if contract == SEARCH_OUTCOME_CONTRACT:
+        return SearchOutcome(
+            query_sha256=query_digest(str(argument.get("query", ""))),
+            requested_provider=descriptor.id,
+            status="error",
+            attempts=(),
+            synthesis=reason,
+            error_code="malformed_outcome",
+        )
+    return ToolOutcome(
+        status="error",
+        tool=operation,
+        payload=None,
+        error_code="malformed_outcome",
+    )
 
 
 def _canonical(value: Any) -> str:

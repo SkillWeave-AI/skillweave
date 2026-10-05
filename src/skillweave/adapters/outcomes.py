@@ -27,6 +27,7 @@ from typing import Any, Iterable, Mapping, Optional
 __all__ = [
     "CREDENTIAL_REFERENCE_SCHEMA_VERSION",
     "SEARCH_OUTCOME_SCHEMA_VERSION",
+    "SEARCH_OUTCOME_CONTRACT",
     "SEARCH_STATUSES",
     "AVAILABILITY_STATES",
     "INJECTION_OWNED_CHILD_ENVIRONMENT",
@@ -40,6 +41,12 @@ __all__ = [
 
 CREDENTIAL_REFERENCE_SCHEMA_VERSION = "1.0.0"
 SEARCH_OUTCOME_SCHEMA_VERSION = "1.0.0"
+
+#: The SDK-owned domain contract a typed :class:`SearchOutcome` is the wire form
+#: of. It is defined here, next to the class that implements it, so the
+#: registry's contract->outcome-type binding can name it without a duplicated
+#: string literal and without importing the backend layer.
+SEARCH_OUTCOME_CONTRACT = "search-outcome/v1"
 
 #: The closed search-outcome status set.
 SEARCH_STATUSES: tuple[str, ...] = (
@@ -399,10 +406,18 @@ class OperationReceipt:
     provenance: Optional[Mapping[str, Any]] = None
     query_sha256: Optional[str] = None
 
-    #: A receipt is never gate authority; kept as a fixed, auditable field.
+    #: A receipt is never gate authority. Kept as a fixed, auditable field that
+    #: only ever serializes as ``false``: ``True`` is rejected here (and by
+    #: :meth:`from_dict`), so "a receipt cannot self-approve" is a property of the
+    #: type, not a convention a caller could bypass.
     self_approving: bool = False
 
     def __post_init__(self) -> None:
+        if self.self_approving is not False:
+            raise OutcomeError(
+                "a receipt cannot self-approve; self_approving must be False",
+                asset="receipt.self_approving",
+            )
         for name in (
             "invocation_id",
             "adapter_id",
@@ -452,6 +467,31 @@ class OperationReceipt:
             "query_sha256": self.query_sha256,
             "self_approving": self.self_approving,
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "OperationReceipt":
+        """Rebuild a receipt from its durable mapping, failing closed.
+
+        A serialized receipt that claims ``self_approving: true`` is refused here
+        exactly as at construction, so a tampered or hand-written record cannot
+        resurrect self-approval authority through the loader.
+        """
+        if not isinstance(data, Mapping):
+            raise OutcomeError("a receipt must be a mapping", asset="receipt")
+        return cls(
+            invocation_id=str(data.get("invocation_id", "")),
+            adapter_id=str(data.get("adapter_id", "")),
+            adapter_version=str(data.get("adapter_version", "")),
+            descriptor_digest=str(data.get("descriptor_digest", "")),
+            operation=str(data.get("operation", "")),
+            domain_contract=str(data.get("domain_contract", "")),
+            transport=str(data.get("transport", "")),
+            status=str(data.get("status", "")),
+            evidence_digest=str(data.get("evidence_digest", "")),
+            provenance=data.get("provenance"),
+            query_sha256=data.get("query_sha256"),
+            self_approving=data.get("self_approving", False),
+        )
 
 
 def canonical_json_bytes(value: Any) -> bytes:

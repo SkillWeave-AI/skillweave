@@ -197,6 +197,94 @@ try:
 except A.AdapterError as exc:
     report["unapproved"] = {"type": type(exc).__name__, "asset": exc.asset}
 
+# -- finding 1: a non-conforming outcome is never a contract-conforming success
+# A backend that returns a *tool* success for a search contract must be turned
+# into a typed, non-success failure -- never a success receipt claiming
+# search-outcome/v1. This is the seam the review exercised as a counterexample.
+class _MisbehavingSearchBackend(A.AdapterBackend):
+    async def invoke(self, operation, argument, context):
+        return A.ToolOutcome(status="success", tool="liar", payload="no sources at all")
+
+mis = A.AdapterRegistry()
+mis.register(ext.external_descriptor(), _MisbehavingSearchBackend(), source="external:mis")
+mis_facade = A.AdapterFacade(
+    mis,
+    A.EffectivePolicy(allowed_adapter_ids=("external-synthetic-search",),
+                      egress=A.EgressPolicy(allow_network=True,
+                                            endpoint_allowlist=("external.example.org",))),
+)
+mis_outcome, mis_receipt = asyncio.run(mis_facade.invoke(
+    category="search", operation=A.SEARCH_OPERATION, argument={"query": "x"},
+    adapter_id="external-synthetic-search",
+    endpoint="https://external.example.org/result",
+))
+report["non_conforming"] = {
+    "outcome_type": type(mis_outcome).__name__,
+    "status": mis_outcome.status,
+    "error_code": getattr(mis_outcome, "error_code", None),
+    "n_results": len(getattr(mis_outcome, "results", ()) or ()),
+    "receipt_status": mis_receipt.status,
+    "receipt_contract": mis_receipt.domain_contract,
+}
+
+# -- finding 2: a receipt can never claim self_approving = true -------------
+receipt_ok = A.OperationReceipt(
+    invocation_id="i", adapter_id="a", adapter_version="1",
+    descriptor_digest="a" * 64, operation=A.SEARCH_OPERATION,
+    domain_contract="search-outcome/v1", transport="http", status="success",
+    evidence_digest="b" * 64,
+)
+report["receipt_serialized_self_approving"] = receipt_ok.to_dict()["self_approving"]
+try:
+    A.OperationReceipt(
+        invocation_id="i", adapter_id="a", adapter_version="1",
+        descriptor_digest="a" * 64, operation=A.SEARCH_OPERATION,
+        domain_contract="search-outcome/v1", transport="http", status="success",
+        evidence_digest="b" * 64, self_approving=True,
+    )
+    report["receipt_ctor_self_approving"] = "ACCEPTED"
+except A.OutcomeError as exc:
+    report["receipt_ctor_self_approving"] = {"type": type(exc).__name__, "asset": exc.asset}
+try:
+    A.OperationReceipt.from_dict({**receipt_ok.to_dict(), "self_approving": True})
+    report["receipt_loader_self_approving"] = "ACCEPTED"
+except A.OutcomeError as exc:
+    report["receipt_loader_self_approving"] = {"type": type(exc).__name__, "asset": exc.asset}
+
+# -- finding 3: malicious descriptor fields are refused on the installed copy
+def _reject(payload):
+    r = A.AdapterRegistry()
+    try:
+        r.register_dict(payload, _NoopBackend())
+        return "ACCEPTED"
+    except A.AdapterDescriptorError as exc:
+        return {"type": type(exc).__name__, "asset": exc.asset, "ids": list(r.ids())}
+
+class _NoopBackend(A.AdapterBackend):
+    async def invoke(self, operation, argument, context):
+        return None
+
+_base = {
+    "schema_version": "1.0.0", "id": "ok-id", "version": "1",
+    "categories": ["generic"],
+    "operations": [{"name": "op", "input_contract": "in/v1", "result_contract": "out/v1"}],
+    "transport": "in-process",
+}
+report["malicious_id"] = _reject({**_base, "id": "../../etc/passwd"})
+report["malicious_transport"] = _reject({**_base, "transport": '__import__("os").system("true")'})
+report["secret_credential_ref"] = _reject({**_base, "credential_refs": ["sk-live-abc123"]})
+report["legit_descriptor"] = "ACCEPTED"
+try:
+    A.AdapterDescriptor.from_dict({**_base, "id": "perplexity-search-mcp",
+                                   "categories": ["search"],
+                                   "operations": [{"name": A.SEARCH_OPERATION,
+                                                   "input_contract": "search-query/v1",
+                                                   "result_contract": "search-outcome/v1"}],
+                                   "transport": "mcp-stdio",
+                                   "credential_refs": ["search-api-key"]})
+except Exception as exc:  # noqa: BLE001
+    report["legit_descriptor"] = f"REJECTED:{exc}"
+
 print(json.dumps(report))
 '''
 
@@ -289,3 +377,62 @@ class TestInstalledFailureCounterexamplesFailClosed:
         refusal = _probe(installed_core)["unapproved"]
         assert refusal != "NOT_REFUSED", "an unapproved adapter must not run"
         assert refusal["asset"] == "allowlist", refusal
+
+
+class TestInstalledContractConformanceRefusesToTrustABackend:
+    """Finding 1 on the installed artifact: a wrong-typed success is not a success."""
+
+    def test_wrong_typed_success_becomes_a_typed_failure(self, installed_core):
+        report = _probe(installed_core)["non_conforming"]
+        assert report["outcome_type"] == "SearchOutcome", report
+        assert report["status"] == "error", report
+        assert report["error_code"] == "malformed_outcome", report
+        assert report["n_results"] == 0, report
+
+    def test_wrong_typed_success_receipt_is_not_a_success(self, installed_core):
+        report = _probe(installed_core)["non_conforming"]
+        assert report["receipt_status"] == "error", report
+        assert report["receipt_status"] != "success", report
+        assert report["receipt_contract"] == "search-outcome/v1", report
+
+
+class TestInstalledReceiptCannotSelfApprove:
+    """Finding 2 on the installed artifact."""
+
+    def test_serialized_receipt_is_always_false(self, installed_core):
+        assert _probe(installed_core)["receipt_serialized_self_approving"] is False
+
+    def test_construction_with_true_is_refused(self, installed_core):
+        refusal = _probe(installed_core)["receipt_ctor_self_approving"]
+        assert refusal != "ACCEPTED", refusal
+        assert refusal["asset"] == "receipt.self_approving", refusal
+
+    def test_loader_with_true_is_refused(self, installed_core):
+        refusal = _probe(installed_core)["receipt_loader_self_approving"]
+        assert refusal != "ACCEPTED", refusal
+        assert refusal["asset"] == "receipt.self_approving", refusal
+
+
+class TestInstalledMaliciousDescriptorsAreRefused:
+    """Finding 3 on the installed artifact."""
+
+    def test_path_escaping_id_is_refused(self, installed_core):
+        refusal = _probe(installed_core)["malicious_id"]
+        assert refusal != "ACCEPTED", refusal
+        assert refusal["asset"] == "id", refusal
+        assert refusal["ids"] == [], refusal
+
+    def test_code_bearing_transport_is_refused(self, installed_core):
+        refusal = _probe(installed_core)["malicious_transport"]
+        assert refusal != "ACCEPTED", refusal
+        assert refusal["asset"] == "transport", refusal
+        assert refusal["ids"] == [], refusal
+
+    def test_secret_looking_credential_ref_is_refused(self, installed_core):
+        refusal = _probe(installed_core)["secret_credential_ref"]
+        assert refusal != "ACCEPTED", refusal
+        assert refusal["asset"] == "credential_refs", refusal
+        assert refusal["ids"] == [], refusal
+
+    def test_legitimate_descriptor_still_loads(self, installed_core):
+        assert _probe(installed_core)["legit_descriptor"] == "ACCEPTED"
