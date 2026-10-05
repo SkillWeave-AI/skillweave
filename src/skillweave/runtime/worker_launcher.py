@@ -64,6 +64,11 @@ class WorkerIsolationAdapter:
     #: Advertised, honest capabilities. Never True unless actually enforced.
     denies_writes: bool = False
     denies_reads: bool = False
+    #: True only when the adapter confines a *process* to a single writable
+    #: tree (all writes outside the scope are denied), not merely sealing a set
+    #: of protected stores. An adapter that only seals protected stores is
+    #: honestly False: it cannot stop a child writing some other outside path.
+    confines_to_scope: bool = False
 
     def available(self) -> bool:
         raise NotImplementedError
@@ -163,6 +168,10 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
     name: str = "darwin-sandbox-exec"
     denies_writes: bool = True
     denies_reads: bool = True
+    #: Seatbelt translates the writable scope into the sandbox profile, so a
+    #: wrapped process can write only under that tree — this is real process
+    #: confinement, not just protected-store sealing.
+    confines_to_scope: bool = True
 
     def available(self) -> bool:
         sandbox_exec = shutil.which("sandbox-exec")
@@ -344,6 +353,12 @@ class StoreProtection:
     adapter: WorkerIsolationAdapter
     protected: ProtectedStores
     require_read_isolation: bool = False
+    #: When True the window also refuses an adapter that cannot confine a
+    #: process to the writable scope (see ``confines_to_scope``). A caller that
+    #: must guarantee "no writes outside the attempt checkout anywhere" sets
+    #: this; a caller that only needs the receipt/store/telemetry roots sealed
+    #: leaves it False and still gets honest ``confines_to_scope`` reporting.
+    require_checkout_confinement: bool = False
     sealed: bool = False
     #: The one directory tree the wrapped worker may write, used by adapters
     #: (e.g. Seatbelt) that translate a writable scope into their sandbox
@@ -363,6 +378,11 @@ class StoreProtection:
         return self.adapter.denies_reads
 
     @property
+    def confines_to_scope(self) -> bool:
+        """True when the adapter confines writes to one tree (not just seals)."""
+        return getattr(self.adapter, "confines_to_scope", False)
+
+    @property
     def read_isolation_available(self) -> bool:
         return self.adapter.denies_reads
 
@@ -376,6 +396,12 @@ class StoreProtection:
             raise IsolationUnavailableError(
                 "read isolation of observer signing material was required but "
                 f"adapter {self.adapter.name!r} does not deny reads; fail closed"
+            )
+        if self.require_checkout_confinement and not self.confines_to_scope:
+            raise IsolationUnavailableError(
+                "checkout confinement was required but adapter "
+                f"{self.adapter.name!r} cannot confine a process to the writable "
+                "scope; fail closed"
             )
         try:
             self.adapter.seal(self.protected)

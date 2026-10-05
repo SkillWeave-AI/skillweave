@@ -185,6 +185,10 @@ class RunApplicationService:
         autonomy_policy: str = "",
         task_id: Optional[str] = None,
         attempt: int = 1,
+        declared_writes: Optional[Sequence[str]] = None,
+        work_contract: Optional[Any] = None,
+        assay_actor_token: Optional[str] = None,
+        assay_envelope: Optional[Any] = None,
     ) -> RunExecution:
         """Run ``command`` through the six-stage integration path.
 
@@ -217,8 +221,34 @@ class RunApplicationService:
 
         ``require_identity=True`` makes a missing authority service a hard
         failure, so a protected caller cannot accidentally run the legacy path.
+
+        ``declared_writes`` and ``work_contract`` turn on the execution
+        write-scope boundary (SW-1510-SCOPE). Both are *protected-only*: naming
+        either without an authenticated worker is a hard failure, so scope
+        enforcement can never be silently downgraded to the legacy path. When
+        present, every declared output is authorized against the resolved
+        attempt checkout (and the protected store roots) *before* the child is
+        spawned, and the child runs inside the same attested isolation window.
+
+        For an Assay run, ``assay_actor_token`` is a live credential the host
+        authority verifies; when supplied, the native Assay admission
+        (actor / pinned subject / brief / deadline / remaining budget) is
+        enforced on every drill mutation through that actor. Both Assay
+        admission parameters are honoured only on the identity-authenticated
+        path (``authority_service`` supplied): the legacy in-process path is
+        unchanged, and a scope-enforced launch refuses for want of identity
+        before it can reach the drill.
         """
         created_at = created_at or datetime.now(timezone.utc).isoformat()
+
+        if (declared_writes is not None or work_contract is not None) and (
+            authority_service is None
+        ):
+            raise RunIntegrationError(
+                "identity",
+                "declared_writes/work_contract require an authenticated worker "
+                "(auth-scoped execution); refusing the unprotected path",
+            )
 
         credential = None
         if authority_service is None and require_identity:
@@ -270,6 +300,33 @@ class RunApplicationService:
                 role="ops",
             )
 
+        # SW-1510-ASSAY: open the native Assay drill *before* the real probe is
+        # launched, so PIN/HYPOTHESIS describe the policy/state machine the
+        # launch actually executes rather than a post-hoc diary. On the
+        # identity-authenticated path this resolves the assay actor through the
+        # live host authority and enforces the admission envelope (actor,
+        # pinned subject/brief, deadline, remaining budget) before the child
+        # exists; a refusal fails the run rather than leaving it dangling.
+        assay_pre_state: Optional[dict[str, Any]] = None
+        if binding.methodology.value == "assay":
+            try:
+                assay_pre_state = self._assay_open(
+                    run_id=run_id,
+                    task_id=task_id or run_id,
+                    attempt=int(attempt),
+                    binding=binding,
+                    command=list(command),
+                    subject_repo=subject_repo,
+                    subject_commit=subject_commit,
+                    authority_service=authority_service,
+                    credential=credential,
+                    assay_actor_token=assay_actor_token,
+                    assay_envelope=assay_envelope,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._fail_run(run_id, f"assay admission refused: {exc}")
+                raise
+
         # Stage 2: launch the worker as a real subprocess. On the protected
         # (identity-authenticated) path the worker is launched inside a real
         # process-protection window: the protected stores are sealed (and, where
@@ -279,30 +336,93 @@ class RunApplicationService:
         # adapter seals them. If no real isolation adapter is available the
         # protected path fails closed here, before the child is spawned — never
         # a quiet unsandboxed launch.
+        #
+        # SW-1510-SCOPE adds the *execution write-scope* half: when the caller
+        # declares outputs (or a work contract), every declared write is
+        # authorized against the resolved attempt checkout and the protected
+        # store roots before launch, and the same attested isolation window
+        # covers the child. A traversal/symlink escape is refused here.
         protection = None
+        scope_requested = declared_writes is not None or work_contract is not None
+        runner_mod = importlib.import_module("skillweave.core.proc.runner")
+        scope_refusals: tuple = (
+            runner_mod.ScopeViolation,
+            runner_mod.ScopeEnforcementUnavailable,
+        )
+        IsolationUnavailableError = None
+        if credential is not None:
+            write_scope_mod = importlib.import_module(
+                "skillweave.runtime.write_scope"
+            )
+            scope_refusals = scope_refusals + (write_scope_mod.WriteScopeViolation,)
+            IsolationUnavailableError = _runtime_attr(
+                "worker_launcher", "IsolationUnavailableError"
+            )
         try:
-            protection = self._open_worker_protection(credential, run_id)
-            argv = list(command)
-            if protection is not None:
-                argv = protection.wrap_command(argv, writable_scope=protection.writable_scope)
             try:
-                result = run_command(
-                    argv,
-                    run_id=run_id,
-                    subject_repo=subject_repo,
-                    subject_commit=subject_commit,
-                    tool=tool,
-                    model=model,
-                    created_at=created_at,
-                )
-            finally:
-                if protection is not None:
-                    protection.__exit__(None, None, None)
+                protection = self._open_worker_protection(credential, run_id)
+            except Exception as exc:  # noqa: BLE001
+                # The launcher fails closed when no real isolation mechanism is
+                # available. For a scope-enforced launch surface that as the
+                # runner's typed HOLD so the caller gets one attributable
+                # isolation-unavailable record rather than a bare error.
+                if (
+                    scope_requested
+                    and IsolationUnavailableError is not None
+                    and isinstance(exc, IsolationUnavailableError)
+                ):
+                    raise runner_mod.ScopeEnforcementUnavailable(
+                        "harness-worker",
+                        f"no real isolation available for the worker: {exc}",
+                    ) from exc
+                raise
+            enforcement, declared = self._open_scope_enforcement(
+                credential, protection, run_id, declared_writes, work_contract
+            )
+            argv = list(command)
+            if enforcement is not None:
+                # Authorize every declared write against the resolved checkout
+                # and the protected store roots before spawning: a traversal or
+                # symlink escape, or a receipt/store/telemetry target, is
+                # refused here, before anything runs (criterion 1). This is a
+                # lexical/realpath pre-flight that needs no OS adapter, so it
+                # refuses an out-of-scope declared target even on a host whose
+                # adapter is later found insufficient.
+                if declared:
+                    enforcement.authorize_writes(declared)
+                # Attest the real isolation *before* the child exists: an
+                # unavailable or insufficient enforcement raises a typed HOLD
+                # here, so an unisolated launch never happens (criterion 2).
+                enforcement.attest()
+                argv = enforcement.wrap_command(argv)
+            elif protection is not None:
+                argv = protection.wrap_command(argv, writable_scope=protection.writable_scope)
+            result = run_command(
+                argv,
+                run_id=run_id,
+                subject_repo=subject_repo,
+                subject_commit=subject_commit,
+                tool=tool,
+                model=model,
+                created_at=created_at,
+            )
+        except scope_refusals:
+            # A write-scope refusal (traversal/symlink/protected-store escape)
+            # or a typed isolation HOLD surfaces as the typed refusal itself, so
+            # the caller can act on the exact reason and retry nothing unsafe.
+            raise
         except RunIntegrationError:
             raise
         except Exception as exc:  # noqa: BLE001
             self._fail_run(run_id, f"launch raised {exc}")
             raise RunIntegrationError("launch", str(exc)) from exc
+        finally:
+            # Release the protection window (unseal the protected stores) on
+            # every path — including a scope refusal raised while composing the
+            # enforcement, before the child ever existed. A leaked seal would
+            # leave the host's own stores locked.
+            if protection is not None:
+                protection.__exit__(None, None, None)
 
         # Stage 3: raw artifact (content-addressed bytes).
         raw_bytes = result.stdout or b""
@@ -469,6 +589,7 @@ class RunApplicationService:
                 result=result,
                 gate_state=gate_state,
                 verdict_receipt=verdict_receipt,
+                pre_state=assay_pre_state,
             )
 
         final_run = self.store.get_run(run_id)
@@ -616,6 +737,116 @@ class RunApplicationService:
 
         base = tempfile.mkdtemp(prefix=f"sw1510-worker-{run_id}-")
         return Path(base).resolve()
+
+    def _open_scope_enforcement(
+        self,
+        credential: Any,
+        protection: Any,
+        run_id: str,
+        declared_writes: Optional[Sequence[str]],
+        work_contract: Any,
+    ) -> tuple[Optional[Any], Optional[Sequence[str]]]:
+        """Compose the real execution write-scope + isolation boundary.
+
+        Returns ``(enforcement, declared)``. Returns ``(None, None)`` on the
+        legacy unprotected path (no credential and nothing declared). On the
+        protected path it always returns a :class:`ScopeEnforcement` bound to
+        the live ``protection`` window: the attempt checkout is the worker's
+        private writable scope, the protected store roots are sealed against
+        writes even inside it, and the enforced isolation is the protection
+        already evidenced by the launcher. The scope is resolved either from an
+        explicit ``declared_writes`` list or from a ``WorkContract``'s
+        normalized write scope — including the generic content/configuration/
+        deployment/incident object kinds, which never synthesize a repository
+        SHA.
+        """
+        checkout_root = (
+            protection.writable_scope if protection is not None else None
+        )
+        if checkout_root is None:
+            if declared_writes is None and work_contract is None:
+                return None, None
+            # Auth-scoped execution was requested but there is no real checkout
+            # to confine to: fail closed rather than enforcing against an
+            # unbounded root.
+            runner_mod = importlib.import_module("skillweave.core.proc.runner")
+            raise runner_mod.ScopeEnforcementUnavailable(
+                "harness-worker",
+                "scope-enforced launch requires a real attempt checkout",
+            )
+
+        # ``skillweave.core.proc.runner`` is a core package (always present), not
+        # the optional ``runtime`` subpackage, so it is resolved directly rather
+        # than through ``_runtime_attr``.
+        runner_mod = importlib.import_module("skillweave.core.proc.runner")
+        ScopeEnforcement = runner_mod.ScopeEnforcement
+
+        # ``ExecutionScope`` is the normalized execution boundary: a target is
+        # admitted only when it resolves inside the attempt checkout (symlinks
+        # followed, traversal refused). It is always built when the paths/
+        # objects execution is requested — whether the outputs came from an
+        # explicit ``declared_writes`` list or a contract's write scope — so a
+        # traversal/symlink escape is refused at the boundary even with no work
+        # contract. A non-Git object contract is enforced against its own kind.
+        ExecutionScope = _runtime_attr("write_scope", "ExecutionScope")
+        scope = None
+        declared = declared_writes
+        if work_contract is not None:
+            scope_from_contract = _runtime_attr(
+                "write_scope", "scope_from_work_contract"
+            )
+            scope = scope_from_contract(work_contract, checkout_root=str(checkout_root))
+            # A generic object contract is validated against its own kind (no
+            # fabricated commit); a paths/objects contract needs declared
+            # outputs to authorize, taken from its allow list.
+            if getattr(scope, "kind", "paths") in ("paths", "objects"):
+                if declared is None:
+                    declared = list(getattr(work_contract, "write_scope", None).allow) if hasattr(
+                        getattr(work_contract, "write_scope", None), "allow"
+                    ) else None
+            else:
+                scope.validate_object()
+        elif declared is not None:
+            scope = ExecutionScope(
+                kind="paths",
+                checkout_root=str(checkout_root),
+                allow=list(declared),
+            )
+
+        protected_roots = ()
+        if protection is not None:
+            protected_roots = tuple(
+                str(p) for p in protection.protected.write_protected_paths()
+            )
+        # Automatic required checkout confinement (SW-1510-SCOPE criterion 2).
+        # A scope-enforced launch promises that no write happens outside the
+        # attempt checkout. A scope object plus declared-write authorization is
+        # *not* that guarantee: an adapter that only seals the protected
+        # authority stores leaves every other outside path writable, so a real
+        # child can still create/overwrite an undeclared file outside the
+        # checkout. The confinement requirement is therefore set here, by the
+        # launch itself — never left to a caller to discover and set as a
+        # hidden optional flag. ``ScopeEnforcement.attest`` turns a seal-only
+        # adapter into a typed HOLD *before* the child exists.
+        #
+        # It applies only when a write scope is actually requested
+        # (``declared_writes`` or a ``work_contract``). A pure identity-
+        # authenticated launch declares no write scope and keeps the original
+        # SW-1510-IDENTITY guarantee — the protected authority stores sealed —
+        # so the seal-only immutable-flag adapter stays valid there. That
+        # legacy compatibility is explicit here rather than implicit in a
+        # caller flag.
+        scope_requested = declared_writes is not None or work_contract is not None
+        enforcement = ScopeEnforcement(
+            isolation=protection,
+            scope=scope,
+            protected_roots=protected_roots,
+            checkout_root=str(checkout_root),
+            require_checkout_confinement=scope_requested,
+            workload="harness-worker",
+            tools=("Bash",),
+        )
+        return enforcement, declared
 
     def _fail_run(self, run_id: str, reason: str) -> None:
         """Mark a run terminal with a stop reason when a stage raises.
@@ -823,6 +1054,171 @@ class RunApplicationService:
             definition=definition,
         )
 
+    def _assay_phase_event(
+        self,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        state: Any,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append one ordered assay phase event and return its payload.
+
+        The payload carries the run/task/attempt triple on every phase so CLI,
+        MCP and replay all read the same attempt. The append is idempotent per
+        (run, phase, attempt), so a re-entry never double-writes a phase.
+        """
+        EventType = _runtime_attr("journal", "EventType")
+        payload = {
+            "phase": state.value,
+            "run_id": run_id,
+            "task_id": task_id,
+            "attempt": attempt,
+            **evidence,
+        }
+        event = self.journal.append(
+            run_id,
+            event_type=EventType.METRIC.value,
+            payload=payload,
+            idempotency_key=f"assay:{run_id}:{state.value}:{attempt}",
+        )
+        return payload, event.sequence
+
+    def _assay_open(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        binding: "_MethodologyBinding",
+        command: Sequence[str],
+        subject_repo: str,
+        subject_commit: str,
+        authority_service: Any,
+        credential: Any,
+        assay_actor_token: Optional[str],
+        assay_envelope: Optional[Any],
+    ) -> dict[str, Any]:
+        """Open the native Assay drill *before* the real probe is spawned.
+
+        The PIN and HYPOTHESIS phases describe the policy/state machine that
+        the next launch executes: the engine is constructed under the declared
+        autonomy policy, the subject/brief are pinned to the run's real content
+        addresses, the owner-authorized envelope is bound, and — on the
+        identity-authenticated path — the assay actor is resolved through the
+        live host authority and every admission axis (actor, pinned subject/
+        brief, deadline, remaining budget) is enforced by the engine itself
+        before the child exists. Any refusal here (e.g. an expired authority
+        deadline or an exhausted reservation) is raised before the launch and
+        the already-recorded PIN/HYPOTHESIS events remain durable.
+
+        These phases are the controller's own policy admission, not a
+        post-hoc diary: the HYPOTHESIS the probe is launched against is
+        recorded before the probe runs, and the PROBE/MEASURE/CLASSIFY records
+        written after the launch describe exactly this engine.
+        """
+        AssayEngine = _runtime_attr("assay", "AssayEngine")
+        AssayState = _runtime_attr("assay", "AssayState")
+        AssayAdmission = _runtime_attr("assay", "AssayAdmission")
+
+        subject_digest = _sha256_hex(
+            f"{subject_repo}@{subject_commit}".encode()
+        )
+        brief_digest = _sha256_hex(" ".join(list(command)).encode())
+
+        resolver = None
+        if authority_service is not None and credential is not None:
+            # An identity-authenticated Assay run enforces admission on every
+            # mutation. The actor must be a live host-verified credential bound
+            # to this exact run/task/attempt — never a caller string.
+            HostAuthorityActorResolver = _runtime_attr(
+                "assay", "HostAuthorityActorResolver"
+            )
+            resolver = HostAuthorityActorResolver(
+                authority_service,
+                attempt_key=(run_id, task_id, attempt),
+                required_capability="execute-attempt",
+            )
+
+        engine = AssayEngine(
+            policy_name=binding.policy_name,
+            run_id=run_id,
+            actor_resolver=resolver,
+            envelope=assay_envelope,
+            max_turns=None,
+        )
+        engine.pin(subject=subject_digest, brief=brief_digest)
+
+        admission = None
+        if resolver is not None:
+            if not assay_actor_token:
+                raise _runtime_attr("assay", "AdmissionRefused")(
+                    "actor",
+                    "an authenticated assay actor token is required for a "
+                    "protected assay mutation",
+                )
+            actor = resolver.resolve(assay_actor_token)
+            admission = AssayAdmission(
+                actor_token=assay_actor_token,
+                subject=subject_digest,
+                brief=brief_digest,
+                envelope=assay_envelope or _runtime_attr("assay", "AssayEnvelope")(),
+                actor=actor,
+            )
+            # Exercise the guarded turn-limit change as the authority act it
+            # is: under an explicit envelope this records the bound *and*
+            # enforces actor/deadline/budget before the probe runs.
+            if assay_envelope is not None:
+                engine.set_turn_limit(
+                    engine.max_turns, admission=admission
+                )
+
+        phases: list[dict[str, Any]] = []
+        phase_events: list[dict[str, Any]] = []
+
+        def record(state: Any, evidence: dict[str, Any]) -> None:
+            payload, sequence = self._assay_phase_event(
+                run_id, task_id, attempt, state, evidence
+            )
+            phases.append(payload)
+            phase_events.append({"sequence": sequence, "phase": state.value})
+
+        # PIN — the exact subject/brief/envelope the drill is bound to.
+        record(
+            AssayState.PIN,
+            {
+                "subject_digest": subject_digest,
+                "brief_digest": brief_digest,
+                "envelope_digest": _sha256_hex(
+                    f"{binding.methodology.value}|{binding.policy_name}|"
+                    f"{(assay_envelope.to_dict() if assay_envelope is not None else {})}".encode()
+                ),
+            },
+        )
+
+        # HYPOTHESIS — the falsifiable claim the probe is launched against,
+        # recorded *before* the probe runs.
+        record(
+            AssayState.HYPOTHESIS,
+            {
+                "claim": "probe command exits 0 with non-empty output",
+                "falsified_by": "non-zero exit or empty stdout",
+                "evidence_type": "test",
+                "method": "completion-contract",
+            },
+        )
+
+        return {
+            "engine": engine,
+            "admission": admission,
+            "resolver": resolver,
+            "subject_digest": subject_digest,
+            "brief_digest": brief_digest,
+            "phases": phases,
+            "phase_events": phase_events,
+            "policy_name": binding.policy_name,
+        }
+
     def _run_assay_drill(
         self,
         *,
@@ -833,75 +1229,37 @@ class RunApplicationService:
         result: Any,
         gate_state: str,
         verdict_receipt: dict[str, Any],
+        pre_state: dict[str, Any],
     ) -> dict[str, Any]:
-        """Run the native Assay drill and persist its ordered phase events.
+        """Close the native Assay drill after the real probe has run.
 
-        The PROBE is the *real, already-executed* bounded subprocess (the
-        ``result`` this service launched above); MEASURE binds its captured
-        bytes; CLASSIFY is the completion contract's gate; the outcome is
-        PASS only when the gate PASSes. Every phase is journaled with the
-        run/task/attempt triple so CLI, MCP and replay all read the same
-        attempt and terminal verdict. A terminal phase that the autonomy policy
-        cannot author is recorded as a HOLD outcome — never silently a pass.
+        The PROBE phase carries the real, already-executed bounded subprocess's
+        measured facts (pid/exit/signal/termination — never a verdict);
+        MEASURE binds its captured bytes; CLASSIFY is the completion contract's
+        gate; the outcome is PASS only when the gate PASSes *and* the policy can
+        author the terminal transition. Every phase is journaled with the
+        run/task/attempt triple. A terminal phase the autonomy policy cannot
+        author is recorded as a HOLD outcome — a self-declared pass is
+        impossible here.
         """
-        AssayEngine = _runtime_attr("assay", "AssayEngine")
         AssayState = _runtime_attr("assay", "AssayState")
         PolicyBlockedError = _runtime_attr("assay", "PolicyBlockedError")
         PolicyHoldError = _runtime_attr("assay", "PolicyHoldError")
-        EventType = _runtime_attr("journal", "EventType")
 
-        engine = AssayEngine(policy_name=binding.policy_name)
+        engine = pre_state["engine"]
+        admission = pre_state["admission"]
+        phases = pre_state["phases"]
+        phase_events = pre_state["phase_events"]
+
         raw_bytes = result.stdout or b""
         gate_is_pass = gate_state == _runtime_attr("verify", "GateState").PASS
 
-        # Ordered phase records: (state, evidence_type, payload).
-        phases: list[dict[str, Any]] = []
-        phase_events: list[dict[str, Any]] = []
-
         def record(state: Any, evidence: dict[str, Any]) -> None:
-            payload = {
-                "phase": state.value,
-                "run_id": run_id,
-                "task_id": task_id,
-                "attempt": attempt,
-                **evidence,
-            }
-            event = self.journal.append(
-                run_id,
-                event_type=EventType.METRIC.value,
-                payload=payload,
-                idempotency_key=f"assay:{run_id}:{state.value}:{attempt}",
+            payload, sequence = self._assay_phase_event(
+                run_id, task_id, attempt, state, evidence
             )
             phases.append(payload)
-            phase_events.append({"sequence": event.sequence, "phase": state.value})
-
-        # PIN — pin the exact subject/brief/envelope digests the drill is bound
-        # to. digests are the run's real content addresses, not free text.
-        record(
-            AssayState.PIN,
-            {
-                "subject_digest": _sha256_hex(
-                    f"{result.metadata.get('subject_repo','')}@"
-                    f"{result.metadata.get('subject_commit','')}".encode()
-                ),
-                "brief_digest": _sha256_hex(
-                    " ".join(list(result.command)).encode()
-                ),
-                "envelope_digest": _sha256_hex(
-                    f"{binding.methodology.value}|{binding.policy_name}|"
-                    f"{gate_state}".encode()
-                ),
-            },
-        )
-
-        # HYPOTHESIS — the falsifiable claim the probe is run against.
-        hypothesis = {
-            "claim": "probe command exits 0 with non-empty output",
-            "falsified_by": "non-zero exit or empty stdout",
-            "evidence_type": "test",
-            "method": "completion-contract",
-        }
-        record(AssayState.HYPOTHESIS, hypothesis)
+            phase_events.append({"sequence": sequence, "phase": state.value})
 
         # PROBE — the real child execution's measured facts (NOT a verdict).
         record(
@@ -938,18 +1296,24 @@ class RunApplicationService:
             },
         )
 
-        # Outcome. A pass(i.e. the gate) requires a human-authorised terminal
-        # phase under this policy; if the policy cannot author it, the outcome
-        # is HOLD — a self-declared pass is impossible here.
+        # Outcome. A pass (i.e. the gate) requires a terminal phase the policy
+        # authorises; if the policy cannot author it, the outcome is HOLD — a
+        # self-declared pass is impossible here. The engine itself enforces
+        # admission on each transition (this is the state machine that ran, not
+        # a diary written after the fact).
         outcome = "hold"
         outcome_reason = ""
+        transitions = [
+            AssayState.HYPOTHESIS,
+            AssayState.PROBE,
+            AssayState.MEASURE,
+            AssayState.CLASSIFY,
+        ]
         if gate_is_pass:
             try:
-                engine.transition(AssayState.HYPOTHESIS)
-                engine.transition(AssayState.PROBE)
-                engine.transition(AssayState.MEASURE)
-                engine.transition(AssayState.CLASSIFY)
-                engine.transition(AssayState.PASS)
+                for target in transitions:
+                    engine.transition(target, admission=admission)
+                engine.transition(AssayState.PASS, admission=admission)
                 outcome = "pass"
             except (PolicyBlockedError, PolicyHoldError) as exc:
                 outcome = "hold"
@@ -959,11 +1323,9 @@ class RunApplicationService:
                 outcome_reason = str(exc)
         else:
             try:
-                engine.transition(AssayState.HYPOTHESIS)
-                engine.transition(AssayState.PROBE)
-                engine.transition(AssayState.MEASURE)
-                engine.transition(AssayState.CLASSIFY)
-                engine.transition(AssayState.HOLD)
+                for target in transitions:
+                    engine.transition(target, admission=admission)
+                engine.transition(AssayState.HOLD, admission=admission)
             except Exception:  # noqa: BLE001
                 pass
             outcome = "hold"

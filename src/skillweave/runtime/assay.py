@@ -411,12 +411,20 @@ class AssayHeartbeat:
 
 @dataclass
 class AssayTurnLimit:
-    """A recorded turn-limit change."""
+    """A recorded turn-limit change.
+
+    ``actor`` is the authenticated actor that authorized the change (empty only
+    for a legacy recording on an engine with no admission requirement). An
+    owner-authorized no-cumulative-limit envelope records ``max_turns=None``,
+    meaning "no fixed cumulative ceiling" — distinct from a number.
+    """
 
     run_id: str
-    max_turns: int
+    max_turns: Optional[int]
     current_turn: int
     updated_at: str
+    actor: str = ""
+    kind: str = "extension"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -424,6 +432,55 @@ class AssayTurnLimit:
             "max_turns": self.max_turns,
             "current_turn": self.current_turn,
             "updated_at": self.updated_at,
+            "actor": self.actor,
+            "kind": self.kind,
+        }
+
+
+@dataclass(frozen=True)
+class AssayEnvelope:
+    """The owner-authorized execution envelope for one assay run.
+
+    ``deadline`` is an ISO instant; when supplied, every admitted mutation and
+    turn-limit change is refused at or after it. ``remaining_budget`` is a
+    finite reservation; when supplied, advancing turns beyond it is refused.
+    Both default to ``None`` = *no cumulative limit*, which is the explicit
+    owner-authorized envelope that must not be replaced by an artificial
+    default. ``require_actor`` makes an authenticated actor mandatory for every
+    mutation and turn-limit change. A negative ``remaining_budget`` is refused.
+    """
+
+    deadline: Optional[str] = None
+    remaining_budget: Optional[int] = None
+    require_actor: bool = False
+
+    def __post_init__(self) -> None:
+        if self.remaining_budget is not None:
+            if isinstance(self.remaining_budget, bool) or not isinstance(
+                self.remaining_budget, int
+            ):
+                raise AdmissionRefused(
+                    "envelope", "remaining_budget must be a non-negative integer"
+                )
+            if self.remaining_budget < 0:
+                raise AdmissionRefused(
+                    "envelope",
+                    f"remaining_budget must not be negative, got {self.remaining_budget}",
+                )
+        if self.deadline is not None:
+            try:
+                datetime.fromisoformat(self.deadline)
+            except (TypeError, ValueError):
+                raise AdmissionRefused(
+                    "envelope",
+                    f"deadline must be an ISO timestamp, got {self.deadline!r}",
+                )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "deadline": self.deadline,
+            "remaining_budget": self.remaining_budget,
+            "require_actor": self.require_actor,
         }
 
 
@@ -447,6 +504,127 @@ class AssaySplit:
         }
 
 
+# ── Admission (actor / subject / brief / envelope) ──────────────────────────
+
+def _parse_instant(value: str) -> Optional[datetime]:
+    """Parse an ISO instant to an aware UTC datetime, or ``None`` if unparseable.
+
+    Used so every deadline comparison is on parsed instants, not raw strings:
+    a lexical comparison between ``'2026-01-01T00:00:00Z'`` and
+    ``'2025-12-31T23:00:00+02:00'`` would order them wrongly. A naive timestamp
+    is read as UTC.
+    """
+    try:
+        when = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when
+
+
+class ActorResolver:
+    """Resolves a presented token to an authenticated actor, or refuses.
+
+    The engine never trusts a caller-supplied actor *string*; it trusts only a
+    credential a resolver independently verifies. A live
+    ``HostAuthorityService``-backed resolver is the production implementation;
+    ``StaticActorResolver`` is the explicit offline/test seam. A resolver
+    returns a non-empty actor string for a live token and raises ``ValueError``
+    otherwise.
+    """
+
+    def resolve(self, token: str) -> str:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+class StaticActorResolver(ActorResolver):
+    """An offline resolver over a fixed token -> actor map.
+
+    Deliberately explicit: it binds no identity by naming convention (an
+    ``auth_real`` style string is never proof), only a token that appears in
+    the map it was constructed with.
+    """
+
+    def __init__(self, tokens: dict[str, str]):
+        self._tokens = dict(tokens)
+
+    def resolve(self, token: str) -> str:
+        actor = self._tokens.get(token)
+        if not actor:
+            raise ValueError("unrecognized actor token")
+        return actor
+
+
+class HostAuthorityActorResolver(ActorResolver):
+    """Resolve an assay actor through the host credential service.
+
+    This is the *production* actor seam: the token presented to
+    :meth:`AssayEngine.transition` is verified by a live
+    ``HostAuthorityService`` (never a caller string), and the resolved actor is
+    the credential's authenticated ``principal`` — bound to the exact
+    attempt triple the engine's run carries. A token that does not verify,
+    carries an approving role (a worker credential must not decide), or is
+    bound to a different run/task/attempt is refused. The service is injected
+    (not imported here) so ``runtime.assay`` keeps no dependency on the
+    authority module and can still be exercised offline with
+    :class:`StaticActorResolver`.
+    """
+
+    def __init__(
+        self,
+        authority_service: Any,
+        *,
+        attempt_key: Optional[tuple[str, str, int]] = None,
+        required_capability: Optional[str] = "execute-attempt",
+    ) -> None:
+        self._service = authority_service
+        self._attempt_key = attempt_key
+        self._required_capability = required_capability
+
+    def resolve(self, token: str) -> str:
+        if not token:
+            raise ValueError("no actor credential presented")
+        try:
+            credential = self._service.verify_credential(token)
+        except Exception as exc:  # noqa: BLE001 - re-raised as a refusal
+            raise ValueError(f"host authority rejected the actor: {exc}") from exc
+        roles = getattr(credential, "roles", frozenset()) or frozenset()
+        approving = set(roles) & {"reviewer", "observer", "controller", "integrator"}
+        if approving:
+            raise ValueError(
+                f"actor credential carries approving role(s) {sorted(approving)}"
+            )
+        attempt_key = getattr(credential, "attempt_key", None)
+        if self._attempt_key is not None and attempt_key != self._attempt_key:
+            raise ValueError(
+                "actor credential is bound to a different run/task/attempt"
+            )
+        principal = getattr(credential, "principal", "")
+        if not principal:
+            raise ValueError("actor credential has no authenticated principal")
+        return principal
+
+
+@dataclass(frozen=True)
+class AssayAdmission:
+    """The authenticated, pinned facts a mutating assay action is admitted under.
+
+    ``actor_token`` is verified by the engine's resolver — the ``actor`` string
+    here is carried only for the record and is never the proof. ``subject`` and
+    ``brief`` are pinned content addresses: the action is admitted only while
+    the subject and brief still digest to these exact values, so a mid-run swap
+    is refused. ``envelope`` carries the owner-authorized deadline and
+    reservation.
+    """
+
+    actor_token: str
+    subject: str
+    brief: str
+    envelope: AssayEnvelope = field(default_factory=AssayEnvelope)
+    actor: str = ""
+
+
 # ── Assay engine ────────────────────────────────────────────────────────────
 
 class AssayEngine:
@@ -454,19 +632,44 @@ class AssayEngine:
 
     No model or router identities appear in this code — only Assay concepts:
     states, policies, turns, heartbeats, splits, and evidence.
+
+    When an ``actor_resolver`` is supplied the engine enforces the admission
+    contract on every mutation and every turn-limit change: the actor must
+    authenticate, the pinned subject/brief must be unchanged, the envelope
+    deadline must not have passed, and the remaining reservation must not be
+    exhausted. ``max_turns=None`` is the explicit owner-authorized
+    no-cumulative-limit envelope and is *not* replaced by an artificial default.
+    A negative turn limit is always refused.
     """
 
     def __init__(
         self,
         policy: Optional[AssayPolicy] = None,
         policy_name: str = "conservative",
-        max_turns: int = 10,
+        max_turns: Optional[int] = 10,
+        *,
+        run_id: str = "",
+        actor_resolver: Optional[ActorResolver] = None,
+        envelope: Optional[AssayEnvelope] = None,
     ) -> None:
         if policy is None:
             policy = create_policy(policy_name)
+        if max_turns is not None and (
+            isinstance(max_turns, bool) or not isinstance(max_turns, int)
+        ):
+            raise AdmissionRefused("turn_limit", "max_turns must be an integer or None")
+        if max_turns is not None and max_turns < 0:
+            raise AdmissionRefused(
+                "turn_limit", f"max_turns must not be negative, got {max_turns}"
+            )
         self.policy = policy
         self.max_turns = max_turns
         self.current_turn = 0
+        self.run_id = run_id
+        self.actor_resolver = actor_resolver
+        self.envelope = envelope or AssayEnvelope(require_actor=actor_resolver is not None)
+        self.subject_digest: Optional[str] = None
+        self.brief_digest: Optional[str] = None
         self._state: AssayState = AssayState.PIN
         self._heartbeats: list[AssayHeartbeat] = []
         self._splits: list[AssaySplit] = []
@@ -475,22 +678,192 @@ class AssayEngine:
         # Record initial heartbeat so there is always a starting record.
         self.heartbeat()
 
+    # ── Admission ───────────────────────────────────────────────────
+
+    def pin(self, *, subject: str, brief: str) -> None:
+        """Pin the subject and brief for the run.
+
+        A second pin that differs is refused: the subject/brief are pinned for
+        the whole run and are never silently re-bound mid-flight.
+        """
+        if not subject or not brief:
+            raise AdmissionRefused("pin", "subject and brief must be non-empty")
+        if self.subject_digest is not None and (
+            self.subject_digest != subject or self.brief_digest != brief
+        ):
+            raise AdmissionRefused(
+                "pin", "subject/brief are already pinned for this run"
+            )
+        self.subject_digest = subject
+        self.brief_digest = brief
+
+    def _resolve_actor(self, admission: AssayAdmission) -> str:
+        if not admission.actor_token:
+            raise AdmissionRefused("actor", "no actor credential presented")
+        if self.actor_resolver is None:
+            raise AdmissionRefused(
+                "actor", "engine has no actor resolver; authenticated mutation is unavailable"
+            )
+        try:
+            return self.actor_resolver.resolve(admission.actor_token)
+        except Exception as exc:  # noqa: BLE001 - re-raised as a typed refusal
+            raise AdmissionRefused("actor", f"actor credential rejected: {exc}") from exc
+
+    def _enforce_deadline(self, deadline: Optional[str], *, axis: str) -> None:
+        """Refuse at or after *deadline*, parsing the timestamp correctly.
+
+        The comparison is on parsed instants, never on the raw strings: a
+        lexical comparison is wrong the moment the two offsets differ (e.g.
+        ``...+00:00`` vs ``...Z``), which would let an expired authority
+        deadline pass. A naive timestamp is read as UTC.
+        """
+        if deadline is None:
+            return
+        try:
+            when = datetime.fromisoformat(deadline)
+        except (TypeError, ValueError) as exc:
+            raise AdmissionRefused(axis, f"deadline {deadline!r} is not ISO") from exc
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) >= when:
+            raise AdmissionRefused(axis, f"deadline {deadline} has passed")
+
+    def _enforce_budget(self, remaining_budget: Optional[int], *, axis: str) -> None:
+        """Refuse at or beyond *remaining_budget*; a negative limit is refused."""
+        if remaining_budget is None:
+            return
+        if isinstance(remaining_budget, bool) or not isinstance(remaining_budget, int):
+            raise AdmissionRefused(axis, "remaining_budget must be an integer or None")
+        if remaining_budget < 0:
+            raise AdmissionRefused(
+                axis,
+                f"remaining budget must not be negative, got {remaining_budget}",
+            )
+        if self.current_turn >= remaining_budget:
+            raise AdmissionRefused(
+                axis,
+                f"remaining budget {remaining_budget} is exhausted at "
+                f"turn {self.current_turn}",
+            )
+
+    def _check_admission(
+        self,
+        admission: Optional[AssayAdmission],
+        *,
+        check_budget: bool = True,
+    ) -> str:
+        """Verify actor, pinned subject/brief, deadline and remaining budget.
+
+        Returns the authenticated actor. Raises :class:`AdmissionRefused` before
+        any mutation when any axis fails.
+
+        The *owner-authorized* envelope is the engine's own ``self.envelope``.
+        A caller's :class:`AssayAdmission` may **tighten** it (a shorter
+        deadline, a smaller budget, a stricter ``require_actor``) but may never
+        **loosen** it: a default or replacement dataclass envelope cannot waive
+        the authority's immutable limits. An extension or replacement of the
+        limits is a separate, independently-authorized act
+        (:meth:`set_turn_limit` / :meth:`authorize_envelope`), never inferred
+        from whatever envelope object a caller passed in.
+        """
+        if admission is None:
+            if self.envelope.require_actor or self.actor_resolver is not None:
+                raise AdmissionRefused(
+                    "admission", "an authenticated admission is required"
+                )
+            # Even an unauthenticated legacy mutation is still bound by the
+            # owner-authorized envelope.
+            self._enforce_deadline(self.envelope.deadline, axis="deadline")
+            if check_budget:
+                self._enforce_budget(self.envelope.remaining_budget, axis="budget")
+            return ""
+        actor = self._resolve_actor(admission)
+        # Unchanged subject/brief: the pinned values must still hold.
+        if self.subject_digest is not None and admission.subject != self.subject_digest:
+            raise AdmissionRefused(
+                "subject", "admitted subject differs from the pinned subject"
+            )
+        if self.brief_digest is not None and admission.brief != self.brief_digest:
+            raise AdmissionRefused(
+                "brief", "admitted brief differs from the pinned brief"
+            )
+        # The authority's envelope is authoritative. Merge the caller's
+        # envelope only to *tighten* it: the earliest deadline and the smallest
+        # budget win; a caller may add a require_actor demand but not remove one.
+        env = self._merged_envelope(admission.envelope)
+        self._enforce_deadline(env["deadline"], axis="deadline")
+        if check_budget:
+            self._enforce_budget(env["remaining_budget"], axis="budget")
+        return actor
+
+    def _merged_envelope(self, proposed: Optional["AssayEnvelope"]) -> dict[str, Any]:
+        """Combine the authority envelope with a caller's, tightening only.
+
+        Returns effective ``{"deadline", "remaining_budget"}``. The authority
+        (``self.envelope``) always applies; a caller envelope can only narrow.
+        A caller envelope that would *widen* the authority's limits is not
+        honoured — the authority's value stands.
+        """
+        auth = self.envelope
+        deadline = auth.deadline
+        budget = auth.remaining_budget
+        if proposed is not None:
+            if proposed.deadline is not None:
+                if deadline is None:
+                    deadline = proposed.deadline
+                else:
+                    # Earliest instant wins (tightest). Parse, don't lexically
+                    # order, so differing offsets are compared correctly.
+                    d_auth = _parse_instant(deadline)
+                    d_prop = _parse_instant(proposed.deadline)
+                    if d_prop is not None and (d_auth is None or d_prop < d_auth):
+                        deadline = proposed.deadline
+            if proposed.remaining_budget is not None:
+                if budget is None:
+                    budget = proposed.remaining_budget
+                else:
+                    budget = min(budget, proposed.remaining_budget)
+        return {"deadline": deadline, "remaining_budget": budget}
+
+    def authorize_envelope(self, envelope: "AssayEnvelope") -> "AssayEnvelope":
+        """Replace the owner-authorized envelope — an explicit authority act.
+
+        This is the *only* way to change the trusted envelope after
+        construction. It is deliberately a separate, named call (never inferred
+        from a caller dataclass passed to a mutation), so widening the deadline
+        or budget is attributable to an explicit authorization rather than a
+        silent override.
+        """
+        if not isinstance(envelope, AssayEnvelope):
+            raise AdmissionRefused("envelope", "envelope must be an AssayEnvelope")
+        self.envelope = envelope
+        return envelope
+
     # ── State ───────────────────────────────────────────────────────
 
     @property
     def state(self) -> AssayState:
         return self._state
 
-    def transition(self, target: AssayState) -> AssayState:
-        """Attempt a state transition, enforcing policy.
+    def transition(
+        self,
+        target: AssayState,
+        *,
+        admission: Optional[AssayAdmission] = None,
+    ) -> AssayState:
+        """Attempt a state transition, enforcing policy and admission.
 
         Raises ``ValueError`` for an illegal transition,
-        ``PolicyBlockedError`` when the policy blocks it, and
-        ``PolicyHoldError`` when the policy requires human intervention.
+        ``PolicyBlockedError`` when the policy blocks it,
+        ``PolicyHoldError`` when the policy requires human intervention, and
+        ``AdmissionRefused`` when the acting mutation fails actor/subject/brief/
+        deadline/budget checks.
         """
         legal = AssayState.legal_transitions(self._state)
         if target not in legal:
             raise InvalidTransitionError(self._state, target)
+
+        self._check_admission(admission)
 
         decision = self.policy.check_transition(self._state, target)
         if not decision.approved:
@@ -512,23 +885,57 @@ class AssayEngine:
 
     # ── Turns ───────────────────────────────────────────────────────
 
-    def advance_turn(self) -> int:
-        """Advance the turn counter, raising on budget exhaustion."""
-        if self.current_turn >= self.max_turns:
+    def advance_turn(
+        self,
+        *,
+        admission: Optional[AssayAdmission] = None,
+    ) -> int:
+        """Advance the turn counter, raising on budget exhaustion.
+
+        A mutation of the run's progress: it checks actor, pinned subject/brief,
+        deadline and remaining budget first. ``max_turns=None`` means the
+        owner-authorized no-cumulative-limit envelope and never blocks here.
+        """
+        self._check_admission(admission)
+        if self.max_turns is not None and self.current_turn >= self.max_turns:
             raise TurnBudgetExhaustedError(
                 f"Turn budget exhausted: {self.current_turn}/{self.max_turns}"
             )
         self.current_turn += 1
         return self.current_turn
 
-    def set_turn_limit(self, max_turns: int) -> AssayTurnLimit:
-        """Change the maximum turn limit and record the change."""
+    def set_turn_limit(
+        self,
+        max_turns: Optional[int],
+        *,
+        admission: Optional[AssayAdmission] = None,
+    ) -> AssayTurnLimit:
+        """Change the maximum turn limit and record the change.
+
+        A negative limit is refused. The change checks actor, pinned subject/
+        brief, deadline and remaining budget before it takes effect: an
+        unauthorized actor cannot extend (or shrink) the bound. ``max_turns=None``
+        records the owner-authorized no-cumulative-limit envelope.
+        """
+        if max_turns is not None:
+            if isinstance(max_turns, bool) or not isinstance(max_turns, int):
+                raise AdmissionRefused(
+                    "turn_limit", "max_turns must be an integer or None"
+                )
+            if max_turns < 0:
+                raise AdmissionRefused(
+                    "turn_limit", f"max_turns must not be negative, got {max_turns}"
+                )
+        actor = self._check_admission(admission)
         self.max_turns = max_turns
+        kind = "no_cumulative_limit" if max_turns is None else "extension"
         limit = AssayTurnLimit(
-            run_id="",
+            run_id=self.run_id,
             max_turns=max_turns,
             current_turn=self.current_turn,
             updated_at=datetime.now(timezone.utc).isoformat(),
+            actor=actor,
+            kind=kind,
         )
         self._turn_limit_changes.append(limit)
         return limit
@@ -709,6 +1116,20 @@ class TurnBudgetExhaustedError(AssayError):
     """Raised when the turn budget is exhausted."""
 
 
+class AdmissionRefused(AssayError):
+    """A mutation or turn-limit change failed actor/subject/brief/envelope checks.
+
+    Raised *before* the mutation. ``axis`` names which check refused (actor,
+    subject, brief, deadline, budget, turn_limit, admission, envelope, pin), so
+    the refusal is attributable.
+    """
+
+    def __init__(self, axis: str, reason: str) -> None:
+        self.axis = axis
+        self.reason = reason
+        super().__init__(f"Assay admission refused ({axis}): {reason}")
+
+
 class EvidenceRejectedError(AssayError):
     """Raised when evidence is rejected (e.g. narrative/compaction)."""
 
@@ -736,6 +1157,11 @@ __all__ = [
     "list_policy_names",
     "AssayHeartbeat",
     "AssayTurnLimit",
+    "AssayEnvelope",
+    "AssayAdmission",
+    "ActorResolver",
+    "StaticActorResolver",
+    "HostAuthorityActorResolver",
     "AssaySplit",
     "AssayEngine",
     "VALID_ASSAY_EVIDENCE_TYPES",
@@ -745,5 +1171,6 @@ __all__ = [
     "PolicyBlockedError",
     "PolicyHoldError",
     "TurnBudgetExhaustedError",
+    "AdmissionRefused",
     "EvidenceRejectedError",
 ]

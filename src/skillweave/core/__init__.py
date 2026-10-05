@@ -3,7 +3,15 @@
 Provides foundational processing, planning, and system primitives.
 """
 
-from .proc.runner import run_process, redact_secrets, ProcessLimitExceeded
+from .proc.runner import (
+    run_process,
+    redact_secrets,
+    ProcessLimitExceeded,
+    ScopeEnforcement,
+    IsolationAttestation,
+    ScopeEnforcementUnavailable,
+    ScopeViolation,
+)
 from .context import (
     ContextBlock,
     ContextCheckpoint,
@@ -24,6 +32,10 @@ __all__ = [
     "run_process",
     "redact_secrets",
     "ProcessLimitExceeded",
+    "ScopeEnforcement",
+    "IsolationAttestation",
+    "ScopeEnforcementUnavailable",
+    "ScopeViolation",
     "ContextBlock",
     "ContextCheckpoint",
     "ContextLimitAssessment",
