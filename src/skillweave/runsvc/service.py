@@ -542,6 +542,38 @@ class RunApplicationService:
                 "result": "already_terminal",
             }
 
+        # Record a durable cancellation intent BEFORE the irreversible signal
+        # boundary.  If the supervisor is lost after signalling (or dies *at*
+        # the signal call itself), the intent stays readable, so a later
+        # production resume (``resume_run``) finishes the cancellation instead
+        # of leaving a non-terminal ``running`` run with no restart authority.
+        # The real signal outcome is still committed below; the intent is only
+        # the recoverable fallback.  A genuine terminal winner was already
+        # returned above, and ``record_intent`` leaves one untouched.
+        KillOutcomeError = _runtime_attr("errors", "KillOutcomeError")
+        reconcile_cancellation_intent = getattr(
+            self.store, "reconcile_cancellation_intent", None)
+        if reconcile_cancellation_intent is not None:
+            try:
+                reconcile_cancellation_intent(
+                    run_id,
+                    pid=pid,
+                    result="pending",
+                    event_payload={"pid": pid, "result": "pending"},
+                    idempotency_key="kill:" + run_id,
+                    reason="service: kill",
+                ).record_intent()
+            except Exception as exc:  # noqa: BLE001
+                # A cancellation whose intent cannot be durably recorded must
+                # not proceed to the irreversible signal as if it were safe.
+                raise KillOutcomeError(
+                    run_id,
+                    {"reason": "cancellation intent could not be durably recorded",
+                     "error": type(exc).__name__, "detail": str(exc)},
+                    result="unknown",
+                    cause=exc,
+                ) from exc
+
         # Graceful kill (SIGTERM) to the process group
         killed_graceful = False
         try:
@@ -709,6 +741,16 @@ class RunApplicationService:
                 "state": "unknown",
                 "error": "historical run cannot be resumed",
             }
+
+        # A cancellation intent recorded before the signal boundary but never
+        # committed (the supervisor died at/after the signal) is finished here,
+        # on the actual production restart/resume path, so the run reaches a
+        # terminal ``killed`` lifecycle with exactly one logical event instead
+        # of being left non-terminal ``running``.
+        CancellationReconciler = _runtime_attr("store", "CancellationReconciler")
+        finished = CancellationReconciler.resume_pending(self.store, run_id)
+        if finished is not None:
+            run = finished
 
         events = self.journal.get_events(run_id)
         return {

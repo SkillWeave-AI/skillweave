@@ -216,10 +216,38 @@ crash between the intent and the commit leaves the intent readable, so
 `CancellationReconciler.resume_pending()` finishes the recorded cancellation
 on a later pass instead of leaving a non-terminal `running` run behind.
 
-The service kill path itself (`RunApplicationService.kill_run`) commits
-through `reconcile_terminal()`, which retries CAS contention without a finite
-bound, so a finite burst of competing writers cannot drop the cancellation
-without needing a durable intent.  `RunStateStore.update_metadata(state="killed")`
+#### Durable intent before the irreversible signal boundary
+
+The signal is irreversible: once `os.killpg(pid, SIGTERM/SIGKILL)` fires, the
+process may be gone and there is no way to un-send it.  Both kill paths
+therefore record the durable cancellation intent **before** the signal block,
+not only before the terminal commit:
+
+* `RunApplicationService.kill_run` calls
+  `reconcile_cancellation_intent(run_id, ...).record_intent()` immediately
+  after the terminal-winner early-return and before the first `os.killpg`.
+  The real signal outcome is still committed afterwards through
+  `reconcile_terminal()`; the intent payload (`result="pending"`) is the
+  recoverable fallback.  If the intent cannot be durably recorded, `kill_run`
+  raises `KillOutcomeError` rather than proceeding to the irreversible signal
+  as if it were safe.
+* The compatibility façade `runlifecycle.handle.kill_run` records the same
+  intent through `RunStateStore._kernel.reconcile_cancellation_intent()` before
+  its signal block.
+
+A crash *at* the signal call (supervisor lost between the signal and the
+terminal commit) therefore still leaves the intent readable, and the
+production resume path finishes the cancellation: `RunApplicationService.resume_run`
+calls `CancellationReconciler.resume_pending()` for a non-terminal,
+non-historical run before returning its state.  A recorded-but-uncommitted
+cancellation therefore reaches terminal `killed` with exactly one logical
+event across a real restart, instead of leaving the run non-terminal
+`running`.
+
+`RunApplicationService.kill_run` additionally commits through
+`reconcile_terminal()`, which retries CAS contention without a finite bound, so
+a finite burst of competing writers cannot drop the cancellation even when the
+service survives to the commit.  `RunStateStore.update_metadata(state="killed")`
 uses the same canonical reconciliation, so a façade-level cancellation cannot
 swallow a CAS conflict either.
 
@@ -292,6 +320,9 @@ file at `.skillweave/runs/{run_id}/run.json`.
 
 - Returns `None` if the run does not exist.
 - Returns an error for terminal or historical runs.
+- Reconciles a recorded-but-uncommitted `_pending_cancellation` intent (a
+  crash at the signal boundary) through `CancellationReconciler.resume_pending()`
+  before returning, so a lost cancellation becomes a terminal `killed` run.
 - Returns the current run state for active runs.
 - Does **not** launch a duplicate process or revive a terminal/historical run.
 

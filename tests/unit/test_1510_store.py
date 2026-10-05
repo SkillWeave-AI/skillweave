@@ -238,6 +238,24 @@ class TestCriterion1_SharedAuthority:
         assert resume is not None
         assert resume["state"] == "preflight"
 
+    def test_resume_run_without_pending_intent_returns_current_state(self):
+        """Resume reconciles only a recorded intent; a plain run is unchanged.
+
+        A normal non-terminal run (no ``_pending_cancellation`` intent) must be
+        returned as-is — resume must never fabricate a terminal transition or
+        add a cancellation event.
+        """
+        svc, store, _ = _make_service()
+        store.save_run(_make_run("resume-no-intent-1"))
+        assert store.get_run("resume-no-intent-1").metadata.get("_pending_cancellation") is None
+
+        resume = svc.resume_run("resume-no-intent-1")
+        assert resume is not None
+        assert resume["state"] == "preflight"
+        after = store.get_run("resume-no-intent-1")
+        assert after.state == "preflight"
+        assert after.metadata.get("_pending_cancellation") is None
+
     def test_resume_terminal_run_fails(self):
         """Resuming a terminal run must return an error."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1856,6 +1874,89 @@ class TestDurableCancellationReconciliation:
             assert _terminal_event_count(reopened, run_id) == 1
             # Idempotent: a second resume finds a terminal run and does nothing.
             assert CancellationReconciler.resume_pending(reopened, run_id) is None
+            reopened.close()
+
+    def test_kill_records_durable_intent_before_signal(self):
+        """``kill_run`` records a cancellation intent before the signal call.
+
+        Simulates abrupt supervisor loss *at* the signal boundary: the first
+        signal call raises (a crash before the real terminal commit).  The
+        durable intent must be readable at that point, so a later restart can
+        still finish the cancellation instead of leaving ``running``.
+        """
+        import skillweave.runsvc.service as service_module
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            run_id = "kill-intent-boundary"
+            store.create_run(run_id, runlifecycle={
+                "pid": 313372, "command": ["offline"], "lifecycle_state": "running"})
+            svc = self._service_run(store)
+
+            intent_at_signal = {}
+
+            def crash_at_signal(*_a, **_k):
+                intent_at_signal["pending"] = (
+                    store.get_run(run_id).metadata.get("_pending_cancellation"))
+                raise KeyboardInterrupt("supervisor lost at the signal boundary")
+
+            old = service_module.os.kill, service_module.os.killpg
+            try:
+                service_module.os.kill = service_module.os.killpg = crash_at_signal
+                with pytest.raises(KeyboardInterrupt):
+                    svc.kill_run(run_id, 313372)
+            finally:
+                service_module.os.kill, service_module.os.killpg = old
+
+            assert isinstance(intent_at_signal.get("pending"), dict), (
+                "no durable cancellation intent existed before the signal boundary")
+            assert intent_at_signal["pending"].get("idempotency_key") == "kill:" + run_id
+            # The run is still non-terminal (the crash prevented the commit).
+            assert not RunStateModel.is_terminal(store.get_run(run_id).state)
+            store.close()
+
+    def test_resume_run_reconciles_recorded_cancellation_intent(self):
+        """Production resume finishes a recorded-but-uncommitted cancellation.
+
+        Mirrors the crash-at-signal-boundary scenario end to end through the
+        real production restart path (``RunApplicationService.resume_run``), not
+        the reconciler helper alone: the run must reach terminal ``killed`` with
+        exactly one logical cancellation event.
+        """
+        import skillweave.runsvc.service as service_module
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "store.db")
+            store = _fresh_store(db_path)
+            run_id = "kill-resume-production"
+            store.create_run(run_id, runlifecycle={
+                "pid": 313372, "command": ["offline"], "lifecycle_state": "running"})
+            svc = self._service_run(store)
+
+            def crash_at_signal(*_a, **_k):
+                raise KeyboardInterrupt("supervisor lost at the signal boundary")
+
+            old = service_module.os.kill, service_module.os.killpg
+            try:
+                service_module.os.kill = service_module.os.killpg = crash_at_signal
+                with pytest.raises(KeyboardInterrupt):
+                    svc.kill_run(run_id, 313372)
+            finally:
+                service_module.os.kill, service_module.os.killpg = old
+
+            assert isinstance(
+                store.get_run(run_id).metadata.get("_pending_cancellation"), dict)
+            store.close()
+
+            # Restart with a fresh connection and resume through the production
+            # path: the recorded cancellation is reconciled.
+            reopened = SQLiteRunStore(db_path)
+            resumed = RunApplicationService(
+                reopened, EventJournal(reopened), RawArtifactStore()).resume_run(run_id)
+            assert resumed is not None
+            after = reopened.get_run(run_id)
+            assert RunStateModel.is_terminal(after.state)
+            assert after.metadata["runlifecycle"]["lifecycle_state"] == "killed"
+            assert _terminal_event_count(reopened, run_id) == 1
             reopened.close()
 
 

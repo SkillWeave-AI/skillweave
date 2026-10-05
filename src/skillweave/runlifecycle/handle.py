@@ -346,6 +346,20 @@ def kill_run(
             "result": "already_terminal",
         }
 
+    # Record a durable cancellation intent BEFORE the irreversible signal
+    # boundary.  If the facade is lost after signalling (or dies at the signal
+    # call itself), the intent stays readable, so a later production resume
+    # (``RunApplicationService.resume_run``) finishes the cancellation instead
+    # of leaving a non-terminal ``running`` run with no restart authority.
+    store._kernel.reconcile_cancellation_intent(
+        run_id,
+        pid=pid,
+        result="pending",
+        event_payload={"pid": pid, "result": "pending"},
+        idempotency_key="kill:" + run_id,
+        reason="lifecycle: kill",
+    ).record_intent()
+
     # Graceful kill (SIGTERM) to the process group
     killed_graceful = False
     try:
