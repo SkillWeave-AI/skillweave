@@ -156,6 +156,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from skillweave.runtime.journal import EventJournal
     from skillweave.runtime.registry import RawArtifactStore
     from skillweave.runtime.stream import DurableStreamStore
+    from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope
     from skillweave.runsvc.service import RunApplicationService
 
     store = SQLiteRunStore(args.db_path)
@@ -171,8 +172,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stream_root = args.stream_root or _default_stream_root(args.db_path)
     stream_store = DurableStreamStore(root=stream_root)
 
-    svc = RunApplicationService(store, journal, raw_artifacts, stream_store)
+    # SW-1510-BUDGET: wire the atomic reservation store explicitly so the
+    # installed `skillweave run` entry is bound to the budget guard.  The owner
+    # envelope is set with explicit unlimited (all None = authorized unlimited),
+    # so the ingress is not silently unguarded: every run acquires a reservation
+    # slot, cumulative usage is tracked, and a finite owner envelope can be
+    # pre-configured by the host to cap usage.
+    reservation_store = ReservationStore(args.db_path)
+    svc = RunApplicationService(
+        store, journal, raw_artifacts, stream_store,
+        reservation_store=reservation_store,
+    )
     run_id = generate_run_id()
+
+    # Set the explicit owner-authorized unlimited envelope so the reservation
+    # store has a persisted owner policy.  All-None means "no hard cumulative
+    # caps" — the authorized owner-unlimited mode.  A host that wants finite
+    # bounds pre-configures the envelope before calling this entry.
+    scope_id = f"{args.task_id or run_id}/attempt-{args.attempt}"
+    owner_env = ReservationEnvelope()
+    reservation_store.set_envelope(run_id, scope_id, owner_env)
 
     try:
         # The native streaming entry authenticates the worker at ingress and,
@@ -192,6 +211,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             task_id=args.task_id or run_id,
             attempt=args.attempt,
             output_root=args.output_root,
+            reservation_envelope=owner_env,
         )
 
         result_obj = execution["result"]

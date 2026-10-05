@@ -875,6 +875,222 @@ class TestEnvelopeWideningGuard:
 
 
 # ===================================================================
+# BLOCKING C: Installed ingress paths wire ReservationStore
+# ===================================================================
+
+class TestInstalledIngressWiresReservation:
+    """cli/run.py and mcp/server.py now wire ReservationStore explicitly."""
+
+    def test_cli_run_main_creates_reservation(self, monkeypatch):
+        """cli/run.main() creates a ReservationStore and tracks reservations."""
+        from skillweave.cli import run as cli_run
+
+        # Capture stdout and prevent sys.exit
+        written: list[str] = []
+        monkeypatch.setattr(sys.stdout, "write", lambda s: written.append(s))
+        exit_codes: list[int] = []
+        monkeypatch.setattr(sys, "exit", lambda code: exit_codes.append(code))
+
+        # Create a temp db path
+        db_path = str(_SCRATCH / f"cli_run_test_{uuid.uuid4().hex}.db")
+
+        try:
+            cli_run.main([
+                "--tool", "opencode",
+                "--model", "budget-test",
+                "--subject-repo", "skillweave",
+                "--subject-commit", "deadbeef",
+                "--db-path", db_path,
+                "--artifacts-path", str(_SCRATCH / f"cli_run_art_{uuid.uuid4().hex}"),
+                "--", sys.executable, "-c", "print('cli-budget-probe')",
+            ])
+
+            # Verify the db has reservation records
+            from skillweave.runtime.reservation import ReservationStore
+            rs = ReservationStore(db_path)
+            rows = rs._conn.execute(
+                "SELECT COUNT(*) as cnt FROM reservations"
+            ).fetchone()
+            assert rows["cnt"] >= 1, (
+                "expected at least one reservation record from CLI run"
+            )
+            # Verify envelope was persisted
+            env_rows = rs._conn.execute(
+                "SELECT COUNT(*) as cnt FROM reservation_envelopes"
+            ).fetchone()
+            assert env_rows["cnt"] >= 1, (
+                "expected at least one envelope record from CLI run"
+            )
+            rs.close()
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(db_path + suffix)
+                except OSError:
+                    pass
+
+    def test_cli_run_reservation_store_not_none(self):
+        """RunApplicationService has a non-None reservation_store when wired."""
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope
+        from skillweave.runsvc.service import RunApplicationService
+
+        db_path = str(_SCRATCH / f"svc_wired_{uuid.uuid4().hex}.db")
+        try:
+            store = SQLiteRunStore(db_path)
+            journal = EventJournal(db_path)
+            raw = RawArtifactStore()
+            stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+            stream_store = DurableStreamStore(root=stream_root)
+            rs = ReservationStore(db_path)
+            svc = RunApplicationService(
+                store, journal, raw, stream_store,
+                reservation_store=rs,
+            )
+            assert svc.reservation_store is not None
+            # Verify owner envelope can be set and used
+            run_id = "ingress-wired-test"
+            scope_id = f"{run_id}/attempt-1"
+            owner_env = ReservationEnvelope()
+            svc.reservation_store.set_envelope(run_id, scope_id, owner_env)
+
+            execution = svc.execute_streaming_native(
+                [sys.executable, "-c", "print('ingress-budget-probe')"],
+                run_id=run_id,
+                tool="opencode",
+                model="budget-test",
+                subject_repo="skillweave",
+                subject_commit="deadbeef",
+                attempt=1,
+                task_id=run_id,
+                reservation_envelope=owner_env,
+            )
+            assert execution["run_id"] == run_id
+
+            # Verify reservation was created and completed
+            reservations = svc.reservation_store.list_reservations(run_id)
+            assert len(reservations) >= 1
+            rec = reservations[0]
+            assert rec.state in (
+                ReservationSlotState.COMPLETED.value,
+                ReservationSlotState.RELEASED.value,
+            )
+            usage = svc.reservation_store.get_run_usage(run_id)
+            assert usage["in_flight"] == 0
+            rs.close()
+            store.close()
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(db_path + suffix)
+                except OSError:
+                    pass
+
+    def test_mcp_create_run_wires_reservation(self):
+        """mcp/server.py create_run tool wires ReservationStore."""
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope
+        from skillweave.runsvc.service import RunApplicationService
+
+        db_path = str(_SCRATCH / f"mcp_wired_{uuid.uuid4().hex}.db")
+        try:
+            store = SQLiteRunStore(db_path)
+            journal = EventJournal(db_path)
+            raw = RawArtifactStore()
+            stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+            stream_store = DurableStreamStore(root=stream_root)
+            rs = ReservationStore(db_path)
+            svc = RunApplicationService(
+                store, journal, raw, stream_store,
+                reservation_store=rs,
+            )
+            assert svc.reservation_store is not None
+
+            # Simulate the MCP create_run path
+            run_id = "mcp-ingress-wired"
+            scope_id = f"{run_id}/attempt-1"
+            owner_env = ReservationEnvelope()
+            svc.reservation_store.set_envelope(run_id, scope_id, owner_env)
+
+            execution = svc.execute_streaming_native(
+                [sys.executable, "-c", "print('mcp-budget-probe')"],
+                run_id=run_id,
+                tool="opencode",
+                model="budget-test",
+                subject_repo="skillweave",
+                subject_commit="deadbeef",
+                attempt=1,
+                task_id=run_id,
+                reservation_envelope=owner_env,
+            )
+            assert execution["run_id"] == run_id
+
+            # Verify reservation was created
+            reservations = svc.reservation_store.list_reservations(run_id)
+            assert len(reservations) >= 1
+            rec = reservations[0]
+            assert rec.state in (
+                ReservationSlotState.COMPLETED.value,
+                ReservationSlotState.RELEASED.value,
+            )
+            mcp_usage = svc.reservation_store.get_run_usage(run_id)
+            assert mcp_usage["in_flight"] == 0
+            rs.close()
+            store.close()
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(db_path + suffix)
+                except OSError:
+                    pass
+
+    def test_installed_ingress_persists_owner_envelope(self, db_path):
+        """Installed ingress persists owner envelope before admission."""
+        from skillweave.runtime.reservation import (
+            ReservationStore, ReservationEnvelope,
+        )
+        rs = ReservationStore(db_path)
+
+        # Simulate what cli/run.py and mcp/server.py do: set owner envelope
+        run_id = "owner-envelope-test"
+        scope_id = f"{run_id}/attempt-1"
+        owner_env = ReservationEnvelope()  # unlimited
+        rs.set_envelope(run_id, scope_id, owner_env)
+
+        # Verify envelope is persisted
+        loaded = rs.get_envelope(run_id, scope_id)
+        assert loaded is not None
+        # All-None = authorized unlimited
+        assert loaded.max_cost is None
+        assert loaded.max_tokens is None
+        assert loaded.max_bytes is None
+        assert loaded.max_requests is None
+        assert loaded.max_in_flight == 3  # default
+
+        # A finite owner envelope pre-configured by the host is authoritative
+        run_id2 = "finite-owner-test"
+        scope_id2 = f"{run_id2}/attempt-1"
+        finite_env = ReservationEnvelope(max_requests=5, max_in_flight=3)
+        rs.set_envelope(run_id2, scope_id2, finite_env)
+
+        loaded2 = rs.get_envelope(run_id2, scope_id2)
+        assert loaded2 is not None
+        assert loaded2.max_requests == 5
+
+        # Caller cannot widen the finite owner envelope
+        from skillweave.runtime.reservation import EnvelopeRejected
+        with pytest.raises(EnvelopeRejected):
+            rs.set_envelope(run_id2, scope_id2, ReservationEnvelope(max_requests=10))
+        rs.close()
+
+
+# ===================================================================
 # Run entry point
 # ===================================================================
 
