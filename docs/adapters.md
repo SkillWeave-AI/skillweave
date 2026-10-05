@@ -202,6 +202,46 @@ egress are four *distinct* refusals, not one generic NO. Discovery and import
 perform **no** network install, **no** provider call and **no** arbitrary
 executable loading.
 
+## The Discovery lifecycle consumer
+
+The `skillweave-discovery` skill ships as a **prompt** pack: `skills/
+skillweave-discovery/SKILL.md` is Markdown a host runs, and a prompt pack does
+not, by itself, invoke a search provider. Treating "Discovery goes through
+Council" as the lifecycle binding is therefore not admissible: Council's Stage 0
+is a *Council* consumer, not a Discovery one, and no Discovery lifecycle
+consumer existed in the sources.
+
+The executable Discovery consumer is delivered by a **minimal, source-owned path
+addition** (`src/skillweave/discovery/`), bound to the *same* extension registry
+Council uses through the one mechanism that actually runs code at a phase
+boundary -- the Studio hook engine:
+
+* `skillweave.discovery.lifecycle_search` -- the seam. It derives its provider
+  map from `SEARCH_PROVIDER_SPECS` (the registry stays the single source of
+  truth), resolves -> admits -> invokes through `AdapterFacade`, and returns a
+  **typed** `SearchOutcome` plus an `OperationReceipt`. An unknown provider
+  raises; a `None`/in-process adapter is named by its own registered id.
+* `skillweave.discovery.lifecycle_hook.DiscoveryResearchHook` -- a
+  `type=python` `HookAdapter` bound at `discovery/pre` (the free-tier
+  `pre_discovery` injection point). It reads `ctx.hook_config`, drives the seam,
+  and returns a hook `pass`/`fail`. It sets **no** `gate_override`: a hook is not
+  gate authority.
+* `skillweave.discovery.binding` -- the source-owned binding descriptor a
+  consumer materializes into `.skillweave/hooks/discovery-pre.yaml`. It embeds
+  no credential value and denies egress by default.
+
+The binding is data, not a script in a foreign home: it names the packaged class
+`skillweave.discovery.lifecycle_hook.DiscoveryResearchHook`, so the engine
+imports it straight from the installed wheel.
+
+Everything fails closed -- each is an asserted counterexample, not a claim:
+
+* a provider **outage** is a typed non-success, reported as a hook `fail`;
+* an **unknown** provider raises and is reported (no DuckDuckGo fallback);
+* a **malformed** outcome (a backend returning the wrong type) is refused;
+* an **unapproved** adapter, a **denied egress** (the default), and a
+  **missing credential** are three distinct pre-invocation refusals.
+
 ## Receipts bind, and carry no authority
 
 Every invocation returns an `OperationReceipt` binding the invocation id, the
@@ -222,6 +262,8 @@ execution*: `self_approving` is always `False` and `is_authority` is always
 | MCP lifecycle; old bare-`tools/call` defect is load-bearing | `tests/contract/test_adapter_mcp_lifecycle.py` |
 | Installed artifact: external adapters register with no vendor edit | `tests/contract/test_installed_adapter_extension.py` |
 | Council is a real registry consumer | `tests/contract/test_adapter_council_search.py` |
+| Discovery lifecycle consumer (real `run_hooks` path; outage/unknown/malformed) | `tests/contract/test_discovery_lifecycle_consumer.py` |
+| Discovery consumer on the **installed** artifact | `tests/contract/test_discovery_installed_consumer.py` |
 | Router/harness decision & admission semantics preserved | `tests/contract/test_adapter_router_harness_semantics.py` |
 | SDK adapter schema contract set | `skillweave-sdk/tests/contract/test_adapter_contract_set.py` |
 
