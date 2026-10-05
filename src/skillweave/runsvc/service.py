@@ -119,10 +119,22 @@ class RunApplicationService:
         store: SQLiteRunStore,
         journal: EventJournal,
         raw_artifacts: RawArtifactStore,
+        stream_store: Optional[Any] = None,
     ):
         self.store = store
         self.journal = journal
         self.raw_artifacts = raw_artifacts
+        # The durable per-attempt stream evidence store (SW-1510-STREAM). It is
+        # optional and resolved lazily so the unchanged legacy path never
+        # requires the optional runtime stream subpackage to be present. It owns
+        # no authority: it is a bounded, cursor-addressed evidence channel the
+        # production collector writes and the observer reads.
+        if stream_store is None:
+            try:
+                stream_store = _runtime_attr("stream", "DurableStreamStore")()
+            except Exception:  # noqa: BLE001 - optional subpackage
+                stream_store = None
+        self.stream_store = stream_store
 
     def execute(
         self,
@@ -947,3 +959,297 @@ class RunApplicationService:
             "updated_at": run.updated_at,
             "event_count": len(events),
         }
+
+    # ------------------------------------------------------------------
+    # Durable stream evidence (SW-1510-STREAM)
+    #
+    # These methods sit beside ``execute`` (which is unchanged) so a caller can
+    # run a worker through the production streaming collector and then bind the
+    # raw evidence, the collected facts, and the gate into the same store and
+    # journal ``execute`` uses. They add no second authority: the durable stream
+    # is a bounded, cursor-addressed evidence channel, the gate is derived by the
+    # same completion contract, and the verifier remains separate.
+    # ------------------------------------------------------------------
+
+    def execute_streaming(
+        self,
+        command: Sequence[str],
+        *,
+        run_id: str,
+        tool: str,
+        model: str,
+        subject_repo: str,
+        subject_commit: str,
+        attempt: int = 1,
+        task_id: str = "task-1",
+        created_at: Optional[str] = None,
+        check_output: Optional[Any] = None,
+        timeout: Optional[float] = None,
+        secrets: Optional[Sequence[str]] = None,
+        stdout_retain_limit: Optional[int] = None,
+        stderr_retain_limit: Optional[int] = None,
+        env_allowlist: Optional[Sequence[str]] = None,
+        extra_env: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        """Run ``command`` streaming its output into ``self.stream_store``.
+
+        This is the streaming sibling of :meth:`execute` and reuses every
+        authoritative primitive it uses — the same ``SQLiteRunStore``, the same
+        ``EventJournal``, the same ``RawArtifactStore``, the same independent
+        ``Verifier`` and ``CompletionContract`` — but the collection is the
+        durable per-attempt stream rather than a pair of flat strings. It does
+        not fork or replace the six-record path; it records the extra stream
+        evidence and the immutable measured facts alongside it.
+        """
+        if self.stream_store is None:
+            raise RunIntegrationError(
+                "stream", "no durable stream store is configured"
+            )
+
+        created_at = created_at or datetime.now(timezone.utc).isoformat()
+
+        EventType = _runtime_attr("journal", "EventType")
+        ArtifactReceipt = _runtime_attr("registry", "ArtifactReceipt")
+        EvidenceQuality = _runtime_attr("registry", "EvidenceQuality")
+        EvidenceType = _runtime_attr("registry", "EvidenceType")
+        Verifier = _runtime_attr("verify", "Verifier")
+        CompletionContract = _runtime_attr("verify", "CompletionContract")
+        GateState = _runtime_attr("verify", "GateState")
+
+        from skillweave.core.proc.runner import run_process_streaming
+
+        # Stage 1: Run, walked through its legal states up to verify (mirrors
+        # execute(); the child is a real subprocess spawned below).
+        self.store.create_run(run_id)
+        for from_state, to_state in (
+            ("preflight", "batch_selection"),
+            ("batch_selection", "lane_plan"),
+            ("lane_plan", "implement"),
+            ("implement", "verify"),
+        ):
+            current = self.store.get_run(run_id)
+            self.store.transition(
+                run_id,
+                to_state,
+                expected_state=from_state,
+                expected_version=current.version,
+                reason="run svc streaming: lane advance",
+                role="ops",
+            )
+
+        # Stage 2: the production streaming spawn/collection.
+        try:
+            result = run_process_streaming(
+                list(command),
+                run_id=run_id,
+                store=self.stream_store,
+                attempt=attempt,
+                task_id=task_id,
+                timeout=timeout,
+                secrets=list(secrets) if secrets else None,
+                stdout_retain_limit=stdout_retain_limit,
+                stderr_retain_limit=stderr_retain_limit,
+                env_allowlist=list(env_allowlist) if env_allowlist else None,
+                extra_env=extra_env,
+            )
+        except Exception as exc:  # noqa: BLE001 - a launch/stage failure is explicit
+            self._fail_run(run_id, f"streaming launch raised {exc}")
+            raise RunIntegrationError("launch", str(exc)) from exc
+
+        fact = result.fact
+        stdout_summary = self.stream_store.summary(attempt, "stdout")
+        stderr_summary = self.stream_store.summary(attempt, "stderr")
+
+        # Stage 3: raw artifacts — the *redacted convenience bytes* under the
+        # run's raw-artifact digest, and each stream's exact observed digest
+        # recorded as an attempt event on the journal (metadata-only).
+        raw_bytes = result.stdout_text.encode("utf-8", errors="replace")
+        raw_digest = self.raw_artifacts.put(raw_bytes)
+
+        # Stage 4: journal — one attempt-fact event carrying the immutable
+        # measured facts and the exact stream digests, plus the artifact event.
+        self.journal.append(
+            run_id,
+            event_type=EventType.ARTIFACT_CREATED.value,
+            payload={
+                "digest": raw_digest,
+                "byte_length": len(raw_bytes),
+                "exit_code": fact.exit_code,
+                "signal": fact.signal,
+                "termination": fact.termination,
+                "result_subtype": fact.result_subtype,
+                "duration_ns": fact.duration_ns,
+                "attempt": attempt,
+                "stdout": stdout_summary.to_dict(),
+                "stderr": stderr_summary.to_dict(),
+            },
+        )
+
+        # Stage 5: the receipt bound to the run and the raw bytes.
+        receipt = ArtifactReceipt(
+            artifact_id=f"runsvc-stream-{run_id}",
+            sha256=raw_digest,
+            schema_version="1",
+            producer_command=" ".join(command),
+            subject_repo=subject_repo,
+            subject_commit=subject_commit,
+            created_at=created_at,
+            evidence_type=EvidenceType.RUNTIME_TRACE.value,
+            purpose=f"streamed attempt {attempt} output for run '{run_id}'",
+            method="runsvc-stream",
+            system_source="runsvc",
+            quality=EvidenceQuality(),
+            metadata={
+                "run_id": run_id,
+                "task_id": task_id,
+                "attempt": attempt,
+                "tool": tool,
+                "model": model,
+                "exit_code": fact.exit_code,
+                "signal": fact.signal,
+                "termination": fact.termination,
+                "result_subtype": fact.result_subtype,
+                "duration_ns": fact.duration_ns,
+                "stdout_digest": stdout_summary.digest,
+                "stderr_digest": stderr_summary.digest,
+                "stdout_observed_bytes": stdout_summary.observed_bytes,
+                "stderr_observed_bytes": stderr_summary.observed_bytes,
+                "stdout_incompleteness": stdout_summary.incompleteness,
+                "stderr_incompleteness": stderr_summary.incompleteness,
+            },
+        )
+        saved_receipt = self.store.save_evidence(receipt)
+
+        # Stage 6: verification — a separate verifier over the *observed* stdout
+        # bytes (not the retained prefix), so an incomplete stream is graded on
+        # what was actually observed.
+        verifier = Verifier()
+        observed_stdout = self.stream_store.spool(attempt, "stdout").read_retained()
+        verdict = verifier.assess(
+            saved_receipt.artifact_id,
+            exit_code=fact.exit_code,
+            signal=fact.signal,
+            termination=fact.termination,
+            stdout=observed_stdout,
+            check_output=check_output,
+        )
+        verdict_body = (
+            f"{verdict.subject_artifact_id}|{verdict.grade}|{verdict.gate_state}"
+        ).encode("utf-8")
+        verification_digest = hashlib.sha256(verdict_body).hexdigest()
+        verdict_receipt = verdict.to_receipt(digest=verification_digest)
+
+        contract = CompletionContract()
+        gate_state = contract.evaluate(
+            exit_code=fact.exit_code,
+            signal=fact.signal,
+            termination=fact.termination,
+            stdout=observed_stdout,
+            check_output=check_output,
+        )
+
+        # Terminal state: route through the lane's legal gate state (unchanged
+        # transition discipline from execute()).
+        current = self.store.get_run(run_id)
+        gate_stage = "review_gate" if gate_state == GateState.PASS else "fix_retry"
+        stop_reason = None if gate_state == GateState.PASS else "before_gate"
+        try:
+            self.store.transition(
+                run_id,
+                gate_stage,
+                expected_state="verify",
+                expected_version=current.version,
+                reason="run svc streaming: gate stage",
+                role="ops",
+            )
+            current = self.store.get_run(run_id)
+            self.store.transition(
+                run_id,
+                "advance_or_stop",
+                expected_state=gate_stage,
+                expected_version=current.version,
+                reason="run svc streaming: verified gate",
+                role="ops",
+                stop_reason=stop_reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._fail_run(run_id, f"terminal transition raised {exc}")
+            raise RunIntegrationError("gate", str(exc)) from exc
+
+        return {
+            "run_id": run_id,
+            "attempt": attempt,
+            "result": result,
+            "fact": fact,
+            "journal": self.journal.get_events(run_id),
+            "raw_digest": raw_digest,
+            "receipt": saved_receipt,
+            "verification": verdict_receipt,
+            "gate_state": gate_state,
+            "stdout_summary": stdout_summary,
+            "stderr_summary": stderr_summary,
+        }
+
+    def stream_frames(
+        self,
+        run_id: str,
+        *,
+        after_cursor: int = 0,
+        limit: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Ordered cursor-based progress frames for ``run_id`` (SW-1510-STREAM).
+
+        A reconnecting consumer resumes from ``after_cursor`` and receives
+        exactly the frames it has not seen. The frames are the interleaved
+        durable stream evidence (stdout/stderr/facts), never a preview.
+        """
+        if self.stream_store is None:
+            return []
+        snapshot = _runtime_attr("snapshot", "progress_frames")
+        return [
+            frame.to_dict()
+            for frame in snapshot(self.stream_store, run_id, after_cursor=after_cursor, limit=limit)
+        ]
+
+    def stream_preview(
+        self,
+        run_id: str,
+        *,
+        after_cursor: int = 0,
+        max_bytes: int = 1024,
+    ) -> dict[str, Any]:
+        """A bounded preview over ``run_id``'s progress, never the raw evidence.
+
+        The preview is always marked ``is_full_evidence=False``; the raw frames
+        stay resolvable through :meth:`stream_frames`.
+        """
+        if self.stream_store is None:
+            return {
+                "run_id": run_id,
+                "is_full_evidence": False,
+                "status": "no durable stream store configured",
+            }
+        preview = _runtime_attr("snapshot", "preview_frames")
+        return preview(
+            self.stream_store, run_id, after_cursor=after_cursor, max_bytes=max_bytes
+        )
+
+    def stream_attempt_events(
+        self,
+        run_id: str,
+        attempt: int,
+        *,
+        issuer: str,
+        principal: str,
+        task_id: str = "task-1",
+    ) -> list[dict[str, Any]]:
+        """Export one attempt's frames as frozen ``attempt-event-v1`` dicts."""
+        if self.stream_store is None:
+            return []
+        return self.stream_store.to_attempt_events(
+            attempt=attempt,
+            issuer=issuer,
+            principal=principal,
+            task_id=task_id,
+            run_id=run_id,
+        )
