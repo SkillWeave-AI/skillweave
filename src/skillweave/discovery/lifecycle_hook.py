@@ -248,7 +248,14 @@ class DiscoveryResearchHook(HookAdapter):
                         "result_count": len(r.outcome.results),
                         "results": [s.to_dict() for s in r.outcome.results],
                         "attempts": [a.to_dict() for a in r.outcome.attempts],
-                        "receipt": r.receipt.to_dict(),
+                        # is_authority is a read-only property (a receipt never
+                        # carries gate authority); record it explicitly so a
+                        # reader of the persisted artifact can verify it without
+                        # holding the live object.
+                        "receipt": {
+                            **r.receipt.to_dict(),
+                            "is_authority": r.receipt.is_authority,
+                        },
                     }
                     for r in runs
                 ],
