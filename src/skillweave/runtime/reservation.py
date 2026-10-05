@@ -453,25 +453,72 @@ class ReservationStore:
 
     # ── Envelope management ──────────────────────────────────────────
 
+    @staticmethod
+    def _envelope_widens(existing: ReservationEnvelope, proposed: ReservationEnvelope) -> Optional[str]:
+        """Return the dimension name if *proposed* widens a finite owner value.
+
+        A caller-supplied envelope must never relax an owner-set finite bound.
+        ``None`` (unlimited) is always wider than any finite value.  Only the
+        owner (or an explicitly authorized caller) may tighten a bound.
+        Returns ``None`` when the proposed envelope is not wider.
+        """
+        dimensions: list[tuple[str, Any, Any]] = [
+            ("max_cost", existing.max_cost, proposed.max_cost),
+            ("max_tokens", existing.max_tokens, proposed.max_tokens),
+            ("max_bytes", existing.max_bytes, proposed.max_bytes),
+            ("max_requests", existing.max_requests, proposed.max_requests),
+            ("max_in_flight", existing.max_in_flight, proposed.max_in_flight),
+            ("max_per_request_bytes", existing.max_per_request_bytes, proposed.max_per_request_bytes),
+            ("max_per_request_tokens", existing.max_per_request_tokens, proposed.max_per_request_tokens),
+        ]
+        for name, owner_val, caller_val in dimensions:
+            if owner_val is None:
+                continue  # owner explicitly unlimited — caller cannot tighten either, but widening is irrelevant
+            if caller_val is None:
+                return name  # caller sets unlimited over owner's finite value = widening
+            if caller_val > owner_val:
+                return name  # caller relaxes owner's bound
+        # Deadline check
+        if existing.max_deadline is not None:
+            if proposed.max_deadline is None:
+                return "max_deadline"
+            try:
+                existing_dt = datetime.fromisoformat(existing.max_deadline)
+                proposed_dt = datetime.fromisoformat(proposed.max_deadline)
+                if proposed_dt > existing_dt:
+                    return "max_deadline"
+            except (TypeError, ValueError):
+                return "max_deadline"
+        return None
+
     def set_envelope(
         self,
         run_id: str,
         scope_id: str,
         envelope: ReservationEnvelope,
+        *,
+        force: bool = False,
     ) -> None:
         """Persist an envelope for a (run_id, scope_id) pair.
 
-        An existing envelope is replaced only when the caller explicitly
-        authorizes it (version-based CAS).  For initial creation, version is 1.
+        When a persisted envelope already exists and ``force`` is ``False``,
+        the update is **refused** if the new envelope would *widen* any
+        finite owner-set dimension (``None`` is unlimited and always wider
+        than a finite value).  This prevents a caller or retry from
+        enlarging the approved budget.
+
+        Pass ``force=True`` (owner-authorized) to override this guard.
+        For initial creation, version is 1.
         """
         now = datetime.now(timezone.utc).isoformat()
-        existing = self._conn.execute(
-            "SELECT version FROM reservation_envelopes WHERE run_id = ? AND scope_id = ?",
+        existing_row = self._conn.execute(
+            "SELECT envelope_json, version FROM reservation_envelopes "
+            "WHERE run_id = ? AND scope_id = ?",
             (run_id, scope_id),
         ).fetchone()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            if existing is None:
+            if existing_row is None:
                 self._conn.execute(
                     """INSERT INTO reservation_envelopes
                        (run_id, scope_id, envelope_json, version, created_at, updated_at)
@@ -479,13 +526,23 @@ class ReservationStore:
                     (run_id, scope_id, json.dumps(envelope.to_dict()), now, now),
                 )
             else:
-                new_version = existing["version"] + 1
+                if not force:
+                    existing_env = ReservationEnvelope.from_dict(
+                        json.loads(existing_row["envelope_json"])
+                    )
+                    widening = self._envelope_widens(existing_env, envelope)
+                    if widening is not None:
+                        raise EnvelopeRejected(
+                            f"caller envelope widens owner-set '{widening}'; "
+                            f"persisted finite owner envelope is authoritative"
+                        )
+                new_version = existing_row["version"] + 1
                 cur = self._conn.execute(
                     """UPDATE reservation_envelopes
                        SET envelope_json = ?, version = ?, updated_at = ?
                        WHERE run_id = ? AND scope_id = ? AND version = ?""",
                     (json.dumps(envelope.to_dict()), new_version, now,
-                     run_id, scope_id, existing["version"]),
+                     run_id, scope_id, existing_row["version"]),
                 )
                 if cur.rowcount == 0:
                     raise ReservationConflict(

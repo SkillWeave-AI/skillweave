@@ -736,11 +736,29 @@ class TestEnvelopePersistence:
         assert env is None
 
     def test_update_envelope(self, store):
-        env1 = _limited(max_cost=50.0)
+        env1 = _limited(max_cost=100.0)
         store.set_envelope("r1", "scope", env1)
-        env2 = _limited(max_cost=100.0)
+        # Tightening (smaller value) is always allowed — not a widening
+        env2 = _limited(max_cost=50.0)
         store.set_envelope("r1", "scope", env2)
         loaded = store.get_envelope("r1", "scope")
+        assert loaded.max_cost == 50.0
+
+    def test_envelope_widening_refused(self, store):
+        """Widening a persisted finite envelope is refused (BLOCKING B)."""
+        env1 = _limited(max_cost=50.0)
+        store.set_envelope("r2", "scope", env1)
+        env2 = _limited(max_cost=100.0)
+        with pytest.raises(EnvelopeRejected):
+            store.set_envelope("r2", "scope", env2)
+
+    def test_envelope_widening_force_bypass(self, store):
+        """Owner-authorized force=True bypasses the widening guard."""
+        env1 = _limited(max_cost=50.0)
+        store.set_envelope("r3", "scope", env1)
+        env2 = _limited(max_cost=100.0)
+        store.set_envelope("r3", "scope", env2, force=True)
+        loaded = store.get_envelope("r3", "scope")
         assert loaded.max_cost == 100.0
 
 

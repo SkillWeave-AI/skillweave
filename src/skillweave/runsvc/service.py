@@ -496,6 +496,8 @@ class RunApplicationService:
             raise
         except Exception as exc:  # noqa: BLE001
             self._fail_run(run_id, f"launch raised {exc}")
+            if reservation_rec is not None and self.reservation_store is not None:
+                self.reservation_store.cancel(reservation_rec.reservation_id)
             raise RunIntegrationError("launch", str(exc)) from exc
         finally:
             # Release the protection window (unseal the protected stores) on
@@ -2208,6 +2210,8 @@ class RunApplicationService:
             raise
         except Exception as exc:  # noqa: BLE001
             self._fail_run(run_id, f"streaming launch raised {exc}")
+            if reservation_rec is not None and self.reservation_store is not None:
+                self.reservation_store.cancel(reservation_rec.reservation_id)
             raise RunIntegrationError("launch", str(exc)) from exc
         finally:
             # Release the protection window (unseal the protected stores) on

@@ -616,6 +616,265 @@ class TestControllerCounterproof:
 
 
 # ===================================================================
+# BLOCKING A: Launch failure cancels the reservation slot
+# ===================================================================
+
+class TestLaunchFailureCancelsReservation:
+    """BLOCKING A: launch failure must cancel/release the acquired slot."""
+
+    def test_execute_launch_failure_cancels_reservation(self, db_path):
+        """execute() launch exception handler cancels the reserved slot."""
+        s = SQLiteRunStore(db_path)
+        j = EventJournal(s.db_path)
+        r = RawArtifactStore()
+        rs = ReservationStore(db_path)
+        svc = RunApplicationService(s, j, r, reservation_store=rs)
+
+        run_id = "launch-fail-exec"
+        # Use a non-existent command to trigger launch failure
+        with pytest.raises(RunIntegrationError) as exc:
+            svc.execute(
+                ["/nonexistent/command-that-will-fail"],
+                run_id=run_id,
+                tool="opencode",
+                model="test",
+                subject_repo="skillweave",
+                subject_commit="deadbeef",
+                created_at="2026-10-05T00:00:00Z",
+                reservation_envelope=_limited(max_in_flight=5),
+            )
+        assert "launch" in str(exc.value).lower()
+
+        # The reservation should be cancelled (state CANCELLED), not stuck
+        # in RESERVED.  Use raw query to check all reservations for this run.
+        rows = rs._conn.execute(
+            "SELECT state FROM reservations WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
+        assert len(rows) > 0, "expected at least one reservation"
+        for row in rows:
+            assert row["state"] == ReservationSlotState.CANCELLED.value, (
+                f"expected CANCELLED, got {row['state']}"
+            )
+
+        # In-flight must be 0 (freed by cancel)
+        usage = rs.get_run_usage(run_id)
+        assert usage["in_flight"] == 0
+        rs.close()
+        s.close()
+
+    def test_streaming_native_launch_failure_cancels_reservation(self, db_path, monkeypatch):
+        """execute_streaming_native() launch exception handler cancels.
+
+        ``run_process_streaming`` catches Popen failures internally and returns
+        a result — it does not raise.  To trigger the exception handler in
+        ``service.py`` we monkey-patch it to raise so the cancellation path
+        is exercised.
+        """
+        import skillweave.core.proc.runner as runner_mod
+        from skillweave.runtime.stream import DurableStreamStore
+
+        def _raise_on_launch(*a, **kw):
+            raise RuntimeError("simulated streaming launch failure")
+
+        monkeypatch.setattr(runner_mod, "run_process_streaming", _raise_on_launch)
+
+        s = SQLiteRunStore(db_path)
+        j = EventJournal(s.db_path)
+        r = RawArtifactStore()
+        stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+        stream_store = DurableStreamStore(root=stream_root)
+        rs = ReservationStore(db_path)
+        svc = RunApplicationService(s, j, r, stream_store=stream_store,
+                                    reservation_store=rs)
+
+        run_id = "launch-fail-stream"
+        with pytest.raises(RunIntegrationError) as exc:
+            svc.execute_streaming_native(
+                ["/nonexistent/command"],
+                run_id=run_id,
+                tool="opencode",
+                model="test",
+                subject_repo="skillweave",
+                subject_commit="deadbeef",
+                attempt=1,
+                task_id=run_id,
+                reservation_envelope=_limited(max_in_flight=5),
+            )
+        assert "launch" in str(exc.value).lower()
+
+        rows = rs._conn.execute(
+            "SELECT state FROM reservations WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
+        assert len(rows) > 0
+        for row in rows:
+            assert row["state"] == ReservationSlotState.CANCELLED.value, (
+                f"expected CANCELLED, got {row['state']}"
+            )
+
+        usage = rs.get_run_usage(run_id)
+        assert usage["in_flight"] == 0
+        rs.close()
+        s.close()
+
+    def test_launch_failure_cumulative_requests_not_leaked(self, db_path):
+        """Cumulative request count is reversed on launch failure cancel."""
+        s = SQLiteRunStore(db_path)
+        j = EventJournal(s.db_path)
+        r = RawArtifactStore()
+        rs = ReservationStore(db_path)
+        svc = RunApplicationService(s, j, r, reservation_store=rs)
+
+        run_id = "launch-fail-cumulative"
+        # First a successful run to establish baseline
+        out = svc.execute(
+            [sys.executable, "-c", "print('ok')"],
+            run_id=run_id + "-ok",
+            tool="opencode",
+            model="test",
+            subject_repo="skillweave",
+            subject_commit="deadbeef",
+            created_at="2026-10-05T00:00:00Z",
+            reservation_envelope=_limited(max_in_flight=5),
+        )
+
+        # Now a launch failure
+        with pytest.raises(RunIntegrationError):
+            svc.execute(
+                ["/nonexistent/command"],
+                run_id=run_id,
+                tool="opencode",
+                model="test",
+                subject_repo="skillweave",
+                subject_commit="deadbeef",
+                created_at="2026-10-05T00:00:00Z",
+                reservation_envelope=_limited(max_in_flight=5),
+            )
+
+        # Cumulative requests must be 0 for the failed run (reversed by cancel)
+        usage = rs.get_run_usage(run_id)
+        assert usage["cumulative_requests"] == 0, (
+            f"expected 0 cumulative_requests after launch failure, "
+            f"got {usage['cumulative_requests']}"
+        )
+        assert usage["in_flight"] == 0
+        rs.close()
+        s.close()
+
+
+# ===================================================================
+# BLOCKING B: Persisted finite owner envelope widening guard
+# ===================================================================
+
+class TestEnvelopeWideningGuard:
+    """BLOCKING B: set_envelope must reject caller envelope that widens owner."""
+
+    def test_widen_max_bytes_rejected(self, store):
+        """Widening max_bytes (None = unlimited) is rejected."""
+        owner_env = _limited(max_bytes=100)
+        store.set_envelope("wb", "s1", owner_env)
+        # Caller tries to widen with unlimited
+        with pytest.raises(EnvelopeRejected) as exc:
+            store.set_envelope("wb", "s1", ReservationEnvelope(max_bytes=None))
+        assert "max_bytes" in str(exc.value)
+
+    def test_widen_max_requests_rejected(self, store):
+        """Widening max_requests (larger value) is rejected."""
+        owner_env = _limited(max_requests=5)
+        store.set_envelope("wr", "s1", owner_env)
+        with pytest.raises(EnvelopeRejected) as exc:
+            store.set_envelope("wr", "s1", _limited(max_requests=10))
+        assert "max_requests" in str(exc.value)
+
+    def test_widen_max_cost_rejected(self, store):
+        """Widening max_cost from 10.0 to None is rejected."""
+        owner_env = _limited(max_cost=10.0)
+        store.set_envelope("wc", "s1", owner_env)
+        with pytest.raises(EnvelopeRejected) as exc:
+            store.set_envelope("wc", "s1", ReservationEnvelope(max_cost=None))
+        assert "max_cost" in str(exc.value)
+
+    def test_widen_max_tokens_rejected(self, store):
+        """Widening max_tokens from 1000 to 2000 is rejected."""
+        owner_env = _limited(max_tokens=1000)
+        store.set_envelope("wtok", "s1", owner_env)
+        with pytest.raises(EnvelopeRejected) as exc:
+            store.set_envelope("wtok", "s1", _limited(max_tokens=2000))
+        assert "max_tokens" in str(exc.value)
+
+    def test_widen_max_in_flight_rejected(self, store):
+        """Widening max_in_flight from 3 to 10 is rejected."""
+        owner_env = _limited(max_in_flight=3)
+        store.set_envelope("wif", "s1", owner_env)
+        with pytest.raises(EnvelopeRejected) as exc:
+            store.set_envelope("wif", "s1", _limited(max_in_flight=10))
+        assert "max_in_flight" in str(exc.value)
+
+    def test_widen_per_request_bytes_rejected(self, store):
+        """Widening max_per_request_bytes is rejected."""
+        owner_env = _limited(max_per_request_bytes=1024)
+        store.set_envelope("wprb", "s1", owner_env)
+        with pytest.raises(EnvelopeRejected) as exc:
+            store.set_envelope("wprb", "s1", _limited(max_per_request_bytes=2048))
+        assert "max_per_request_bytes" in str(exc.value)
+
+    def test_widen_per_request_tokens_rejected(self, store):
+        """Widening max_per_request_tokens is rejected."""
+        owner_env = _limited(max_per_request_tokens=500)
+        store.set_envelope("wprt", "s1", owner_env)
+        with pytest.raises(EnvelopeRejected) as exc:
+            store.set_envelope("wprt", "s1", _limited(max_per_request_tokens=1000))
+        assert "max_per_request_tokens" in str(exc.value)
+
+    def test_widen_deadline_rejected(self, store):
+        """Widening max_deadline to a later time is rejected."""
+        owner_env = _limited(max_deadline="2026-10-06T00:00:00Z")
+        store.set_envelope("wd", "s1", owner_env)
+        with pytest.raises(EnvelopeRejected) as exc:
+            store.set_envelope("wd", "s1", _limited(max_deadline="2026-10-07T00:00:00Z"))
+        assert "max_deadline" in str(exc.value)
+
+    def test_force_true_bypasses_widen_guard(self, store):
+        """force=True allows owner-authorized widening."""
+        owner_env = _limited(max_bytes=100)
+        store.set_envelope("force", "s1", owner_env)
+        # Owner-authorized bypass with force=True
+        store.set_envelope("force", "s1", ReservationEnvelope(max_bytes=None), force=True)
+        # Verify it was updated
+        env = store.get_envelope("force", "s1")
+        assert env.max_bytes is None
+
+    def test_owner_tightening_allowed(self, store):
+        """Owner-authorized tightening (reducing bound) is always allowed."""
+        owner_env = _limited(max_bytes=1000, max_requests=10)
+        store.set_envelope("tight", "s1", owner_env)
+        # Tighten (without force, since we're not widening — we're narrowing)
+        store.set_envelope("tight", "s1", _limited(max_bytes=500, max_requests=5))
+        env = store.get_envelope("tight", "s1")
+        assert env.max_bytes == 500
+        assert env.max_requests == 5
+
+    def test_same_value_not_widening(self, store):
+        """Setting same value as owner is not widening."""
+        owner_env = _limited(max_bytes=100)
+        store.set_envelope("same", "s1", owner_env)
+        # Same value — no widening
+        store.set_envelope("same", "s1", _limited(max_bytes=100))
+        env = store.get_envelope("same", "s1")
+        assert env.max_bytes == 100
+
+    def test_owner_unlimited_caller_finite_not_widening(self, store):
+        """Owner-unlimited (None) is not widened by a finite caller value."""
+        owner_env = ReservationEnvelope()  # all None = unlimited
+        store.set_envelope("unl", "s1", owner_env)
+        # Caller supplies finite — this is tightening, not widening
+        store.set_envelope("unl", "s1", _limited(max_bytes=100))
+        env = store.get_envelope("unl", "s1")
+        assert env.max_bytes == 100
+
+
+# ===================================================================
 # Run entry point
 # ===================================================================
 
