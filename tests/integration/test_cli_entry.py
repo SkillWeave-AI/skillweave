@@ -677,19 +677,15 @@ def test_router_delegates_post_subcommand_argv(monkeypatch, name, argv, expected
     assert calls == [(name, expected)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-existing router bug, out of scope for SW-156-ENTRY-003: "
-        "``_build_parser`` uses add_subparsers(dest='command'), but "
-        "``run.build_parser()`` contributes a REMAINDER positional also named "
-        "``command``, which overwrites the router's value with ``[]``. So "
-        "``args.command == 'run'`` is never true and the router prints help "
-        "instead of delegating. Reproduced unchanged at the pinned parent SHA "
-        "b29860b2. Marked strict so a fix flips this to XPASS and is noticed."
-    ),
-)
 def test_router_delegates_to_run(monkeypatch):
+    """The router must delegate ``run`` to ``cli.run.main`` with its own argv.
+
+    The REMAINDER positional in ``run.build_parser()`` is named ``run_argv``
+    (not ``command``) precisely so it cannot overwrite the router's
+    ``add_subparsers(dest="command")`` value -- otherwise the installed
+    ``skillweave run`` entry never reached the run surface. Marked as a plain
+    test now that the fix has flipped the former strict xfail to XPASS.
+    """
     calls: list[tuple[str, list[str]]] = []
     _spy(monkeypatch, calls)
     argv = [

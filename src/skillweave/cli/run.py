@@ -52,12 +52,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="The lane identifier",
     )
     parser.add_argument(
+        "--methodology",
+        default="ralph",
+        choices=["ralph", "rex", "gauntlet", "assay"],
+        help=(
+            "Declared methodology binding (default: ralph). 'assay' runs the "
+            "native Assay drill and is never silently downgraded to ralph."
+        ),
+    )
+    parser.add_argument(
+        "--autonomy-policy",
+        dest="autonomy_policy",
+        default="",
+        help=(
+            "Assay autonomy policy (conservative|moderate|unicorn); "
+            "empty uses the default (unicorn)"
+        ),
+    )
+    parser.add_argument(
+        "--task-id",
+        dest="task_id",
+        default=None,
+        help="Task identifier for the run/task/attempt triple (default: run id)",
+    )
+    parser.add_argument(
+        "--attempt",
+        type=int,
+        default=1,
+        help="Attempt number for the run/task/attempt triple (default: 1)",
+    )
+    parser.add_argument(
         "--rework",
         action="store_true",
         help="Draft rework briefs from failed gates",
     )
     parser.add_argument(
-        "command",
+        "run_argv",
         nargs=argparse.REMAINDER,
         help="The actual command to run (use -- to separate)",
     )
@@ -68,7 +98,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    command = args.command
+    # NOTE: the REMAINDER positional is deliberately *not* named ``command``.
+    # ``skillweave.cli.main`` builds the router with
+    # ``add_subparsers(dest="command")`` and mounts this parser as a *parent*;
+    # a positional also named ``command`` would overwrite the router's
+    # subcommand value with ``[]``, so ``args.command == "run"`` could never be
+    # true and the installed ``skillweave run`` entry would print help instead
+    # of dispatching here.
+    command = args.run_argv
     if command and command[0] == "--":
         command = command[1:]
 
@@ -95,6 +132,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             model=args.model,
             subject_repo=args.subject_repo,
             subject_commit=args.subject_commit,
+            methodology=args.methodology,
+            autonomy_policy=args.autonomy_policy,
+            task_id=args.task_id,
+            attempt=args.attempt,
         )
 
         result_dict = {
@@ -103,7 +144,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "gate_state": execution.gate_state,
             "raw_digest": execution.raw_digest,
             "verification": execution.verification,
+            "methodology": execution.methodology,
         }
+        if execution.assay is not None:
+            result_dict["assay"] = execution.assay
 
         if getattr(args, "rework", False) and execution.gate_state == "fail":
             # Unify on the structured brief artifact. run.py delegates to the

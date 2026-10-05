@@ -58,6 +58,39 @@ def _runtime_attr(submodule: str, *names: str):
     return [getattr(module, n) for n in names]
 
 
+def _sha256_hex(data: bytes) -> str:
+    """Hex sha256 of ``data`` (used to content-address assay phase evidence)."""
+    return hashlib.sha256(data).hexdigest()
+
+
+@dataclass(frozen=True)
+class _MethodologyBinding:
+    """A resolved, validated methodology binding for one run.
+
+    ``methodology``, ``topology`` and ``policy`` are kept as three separate
+    fields (never conflated into one mode string). ``policy_name`` is the
+    autonomy policy name recorded on the run (``conservative`` / ``moderate`` /
+    ``unicorn`` for Assay).
+    """
+
+    methodology: Any
+    topology: Any
+    policy: Any
+    policy_name: str
+    definition: Any
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "methodology": self.methodology.value,
+            "topology": self.topology.value,
+            "policy": self.policy.value,
+            "autonomy_policy": self.policy_name,
+            "risk": self.definition.risk.value,
+            "authority": self.definition.authority.value,
+            "version": self.definition.version,
+        }
+
+
 class RunIntegrationError(Exception):
     """A run could not be completed end to end.
 
@@ -99,6 +132,16 @@ class RunExecution:
     receipt: ArtifactReceipt
     verification: dict[str, Any]
     gate_state: str
+    #: The methodology actually executed (``"assay"``, ``"ralph"`` ...), or the
+    #: empty string on the unchanged legacy path. Never a substitute for the
+    #: run's own lane state — the methodology is a declared binding, not a
+    #: terminal verdict.
+    methodology: str = ""
+    #: The Assay phase record (``task_id``, ``attempt``, ordered ``phases``, the
+    #: ``outcome`` and the measured child-execution facts), or ``None`` when the
+    #: method is not Assay. Child-execution facts and the verifier verdict stay
+    #: distinct here; this block never carries a self-declared pass.
+    assay: Optional[dict[str, Any]] = None
 
     @property
     def run_id(self) -> str:
@@ -138,12 +181,32 @@ class RunApplicationService:
         authority_service: Optional[Any] = None,
         worker_token: Optional[str] = None,
         require_identity: bool = False,
+        methodology: str = "ralph",
+        autonomy_policy: str = "",
+        task_id: Optional[str] = None,
+        attempt: int = 1,
     ) -> RunExecution:
         """Run ``command`` through the six-stage integration path.
 
         The six record kinds are produced in a single, gap-free sequence, and
         the gate state is derived from the verifier's verdict over the bound
         receipt — never from a raw exit code alone.
+
+        ``methodology`` names the declared methodology binding. The DEFAULT is
+        ``"ralph"`` — the *existing* lane the run path already walks — so an
+        unchanged caller keeps exactly today's behaviour. A request that does
+        NOT name a known methodology stays on that lane. A request that names
+        ``"assay"`` runs the native Assay path (PIN → HYPOTHESIS → PROBE →
+        MEASURE → CLASSIFY → outcome) and is **never** silently downgraded to
+        Ralph: an Assay request either executes as Assay or fails explicitly.
+
+        ``autonomy_policy`` is the Assay autonomy policy name (``conservative``
+        / ``moderate`` / ``unicorn``); empty means the registry default. It is
+        recorded as its own field and never conflated with the methodology.
+
+        ``task_id`` / ``attempt`` address the run/task/attempt triple that the
+        SDK run-snapshot and attempt-event contracts carry. ``task_id``
+        defaults to ``run_id`` for the single-task legacy path.
 
         When ``authority_service`` is supplied, the host authenticates the
         worker at *ingress*: ``worker_token`` must verify against the host
@@ -167,6 +230,16 @@ class RunApplicationService:
             credential = self._authenticate_worker(
                 authority_service, worker_token=worker_token, run_id=run_id
             )
+
+        # Resolve the declared methodology binding BEFORE any run state is
+        # written. This is where an Assay request is either honoured or refused
+        # explicitly — never reinterpreted as some other methodology. The
+        # binding also validates the methodology/topology/policy combination
+        # (an incompatible Assay combination fails with its named reason).
+        binding = self._resolve_methodology_binding(
+            methodology=methodology,
+            autonomy_policy=autonomy_policy,
+        )
 
         run_command = _runtime_attr("runner_adapter", "run_command")
         EventType = _runtime_attr("journal", "EventType")
@@ -289,6 +362,38 @@ class RunApplicationService:
         ).encode("utf-8")
         verification_digest = hashlib.sha256(verdict_body).hexdigest()
         verdict_receipt = verdict.to_receipt(digest=verification_digest)
+        # Persist the verifier's own receipt as a separate, addressable record,
+        # so the verdict (grade, gate_state, verified_by) is durable and
+        # reconstructable by CLI/MCP/replay — not only returned in memory. It
+        # is a distinct artifact from the producer receipt above; its metadata
+        # carries the gate outcome and the verifier identity as DATA.
+        try:
+            verify_receipt = ArtifactReceipt(
+                artifact_id=verdict_receipt["artifact_id"],
+                sha256=verification_digest,
+                schema_version="1",
+                producer_command="verifier",
+                subject_repo=subject_repo,
+                subject_commit=subject_commit,
+                created_at=verdict.created_at,
+                evidence_type=EvidenceType.ARTIFACT.value,
+                purpose=f"independent verification of run '{run_id}'",
+                method="verifier",
+                system_source="runsvc",
+                quality=EvidenceQuality(),
+                metadata={
+                    "run_id": run_id,
+                    "task_id": task_id or run_id,
+                    "attempt": int(attempt),
+                    "grade": verdict.grade,
+                    "gate_state": verdict.gate_state,
+                    "verified_by": verdict.verified_by,
+                    "subject_artifact_id": verdict.subject_artifact_id,
+                },
+            )
+            self.store.save_evidence(verify_receipt)
+        except Exception:  # noqa: BLE001 - verdict receipt is best-effort durability
+            pass
 
         # Gate: derived from the completion contract, over the verified outcome.
         contract = CompletionContract()
@@ -299,6 +404,29 @@ class RunApplicationService:
             stdout=raw_bytes,
             check_output=check_output,
         )
+
+        # Record the declared methodology binding on the run's metadata as its
+        # own fields (methodology, autonomy_policy) plus the run/task/attempt
+        # triple. This is data, separate from the lane state: a deployment can
+        # read which methodology actually ran without inferring it from a
+        # state. Written while the run is still at ``verify`` (metadata cannot
+        # be merged into a terminal record), so it survives the terminal
+        # transition below.
+        try:
+            pre_terminal = self.store.get_run(run_id)
+            self.store.update_metadata(
+                run_id,
+                expected_version=pre_terminal.version,
+                metadata={
+                    "methodology": binding.methodology.value,
+                    "autonomy_policy": binding.policy_name,
+                    "task_id": task_id or run_id,
+                    "attempt": int(attempt),
+                    "methodology_binding": binding.to_dict(),
+                },
+            )
+        except Exception:  # noqa: BLE001 - binding metadata is best-effort data
+            pass
 
         # Terminal state: route through the lane's legal gate state to a
         # definite end. PASS goes verify -> review_gate -> advance_or_stop; a
@@ -331,6 +459,18 @@ class RunApplicationService:
             self._fail_run(run_id, f"terminal transition raised {exc}")
             raise RunIntegrationError("gate", str(exc)) from exc
 
+        assay_block: Optional[dict[str, Any]] = None
+        if binding.methodology.value == "assay":
+            assay_block = self._run_assay_drill(
+                run_id=run_id,
+                task_id=task_id or run_id,
+                attempt=int(attempt),
+                binding=binding,
+                result=result,
+                gate_state=gate_state,
+                verdict_receipt=verdict_receipt,
+            )
+
         final_run = self.store.get_run(run_id)
         journal_events = self.journal.get_events(run_id)
 
@@ -342,6 +482,8 @@ class RunApplicationService:
             receipt=saved_receipt,
             verification=verdict_receipt,
             gate_state=gate_state,
+            methodology=binding.methodology.value,
+            assay=assay_block,
         )
 
     def _authenticate_worker(
@@ -510,6 +652,350 @@ class RunApplicationService:
         except Exception:  # noqa: BLE001
             # Best effort: the primary failure is already on its way up.
             pass
+
+    # ------------------------------------------------------------------
+    # Shared run view (SW-1510-ASSAY criterion 2)
+    #
+    # One reconstruction of a run's methodology/attempt/terminal verdict,
+    # readable from the persisted run and its ordered journal. CLI, MCP and a
+    # replay all call this so they cannot disagree about what ran.
+    # ------------------------------------------------------------------
+
+    def run_snapshot(self, run_id: str) -> Optional[dict[str, Any]]:
+        """Reconstruct one run's methodology/attempt/outcome view.
+
+        Reads the persisted ``RunRecord`` metadata (methodology,
+        autonomy_policy, task_id, attempt) and the ordered journal events
+        (the ordered Assay phases and the terminal outcome). Returns ``None``
+        when the run is unknown. This is the single view the CLI, MCP and a
+        replay share; it never re-derives a verdict from an exit code and never
+        reads a model-authored string as a verdict.
+        """
+        record = self.store.get_run(run_id)
+        if record is None:
+            return None
+        events = self.journal.get_events(run_id)
+        phases: list[dict[str, Any]] = []
+        outcome: Optional[str] = None
+        verification: Optional[dict[str, Any]] = None
+        for event in events:
+            payload = event.payload or {}
+            phase = payload.get("phase")
+            if phase:
+                phases.append({"phase": phase, "sequence": event.sequence})
+            if phase in ("pass", "hold") and payload.get("outcome"):
+                outcome = payload["outcome"]
+            if event.event_type == "artifact_created" and payload.get("verification"):
+                verification = payload["verification"]
+
+        verified = self.store.get_evidence(f"verify-runsvc-{run_id}")
+        if verified is not None:
+            verification = {
+                "artifact_id": verified.artifact_id,
+                "grade": verified.metadata.get("grade"),
+                "gate_state": verified.metadata.get("gate_state"),
+                "verified_by": verified.metadata.get("verified_by"),
+                "subject_artifact_id": verified.metadata.get("subject_artifact_id"),
+            }
+
+        metadata = record.metadata or {}
+        snapshot: dict[str, Any] = {
+            "run_id": run_id,
+            "task_id": metadata.get("task_id"),
+            "attempt": metadata.get("attempt"),
+            "state": record.state,
+            "stop_reason": metadata.get("stop_reason"),
+            "methodology": metadata.get("methodology", "ralph"),
+            "autonomy_policy": metadata.get("autonomy_policy"),
+            "event_cursor": self.journal.get_last_sequence(run_id),
+            "phases": phases,
+            "outcome": outcome,
+            "verification": verification,
+        }
+        if verification is not None:
+            snapshot["gate_state"] = verification.get("gate_state")
+        return snapshot
+
+    # ------------------------------------------------------------------
+    # Declared methodology binding (SW-1510-ASSAY)
+    #
+    # A methodology is *declared data*, resolved through the versioned
+    # registry. A request that names Assay is either executed as Assay or
+    # refused with a named reason — it is never silently reinterpreted as
+    # another methodology (in particular never falls through to Ralph).
+    # ------------------------------------------------------------------
+
+    def _resolve_methodology_binding(
+        self, *, methodology: str, autonomy_policy: str
+    ) -> "_MethodologyBinding":
+        """Resolve and validate the declared methodology binding.
+
+        Returns a :class:`_MethodologyBinding`, or raises
+        :class:`RunIntegrationError` at stage ``"methodology"``. An unknown
+        methodology name is refused explicitly (never coerced); a known but
+        unexecutable methodology is refused by name; an incompatible
+        methodology/topology/policy combination fails with the registry's
+        named reason.
+        """
+        try:
+            Methodology = _runtime_attr("methodology", "Methodology")
+            TopologyType = _runtime_attr("methodology", "TopologyType")
+            PolicyType = _runtime_attr("methodology", "PolicyType")
+            DEFAULT_REGISTRY = _runtime_attr("methodology", "DEFAULT_REGISTRY")
+            assert_compatible = _runtime_attr("methodology", "assert_compatible")
+        except Exception as exc:  # noqa: BLE001
+            raise RunIntegrationError(
+                "methodology", f"methodology registry unavailable: {exc}"
+            ) from exc
+
+        name = (methodology or "").strip().lower()
+        if not name:
+            raise RunIntegrationError(
+                "methodology", "no methodology declared; refusing to guess"
+            )
+        try:
+            method = Methodology(name)
+        except ValueError as exc:
+            raise RunIntegrationError(
+                "methodology",
+                f"unknown methodology {methodology!r}; "
+                f"expected one of {sorted(m.value for m in Methodology)}",
+            ) from exc
+
+        # Each declared methodology gets its own *declared* binding. Assay runs
+        # the native drill (PIN → HYPOTHESIS → PROBE → MEASURE → CLASSIFY →
+        # outcome) under the SEQUENTIAL/SUPERVISED combination; every other
+        # registered methodology continues through the shared lane path, but
+        # under its own declared topology/policy rather than a silent default.
+        # Whatever runs, the combination is validated against the versioned
+        # registry so a request is executed as declared or refused with a
+        # *named* reason — never reinterpreted as a different methodology.
+        if method == Methodology.ASSAY:
+            topology = TopologyType.SEQUENTIAL
+            policy = PolicyType.SUPERVISED
+        elif method == Methodology.RALPH:
+            topology = TopologyType.DAG
+            policy = PolicyType.APPROVAL_REQUIRED
+        elif method == Methodology.REX:
+            topology = TopologyType.SEQUENTIAL
+            policy = PolicyType.SUPERVISED
+        elif method == Methodology.GAUNTLET:
+            topology = TopologyType.PARALLEL_LANES
+            policy = PolicyType.COLLABORATIVE
+        else:
+            raise RunIntegrationError(
+                "methodology",
+                f"methodology {name!r} has no declared execution binding on "
+                f"this path; refusing to run it as another methodology",
+            )
+
+        definition = DEFAULT_REGISTRY.get(method)
+
+        # An Assay request must never silently run as Ralph: the requested
+        # methodology and the executed one are compared explicitly.
+        reason = _runtime_attr("methodology", "check_compatibility")(method, topology, policy)
+        if reason is not None:
+            raise RunIntegrationError(
+                "methodology",
+                f"declared methodology binding {name!r} is incompatible: {reason}",
+            )
+        assert_compatible(method, topology, policy)
+
+        # Autonomy policy is its own field, recorded separately from both the
+        # methodology and any session schedule.
+        if method == Methodology.ASSAY:
+            policy_name = (autonomy_policy or "unicorn").strip().lower()
+            allowed = _runtime_attr("assay", "list_policy_names")()
+            if policy_name not in allowed:
+                raise RunIntegrationError(
+                    "methodology",
+                    f"unknown assay autonomy policy {autonomy_policy!r}; "
+                    f"expected one of {allowed}",
+                )
+        else:
+            policy_name = (autonomy_policy or "collaborative").strip().lower()
+
+        return _MethodologyBinding(
+            methodology=method,
+            topology=topology,
+            policy=policy,
+            policy_name=policy_name,
+            definition=definition,
+        )
+
+    def _run_assay_drill(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        binding: "_MethodologyBinding",
+        result: Any,
+        gate_state: str,
+        verdict_receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run the native Assay drill and persist its ordered phase events.
+
+        The PROBE is the *real, already-executed* bounded subprocess (the
+        ``result`` this service launched above); MEASURE binds its captured
+        bytes; CLASSIFY is the completion contract's gate; the outcome is
+        PASS only when the gate PASSes. Every phase is journaled with the
+        run/task/attempt triple so CLI, MCP and replay all read the same
+        attempt and terminal verdict. A terminal phase that the autonomy policy
+        cannot author is recorded as a HOLD outcome — never silently a pass.
+        """
+        AssayEngine = _runtime_attr("assay", "AssayEngine")
+        AssayState = _runtime_attr("assay", "AssayState")
+        PolicyBlockedError = _runtime_attr("assay", "PolicyBlockedError")
+        PolicyHoldError = _runtime_attr("assay", "PolicyHoldError")
+        EventType = _runtime_attr("journal", "EventType")
+
+        engine = AssayEngine(policy_name=binding.policy_name)
+        raw_bytes = result.stdout or b""
+        gate_is_pass = gate_state == _runtime_attr("verify", "GateState").PASS
+
+        # Ordered phase records: (state, evidence_type, payload).
+        phases: list[dict[str, Any]] = []
+        phase_events: list[dict[str, Any]] = []
+
+        def record(state: Any, evidence: dict[str, Any]) -> None:
+            payload = {
+                "phase": state.value,
+                "run_id": run_id,
+                "task_id": task_id,
+                "attempt": attempt,
+                **evidence,
+            }
+            event = self.journal.append(
+                run_id,
+                event_type=EventType.METRIC.value,
+                payload=payload,
+                idempotency_key=f"assay:{run_id}:{state.value}:{attempt}",
+            )
+            phases.append(payload)
+            phase_events.append({"sequence": event.sequence, "phase": state.value})
+
+        # PIN — pin the exact subject/brief/envelope digests the drill is bound
+        # to. digests are the run's real content addresses, not free text.
+        record(
+            AssayState.PIN,
+            {
+                "subject_digest": _sha256_hex(
+                    f"{result.metadata.get('subject_repo','')}@"
+                    f"{result.metadata.get('subject_commit','')}".encode()
+                ),
+                "brief_digest": _sha256_hex(
+                    " ".join(list(result.command)).encode()
+                ),
+                "envelope_digest": _sha256_hex(
+                    f"{binding.methodology.value}|{binding.policy_name}|"
+                    f"{gate_state}".encode()
+                ),
+            },
+        )
+
+        # HYPOTHESIS — the falsifiable claim the probe is run against.
+        hypothesis = {
+            "claim": "probe command exits 0 with non-empty output",
+            "falsified_by": "non-zero exit or empty stdout",
+            "evidence_type": "test",
+            "method": "completion-contract",
+        }
+        record(AssayState.HYPOTHESIS, hypothesis)
+
+        # PROBE — the real child execution's measured facts (NOT a verdict).
+        record(
+            AssayState.PROBE,
+            {
+                "evidence_type": "runtime_trace",
+                "pid": result.pid,
+                "exit_code": result.exit_code,
+                "signal": result.signal,
+                "termination": result.termination,
+                "command": list(result.command),
+            },
+        )
+
+        # MEASURE — the captured bytes, content-addressed.
+        measure_digest = _sha256_hex(raw_bytes)
+        record(
+            AssayState.MEASURE,
+            {
+                "evidence_type": "artifact",
+                "stdout_digest": measure_digest,
+                "byte_length": len(raw_bytes),
+            },
+        )
+
+        # CLASSIFY — the verifier's grade over the subject receipt.
+        record(
+            AssayState.CLASSIFY,
+            {
+                "evidence_type": "decision",
+                "grade": verdict_receipt.get("grade", ""),
+                "gate_state": gate_state,
+                "subject_artifact_id": verdict_receipt.get("subject_artifact_id", ""),
+            },
+        )
+
+        # Outcome. A pass(i.e. the gate) requires a human-authorised terminal
+        # phase under this policy; if the policy cannot author it, the outcome
+        # is HOLD — a self-declared pass is impossible here.
+        outcome = "hold"
+        outcome_reason = ""
+        if gate_is_pass:
+            try:
+                engine.transition(AssayState.HYPOTHESIS)
+                engine.transition(AssayState.PROBE)
+                engine.transition(AssayState.MEASURE)
+                engine.transition(AssayState.CLASSIFY)
+                engine.transition(AssayState.PASS)
+                outcome = "pass"
+            except (PolicyBlockedError, PolicyHoldError) as exc:
+                outcome = "hold"
+                outcome_reason = getattr(exc, "reason", str(exc))
+            except Exception as exc:  # noqa: BLE001
+                outcome = "hold"
+                outcome_reason = str(exc)
+        else:
+            try:
+                engine.transition(AssayState.HYPOTHESIS)
+                engine.transition(AssayState.PROBE)
+                engine.transition(AssayState.MEASURE)
+                engine.transition(AssayState.CLASSIFY)
+                engine.transition(AssayState.HOLD)
+            except Exception:  # noqa: BLE001
+                pass
+            outcome = "hold"
+
+        record(
+            AssayState.PASS if outcome == "pass" else AssayState.HOLD,
+            {
+                "evidence_type": "decision",
+                "outcome": outcome,
+                "reason": outcome_reason,
+            },
+        )
+
+        return {
+            "methodology": binding.methodology.value,
+            "autonomy_policy": binding.policy_name,
+            "task_id": task_id,
+            "attempt": attempt,
+            "phases": phases,
+            "phase_events": phase_events,
+            "outcome": outcome,
+            "reason": outcome_reason,
+            "gate_state": gate_state,
+            "child_execution": {
+                "pid": result.pid,
+                "exit_code": result.exit_code,
+                "signal": result.signal,
+                "termination": result.termination,
+                "stdout_digest": measure_digest,
+                "byte_length": len(raw_bytes),
+            },
+        }
 
     # ------------------------------------------------------------------
     # Native async lifecycle (SW-1510-STORE)

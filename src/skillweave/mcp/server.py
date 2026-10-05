@@ -33,11 +33,15 @@ def _get_run_svc(db_path=".skillweave/store.db", artifacts_path=".skillweave/art
     return RunApplicationService(store, journal, raw_artifacts)
 
 @mcp.tool()
-def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, command: str, db_path: str = ".skillweave/store.db", artifacts_path: str = ".skillweave/artifacts") -> str:
-    """Create and execute a new SkillWeave run."""
+def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, command: str, db_path: str = ".skillweave/store.db", artifacts_path: str = ".skillweave/artifacts", methodology: str = "ralph", autonomy_policy: str = "", task_id: str = "", attempt: int = 1) -> str:
+    """Create and execute a new SkillWeave run.
+
+    ``methodology`` is the declared methodology binding (default ``ralph``).
+    ``assay`` runs the native Assay drill and is never silently downgraded.
+    """
     svc = _get_run_svc(db_path, artifacts_path)
     run_id = generate_run_id()
-    
+
     cmd_list = shlex.split(command)
     execution = svc.execute(
         command=cmd_list,
@@ -46,27 +50,35 @@ def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, co
         model=model,
         subject_repo=subject_repo,
         subject_commit=subject_commit,
+        methodology=methodology,
+        autonomy_policy=autonomy_policy,
+        task_id=task_id or None,
+        attempt=attempt,
     )
-    
-    return json.dumps({
+
+    payload = {
         "run_id": execution.run.run_id,
         "state": execution.run.state,
         "gate_state": execution.gate_state,
         "raw_digest": execution.raw_digest,
-    })
+        "methodology": execution.methodology,
+    }
+    if execution.assay is not None:
+        payload["assay"] = execution.assay
+    return json.dumps(payload)
 
 @mcp.tool()
 def status_run(run_id: str, db_path: str = ".skillweave/store.db") -> str:
-    """Get the status of a specific run."""
-    store = _get_store(db_path)
-    record = store.get_run(run_id)
-    if not record:
+    """Get the status of a specific run.
+
+    Includes the methodology/attempt and (for Assay) the ordered phases and
+    terminal outcome, read from the same snapshot the CLI and replay use.
+    """
+    svc = _get_run_svc(db_path)
+    snapshot = svc.run_snapshot(run_id)
+    if snapshot is None:
         return json.dumps({"error": "Run not found"})
-    return json.dumps({
-        "run_id": record.run_id,
-        "state": record.state,
-        "version": record.version,
-    })
+    return json.dumps(snapshot)
 
 @mcp.tool()
 def cancel_run(run_id: str, reason: str, db_path: str = ".skillweave/store.db") -> str:
