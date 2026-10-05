@@ -347,11 +347,13 @@ out = svc.execute_streaming_native(
     artifact_evidence=artifacts, source_resolver=resolver, analysis_reader=reader,
 )
 block = out["assay"]
+verdicts = block["artifact_evidence"].get("verdicts") or []
 print(json.dumps({
     "outcome": block["outcome"],
     "admitted": block["artifact_evidence"]["admitted"],
     "reasons": block["artifact_evidence"]["reasons"],
     "gate_state": block["completion_gate_state"],
+    "schema_authority": verdicts[0].get("schema_authority") if verdicts else None,
 }))
 '''
 
@@ -360,6 +362,66 @@ def _venv_site(venv_dir: Path) -> Path:
     matches = sorted(venv_dir.glob("lib/python*/site-packages"))
     assert matches, f"no venv site-packages under {venv_dir}"
     return matches[0]
+
+
+def _clean_env() -> dict:
+    """A subprocess environment with ``PYTHONPATH`` removed.
+
+    The lane runs the tests with ``PYTHONPATH`` pointing at the accepted-SDK
+    site-packages, which *also* carries a ``skillweave`` install. An inherited
+    ``PYTHONPATH`` makes ``pip`` report "already installed with the same
+    version" and skip the freshly-built wheel, leaving the new venv without
+    ``skillweave``. Build/install/verify subprocesses therefore run with
+    ``PYTHONPATH`` cleared, proving the *installed* wheel is exercised.
+    """
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    return env
+
+
+def _accepted_sdk_dir() -> Path | None:
+    """The accepted ``skillweave_sdk`` package dir, or ``None``.
+
+    Only an SDK whose ``validator.py`` exports ``AuthenticatedServiceContext``
+    is the accepted authority -- the ambient 0.2.0 lacks it. The directory is
+    found via ``PYTHONPATH`` (the accepted-SDK site-packages the lane runs
+    under), the interpreter's own site-packages, or the ambient install. The
+    installed venv bundles these files so the verifier validates against the
+    pinned SDK rather than silently degrading to the structural fallback.
+    """
+    cands: list[Path] = []
+    for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if entry:
+            cands.append(Path(entry))
+    for site in Path(sys.prefix).glob("lib/python*/site-packages"):
+        cands.append(site)
+    # Sequence-relative: the accepted ``core-execution`` venv under the
+    # checkout's own sequence (the ancestor that holds ``checkouts/``). A
+    # reviewer lane can reach this; an OS sandbox that hides ``preflight``
+    # simply yields no candidate (fails closed).
+    for up in Path(__file__).resolve().parents:
+        if (up / "checkouts").is_dir():
+            try:
+                for sdk in sorted(up.glob(
+                        "preflight/*/venv/lib/python*/site-packages/skillweave_sdk")):
+                    cands.append(sdk.parent)
+            except OSError:
+                pass
+            break
+    cands += [
+        Path("/opt/homebrew/lib/python3.11/site-packages"),
+        Path("/opt/homebrew/lib/python3.14/site-packages"),
+    ]
+    for cand in cands:
+        validator = cand / "skillweave_sdk" / "validator.py"
+        if not validator.is_file():
+            continue
+        try:
+            if "AuthenticatedServiceContext" in validator.read_text():
+                return cand / "skillweave_sdk"
+        except OSError:
+            continue
+    return None
 
 
 def _build_wheel(work: Path) -> Path:
@@ -372,7 +434,7 @@ def _build_wheel(work: Path) -> Path:
     proc = subprocess.run(
         [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-index",
          "--no-build-isolation", "-w", str(work / "dist"), str(work)],
-        cwd=str(work), capture_output=True, text=True,
+        cwd=str(work), capture_output=True, text=True, env=_clean_env(),
     )
     assert proc.returncode == 0, proc.stderr
     wheels = sorted((work / "dist").glob("skillweave-*.whl"))
@@ -382,13 +444,14 @@ def _build_wheel(work: Path) -> Path:
 
 def _install_into_fresh_venv(work: Path, wheel: Path) -> Path:
     venv_dir = work / "venv"
+    env = _clean_env()
     subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True,
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, env=env)
     site = _venv_site(venv_dir)
     subprocess.run(
         [str(venv_dir / "bin" / "pip"), "install", "--no-deps", "--no-index",
          str(wheel)],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, env=env,
     )
     import yaml  # noqa: PLC0415 - intentional late import
 
@@ -397,6 +460,14 @@ def _install_into_fresh_venv(work: Path, wheel: Path) -> Path:
     extra = ambient_yaml.parent / "_yaml"
     if extra.exists():
         shutil.copytree(extra, site / "_yaml")
+    # Bundle the accepted SDK so the installed verifier validates against the
+    # pinned schema authority (never the structural fallback, never ambient).
+    accepted = _accepted_sdk_dir()
+    assert accepted is not None, (
+        "no accepted skillweave_sdk (validator exporting "
+        "AuthenticatedServiceContext) is resolvable"
+    )
+    shutil.copytree(accepted, site / "skillweave_sdk")
     return venv_dir
 
 
@@ -415,8 +486,7 @@ def _run_installed(venv_dir: Path, tmp_path: Path, name: str, ev: dict) -> dict:
     ev_file = case / "ev.json"
     ev_file.write_text(json.dumps(ev))
 
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)  # prove the *installed* package is exercised
+    env = _clean_env()  # prove the *installed* package (and its bundled SDK) is used
     env["TMPDIR"] = str(case / "tmp")
     (case / "tmp").mkdir(exist_ok=True)
 
@@ -464,6 +534,8 @@ def test_installed_wheel_native_consumer_enforces_semantics(tmp_path):
     assert good["admitted"] is True
     assert good["outcome"] == "pass"
     assert good["reasons"] == []
+    # Validated against the pinned SDK schema, never the structural fallback.
+    assert good["schema_authority"] == "sdk"
 
     # -- omission: no artifact evidence at all -> refusal by the consumer.
     omitted = case("omit", None)
@@ -528,23 +600,126 @@ def test_installed_wheel_native_consumer_enforces_semantics(tmp_path):
     assert false_bound["admitted"] is False and false_bound["outcome"] == "hold"
     assert any("does not cover" in r for r in false_bound["reasons"])
 
-    # -- positive: the same file excluded with a genuinely-covering bound is
-    #    admitted, so legitimate bounded exclusions still pass (the fix is not
-    #    a blanket refusal of all exclusions).
+    # -- the reviewed counterexample, end to end through the installed native
+    #    consumer: ``settings.py`` with real executable bytes (``LIMIT = 7``),
+    #    excluded as ``not_applicable`` under a narrative justification and a
+    #    bound that *correctly* names its own path. Matching the path does not
+    #    establish the reason -- the installed consumer refutes the narrative
+    #    claim against the real source bytes and withholds the PASS.
+    #    A real, populated tree gaining one executable file.
+    files["settings.py"] = b"LIMIT = 7\n"
+    (src / "settings.py").write_bytes(files["settings.py"])
+    analysis["settings.py"] = b"analysis of settings.py"
+    (ana / "settings.py").write_bytes(analysis["settings.py"])
+    analysis_text["settings.py"] = analysis["settings.py"].decode()
+    contradicted_proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [coverage_entry("settings.py", files, analysis)],
+        "exclusions": [
+            {"path": "settings.py",
+             "justification": "Narrative documentation only; no executable code",
+             "bounded": "settings.py"},
+        ],
+    }
+    contradicted = case("contradicted", [artifact(contradicted_proof, commit=COMMIT)])
+    assert contradicted["admitted"] is False and contradicted["outcome"] == "hold"
+    assert any(
+        "contradicted exclusion reason" in r for r in contradicted["reasons"]
+    ), contradicted["reasons"]
+
+    # -- positive counterpart from the same counterexample: a *genuine* code
+    #    analysis of the very same executable file is admitted by the same
+    #    installed consumer under SDK authority, so the fix refuses the
+    #    contradicted exclusion without refusing legitimate analysis.
+    code_proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [
+            coverage_entry("pkg/module.py", files, analysis),
+            coverage_entry("pkg/util.py", files, analysis),
+            coverage_entry("settings.py", files, analysis),
+        ],
+        "exclusions": [
+            {"path": "README.md",
+             "justification": "documentation only, not executable source",
+             "bounded": "narrative paths (*.md)"},
+        ],
+    }
+    code_positive = case("code-positive", [artifact(code_proof, commit=COMMIT)])
+    assert code_positive["admitted"] is True and code_positive["outcome"] == "pass"
+    assert code_positive["reasons"] == []
+    assert code_positive["schema_authority"] == "sdk"
+
+    # -- positive: a legitimate bounded exclusion of a *non-code* file is
+    #    admitted (the fix is not a blanket refusal of all exclusions). A real
+    #    data file is excluded with a source-bound reason and a bound naming its
+    #    own path; it is independently proved non-executable by its real
+    #    bytes/suffix, while a code file in the same tree is genuinely analyzed.
+    data_src = tmp_path / "data-src"
+    data_files = {
+        "config/settings.json": b'{"limit": 7}\n',
+        "pkg/util.py": b"VALUE = 'util'\n",
+    }
+    write_source_tree(data_src, data_files)
+    data_analysis = write_analysis_tree(tmp_path / "data-analysis", data_files)
     legit_proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [coverage_entry("pkg/util.py", data_files, data_analysis)],
+        "exclusions": [
+            {"path": "config/settings.json",
+             "justification": "documentation only, not executable source",
+             "bounded": "config/settings.json"},
+        ],
+    }
+    legit = _run_installed(venv_dir, tmp_path, "legit-bound", {
+        "artifacts": [artifact(legit_proof, commit=COMMIT)],
+        "analysis": {k: v.decode() for k, v in data_analysis.items()},
+        "source_root": str(data_src),
+        "commit": COMMIT,
+    })
+    assert legit["admitted"] is True and legit["outcome"] == "pass"
+    assert legit["reasons"] == []
+
+    # -- an *unsupported* exclusion authority: a generated/vendored claim with
+    #    no independent provenance is refused even when its bound covers the
+    #    path, because the reason itself is not independently established.
+    generated_proof = {
         "version": VERSION,
         "analyzed": True,
         "coverage": [coverage_entry("pkg/util.py", files, analysis)],
         "exclusions": [
-            {"path": "pkg/module.py", "justification": "vendored constant table",
+            {"path": "pkg/module.py",
+             "justification": "generated constant table; vendored",
              "bounded": "pkg/*.py"},
             {"path": "README.md", "justification": "documentation only",
              "bounded": "narrative paths (*.md)"},
         ],
     }
-    legit = case("legit-bound", [artifact(legit_proof, commit=COMMIT)])
-    assert legit["admitted"] is True and legit["outcome"] == "pass"
-    assert legit["reasons"] == []
+    generated = case("generated", [artifact(generated_proof, commit=COMMIT)])
+    assert generated["admitted"] is False and generated["outcome"] == "hold"
+    assert any("unsupported exclusion authority" in r
+               for r in generated["reasons"]), generated["reasons"]
+
+    # -- a *generic* justification that is not source-bound is refused: a
+    #    non-empty string is not an independently checkable reason.
+    generic_proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [coverage_entry("pkg/util.py", files, analysis)],
+        "exclusions": [
+            {"path": "pkg/module.py",
+             "justification": "not needed for this analysis",
+             "bounded": "pkg/module.py"},
+            {"path": "README.md", "justification": "documentation only",
+             "bounded": "narrative paths (*.md)"},
+        ],
+    }
+    generic = case("generic", [artifact(generic_proof, commit=COMMIT)])
+    assert generic["admitted"] is False and generic["outcome"] == "hold"
+    assert any("not independently checkable" in r
+               for r in generic["reasons"]), generic["reasons"]
 
     # -- missing source binding: a genuine proof with no source -> refusal.
     no_src = case("no-src", [genuine], source=None)

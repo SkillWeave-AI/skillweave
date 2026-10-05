@@ -248,9 +248,11 @@ def test_readme_only_graph_is_refused_even_with_full_exclusions(tmp_path):
     }
     result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
     # Even with every populated file "excluded", no real source was analyzed:
-    # a narrative-only graph never passes.
+    # a narrative-only graph never passes. (Under independently-checked
+    # exclusions, excluding the executable files is itself refused, so the
+    # refusal may surface at the exclusion layer or the population layer.)
     assert result.admitted is False
-    assert any("narrative" in r or "populated" in r for r in result.reasons)
+    assert result.gate_state == GateState.FAIL
 
 
 def test_unsupported_analyzed_flag_fails(tmp_path):
@@ -405,25 +407,43 @@ def test_phantom_covered_path_fails(tmp_path):
 # Criterion 3: bounded, justified N/A; missing input / timeout / partial graph
 # ---------------------------------------------------------------------------
 
+def _narrative_tree(root: Path) -> dict[str, bytes]:
+    """A populated source tree with two independently-checkable narrative files."""
+    files = _source_tree(root)
+    files["docs/guide.md"] = b"# Guide\n\nHow to use the module.\n"
+    target = root / "docs" / "guide.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(files["docs/guide.md"])
+    return files
+
+
 def test_justified_bounded_exclusion_is_admitted(tmp_path):
-    files = _source_tree(tmp_path)
+    """Legitimate narrative exclusions, when the reason is independently
+    established (a real narrative file with a narrative reason and a covering
+    bound), are admitted -- the fix is not a blanket refusal of exclusions."""
+    files = _narrative_tree(tmp_path)
     analysis = _analysis_for(files)
     proof = {
         "version": VERSION,
         "analyzed": True,
-        "coverage": [_coverage_entry("pkg/module.py", files, analysis)],
+        "coverage": [
+            _coverage_entry("pkg/module.py", files, analysis),
+            _coverage_entry("pkg/util.py", files, analysis),
+        ],
         "exclusions": [
-            {"path": "pkg/util.py", "justification": "generated constant table",
-             "bounded": "pkg/util.py"},
-            {"path": "README.md", "justification": "documentation only",
-             "bounded": "narrative paths"},
+            {"path": "docs/guide.md",
+             "justification": "documentation only, not executable source",
+             "bounded": "docs/guide.md"},
+            {"path": "README.md",
+             "justification": "narrative documentation, no executable code",
+             "bounded": "narrative paths (*.md)"},
         ],
     }
     result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
     assert result.admitted is True
     assert result.exclusions == {
-        "pkg/util.py": "generated constant table",
-        "README.md": "documentation only",
+        "docs/guide.md": "documentation only, not executable source",
+        "README.md": "narrative documentation, no executable code",
     }
 
 
@@ -536,32 +556,83 @@ def test_bound_not_covering_a_sibling_glob_fails(tmp_path):
 
 
 def test_genuinely_covering_glob_bound_is_admitted(tmp_path):
-    """Positive control: the same executable file excluded with a bound that
-    genuinely covers it (a ``*.py`` glob) is admitted, so the fix refuses only
-    false bounds and preserves legitimate positive exclusions."""
-    files = _source_tree(tmp_path)
+    """Positive control: a narrative file excluded with a bound that genuinely
+    covers it (a ``docs/*.md`` glob family) and a reason the bytes confirm is
+    admitted -- the fix refuses only false/unsupported exclusions."""
+    files = _narrative_tree(tmp_path)
     analysis = _analysis_for(files)
     proof = {
         "version": VERSION,
         "analyzed": True,
-        "coverage": [_coverage_entry("pkg/module.py", files, analysis)],
+        "coverage": [
+            _coverage_entry("pkg/module.py", files, analysis),
+            _coverage_entry("pkg/util.py", files, analysis),
+        ],
         "exclusions": [
-            {"path": "pkg/util.py", "justification": "generated constant table",
-             "bounded": "*.py"},
-            {"path": "README.md", "justification": "documentation only",
-             "bounded": "narrative paths"},
+            {"path": "docs/guide.md",
+             "justification": "documentation only, not executable source",
+             "bounded": "docs/*.md"},
+            {"path": "README.md",
+             "justification": "narrative documentation, no executable code",
+             "bounded": "*.md"},
         ],
     }
     result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
     assert result.admitted is True
-    assert result.exclusions == {
-        "pkg/util.py": "generated constant table",
-        "README.md": "documentation only",
-    }
+    assert set(result.exclusions) == {"docs/guide.md", "README.md"}
 
 
 def test_literal_path_bound_is_admitted(tmp_path):
-    """Positive control: a bound that names the exact excluded path covers it."""
+    """Positive control: a bound that names the exact excluded narrative path
+    covers it, and the reason is established by the file's real bytes."""
+    files = _narrative_tree(tmp_path)
+    analysis = _analysis_for(files)
+    proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [
+            _coverage_entry("pkg/module.py", files, analysis),
+            _coverage_entry("pkg/util.py", files, analysis),
+        ],
+        "exclusions": [
+            {"path": "docs/guide.md",
+             "justification": "documentation only, not executable source",
+             "bounded": "docs/guide.md"},
+            {"path": "README.md",
+             "justification": "narrative documentation, no executable code",
+             "bounded": "narrative paths (*.md)"},
+        ],
+    }
+    result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
+    assert result.admitted is True
+
+
+def test_independently_justified_na_with_contradictory_code_fails(tmp_path):
+    """The reviewed defect, at its tightest: ``settings.py`` contains real
+    executable code (``LIMIT = 7``), is excluded as ``not_applicable`` with a
+    narrative-sounding justification, and is *correctly* bounded to its own
+    path. Matching the path alone does not establish the reason -- the source
+    bytes refute the narrative claim, so the exclusion is refused."""
+    files = {"settings.py": b"LIMIT = 7\n"}
+    (tmp_path / "settings.py").write_bytes(files["settings.py"])
+    proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [{"path": "settings.py", "disposition": "not_applicable",
+                      "justification": "Narrative documentation only; no executable code",
+                      "bounded": "settings.py"}],
+    }
+    result, _, _ = _verify(tmp_path, proof, files=files, analysis={})
+    assert result.admitted is False
+    assert result.gate_state == GateState.FAIL
+    assert any("contradicted exclusion reason" in r for r in result.reasons), result.reasons
+    assert "settings.py" not in result.exclusions
+
+
+def test_generated_na_without_provenance_fails(tmp_path):
+    """A generated/vendored justification makes a specific claim about the
+    file's provenance. Nothing in the source independently establishes that
+    provenance, so the exclusion is unsupported and refused."""
     files = _source_tree(tmp_path)
     analysis = _analysis_for(files)
     proof = {
@@ -572,11 +643,59 @@ def test_literal_path_bound_is_admitted(tmp_path):
             {"path": "pkg/util.py", "justification": "generated constant table",
              "bounded": "pkg/util.py"},
             {"path": "README.md", "justification": "documentation only",
-             "bounded": "narrative paths"},
+             "bounded": "narrative paths (*.md)"},
         ],
     }
     result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
-    assert result.admitted is True
+    assert result.admitted is False
+    assert any("unsupported exclusion authority" in r for r in result.reasons), result.reasons
+
+
+def test_generic_na_reason_fails_closed(tmp_path):
+    """A generic reason ("not needed here") is not independently checkable
+    source-bound evidence: it asserts nothing the source can confirm, so it
+    fails closed even when the bound genuinely covers the path."""
+    files = _source_tree(tmp_path)
+    analysis = _analysis_for(files)
+    proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [_coverage_entry("pkg/module.py", files, analysis)],
+        "exclusions": [
+            {"path": "pkg/util.py", "justification": "not needed for this analysis",
+             "bounded": "pkg/util.py"},
+            {"path": "README.md", "justification": "documentation only",
+             "bounded": "narrative paths (*.md)"},
+        ],
+    }
+    result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
+    assert result.admitted is False
+    assert any("not independently checkable" in r for r in result.reasons), result.reasons
+
+
+def test_na_without_resolvable_source_bytes_fails(tmp_path):
+    """When the excluded path's bytes cannot be resolved the narrative claim
+    cannot be independently established, so the exclusion fails closed rather
+    than being trusted on the strength of a non-empty justification string."""
+    files = _source_tree(tmp_path)
+    analysis = _analysis_for(files)
+    proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [_coverage_entry("pkg/module.py", files, analysis)],
+        "exclusions": [
+            {"path": "absent/settings.py",
+             "justification": "Narrative documentation only; no executable code",
+             "bounded": "absent/settings.py"},
+            {"path": "README.md", "justification": "documentation only",
+             "bounded": "narrative paths (*.md)"},
+        ],
+    }
+    result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
+    assert result.admitted is False
+    assert any(
+        "content for the excluded path is unavailable" in r for r in result.reasons
+    ), result.reasons
 
 
 def test_missing_source_input_fails(tmp_path):
@@ -669,6 +788,66 @@ def _venv_site(venv_dir: Path) -> Path:
     return matches[0]
 
 
+def _clean_env() -> dict:
+    """A subprocess environment with ``PYTHONPATH`` removed.
+
+    The lane runs the tests with ``PYTHONPATH`` pointing at the accepted-SDK
+    site-packages, which *also* carries a ``skillweave`` install. An inherited
+    ``PYTHONPATH`` therefore makes ``pip`` report "already installed with the
+    same version" and skip the freshly-built wheel, leaving the new venv
+    without ``skillweave``. Build/install/verify subprocesses therefore run
+    with ``PYTHONPATH`` cleared, proving the *installed* wheel is exercised.
+    """
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    return env
+
+
+def _accepted_sdk_dir() -> Path | None:
+    """The accepted ``skillweave_sdk`` package dir, or ``None``.
+
+    Only an SDK whose ``validator.py`` exports ``AuthenticatedServiceContext``
+    is the accepted authority -- the ambient 0.2.0 lacks it. The directory is
+    found via ``PYTHONPATH`` (the accepted-SDK site-packages the lane runs
+    under), the interpreter's own site-packages, or the ambient install. The
+    installed venv bundles these files so the verifier validates against the
+    pinned SDK rather than silently degrading to the structural fallback.
+    """
+    cands: list[Path] = []
+    for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if entry:
+            cands.append(Path(entry))
+    for site in Path(sys.prefix).glob("lib/python*/site-packages"):
+        cands.append(site)
+    # Sequence-relative: the accepted ``core-execution`` venv under the
+    # checkout's own sequence (the ancestor that holds ``checkouts/``). A
+    # reviewer lane can reach this; an OS sandbox that hides ``preflight``
+    # simply yields no candidate (fails closed).
+    for up in Path(__file__).resolve().parents:
+        if (up / "checkouts").is_dir():
+            try:
+                for sdk in sorted(up.glob(
+                        "preflight/*/venv/lib/python*/site-packages/skillweave_sdk")):
+                    cands.append(sdk.parent)
+            except OSError:
+                pass
+            break
+    cands += [
+        Path("/opt/homebrew/lib/python3.11/site-packages"),
+        Path("/opt/homebrew/lib/python3.14/site-packages"),
+    ]
+    for cand in cands:
+        validator = cand / "skillweave_sdk" / "validator.py"
+        if not validator.is_file():
+            continue
+        try:
+            if "AuthenticatedServiceContext" in validator.read_text():
+                return cand / "skillweave_sdk"
+        except OSError:
+            continue
+    return None
+
+
 def _build_wheel(work: Path) -> Path:
     """Copy the checkout and build a wheel offline (never writes the checkout)."""
     (work / "src").parent.mkdir(parents=True, exist_ok=True)
@@ -680,7 +859,7 @@ def _build_wheel(work: Path) -> Path:
     proc = subprocess.run(
         [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-index",
          "--no-build-isolation", "-w", str(work / "dist"), str(work)],
-        cwd=str(work), capture_output=True, text=True,
+        cwd=str(work), capture_output=True, text=True, env=_clean_env(),
     )
     assert proc.returncode == 0, proc.stderr
     wheels = sorted((work / "dist").glob("skillweave-*.whl"))
@@ -690,13 +869,14 @@ def _build_wheel(work: Path) -> Path:
 
 def _install_into_fresh_venv(work: Path, wheel: Path) -> Path:
     venv_dir = work / "venv"
+    env = _clean_env()
     subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True,
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, env=env)
     site = _venv_site(venv_dir)
     subprocess.run(
         [str(venv_dir / "bin" / "pip"), "install", "--no-deps", "--no-index",
          str(wheel)],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, env=env,
     )
     # The offline install cannot fetch PyYAML; make it available without
     # reaching the network or the source tree.
@@ -707,6 +887,14 @@ def _install_into_fresh_venv(work: Path, wheel: Path) -> Path:
     extra = ambient_yaml.parent / "_yaml"
     if extra.exists():
         shutil.copytree(extra, site / "_yaml")
+    # Bundle the accepted SDK so the installed verifier validates against the
+    # pinned schema authority (never the structural fallback, never ambient).
+    accepted = _accepted_sdk_dir()
+    assert accepted is not None, (
+        "no accepted skillweave_sdk (validator exporting "
+        "AuthenticatedServiceContext) is resolvable"
+    )
+    shutil.copytree(accepted, site / "skillweave_sdk")
     return venv_dir
 
 
@@ -717,8 +905,7 @@ def _run_installed(venv_dir: Path, tmp_path: Path, artifact: dict,
     amap_file = tmp_path / "amap.json"
     amap_file.write_text(json.dumps({k: v.decode() for k, v in analysis.items()}))
 
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)  # prove the *installed* package is exercised
+    env = _clean_env()  # prove the *installed* package (and its bundled SDK) is used
     env["TMPDIR"] = str(tmp_path / "tmp")
     (tmp_path / "tmp").mkdir(exist_ok=True)
 
@@ -747,6 +934,9 @@ def test_installed_wheel_rejects_falsified_and_admits_genuine(tmp_path):
     genuine_result = _run_installed(venv_dir, tmp_path, genuine, root, analysis)
     assert genuine_result["admitted"] is True
     assert genuine_result["gate_state"] == "pass"
+    # The installed verifier validated against the *pinned SDK schema*, never
+    # the structural fallback -- the real authority is exercised.
+    assert genuine_result["schema_authority"] == "sdk"
     # Exact source pins and raw diagnostics are preserved end to end.
     assert genuine_result["artifact_digest"] == genuine["sha256"]
     assert genuine_result["analyzed_files"] == ["pkg/module.py", "pkg/util.py"]
@@ -769,6 +959,59 @@ def test_installed_wheel_rejects_falsified_and_admits_genuine(tmp_path):
     })
     readme_result = _run_installed(venv_dir, tmp_path, readme_only, root, analysis)
     assert readme_result["admitted"] is False
+
+    # -- the reviewed counterexample, end to end through the installed wheel:
+    #    ``settings.py`` with real executable code, excluded as
+    #    ``not_applicable`` under a narrative justification and *correctly*
+    #    bounded to its own path. Matching the path alone must not admit it --
+    #    the installed native consumer refutes the reason against real bytes.
+    (root / "settings.py").write_bytes(b"LIMIT = 7\n")
+    settings_proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [{"path": "settings.py", "disposition": "not_applicable",
+                      "justification": "Narrative documentation only; no executable code",
+                      "bounded": "settings.py"}],
+    }
+    settings_result = _run_installed(
+        venv_dir, tmp_path, _artifact(settings_proof), root, analysis
+    )
+    assert settings_result["admitted"] is False
+    assert settings_result["gate_state"] == "fail"
+    assert any(
+        "contradicted exclusion reason" in r for r in settings_result["reasons"]
+    ), settings_result["reasons"]
+
+    # -- the positive counterpart in the *same* tree: a genuine code-analysis
+    #    proof is admitted by the same installed consumer, so the fix refuses
+    #    the contradicted exclusion without refusing legitimate analysis.
+    code_tree = {
+        "settings.py": b"LIMIT = 7\n",
+        "pkg/module.py": b"def real():\n    return 42\n",
+        "pkg/util.py": b"VALUE = 'util'\n",
+        "README.md": b"# A readme\n",
+    }
+    code_analysis = {rel: f"analysis of {rel}".encode() for rel in code_tree}
+    positive_proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [
+            _coverage_entry("settings.py", code_tree, code_analysis),
+            _coverage_entry("pkg/module.py", code_tree, code_analysis),
+            _coverage_entry("pkg/util.py", code_tree, code_analysis),
+        ],
+        "exclusions": [
+            {"path": "README.md",
+             "justification": "documentation only, not executable source",
+             "bounded": "narrative paths (*.md)"},
+        ],
+    }
+    positive_result = _run_installed(
+        venv_dir, tmp_path, _artifact(positive_proof), root, code_analysis
+    )
+    assert positive_result["admitted"] is True
+    assert positive_result["gate_state"] == "pass"
+    assert positive_result["reasons"] == []
 
 
 def test_clean_nonempty_output_is_still_the_only_completion_pass():

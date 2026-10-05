@@ -320,6 +320,124 @@ def _bound_covers(bounded: Any, path: str) -> bool:
     return False
 
 
+#: Suffixes whose files are documentation/data, never executable source.
+_NON_EXECUTABLE_SUFFIXES: frozenset[str] = frozenset({
+    ".md", ".rst", ".txt", ".adoc", ".markdown", ".json", ".yaml", ".yml",
+    ".toml", ".ini", ".cfg", ".csv", ".tsv", ".lock", ".png", ".jpg",
+    ".jpeg", ".gif", ".svg", ".ico", ".pdf", ".woff", ".woff2", ".ttf",
+})
+
+#: Justification phrases that assert a file is narrative / has no code. These
+#: are only independently checkable against the source *name and bytes*; a
+#: claim of "no executable code" over a file whose bytes are code is refuted.
+_NARRATIVE_REASON_KEYWORDS: tuple[str, ...] = (
+    "narrative", "documentation", "doc-only", "docs only", "doc only",
+    "no executable", "not executable", "non-executable", "not code", "no code",
+    "prose", "commentary", "readme",
+)
+#: Justification phrases that assert a file is generated/vendored (specifically
+#: not hand-authored source). Unsupported without independent provenance.
+_GENERATED_REASON_KEYWORDS: tuple[str, ...] = (
+    "generated", "vendored", "third-party", "third party", "third_party",
+    "codegen",
+)
+_CODE_SUFFIXES: frozenset[str] = frozenset({
+    ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".java",
+    ".kt", ".kts", ".go", ".rs", ".rb", ".php", ".c", ".h", ".cc", ".cpp",
+    ".cxx", ".hpp", ".cs", ".swift", ".scala", ".sh", ".bash", ".zsh",
+    ".fish", ".ps1", ".pl", ".lua", ".r", ".jl", ".dart", ".m", ".ex",
+    ".exs", ".erl", ".hs", ".clj", ".vue", ".svelte", ".sol",
+})
+
+
+def _looks_like_executable_source(content: Any, path: str) -> bool:
+    """Whether *content* is plausibly executable code rather than narrative.
+
+    Independent of the exclusion's own claim. Uses the file suffix plus real
+    bytes: a code suffix, or a shebang, or a python ``def``/``class``/``import``
+    declaration, all mark executable source. A ``.md``/``.md``-suffix file is
+    documentation even though its bytes also contain letters.
+    """
+    suffix = PurePosixPath(path).suffix.lower()
+    if suffix in _NON_EXECUTABLE_SUFFIXES:
+        return False
+    if not isinstance(content, (bytes, bytearray)):
+        # The name alone says code; without bytes we cannot refute a code name.
+        return suffix in _CODE_SUFFIXES
+    if suffix in _CODE_SUFFIXES:
+        return True
+    try:
+        text = bytes(content).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - undecodable bytes are not provably code
+        return False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#!"):
+            return True
+        if stripped.startswith(("def ", "class ", "import ", "from ")):
+            return True
+    return False
+
+
+def _classify_exclusion_reason(justification: str) -> str:
+    """Classify an exclusion justification as ``narrative``, ``generated`` or
+    ``generic`` -- the claim the verifier must independently check."""
+    low = justification.lower()
+    if any(k in low for k in _NARRATIVE_REASON_KEYWORDS):
+        return "narrative"
+    if any(k in low for k in _GENERATED_REASON_KEYWORDS):
+        return "generated"
+    return "generic"
+
+
+def _independent_reason_check(
+    path: str, justification: str, content: Any
+) -> tuple[bool, str]:
+    """Whether the exclusion's *stated reason* is independently checkable.
+
+    Matching the bounded path alone does not establish the reason. When a
+    justification asserts a narrative/no-code or generated/vendored nature,
+    that claim is checked against the real source name and bytes -- never
+    against the justification itself. A narrative claim over executable code
+    (``settings.py`` containing ``LIMIT = 7``) is refuted; a generated claim
+    with no independent provenance is unsupported. A generic reason is not
+    independently checkable and fails closed. When the source bytes are
+    unavailable nothing can be independently established, so the exclusion is
+    refused rather than trusted.
+    """
+    kind = _classify_exclusion_reason(justification)
+    if kind == "generated":
+        return False, (
+            "exclusion reason claims a generated/vendored file but no "
+            "independent provenance establishes it (unsupported exclusion "
+            "authority)"
+        )
+    if content is None:
+        return False, (
+            "exclusion reason cannot be independently established: the source "
+            "content for the excluded path is unavailable"
+        )
+    if not isinstance(content, (bytes, bytearray)):
+        return False, (
+            "exclusion reason cannot be independently established: source "
+            "content is not real bytes"
+        )
+    if kind == "generic":
+        return False, (
+            "exclusion reason is not independently checkable source-bound "
+            "evidence (unsupported exclusion authority)"
+        )
+    # kind == "narrative": the source bytes must not be executable code.
+    if _looks_like_executable_source(content, path):
+        return False, (
+            "exclusion reason claims a narrative path but the source bytes for "
+            f"{path!r} are executable code (contradicted exclusion reason)"
+        )
+    return True, ""
+
+
 def canonical_artifact_bytes(artifact: Any, *, exclude: Sequence[str] = ("sha256",)) -> bytes:
     """Canonical bytes over *artifact* with *exclude* keys removed.
 
@@ -351,6 +469,16 @@ class SourceResolver:
 
     def content_sha256(self, path: str) -> Optional[str]:  # pragma: no cover - interface
         raise NotImplementedError
+
+    def content_bytes(self, path: str) -> Optional[bytes]:
+        """The real bytes of *path*, or ``None`` if it does not resolve.
+
+        Used to independently check an exclusion's stated reason against the
+        actual source. An implementation that cannot supply real bytes must
+        return ``None`` -- never fabricated content, which would let a
+        contradicted reason pass.
+        """
+        return None  # pragma: no cover - interface default
 
 
 class FilesystemSourceResolver(SourceResolver):
@@ -394,6 +522,16 @@ class FilesystemSourceResolver(SourceResolver):
         if not candidate.is_file():
             return None
         return hashlib.sha256(candidate.read_bytes()).hexdigest()
+
+    def content_bytes(self, path: str) -> Optional[bytes]:
+        candidate = (self.root / path).resolve()
+        try:
+            candidate.relative_to(self.root)
+        except ValueError:
+            return None
+        if not candidate.is_file():
+            return None
+        return candidate.read_bytes()
 
 
 class GitSourceResolver(SourceResolver):
@@ -451,6 +589,16 @@ class GitSourceResolver(SourceResolver):
         if not candidate.is_file():
             return None
         return hashlib.sha256(candidate.read_bytes()).hexdigest()
+
+    def content_bytes(self, path: str) -> Optional[bytes]:
+        candidate = (self.root / path).resolve()
+        try:
+            candidate.relative_to(self.root)
+        except ValueError:
+            return None
+        if not candidate.is_file():
+            return None
+        return candidate.read_bytes()
 
 
 @dataclass
@@ -767,7 +915,7 @@ class ArtifactEvidenceVerifier:
                     return result
                 path = entry.get("path")
                 ok, reason = self._justify_exclusion(
-                    entry, path if isinstance(path, str) else ""
+                    entry, path if isinstance(path, str) else "", resolver
                 )
                 if not ok:
                     result.reasons.append(f"exclusion {path!r}: {reason}")
@@ -804,7 +952,7 @@ class ArtifactEvidenceVerifier:
                 # it (still validating its justification) and refuse by name.
                 disposition = str(entry.get("disposition", "analyzed"))
                 if disposition in EXCLUSION_DISPOSITIONS:
-                    ok, reason = self._justify_exclusion(entry, path)
+                    ok, reason = self._justify_exclusion(entry, path, resolver)
                     if not ok:
                         result.reasons.append(f"N/A {path!r}: {reason}")
                         return result
@@ -818,7 +966,7 @@ class ArtifactEvidenceVerifier:
                 continue
             disposition = str(entry.get("disposition", "analyzed"))
             if disposition in EXCLUSION_DISPOSITIONS:
-                ok, reason = self._justify_exclusion(entry, path)
+                ok, reason = self._justify_exclusion(entry, path, resolver)
                 if not ok:
                     result.reasons.append(f"N/A {path!r}: {reason}")
                     return result
@@ -914,14 +1062,24 @@ class ArtifactEvidenceVerifier:
             return False, "analysis_digest does not match the analysis artifact bytes"
         return True, ""
 
-    def _justify_exclusion(self, entry: Any, path: str) -> tuple[bool, str]:
+    def _justify_exclusion(
+        self,
+        entry: Any,
+        path: str,
+        resolver: Optional[SourceResolver] = None,
+    ) -> tuple[bool, str]:
         """Whether an exclusion/N-A entry is explicit, bounded and justified.
 
         ``path`` is the file being excluded: the claimed *bounded* scope must
-        actually cover it. A bound naming some *other* file (a ``README.md``
-        bound used to exclude an executable ``settings.py``) is a false bound
-        and is refused -- the justification must be consistent with what is
-        being excluded, not merely non-empty.
+        actually cover it (a ``README.md`` bound on an executable
+        ``settings.py`` is a false bound), *and* the stated reason must be
+        independently checkable against the real source. Matching the path
+        alone is not enough: an executable file excluded as "narrative /
+        documentation" -- even when correctly bounded to itself -- is refuted
+        by its own source bytes; a generated/vendored claim with no
+        independent provenance is unsupported. When the reason cannot be
+        independently established (no real source bytes, a generic reason)
+        the exclusion fails closed.
         """
         justification = entry.get("justification", entry.get("reason"))
         bounded = entry.get("bounded", entry.get("scope"))
@@ -942,6 +1100,18 @@ class ArtifactEvidenceVerifier:
                 f"bounding scope {bounded!r} does not cover the excluded path "
                 f"{path!r}"
             )
+        # Independent reason check: the *reason*, not just the bound, must be
+        # established by real source facts. A resolver is mandatory to supply
+        # those facts; without one the exclusion fails closed.
+        if resolver is None:
+            return False, (
+                "exclusion reason cannot be independently established without a "
+                "source resolver"
+            )
+        content = resolver.content_bytes(path)
+        ok, reason = _independent_reason_check(path, justification.strip(), content)
+        if not ok:
+            return False, reason
         return True, justification.strip()
 
     @staticmethod

@@ -96,14 +96,35 @@ understanding of the graph is:
   bounded, independently-justified exclusion.
 * **Exclusions / N/A** (`EXCLUSION_DISPOSITIONS`): `not_applicable`,
   `excluded`, `skipped`, `ignored`. Each requires a real justification
-  (`_PLACEHOLDER_JUSTIFICATIONS` such as `n/a`, `todo`, `-` are refused) **and**
-  a bound scope.
+  (`_PLACEHOLDER_JUSTIFICATIONS` such as `n/a`, `todo`, `-` are refused), a
+  bound scope that actually *covers* the excluded path, **and** a reason that
+  is independently checkable against the real source name and bytes.
+* **Independent exclusion-reason authority.** Matching the bound to the path
+  does not establish the *reason*. The stated justification is classified as
+  a **narrative / no-code** claim, a **generated / vendored** claim, or a
+  **generic** claim, and each is checked independently
+  (`_independent_reason_check`):
+  * A narrative claim is checked against the real source: if the bytes for the
+    excluded path look like executable source (a code suffix, a `#!` shebang,
+    or a `def`/`class`/`import`/`from` declaration) the claim is
+    **contradicted** and refused -- e.g. `settings.py` containing `LIMIT = 7`
+    excluded as "narrative documentation only; no executable code". A
+    narrative claim over genuinely non-code bytes (a README, a data file) is
+    admitted.
+  * A generated/vendored claim with no independent provenance is
+    **unsupported** and refused.
+  * A generic justification that is not source-bound is not independently
+    checkable and fails closed.
+  * When the resolver cannot return the real source bytes for the excluded
+    path (no resolver, missing file, non-bytes), nothing can be independently
+    established, so the exclusion is refused rather than trusted.
 * **Refused outright:** a missing resolver; an unresolvable file; a coverage
   entry whose only evidence is a `git ls-tree` / `git ls-files` enumeration (a
   line of output is not an analysis); a **README-only** graph over a tree with
   real files (`NARRATIVE_PATH_MARKERS`); a **phantom** covered path not present
   in the source; a **substituted** commit/content field; an empty/partial graph
-  over a populated source.
+  over a populated source; a **contradicted**, **unsupported** or
+  **unavailable** exclusion reason.
 
 A refusal is never repaired by schema fixup or a placeholder coverage entry,
 and a timeout or missing input never becomes a PASS.

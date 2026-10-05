@@ -504,6 +504,20 @@ def _venv_site(venv_dir: Path) -> Path:
     return matches[0]
 
 
+def _clean_env() -> dict:
+    """A subprocess environment with ``PYTHONPATH`` removed.
+
+    The lane runs the tests with ``PYTHONPATH`` pointing at the accepted-SDK
+    site-packages, which *also* carries a ``skillweave`` install. An inherited
+    ``PYTHONPATH`` makes ``pip`` report "already installed with the same
+    version" and skip the freshly-built wheel, so the venv never gets the
+    console script. Build/install subprocesses therefore clear ``PYTHONPATH``.
+    """
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    return env
+
+
 def _build_wheel(work: Path) -> Path:
     """Copy the checkout to *work* and build a wheel offline.
 
@@ -520,7 +534,7 @@ def _build_wheel(work: Path) -> Path:
     proc = subprocess.run(
         [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-index",
          "--no-build-isolation", "-w", str(work / "dist"), str(work)],
-        cwd=str(work), capture_output=True, text=True,
+        cwd=str(work), capture_output=True, text=True, env=_clean_env(),
     )
     assert proc.returncode == 0, proc.stderr
     wheels = sorted((work / "dist").glob("skillweave-*.whl"))
@@ -530,13 +544,14 @@ def _build_wheel(work: Path) -> Path:
 
 def _install_into_fresh_venv(work: Path, wheel: Path) -> Path:
     venv_dir = work / "venv"
+    env = _clean_env()
     subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True,
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, env=env)
     site = _venv_site(venv_dir)
     subprocess.run(
         [str(venv_dir / "bin" / "pip"), "install", "--no-deps", "--no-index",
          str(wheel)],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, env=env,
     )
     # The offline install cannot fetch PyYAML (a declared runtime dependency).
     # Make the dependency available to the isolated interpreter without
@@ -570,9 +585,8 @@ def test_installed_wheel_console_script_runs_native_assay(tmp_path):
     evidence_file = tmp_path / "installed-evidence.json"
     evidence_file.write_text(json.dumps(genuine_artifact(files, analysis, commit=COMMIT)))
 
-    env = dict(os.environ)
+    env = _clean_env()
     # Prove the *installed* package is exercised: drop any source-tree path.
-    env.pop("PYTHONPATH", None)
     env["TMPDIR"] = str(tmp_path / "tmp")
     (tmp_path / "tmp").mkdir(exist_ok=True)
 
@@ -644,8 +658,7 @@ def test_installed_wheel_refuses_unknown_methodology(tmp_path):
     venv_dir = _install_into_fresh_venv(work, wheel)
     script = venv_dir / "bin" / "skillweave"
 
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
+    env = _clean_env()
     env["TMPDIR"] = str(tmp_path / "tmp")
     (tmp_path / "tmp").mkdir(exist_ok=True)
 
