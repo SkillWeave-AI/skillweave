@@ -138,6 +138,8 @@ class RunApplicationService:
         authority_service: Optional[Any] = None,
         worker_token: Optional[str] = None,
         require_identity: bool = False,
+        declared_writes: Optional[Sequence[str]] = None,
+        work_contract: Optional[Any] = None,
     ) -> RunExecution:
         """Run ``command`` through the six-stage integration path.
 
@@ -154,8 +156,25 @@ class RunApplicationService:
 
         ``require_identity=True`` makes a missing authority service a hard
         failure, so a protected caller cannot accidentally run the legacy path.
+
+        ``declared_writes`` and ``work_contract`` turn on the execution
+        write-scope boundary (SW-1510-SCOPE). Both are *protected-only*: naming
+        either without an authenticated worker is a hard failure, so scope
+        enforcement can never be silently downgraded to the legacy path. When
+        present, every declared output is authorized against the resolved
+        attempt checkout (and the protected store roots) *before* the child is
+        spawned, and the child runs inside the same attested isolation window.
         """
         created_at = created_at or datetime.now(timezone.utc).isoformat()
+
+        if (declared_writes is not None or work_contract is not None) and (
+            authority_service is None
+        ):
+            raise RunIntegrationError(
+                "identity",
+                "declared_writes/work_contract require an authenticated worker "
+                "(auth-scoped execution); refusing the unprotected path",
+            )
 
         credential = None
         if authority_service is None and require_identity:
@@ -206,30 +225,90 @@ class RunApplicationService:
         # adapter seals them. If no real isolation adapter is available the
         # protected path fails closed here, before the child is spawned — never
         # a quiet unsandboxed launch.
+        #
+        # SW-1510-SCOPE adds the *execution write-scope* half: when the caller
+        # declares outputs (or a work contract), every declared write is
+        # authorized against the resolved attempt checkout and the protected
+        # store roots before launch, and the same attested isolation window
+        # covers the child. A traversal/symlink escape is refused here.
         protection = None
+        scope_requested = declared_writes is not None or work_contract is not None
+        runner_mod = importlib.import_module("skillweave.core.proc.runner")
+        scope_refusals: tuple = (
+            runner_mod.ScopeViolation,
+            runner_mod.ScopeEnforcementUnavailable,
+        )
+        IsolationUnavailableError = None
+        if credential is not None:
+            write_scope_mod = importlib.import_module(
+                "skillweave.runtime.write_scope"
+            )
+            scope_refusals = scope_refusals + (write_scope_mod.WriteScopeViolation,)
+            IsolationUnavailableError = _runtime_attr(
+                "worker_launcher", "IsolationUnavailableError"
+            )
         try:
-            protection = self._open_worker_protection(credential, run_id)
-            argv = list(command)
-            if protection is not None:
-                argv = protection.wrap_command(argv, writable_scope=protection.writable_scope)
             try:
-                result = run_command(
-                    argv,
-                    run_id=run_id,
-                    subject_repo=subject_repo,
-                    subject_commit=subject_commit,
-                    tool=tool,
-                    model=model,
-                    created_at=created_at,
-                )
-            finally:
-                if protection is not None:
-                    protection.__exit__(None, None, None)
+                protection = self._open_worker_protection(credential, run_id)
+            except Exception as exc:  # noqa: BLE001
+                # The launcher fails closed when no real isolation mechanism is
+                # available. For a scope-enforced launch surface that as the
+                # runner's typed HOLD so the caller gets one attributable
+                # isolation-unavailable record rather than a bare error.
+                if (
+                    scope_requested
+                    and IsolationUnavailableError is not None
+                    and isinstance(exc, IsolationUnavailableError)
+                ):
+                    raise runner_mod.ScopeEnforcementUnavailable(
+                        "harness-worker",
+                        f"no real isolation available for the worker: {exc}",
+                    ) from exc
+                raise
+            enforcement, declared = self._open_scope_enforcement(
+                credential, protection, run_id, declared_writes, work_contract
+            )
+            argv = list(command)
+            if enforcement is not None:
+                # Attest the real isolation *before* the child exists: an
+                # unavailable or insufficient enforcement raises a typed HOLD
+                # here, so an unisolated launch never happens (criterion 2).
+                # Authorize every declared write against the resolved checkout
+                # and the protected store roots before spawning: a traversal or
+                # symlink escape, or a receipt/store/telemetry target, is
+                # refused here, before anything runs (criterion 1).
+                enforcement.attest()
+                if declared:
+                    enforcement.authorize_writes(declared)
+                argv = enforcement.wrap_command(argv)
+            elif protection is not None:
+                argv = protection.wrap_command(argv, writable_scope=protection.writable_scope)
+            result = run_command(
+                argv,
+                run_id=run_id,
+                subject_repo=subject_repo,
+                subject_commit=subject_commit,
+                tool=tool,
+                model=model,
+                created_at=created_at,
+            )
+        except scope_refusals:
+            # A write-scope refusal (traversal/symlink/protected-store escape)
+            # or a typed isolation HOLD surfaces as the typed refusal itself, so
+            # the caller can act on the exact reason and retry nothing unsafe.
+            raise
         except RunIntegrationError:
             raise
         except Exception as exc:  # noqa: BLE001
             self._fail_run(run_id, f"launch raised {exc}")
             raise RunIntegrationError("launch", str(exc)) from exc
+        finally:
+            # Release the protection window (unseal the protected stores) on
+            # every path — including a scope refusal raised while composing the
+            # enforcement, before the child ever existed. A leaked seal would
+            # leave the host's own stores locked.
+            if protection is not None:
+                protection.__exit__(None, None, None)
 
         # Stage 3: raw artifact (content-addressed bytes).
         raw_bytes = result.stdout or b""
@@ -474,6 +553,96 @@ class RunApplicationService:
 
         base = tempfile.mkdtemp(prefix=f"sw1510-worker-{run_id}-")
         return Path(base).resolve()
+
+    def _open_scope_enforcement(
+        self,
+        credential: Any,
+        protection: Any,
+        run_id: str,
+        declared_writes: Optional[Sequence[str]],
+        work_contract: Any,
+    ) -> tuple[Optional[Any], Optional[Sequence[str]]]:
+        """Compose the real execution write-scope + isolation boundary.
+
+        Returns ``(enforcement, declared)``. Returns ``(None, None)`` on the
+        legacy unprotected path (no credential and nothing declared). On the
+        protected path it always returns a :class:`ScopeEnforcement` bound to
+        the live ``protection`` window: the attempt checkout is the worker's
+        private writable scope, the protected store roots are sealed against
+        writes even inside it, and the enforced isolation is the protection
+        already evidenced by the launcher. The scope is resolved either from an
+        explicit ``declared_writes`` list or from a ``WorkContract``'s
+        normalized write scope — including the generic content/configuration/
+        deployment/incident object kinds, which never synthesize a repository
+        SHA.
+        """
+        checkout_root = (
+            protection.writable_scope if protection is not None else None
+        )
+        if checkout_root is None:
+            if declared_writes is None and work_contract is None:
+                return None, None
+            # Auth-scoped execution was requested but there is no real checkout
+            # to confine to: fail closed rather than enforcing against an
+            # unbounded root.
+            runner_mod = importlib.import_module("skillweave.core.proc.runner")
+            raise runner_mod.ScopeEnforcementUnavailable(
+                "harness-worker",
+                "scope-enforced launch requires a real attempt checkout",
+            )
+
+        # ``skillweave.core.proc.runner`` is a core package (always present), not
+        # the optional ``runtime`` subpackage, so it is resolved directly rather
+        # than through ``_runtime_attr``.
+        runner_mod = importlib.import_module("skillweave.core.proc.runner")
+        ScopeEnforcement = runner_mod.ScopeEnforcement
+
+        # ``ExecutionScope`` is the normalized execution boundary: a target is
+        # admitted only when it resolves inside the attempt checkout (symlinks
+        # followed, traversal refused). It is always built when the paths/
+        # objects execution is requested — whether the outputs came from an
+        # explicit ``declared_writes`` list or a contract's write scope — so a
+        # traversal/symlink escape is refused at the boundary even with no work
+        # contract. A non-Git object contract is enforced against its own kind.
+        ExecutionScope = _runtime_attr("write_scope", "ExecutionScope")
+        scope = None
+        declared = declared_writes
+        if work_contract is not None:
+            scope_from_contract = _runtime_attr(
+                "write_scope", "scope_from_work_contract"
+            )
+            scope = scope_from_contract(work_contract, checkout_root=str(checkout_root))
+            # A generic object contract is validated against its own kind (no
+            # fabricated commit); a paths/objects contract needs declared
+            # outputs to authorize, taken from its allow list.
+            if getattr(scope, "kind", "paths") in ("paths", "objects"):
+                if declared is None:
+                    declared = list(getattr(work_contract, "write_scope", None).allow) if hasattr(
+                        getattr(work_contract, "write_scope", None), "allow"
+                    ) else None
+            else:
+                scope.validate_object()
+        elif declared is not None:
+            scope = ExecutionScope(
+                kind="paths",
+                checkout_root=str(checkout_root),
+                allow=list(declared),
+            )
+
+        protected_roots = ()
+        if protection is not None:
+            protected_roots = tuple(
+                str(p) for p in protection.protected.write_protected_paths()
+            )
+        enforcement = ScopeEnforcement(
+            isolation=protection,
+            scope=scope,
+            protected_roots=protected_roots,
+            checkout_root=str(checkout_root),
+            workload="harness-worker",
+            tools=("Bash",),
+        )
+        return enforcement, declared
 
     def _fail_run(self, run_id: str, reason: str) -> None:
         """Mark a run terminal with a stop reason when a stage raises.
