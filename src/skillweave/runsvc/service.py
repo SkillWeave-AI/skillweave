@@ -162,10 +162,22 @@ class RunApplicationService:
         store: SQLiteRunStore,
         journal: EventJournal,
         raw_artifacts: RawArtifactStore,
+        stream_store: Optional[Any] = None,
     ):
         self.store = store
         self.journal = journal
         self.raw_artifacts = raw_artifacts
+        # The durable per-attempt stream evidence store (SW-1510-STREAM). It is
+        # optional and resolved lazily so the unchanged legacy path never
+        # requires the optional runtime stream subpackage to be present. It owns
+        # no authority: it is a bounded, cursor-addressed evidence channel the
+        # production collector writes and the observer reads.
+        if stream_store is None:
+            try:
+                stream_store = _runtime_attr("stream", "DurableStreamStore")()
+            except Exception:  # noqa: BLE001 - optional subpackage
+                stream_store = None
+        self.stream_store = stream_store
 
     def execute(
         self,
@@ -1795,3 +1807,560 @@ class RunApplicationService:
             "updated_at": run.updated_at,
             "event_count": len(events),
         }
+
+    # ------------------------------------------------------------------
+    # Durable stream evidence (SW-1510-STREAM)
+    #
+    # The *actual* protected native execution path is ``execute_streaming_native``
+    # below. Like ``execute`` it authenticates the worker at ingress, opens the
+    # real process-isolation window, and requires a durable stream store — never
+    # a memory-only fallback. The read methods expose the collected evidence and
+    # a narrow, caller-supplied collector interface the owning composed
+    # Assay/Scope lane can wire without this lane reaching into that checkout.
+    # ------------------------------------------------------------------
+
+    def execute_streaming_native(
+        self,
+        command: Sequence[str],
+        *,
+        run_id: str,
+        tool: str,
+        model: str,
+        subject_repo: str,
+        subject_commit: str,
+        attempt: int = 1,
+        task_id: str = "task-1",
+        created_at: Optional[str] = None,
+        check_output: Optional[Any] = None,
+        timeout: Optional[float] = None,
+        secrets: Optional[Sequence[str]] = None,
+        stdout_retain_limit: Optional[int] = None,
+        stderr_retain_limit: Optional[int] = None,
+        authority_service: Optional[Any] = None,
+        worker_token: Optional[str] = None,
+        require_identity: bool = False,
+        methodology: str = "ralph",
+        autonomy_policy: str = "",
+        declared_writes: Optional[Sequence[str]] = None,
+        work_contract: Optional[Any] = None,
+        assay_actor_token: Optional[str] = None,
+        assay_envelope: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Protected native execution whose output is durably streamed.
+
+        This is the streaming sibling of :meth:`execute` and shares its
+        *authenticated* admission: the worker credential is verified at ingress
+        (``worker_token`` must verify against ``authority_service`` and bind to
+        this ``run_id``, carrying no approving role), and, when a credential is
+        present, the child is launched inside the real :class:`StoreProtection`
+        window the runner applies via ``wrap_command``. An authenticated
+        request therefore cannot silently run unsandboxed, and
+        ``require_identity=True`` forbids the unprotected path outright.
+
+        Streaming is durable or it does not run: this method refuses a
+        memory-only ``stream_store``, because a protected run whose evidence
+        vanishes with the process is not evidence.
+
+        Scope/envelope enforcement and the native Assay methodology are
+        *composed independently* by the owning lane; this method exposes the
+        narrow collector interface (:meth:`stream_read`, and the store the
+        runner writes) and does not guess that lane's uncommitted code.
+        """
+        from skillweave.core.proc.runner import run_process_streaming
+
+        if self.stream_store is None:
+            raise RunIntegrationError("stream", "no durable stream store is configured")
+        if not getattr(self.stream_store, "is_durable", False):
+            raise RunIntegrationError(
+                "stream",
+                "the protected native path requires a durable stream store; a "
+                "memory-only store cannot silently stand in for persisted evidence",
+            )
+
+        credential = None
+        if authority_service is None and require_identity:
+            raise RunIntegrationError(
+                "identity",
+                "require_identity=True but no authority_service was supplied",
+            )
+        if authority_service is not None:
+            credential = self._authenticate_worker(
+                authority_service, worker_token=worker_token, run_id=run_id
+            )
+
+        # SW-1510-SCOPE: a declared write scope is protected-only, exactly as on
+        # the bounded ``execute`` path. Naming ``declared_writes``/``work_contract``
+        # without an authenticated worker would silently downgrade confinement to
+        # the unprotected legacy path, so it is refused here before any state.
+        if (declared_writes is not None or work_contract is not None) and (
+            authority_service is None
+        ):
+            raise RunIntegrationError(
+                "identity",
+                "declared_writes/work_contract require an authenticated worker "
+                "(auth-scoped execution); refusing the unprotected path",
+            )
+
+        # Resolve the declared methodology binding BEFORE any run state is
+        # written, so an Assay request is honoured or refused explicitly — never
+        # silently reinterpreted as Ralph — on the streaming path too.
+        binding = self._resolve_methodology_binding(
+            methodology=methodology,
+            autonomy_policy=autonomy_policy,
+        )
+
+        created_at = created_at or datetime.now(timezone.utc).isoformat()
+
+        EventType = _runtime_attr("journal", "EventType")
+        ArtifactReceipt = _runtime_attr("registry", "ArtifactReceipt")
+        EvidenceQuality = _runtime_attr("registry", "EvidenceQuality")
+        EvidenceType = _runtime_attr("registry", "EvidenceType")
+        Verifier = _runtime_attr("verify", "Verifier")
+        CompletionContract = _runtime_attr("verify", "CompletionContract")
+        GateState = _runtime_attr("verify", "GateState")
+
+        # Stage 1: Run — walk the lane to ``verify`` under CAS, as ``execute`` does.
+        self.store.create_run(run_id)
+        for from_state, to_state in (
+            ("preflight", "batch_selection"),
+            ("batch_selection", "lane_plan"),
+            ("lane_plan", "implement"),
+            ("implement", "verify"),
+        ):
+            current = self.store.get_run(run_id)
+            self.store.transition(
+                run_id,
+                to_state,
+                expected_state=from_state,
+                expected_version=current.version,
+                reason="run svc streaming: lane advance",
+                role="ops",
+            )
+
+        # SW-1510-ASSAY: open the native Assay drill *before* the real probe is
+        # launched, exactly as the bounded ``execute`` path does. PIN/HYPOTHESIS
+        # describe the policy/state machine this streaming launch actually
+        # executes — the same engine the post-spawn PROBE/MEASURE/CLASSIFY
+        # records describe — rather than a post-hoc diary. On the identity-
+        # authenticated path this resolves the assay actor through the live host
+        # authority and enforces the admission envelope (actor, pinned subject/
+        # brief, deadline, remaining budget) before the child exists; a refusal
+        # fails the run rather than leaving it dangling.
+        assay_pre_state: Optional[dict[str, Any]] = None
+        if binding.methodology.value == "assay":
+            try:
+                assay_pre_state = self._assay_open(
+                    run_id=run_id,
+                    task_id=task_id or run_id,
+                    attempt=int(attempt),
+                    binding=binding,
+                    command=list(command),
+                    subject_repo=subject_repo,
+                    subject_commit=subject_commit,
+                    authority_service=authority_service,
+                    credential=credential,
+                    assay_actor_token=assay_actor_token,
+                    assay_envelope=assay_envelope,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._fail_run(run_id, f"assay admission refused: {exc}")
+                raise
+
+        # Stage 2: the real protected launch + durable streaming collection.
+        # The streaming path composes the *same* SCOPE boundary as ``execute``:
+        # the declared write scope is authorized and the real isolation attested
+        # BEFORE the child is spawned (an unavailable/insufficient enforcement
+        # is a typed pre-spawn HOLD), and the child runs inside that enforced
+        # window. ``execute_streaming_native`` therefore cannot bypass the
+        # authoritative controller's pre-spawn envelope or confinement.
+        protection = None
+        result = None
+        scope_requested = declared_writes is not None or work_contract is not None
+        runner_mod = importlib.import_module("skillweave.core.proc.runner")
+        scope_refusals: tuple = (
+            runner_mod.ScopeViolation,
+            runner_mod.ScopeEnforcementUnavailable,
+        )
+        IsolationUnavailableError = None
+        if credential is not None:
+            write_scope_mod = importlib.import_module(
+                "skillweave.runtime.write_scope"
+            )
+            scope_refusals = scope_refusals + (write_scope_mod.WriteScopeViolation,)
+            IsolationUnavailableError = _runtime_attr(
+                "worker_launcher", "IsolationUnavailableError"
+            )
+        try:
+            try:
+                protection = self._open_worker_protection(credential, run_id)
+            except Exception as exc:  # noqa: BLE001
+                if (
+                    scope_requested
+                    and IsolationUnavailableError is not None
+                    and isinstance(exc, IsolationUnavailableError)
+                ):
+                    raise runner_mod.ScopeEnforcementUnavailable(
+                        "harness-worker",
+                        f"no real isolation available for the worker: {exc}",
+                    ) from exc
+                raise
+            enforcement, declared = self._open_scope_enforcement(
+                credential, protection, run_id, declared_writes, work_contract
+            )
+            wrap = None
+            if enforcement is not None:
+                # Authorize every declared write against the resolved checkout
+                # and the protected store roots before spawning (criterion 1),
+                # then attest the real isolation — an unavailable or
+                # insufficient enforcement raises a typed HOLD here, before the
+                # child exists (criterion 2).
+                if declared:
+                    enforcement.authorize_writes(declared)
+                enforcement.attest()
+                def wrap(argv, _e=enforcement):
+                    return _e.wrap_command(argv)
+            elif protection is not None:
+                def wrap(argv, _p=protection):
+                    return _p.wrap_command(
+                        argv, writable_scope=_p.writable_scope
+                    )
+            result = run_process_streaming(
+                list(command),
+                run_id=run_id,
+                store=self.stream_store,
+                attempt=attempt,
+                task_id=task_id,
+                timeout=timeout,
+                secrets=list(secrets) if secrets else None,
+                stdout_retain_limit=stdout_retain_limit,
+                stderr_retain_limit=stderr_retain_limit,
+                wrap_command=wrap,
+            )
+        except scope_refusals:
+            # A write-scope refusal or a typed isolation HOLD surfaces as the
+            # typed refusal itself, so the caller can act on the exact reason.
+            raise
+        except RunIntegrationError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._fail_run(run_id, f"streaming launch raised {exc}")
+            raise RunIntegrationError("launch", str(exc)) from exc
+        finally:
+            # Release the protection window (unseal the protected stores) on
+            # every path, including a scope refusal raised while composing the
+            # enforcement before the child ever existed.
+            if protection is not None:
+                protection.__exit__(None, None, None)
+
+        fact = result.fact
+        out_summary = self.stream_store.summary(
+            attempt, "stdout", run_id=run_id, task_id=task_id
+        )
+        err_summary = self.stream_store.summary(
+            attempt, "stderr", run_id=run_id, task_id=task_id
+        )
+
+        # Stage 3: raw artifact — the stored convenience bytes (redacted text).
+        raw_bytes = result.stdout_text.encode("utf-8", errors="replace")
+        raw_digest = self.raw_artifacts.put(raw_bytes)
+
+        # Stage 4: journal — the immutable facts and exact stream digests.
+        self.journal.append(
+            run_id,
+            event_type=EventType.ARTIFACT_CREATED.value,
+            payload={
+                "digest": raw_digest,
+                "byte_length": len(raw_bytes),
+                "exit_code": fact.exit_code,
+                "signal": fact.signal,
+                "termination": fact.termination,
+                "result_subtype": fact.result_subtype,
+                "duration_ns": fact.duration_ns,
+                "attempt": attempt,
+                "task_id": task_id,
+                "stdout": out_summary.to_dict(),
+                "stderr": err_summary.to_dict(),
+            },
+        )
+
+        # Stage 5: the receipt bound to the run and the raw bytes.
+        receipt = ArtifactReceipt(
+            artifact_id=f"runsvc-stream-{run_id}",
+            sha256=raw_digest,
+            schema_version="1",
+            producer_command=" ".join(command),
+            subject_repo=subject_repo,
+            subject_commit=subject_commit,
+            created_at=created_at,
+            evidence_type=EvidenceType.RUNTIME_TRACE.value,
+            purpose=f"streamed attempt {attempt} output for run '{run_id}'",
+            method="runsvc-stream",
+            system_source="runsvc",
+            quality=EvidenceQuality(),
+            metadata={
+                "run_id": run_id,
+                "task_id": task_id,
+                "attempt": attempt,
+                "tool": tool,
+                "model": model,
+                "exit_code": fact.exit_code,
+                "signal": fact.signal,
+                "termination": fact.termination,
+                "result_subtype": fact.result_subtype,
+                "duration_ns": fact.duration_ns,
+                "stdout_digest": out_summary.digest,
+                "stderr_digest": err_summary.digest,
+                "stdout_observed_bytes": out_summary.observed_bytes,
+                "stderr_observed_bytes": err_summary.observed_bytes,
+                "stdout_incompleteness": out_summary.incompleteness,
+                "stderr_incompleteness": err_summary.incompleteness,
+            },
+        )
+        saved_receipt = self.store.save_evidence(receipt)
+
+        # Stage 6: verification — a separate verifier over the *observed* bytes.
+        observed_stdout = self.stream_store.spool(
+            attempt, "stdout", run_id=run_id, task_id=task_id
+        ).read_retained()
+        verifier = Verifier()
+        verdict = verifier.assess(
+            saved_receipt.artifact_id,
+            exit_code=fact.exit_code,
+            signal=fact.signal,
+            termination=fact.termination,
+            stdout=observed_stdout,
+            check_output=check_output,
+        )
+        verdict_body = (
+            f"{verdict.subject_artifact_id}|{verdict.grade}|{verdict.gate_state}"
+        ).encode("utf-8")
+        verification_digest = hashlib.sha256(verdict_body).hexdigest()
+        verdict_receipt = verdict.to_receipt(digest=verification_digest)
+
+        contract = CompletionContract()
+        gate_state = contract.evaluate(
+            exit_code=fact.exit_code,
+            signal=fact.signal,
+            termination=fact.termination,
+            stdout=observed_stdout,
+            check_output=check_output,
+        )
+
+        # Record the declared methodology binding on the run metadata as its own
+        # fields (methodology, autonomy_policy) plus the run/task/attempt triple,
+        # exactly as the bounded path does, while the run is still at ``verify``.
+        try:
+            pre_terminal = self.store.get_run(run_id)
+            self.store.update_metadata(
+                run_id,
+                expected_version=pre_terminal.version,
+                metadata={
+                    "methodology": binding.methodology.value,
+                    "autonomy_policy": binding.policy_name,
+                    "task_id": task_id or run_id,
+                    "attempt": int(attempt),
+                    "methodology_binding": binding.to_dict(),
+                },
+            )
+        except Exception:  # noqa: BLE001 - binding metadata is best-effort data
+            pass
+
+        # Terminal state: legal gate route (unchanged transition discipline).
+        current = self.store.get_run(run_id)
+        gate_stage = "review_gate" if gate_state == GateState.PASS else "fix_retry"
+        stop_reason = None if gate_state == GateState.PASS else "before_gate"
+        try:
+            self.store.transition(
+                run_id,
+                gate_stage,
+                expected_state="verify",
+                expected_version=current.version,
+                reason="run svc streaming: gate stage",
+                role="ops",
+            )
+            current = self.store.get_run(run_id)
+            self.store.transition(
+                run_id,
+                "advance_or_stop",
+                expected_state=gate_stage,
+                expected_version=current.version,
+                reason="run svc streaming: verified gate",
+                role="ops",
+                stop_reason=stop_reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._fail_run(run_id, f"terminal transition raised {exc}")
+            raise RunIntegrationError("gate", str(exc)) from exc
+
+        # SW-1510-ASSAY: close the native Assay drill after the real streamed
+        # probe. PROBE carries the child's measured facts (pid/exit/signal/
+        # termination), MEASURE binds the observed content-addressed bytes,
+        # CLASSIFY is the verifier's grade, and the outcome is PASS only when the
+        # gate PASSes *and* the policy can author the terminal transition — a
+        # self-declared pass is impossible. This describes the same engine whose
+        # PIN/HYPOTHESIS were recorded before the launch.
+        assay_block: Optional[dict[str, Any]] = None
+        if binding.methodology.value == "assay":
+            # Reuse the executed child's own measured facts by handing the drill
+            # an object exposing the same fields it reads from ``RunCommandResult``.
+            class _StreamProbeView:
+                pid = result.pid
+                exit_code = result.exit_code
+                signal = result.signal
+                termination = result.termination
+                command = result.command
+
+                @property
+                def stdout(self):
+                    return observed_stdout
+
+            assay_block = self._run_assay_drill(
+                run_id=run_id,
+                task_id=task_id or run_id,
+                attempt=int(attempt),
+                binding=binding,
+                result=_StreamProbeView(),
+                gate_state=gate_state,
+                verdict_receipt=verdict_receipt,
+                pre_state=assay_pre_state,
+            )
+
+        out = {
+            "run_id": run_id,
+            "task_id": task_id,
+            "attempt": attempt,
+            "result": result,
+            "fact": fact,
+            "journal": self.journal.get_events(run_id),
+            "raw_digest": raw_digest,
+            "receipt": saved_receipt,
+            "verification": verdict_receipt,
+            "gate_state": gate_state,
+            "stdout_summary": out_summary,
+            "stderr_summary": err_summary,
+            "methodology": binding.methodology.value,
+            "autonomy_policy": binding.policy_name,
+            "durable": True,
+        }
+        if assay_block is not None:
+            out["assay"] = assay_block
+        return out
+
+    # -- narrow collector interface for the owning composed lane ------------
+    #
+
+    def stream_read(
+        self,
+        run_id: str,
+        *,
+        attempt: int = 1,
+        task_id: str = "task-1",
+        after_cursor: int = 0,
+    ) -> dict[str, Any]:
+        """Read one attempt's durable evidence through the collector interface.
+
+        This is the narrow seam the *owning* Assay/Scope lane wires after this
+        lane's clean candidate completes: it returns the retained streams, their
+        exact digests, typed incompleteness, the immutable fact and the ordered
+        cursor. It makes no scope/envelope decision and reads no other lane's
+        code.
+        """
+        if self.stream_store is None:
+            return {"run_id": run_id, "durable": False, "status": "no stream store"}
+        store = self.stream_store
+        out = store.summary(attempt, "stdout", run_id=run_id, task_id=task_id)
+        err = store.summary(attempt, "stderr", run_id=run_id, task_id=task_id)
+        fact = store.fact(attempt, run_id=run_id, task_id=task_id)
+        frames = store.frames(
+            after_cursor, run_id=run_id, task_id=task_id
+        )
+        return {
+            "run_id": run_id,
+            "task_id": task_id,
+            "attempt": attempt,
+            "durable": getattr(store, "is_durable", False),
+            "persistence_mode": getattr(store, "persistence_mode", "memory"),
+            "degraded": getattr(store, "degraded", False),
+            "cursor": store.cursor,
+            "latest_cursor": frames[-1].cursor if frames else after_cursor,
+            "stdout": out.to_dict(),
+            "stderr": err.to_dict(),
+            "fact": fact.to_dict() if fact is not None else None,
+            "retained_stdout": store.spool(
+                attempt, "stdout", run_id=run_id, task_id=task_id
+            ).read_retained(),
+            "retained_stderr": store.spool(
+                attempt, "stderr", run_id=run_id, task_id=task_id
+            ).read_retained(),
+            "is_full_evidence": True,
+        }
+
+    def stream_frames(
+        self,
+        run_id: str,
+        *,
+        after_cursor: int = 0,
+        limit: Optional[int] = None,
+        task_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Ordered cursor-based progress frames for ``run_id``.
+
+        A reconnecting consumer resumes from ``after_cursor`` and receives
+        exactly the frames it has not seen: the interleaved durable stream
+        evidence, never a preview.
+        """
+        if self.stream_store is None:
+            return []
+        snapshot = _runtime_attr("snapshot", "progress_frames")
+        return [
+            frame.to_dict()
+            for frame in snapshot(
+                self.stream_store, run_id,
+                after_cursor=after_cursor, limit=limit, task_id=task_id,
+            )
+        ]
+
+    def stream_preview(
+        self,
+        run_id: str,
+        *,
+        after_cursor: int = 0,
+        max_bytes: int = 1024,
+        task_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """A bounded preview over ``run_id``'s progress, never the raw evidence.
+
+        The preview is always marked ``is_full_evidence=False``; the raw frames
+        stay resolvable through :meth:`stream_frames`.
+        """
+        if self.stream_store is None:
+            return {
+                "run_id": run_id,
+                "is_full_evidence": False,
+                "status": "no durable stream store configured",
+            }
+        preview = _runtime_attr("snapshot", "preview_frames")
+        return preview(
+            self.stream_store, run_id,
+            after_cursor=after_cursor, max_bytes=max_bytes, task_id=task_id,
+        )
+
+    def stream_attempt_events(
+        self,
+        run_id: str,
+        attempt: int,
+        *,
+        issuer: str,
+        principal: str,
+        task_id: str = "task-1",
+    ) -> list[dict[str, Any]]:
+        """Export one attempt's frames as frozen ``attempt-event-v1`` dicts."""
+        if self.stream_store is None:
+            return []
+        return self.stream_store.to_attempt_events(
+            attempt=attempt,
+            issuer=issuer,
+            principal=principal,
+            task_id=task_id,
+            run_id=run_id,
+        )
