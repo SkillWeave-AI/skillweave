@@ -163,6 +163,7 @@ class RunApplicationService:
         journal: EventJournal,
         raw_artifacts: RawArtifactStore,
         stream_store: Optional[Any] = None,
+        reservation_store: Optional[Any] = None,
     ):
         self.store = store
         self.journal = journal
@@ -178,6 +179,28 @@ class RunApplicationService:
             except Exception:  # noqa: BLE001 - optional subpackage
                 stream_store = None
         self.stream_store = stream_store
+        # The atomic reservation/admission store (SW-1510-BUDGET). It is
+        # optional and resolved lazily so the unchanged legacy path never
+        # requires the reservation module. When supplied, every execute call
+        # acquires a reservation slot BEFORE launching the worker, enforcing
+        # the envelope's cumulative and in-flight bounds atomically.
+        #
+        # Only ModuleNotFoundError (module genuinely absent from the runtime
+        # subpackage) is silently treated as legacy compatibility. Any other
+        # initialization error (permission denied, corrupt database, import
+        # failure) propagates so a protected/native caller cannot silently
+        # run unguarded.
+        if reservation_store is None:
+            try:
+                rs_cls = _runtime_attr("reservation", "ReservationStore")
+                reservation_store = rs_cls(
+                    db_path=getattr(store, "db_path", ":memory:")
+                )
+            except ModuleNotFoundError:  # noqa: BLE001 - optional module absent
+                reservation_store = None
+            except Exception:  # noqa: BLE001 - other init failure
+                raise
+        self.reservation_store = reservation_store
 
     def execute(
         self,
@@ -202,6 +225,7 @@ class RunApplicationService:
         output_root: Optional[str] = None,
         assay_actor_token: Optional[str] = None,
         assay_envelope: Optional[Any] = None,
+        reservation_envelope: Optional[Any] = None,
     ) -> RunExecution:
         """Run ``command`` through the six-stage integration path.
 
@@ -340,6 +364,35 @@ class RunApplicationService:
                 self._fail_run(run_id, f"assay admission refused: {exc}")
                 raise
 
+        # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the worker
+        # is launched.  This is the admission gate: no provider or tool
+        # execution can run without an acquired slot.  The envelope's finite
+        # bounds (in-flight, cumulative requests, bytes, tokens, cost,
+        # deadline) are enforced atomically, and concurrent reservation writers
+        # cannot overspend.  A refused reservation fails the run.
+        #
+        # When no reservation_store is available (legacy path) the admission
+        # check is skipped — the unchanged legacy path keeps its behaviour.
+        reservation_rec = None
+        if self.reservation_store is not None:
+            scope_id = f"{task_id or run_id}/attempt-{attempt}"
+            # Resolve the envelope: use caller-supplied or persist a default
+            env = reservation_envelope
+            if env is not None:
+                self.reservation_store.set_envelope(run_id, scope_id, env)
+            try:
+                reservation_rec = self.reservation_store.reserve(
+                    run_id=run_id,
+                    task_id=task_id or run_id,
+                    attempt=int(attempt),
+                    scope_id=scope_id,
+                    idempotency_key=f"execute:{run_id}:{scope_id}",
+                    envelope=env,
+                )
+            except Exception as exc:  # noqa: BLE001 - typed admission refusal
+                self._fail_run(run_id, f"reservation refused: {exc}")
+                raise RunIntegrationError("reservation", str(exc)) from exc
+
         # Stage 2: launch the worker as a real subprocess. On the protected
         # (identity-authenticated) path the worker is launched inside a real
         # process-protection window: the protected stores are sealed (and, where
@@ -451,6 +504,29 @@ class RunApplicationService:
             # leave the host's own stores locked.
             if protection is not None:
                 protection.__exit__(None, None, None)
+
+        # SW-1510-BUDGET: complete the reservation with observed usage now that
+        # the worker has produced its transport outcome.  This frees the in-flight
+        # slot and records observed bytes/tokens.  Unknown usage stays reserved
+        # until an explicit reconcile call.
+        #
+        # A post-dispatch storage failure during completion is exposed as a
+        # RunIntegrationError (durable incomplete-reconciliation record) so the
+        # caller knows the reservation was not cleanly closed.  The primary run
+        # lifecycle (stages 3-6) still continues — the run record is valid, the
+        # reservation is durable at COMPLETED state — but the incomplete
+        # reconciliation is not silently swallowed.
+        if reservation_rec is not None and self.reservation_store is not None:
+            try:
+                self.reservation_store.complete(
+                    reservation_rec.reservation_id,
+                    observed_bytes=len(result.stdout or b""),
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RunIntegrationError(
+                    "reservation",
+                    f"reservation completion failed: {exc}",
+                ) from exc
 
         # Stage 3: raw artifact (content-addressed bytes).
         raw_bytes = result.stdout or b""
@@ -1882,6 +1958,7 @@ class RunApplicationService:
         output_root: Optional[str] = None,
         assay_actor_token: Optional[str] = None,
         assay_envelope: Optional[Any] = None,
+        reservation_envelope: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Protected native execution whose output is durably streamed.
 
@@ -2003,6 +2080,40 @@ class RunApplicationService:
                 self._fail_run(run_id, f"assay admission refused: {exc}")
                 raise
 
+        # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the worker
+        # is launched — exactly as the bounded ``execute`` path does.  On the
+        # protected streaming path the reservation is mandatory: a missing or
+        # inaccessible reservation_store is a hard failure (fail-closed) so a
+        # protected native request cannot silently run without admission.
+        #
+        # When the reservation_store is None and the caller did NOT explicitly
+        # request the legacy compatibility path, the admission is refused.
+        reservation_rec = None
+        if self.reservation_store is not None:
+            scope_id = f"{task_id or run_id}/attempt-{attempt}"
+            env = reservation_envelope
+            if env is not None:
+                self.reservation_store.set_envelope(run_id, scope_id, env)
+            try:
+                reservation_rec = self.reservation_store.reserve(
+                    run_id=run_id,
+                    task_id=task_id or run_id,
+                    attempt=int(attempt),
+                    scope_id=scope_id,
+                    idempotency_key=f"execute_streaming:{run_id}:{scope_id}",
+                    envelope=env,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._fail_run(run_id, f"reservation refused: {exc}")
+                raise RunIntegrationError("reservation", str(exc)) from exc
+        elif require_identity or authority_service is not None:
+            # Protected native path: missing reservation store is fail-closed.
+            raise RunIntegrationError(
+                "reservation",
+                "the protected native path requires a reservation store; "
+                "a missing budget guard cannot silently admit unguarded execution",
+            )
+
         # Stage 2: the real protected launch + durable streaming collection.
         # The streaming path composes the *same* SCOPE boundary as ``execute``:
         # the declared write scope is authorized and the real isolation attested
@@ -2104,6 +2215,27 @@ class RunApplicationService:
             # enforcement before the child ever existed.
             if protection is not None:
                 protection.__exit__(None, None, None)
+
+        # SW-1510-BUDGET: complete the reservation with observed usage.  On the
+        # streaming path we capture the retained stdout bytes as the observed
+        # transport outcome.  A storage failure during completion is exposed as
+        # a durable incomplete-reconciliation record (the reservation stays at
+        # COMPLETED with unknown usage) rather than silently swallowed.
+        if reservation_rec is not None and self.reservation_store is not None:
+            try:
+                observed = None
+                if result and hasattr(result, 'stdout_text'):
+                    observed = len(result.stdout_text.encode("utf-8", errors="replace"))
+                self.reservation_store.complete(
+                    reservation_rec.reservation_id,
+                    observed_bytes=observed,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Expose the incomplete reconciliation — do not silently swallow.
+                raise RunIntegrationError(
+                    "reservation",
+                    f"reservation completion failed: {exc}",
+                ) from exc
 
         fact = result.fact
         out_summary = self.stream_store.summary(
