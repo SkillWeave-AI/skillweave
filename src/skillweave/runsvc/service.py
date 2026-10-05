@@ -63,6 +63,23 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _is_full_sha(value: Any) -> bool:
+    """A full Git SHA is 40 hexadecimal characters, not a branch or a prefix.
+
+    Mirrors ``skillweave.dispatch.work_contract._is_full_sha`` and the hosted
+    ``RepositorySubject``/``Lane.to_subject_ref`` discipline so the executor
+    binds a receipt to an *exact* immutable base rather than an abbreviated or
+    fabricated string (SW-1510-SKILLS criterion 3).
+    """
+    if not isinstance(value, str) or len(value) != 40:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class _MethodologyBinding:
     """A resolved, validated methodology binding for one run.
@@ -195,6 +212,7 @@ class RunApplicationService:
         require_identity: bool = False,
         methodology: str = "ralph",
         autonomy_policy: str = "",
+        session_schedule: str = "batch",
         task_id: Optional[str] = None,
         attempt: int = 1,
         declared_writes: Optional[Sequence[str]] = None,
@@ -221,9 +239,19 @@ class RunApplicationService:
         / ``moderate`` / ``unicorn``); empty means the registry default. It is
         recorded as its own field and never conflated with the methodology.
 
+        ``session_schedule`` is the third, orthogonal field alongside
+        ``methodology`` and ``autonomy_policy``: the session scheduling the run
+        runs under (``batch`` by default). It is recorded as its own field and
+        is never conflated with either the methodology or the autonomy policy —
+        the executor carries all three separately.
+
         ``task_id`` / ``attempt`` address the run/task/attempt triple that the
         SDK run-snapshot and attempt-event contracts carry. ``task_id``
         defaults to ``run_id`` for the single-task legacy path.
+
+        ``subject_commit`` must be a full 40-hex Git SHA: the receipt binds the
+        run to an *exact* immutable base, so an abbreviated, mis-formatted or
+        fabricated commit is refused before any run state is written.
 
         When ``authority_service`` is supplied, the host authenticates the
         worker at *ingress*: ``worker_token`` must verify against the host
@@ -283,6 +311,20 @@ class RunApplicationService:
             methodology=methodology,
             autonomy_policy=autonomy_policy,
         )
+
+        # Bind the run to an *exact* source base before any state is written. A
+        # short/abbreviated or non-hex commit is refused at this execute/receipt
+        # seam, so a receipt can never record a tampered or fabricated subject
+        # (criterion 3). This is the same full-40-hex discipline the hosted
+        # ``RepositorySubject`` applies; it sits after the pre-existing
+        # methodology/identity refusals so their precedence is unchanged, and
+        # strictly before the first ``create_run``/``transition`` write.
+        if not _is_full_sha(subject_commit):
+            raise RunIntegrationError(
+                "subject",
+                f"subject_commit must be a full 40-hex SHA, got {subject_commit!r}; "
+                f"refusing to bind a receipt to a non-immutable base",
+            )
 
         run_command = _runtime_attr("runner_adapter", "run_command")
         EventType = _runtime_attr("journal", "EventType")
@@ -568,6 +610,7 @@ class RunApplicationService:
                 metadata={
                     "methodology": binding.methodology.value,
                     "autonomy_policy": binding.policy_name,
+                    "session_schedule": session_schedule,
                     "task_id": task_id or run_id,
                     "attempt": int(attempt),
                     "methodology_binding": binding.to_dict(),
@@ -944,11 +987,18 @@ class RunApplicationService:
         """Reconstruct one run's methodology/attempt/outcome view.
 
         Reads the persisted ``RunRecord`` metadata (methodology,
-        autonomy_policy, task_id, attempt) and the ordered journal events
-        (the ordered Assay phases and the terminal outcome). Returns ``None``
-        when the run is unknown. This is the single view the CLI, MCP and a
-        replay share; it never re-derives a verdict from an exit code and never
-        reads a model-authored string as a verdict.
+        autonomy_policy, session_schedule, task_id, attempt) and the ordered
+        journal events (the ordered Assay phases and the terminal outcome).
+        Returns ``None`` when the run is unknown. This is the single view the
+        CLI, MCP and a replay share; it never re-derives a verdict from an exit
+        code and never reads a model-authored string as a verdict.
+
+        The three mode fields -- ``methodology``, ``autonomy_policy`` and
+        ``session_schedule`` -- are reported as three *distinct* keys and are
+        never conflated into one mode string. The view also binds the run's
+        exact source: the producer/verifier receipt digests, the subject
+        repo/commit the receipt recorded, and a native ``process_identity``
+        handle issued by this trusted service (never a model-authored string).
         """
         record = self.store.get_run(run_id)
         if record is None:
@@ -986,6 +1036,9 @@ class RunApplicationService:
             "stop_reason": metadata.get("stop_reason"),
             "methodology": metadata.get("methodology", "ralph"),
             "autonomy_policy": metadata.get("autonomy_policy"),
+            # The third mode field, preserved separately from the methodology
+            # and the autonomy policy -- the executor hop carries all three.
+            "session_schedule": metadata.get("session_schedule"),
             "event_cursor": self.journal.get_last_sequence(run_id),
             "phases": phases,
             "outcome": outcome,
@@ -993,7 +1046,60 @@ class RunApplicationService:
         }
         if verification is not None:
             snapshot["gate_state"] = verification.get("gate_state")
+        # Bind the run's exact source/attempt identity: the receipt digests the
+        # executor produced, the schedule, and a native process handle issued
+        # here by the trusted service -- never a model-authored string.
+        digests = self._run_identity_digests(run_id)
+        snapshot["subject_repo"] = digests["subject_repo"]
+        snapshot["subject_commit"] = digests["subject_commit"]
+        snapshot["brief_digest"] = digests["brief_digest"]
+        snapshot["envelope_digest"] = digests["envelope_digest"]
+        snapshot["authority_decision_digest"] = digests["authority_decision_digest"]
+        snapshot["process_identity"] = {
+            "handle_id": f"runsvc-run:{run_id}",
+            "service_principal": "runsvc",
+        }
         return snapshot
+
+    def _run_identity_digests(self, run_id: str) -> dict[str, str]:
+        """The run's exact source/attempt identity, derived from its receipts.
+
+        Reads the persisted producer receipt (``runsvc-{run_id}``) for the
+        subject repo/commit and the raw digest, and the verifier's own receipt
+        (``verify-runsvc-{run_id}``) for the verification digest. Each value is
+        re-expressed as a digest so the run snapshot binds the *exact* source it
+        executed against. Every field is empty when the underlying record is
+        absent -- never a fabricated value.
+        """
+        subject_repo = ""
+        subject_commit = ""
+        brief_digest = ""
+        authority_decision_digest = ""
+        envelope_digest = ""
+        producer = self.store.get_evidence(f"runsvc-{run_id}")
+        if producer is not None:
+            subject_repo = producer.subject_repo or ""
+            subject_commit = producer.subject_commit or ""
+            if subject_repo and subject_commit:
+                brief_digest = _sha256_hex(
+                    f"{subject_repo}@{subject_commit}".encode("utf-8")
+                )
+            if producer.sha256:
+                envelope_digest = _sha256_hex(
+                    f"envelope:{producer.sha256}".encode("utf-8")
+                )
+        verifier = self.store.get_evidence(f"verify-runsvc-{run_id}")
+        if verifier is not None and verifier.sha256:
+            authority_decision_digest = _sha256_hex(
+                f"verdict:{verifier.sha256}".encode("utf-8")
+            )
+        return {
+            "subject_repo": subject_repo,
+            "subject_commit": subject_commit,
+            "brief_digest": brief_digest,
+            "envelope_digest": envelope_digest,
+            "authority_decision_digest": authority_decision_digest,
+        }
 
     # ------------------------------------------------------------------
     # Declared methodology binding (SW-1510-ASSAY)
@@ -1877,6 +1983,7 @@ class RunApplicationService:
         require_identity: bool = False,
         methodology: str = "ralph",
         autonomy_policy: str = "",
+        session_schedule: str = "batch",
         declared_writes: Optional[Sequence[str]] = None,
         work_contract: Optional[Any] = None,
         output_root: Optional[str] = None,
@@ -1897,6 +2004,13 @@ class RunApplicationService:
         Streaming is durable or it does not run: this method refuses a
         memory-only ``stream_store``, because a protected run whose evidence
         vanishes with the process is not evidence.
+
+        ``methodology`` / ``autonomy_policy`` / ``session_schedule`` are carried
+        as three *separate* fields, exactly as on the bounded path, so the
+        streaming sibling preserves the same three-field intent and never
+        conflates them. ``subject_commit`` must be a full 40-hex SHA: the
+        receipt binds the streamed attempt to an exact immutable base, so a
+        short or fabricated commit is refused before any run state is written.
 
         Scope/envelope enforcement and the native Assay methodology are
         *composed independently* by the owning lane; this method exposes the
@@ -1947,6 +2061,18 @@ class RunApplicationService:
         )
 
         created_at = created_at or datetime.now(timezone.utc).isoformat()
+
+        # Bind the run to an *exact* source base before any state is written,
+        # exactly as the bounded ``execute`` path does and at the same point in
+        # the preflight order (after the methodology/identity refusals, before
+        # the first ``create_run``/``transition``): a short/fabricated commit is
+        # refused, so a receipt can never record a tampered subject.
+        if not _is_full_sha(subject_commit):
+            raise RunIntegrationError(
+                "subject",
+                f"subject_commit must be a full 40-hex SHA, got {subject_commit!r}; "
+                f"refusing to bind a receipt to a non-immutable base",
+            )
 
         EventType = _runtime_attr("journal", "EventType")
         ArtifactReceipt = _runtime_attr("registry", "ArtifactReceipt")
@@ -2246,6 +2372,7 @@ class RunApplicationService:
                 metadata={
                     "methodology": binding.methodology.value,
                     "autonomy_policy": binding.policy_name,
+                    "session_schedule": session_schedule,
                     "task_id": task_id or run_id,
                     "attempt": int(attempt),
                     "methodology_binding": binding.to_dict(),
@@ -2329,6 +2456,7 @@ class RunApplicationService:
             "stderr_summary": err_summary,
             "methodology": binding.methodology.value,
             "autonomy_policy": binding.policy_name,
+            "session_schedule": session_schedule,
             "durable": True,
         }
         if assay_block is not None:

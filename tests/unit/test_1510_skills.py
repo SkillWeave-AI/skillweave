@@ -73,7 +73,7 @@ from skillweave.dispatch.work_contract import (  # noqa: E402
     ConfigurationSubject,
     WorkContract,
 )
-from skillweave.runsvc import RunApplicationService  # noqa: E402
+from skillweave.runsvc import RunApplicationService, RunIntegrationError  # noqa: E402
 from skillweave.runtime.journal import EventJournal  # noqa: E402
 from skillweave.runtime.registry import RawArtifactStore  # noqa: E402
 from skillweave.runtime.snapshot import (  # noqa: E402
@@ -339,7 +339,10 @@ def test_blank_legacy_mode_never_derives_ralph_for_a_declared_assay():
     assert sequence["execution_mode"] == ""
 
 
-def test_executor_preserves_methodology_and_policy_distinctly():
+def test_executor_preserves_three_fields_distinctly():
+    # Drives the REAL executor hop (RunApplicationService.execute) and reads the
+    # run snapshot it produces -- not the standalone snapshot helper. All three
+    # mode fields are preserved as separate keys at the executor hop.
     service, store, journal, raw = _service()
     sequence = rs.build_execution_sequences(_load_prd())
     result = service.execute(
@@ -352,6 +355,7 @@ def test_executor_preserves_methodology_and_policy_distinctly():
         created_at="2026-10-05T00:00:00Z",
         methodology=sequence["methodology"],
         autonomy_policy=sequence["autonomy_policy"],
+        session_schedule=sequence["session_schedule"],
         task_id="SW-1510-SKILLS-1",
         attempt=1,
     )
@@ -361,6 +365,43 @@ def test_executor_preserves_methodology_and_policy_distinctly():
     # The policy is its own recorded field, never conflated with the methodology.
     assert metadata["autonomy_policy"] == "unicorn"
     assert metadata["autonomy_policy"] != metadata["methodology"]
+    # The session schedule is a third, separate recorded field at the executor
+    # hop -- the exact gap the executor must not leave unfilled.
+    assert metadata["session_schedule"] == "batch"
+    snapshot = service.run_snapshot("sw1510-skills-exec")
+    assert snapshot["methodology"] == "assay"
+    assert snapshot["autonomy_policy"] == "unicorn"
+    assert snapshot["session_schedule"] == "batch"
+    assert snapshot["methodology"] != snapshot["autonomy_policy"]
+
+
+def test_run_snapshot_carries_the_three_fields_for_the_executor_hop():
+    # The executor's own snapshot (not the standalone runtime helper) carries
+    # methodology / autonomy_policy / session_schedule as three distinct keys,
+    # and binds the run's exact source base the receipt recorded.
+    service, store, journal, raw = _service()
+    service.execute(
+        [sys.executable, "-c", "print('sw-1510-skills-snap')"],
+        run_id="sw1510-skills-snap-hop",
+        tool="native",
+        model="declared-methodology",
+        subject_repo="skillweave/skillweave",
+        subject_commit=FIXTURE_BASE,
+        created_at="2026-10-05T00:00:00Z",
+        methodology="assay",
+        autonomy_policy="unicorn",
+        session_schedule="batch",
+        task_id="SW-1510-SKILLS-1",
+        attempt=1,
+    )
+    snapshot = service.run_snapshot("sw1510-skills-snap-hop")
+    for field in ("methodology", "autonomy_policy", "session_schedule"):
+        assert field in snapshot, field
+    assert snapshot["session_schedule"] == "batch"
+    # The snapshot binds the exact source base the receipt recorded (criterion
+    # 3): a 40-hex subject commit, re-derivable from the producer receipt.
+    assert snapshot["subject_commit"] == FIXTURE_BASE
+    assert snapshot["subject_repo"] == "skillweave/skillweave"
 
 
 def test_run_snapshot_keeps_three_fields_and_binds_exact_digests():
@@ -460,6 +501,29 @@ def test_no_intent_at_all_is_refused():
         "no_declared_methodology",
         "methodology",
     )
+
+
+def test_declared_methodology_outside_the_contract_enum_is_refused():
+    # A declared methodology the shipped schema enum does not recognise is
+    # refused by the compiler (never emitted), so the generator cannot fail
+    # open on an out-of-contract value like 'warp-drive'.
+    _assert_refused(
+        lambda: _compile({"methodology": "warp-drive", "execution_mode": ""}),
+        "unknown_methodology:warp-drive",
+        "methodology",
+    )
+    # The refusal is driven through the PRODUCTION generator too, not just the
+    # helper: a PRD declaring an out-of-contract methodology fails closed.
+    prd = _load_prd()
+    prd["sequence"]["methodology"] = "warp-drive"
+    _assert_refused(
+        lambda: rs.build_execution_sequences(prd),
+        "unknown_methodology:warp-drive",
+        "methodology",
+    )
+    # Every contract-value methodology is still accepted (no over-refusal).
+    for name in rs.SUPPORTED_METHODOLOGIES:
+        assert _compile({"methodology": name, "execution_mode": ""})["methodology"] == name
 
 
 def test_legacy_workflow_vocabulary_is_explicit_and_fail_closed():
@@ -662,10 +726,36 @@ def test_chain_execute_produces_receipt_bound_to_source_and_base():
     assert result.receipt.subject_commit == FIXTURE_BASE
     assert result.receipt.sha256 == result.raw_digest
     assert raw.resolve(result.receipt.sha256) == result.raw_bytes
-    # And the run snapshot agrees with the declared methodology, distinctly.
+    # And the run snapshot agrees with the declared methodology, distinctly,
+    # and binds the exact source base the receipt recorded.
     snapshot = service.run_snapshot("sw1510-skills-receipt")
     assert snapshot["methodology"] == "assay"
     assert snapshot["autonomy_policy"] == "unicorn"
+    assert snapshot["session_schedule"] == "batch"
     assert snapshot["task_id"] == "SW-1510-SKILLS-1"
     assert snapshot["attempt"] == 1
+    assert snapshot["subject_commit"] == FIXTURE_BASE
     assert journal.has_gaps("sw1510-skills-receipt") is False
+
+
+def test_chain_execute_refuses_a_tampered_short_source_base():
+    # Criterion 3: the exact-source binding is refused at the execute/receipt
+    # seam when the base is not a full 40-hex SHA. A tampered/abbreviated commit
+    # must never be bound into a receipt.
+    service, store, journal, raw = _service()
+    with pytest.raises(RunIntegrationError) as excinfo:
+        service.execute(
+            [sys.executable, "-c", "print('must not run')"],
+            run_id="sw1510-skills-short",
+            tool="native",
+            model="declared-methodology",
+            subject_repo="skillweave/skillweave",
+            subject_commit="deadbeef",
+            created_at="2026-10-05T00:00:00Z",
+            methodology="assay",
+            autonomy_policy="unicorn",
+            session_schedule="batch",
+        )
+    assert excinfo.value.stage == "subject"
+    # The refusal fails closed before any receipt exists.
+    assert store.get_evidence("runsvc-sw1510-skills-short") is None

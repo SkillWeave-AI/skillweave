@@ -97,6 +97,12 @@ ASSAY_DEFAULT_AUTONOMY_POLICY = "unicorn"
 #: no methodology, so this default substitutes none.
 DEFAULT_SESSION_SCHEDULE = "batch"
 
+#: The methodologies the shipped contract recognises (the ``methodology`` enum
+#: of ``schemas/prompt-sequence.schema.json`` and its dispatch sibling). A
+#: resolved methodology outside this set is refused by the compiler, so the
+#: generator cannot emit a sequence the ecosystem's own schema would reject.
+SUPPORTED_METHODOLOGIES: tuple[str, ...] = ("rex", "ralph", "gauntlet", "assay")
+
 
 class ExecutionEnvelopeError(ValueError):
     """The envelope could not be compiled without a silent substitution.
@@ -206,7 +212,10 @@ def compile_execution_envelope(
     3. The legacy ``suggested_workflow`` is an *explicit* adapter: unknown
        values are refused, and a value denoting a different methodology than
        the resolved one is refused.
-    4. No intent at all is refused -- the compiler does not invent a default
+    4. The resolved methodology is validated against the shipped contract enum
+       (``SUPPORTED_METHODOLOGIES``); an out-of-contract value is refused with a
+       named reason rather than emitted.
+    5. No intent at all is refused -- the compiler does not invent a default
        methodology.
 
     ``autonomy_policy`` is Assay's own field (default ``unicorn`` for Assay,
@@ -238,6 +247,19 @@ def compile_execution_envelope(
         methodology = implied
         emitted_from_legacy.append(
             f"execution_mode:{sequence.get('execution_mode')}"
+        )
+
+    # The resolved methodology must be one the shipped contract recognises. A
+    # declared value outside the schema enum is refused here, so the generator
+    # fails closed instead of emitting a sequence the ecosystem's own
+    # ``methodology`` enum would reject (e.g. a PRD declaring ``warp-drive``).
+    if methodology not in SUPPORTED_METHODOLOGIES:
+        raise ExecutionEnvelopeError(
+            f"unknown methodology {methodology!r}; the compiler knows "
+            f"{list(SUPPORTED_METHODOLOGIES)} only and refuses to emit an "
+            f"out-of-contract methodology",
+            field="methodology",
+            reason=f"unknown_methodology:{methodology}",
         )
 
     # The legacy execution_mode adapter must never disagree with an explicitly
