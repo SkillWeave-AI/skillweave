@@ -254,6 +254,72 @@ def _looks_like_digest(value: Any) -> bool:
     )
 
 
+#: Keywords that introduce a *predicate* bounding scope (a family of paths)
+#: rather than naming one literal path. They are matched against the excluded
+#: path so a predicate cannot be claimed for an unrelated file.
+_NARRATIVE_BOUND_KEYWORDS: tuple[str, ...] = (
+    "narrative", "documentation", "doc-only", "docs only", "doc only",
+)
+_GENERATED_BOUND_KEYWORDS: tuple[str, ...] = (
+    "generated", "vendored", "third-party", "third party", "third_party",
+)
+_GENERATED_PATH_MARKERS: tuple[str, ...] = (
+    "generated", "vendor", "vendored", "third_party", "third-party",
+    "thirdparty", "external",
+)
+
+
+def _is_narrative_path_name(path: str) -> bool:
+    lowered = PurePosixPath(path).name.lower()
+    if any(marker in lowered for marker in NARRATIVE_PATH_MARKERS):
+        return True
+    return PurePosixPath(path).suffix.lower() in _NARRATIVE_SUFFIXES
+
+
+def _bound_covers(bounded: Any, path: str) -> bool:
+    """Whether the *bounded* scope actually covers the excluded *path*.
+
+    An exclusion's bound must be resolvable to a matcher the excluded path
+    satisfies -- a literal path, a prefix directory, a glob/family, or a
+    predicate descriptor (narrative / generated / vendored). A bound that
+    merely *names some other file* does not justify excluding this one: a
+    false bound is refused (``the claimed bound does not cover this path``),
+    so an exclusion cannot be made to pass by writing any non-empty string.
+    """
+    import fnmatch
+
+    if isinstance(bounded, (list, tuple)):
+        return any(_bound_covers(b, path) for b in bounded)
+    if not isinstance(bounded, str):
+        return False
+    bound = bounded.strip()
+    if not bound:
+        return False
+    low = bound.lower()
+
+    # Predicate descriptors: the bound names a *family*; the path must belong.
+    if any(k in low for k in _NARRATIVE_BOUND_KEYWORDS):
+        return _is_narrative_path_name(path)
+    if any(k in low for k in _GENERATED_BOUND_KEYWORDS):
+        parts = {part.lower() for part in PurePosixPath(path).parts}
+        return bool(parts & set(_GENERATED_PATH_MARKERS)) or any(
+            marker in path.lower() for marker in _GENERATED_PATH_MARKERS
+        )
+
+    # A literal path, a prefix directory, or a glob family.
+    stripped = bound.rstrip("/")
+    if path == stripped or path.startswith(stripped + "/"):
+        return True
+    if fnmatch.fnmatchcase(path, bound) or fnmatch.fnmatchcase(path, bound + "/*"):
+        return True
+    if "/" not in bound and fnmatch.fnmatchcase(PurePosixPath(path).name, bound):
+        return True
+    # A bare filename bound (e.g. "README.md") may name the path by basename.
+    if "/" not in bound and PurePosixPath(bound).name == PurePosixPath(path).name:
+        return True
+    return False
+
+
 def canonical_artifact_bytes(artifact: Any, *, exclude: Sequence[str] = ("sha256",)) -> bytes:
     """Canonical bytes over *artifact* with *exclude* keys removed.
 
@@ -700,7 +766,9 @@ class ArtifactEvidenceVerifier:
                     result.reasons.append("exclusion entry is not a mapping")
                     return result
                 path = entry.get("path")
-                ok, reason = self._justify_exclusion(entry)
+                ok, reason = self._justify_exclusion(
+                    entry, path if isinstance(path, str) else ""
+                )
                 if not ok:
                     result.reasons.append(f"exclusion {path!r}: {reason}")
                     return result
@@ -736,7 +804,7 @@ class ArtifactEvidenceVerifier:
                 # it (still validating its justification) and refuse by name.
                 disposition = str(entry.get("disposition", "analyzed"))
                 if disposition in EXCLUSION_DISPOSITIONS:
-                    ok, reason = self._justify_exclusion(entry)
+                    ok, reason = self._justify_exclusion(entry, path)
                     if not ok:
                         result.reasons.append(f"N/A {path!r}: {reason}")
                         return result
@@ -750,7 +818,7 @@ class ArtifactEvidenceVerifier:
                 continue
             disposition = str(entry.get("disposition", "analyzed"))
             if disposition in EXCLUSION_DISPOSITIONS:
-                ok, reason = self._justify_exclusion(entry)
+                ok, reason = self._justify_exclusion(entry, path)
                 if not ok:
                     result.reasons.append(f"N/A {path!r}: {reason}")
                     return result
@@ -846,8 +914,15 @@ class ArtifactEvidenceVerifier:
             return False, "analysis_digest does not match the analysis artifact bytes"
         return True, ""
 
-    def _justify_exclusion(self, entry: Any) -> tuple[bool, str]:
-        """Whether an exclusion/N-A entry is explicit, bounded and justified."""
+    def _justify_exclusion(self, entry: Any, path: str) -> tuple[bool, str]:
+        """Whether an exclusion/N-A entry is explicit, bounded and justified.
+
+        ``path`` is the file being excluded: the claimed *bounded* scope must
+        actually cover it. A bound naming some *other* file (a ``README.md``
+        bound used to exclude an executable ``settings.py``) is a false bound
+        and is refused -- the justification must be consistent with what is
+        being excluded, not merely non-empty.
+        """
         justification = entry.get("justification", entry.get("reason"))
         bounded = entry.get("bounded", entry.get("scope"))
         if not isinstance(justification, str) or not justification.strip():
@@ -862,14 +937,16 @@ class ArtifactEvidenceVerifier:
             return False, "bounding scope is empty"
         if not isinstance(bounded, (str, list, tuple)):
             return False, "bounding scope must be a string or list"
+        if not _bound_covers(bounded, path):
+            return False, (
+                f"bounding scope {bounded!r} does not cover the excluded path "
+                f"{path!r}"
+            )
         return True, justification.strip()
 
     @staticmethod
     def _is_narrative_path(path: str) -> bool:
-        lowered = PurePosixPath(path).name.lower()
-        if any(marker in lowered for marker in NARRATIVE_PATH_MARKERS):
-            return True
-        return PurePosixPath(path).suffix.lower() in _NARRATIVE_SUFFIXES
+        return _is_narrative_path_name(path)
 
 
 def verify_artifact_evidence(

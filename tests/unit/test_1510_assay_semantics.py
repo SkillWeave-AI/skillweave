@@ -506,6 +506,46 @@ def test_installed_wheel_native_consumer_enforces_semantics(tmp_path):
     assert na["admitted"] is False and na["outcome"] == "hold"
     assert any("N/A" in r and "justification" in r for r in na["reasons"])
 
+    # -- false bounded N/A: a real executable file excluded as N/A with a
+    #    plausible narrative justification but a bound that does not cover it
+    #    (README.md on pkg/module.py) -> refusal. A non-empty justification
+    #    string is not an independent justification; the bound must cover the
+    #    excluded path. This is the reviewed defect, refused end-to-end by the
+    #    *installed* native consumer under SDK schema authority.
+    false_bound_proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [coverage_entry("pkg/util.py", files, analysis)],
+        "exclusions": [
+            {"path": "pkg/module.py",
+             "justification": "Narrative documentation only; no executable code",
+             "bounded": "README.md"},
+            {"path": "README.md", "justification": "documentation only",
+             "bounded": "narrative paths (*.md)"},
+        ],
+    }
+    false_bound = case("false-bound", [artifact(false_bound_proof, commit=COMMIT)])
+    assert false_bound["admitted"] is False and false_bound["outcome"] == "hold"
+    assert any("does not cover" in r for r in false_bound["reasons"])
+
+    # -- positive: the same file excluded with a genuinely-covering bound is
+    #    admitted, so legitimate bounded exclusions still pass (the fix is not
+    #    a blanket refusal of all exclusions).
+    legit_proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [coverage_entry("pkg/util.py", files, analysis)],
+        "exclusions": [
+            {"path": "pkg/module.py", "justification": "vendored constant table",
+             "bounded": "pkg/*.py"},
+            {"path": "README.md", "justification": "documentation only",
+             "bounded": "narrative paths (*.md)"},
+        ],
+    }
+    legit = case("legit-bound", [artifact(legit_proof, commit=COMMIT)])
+    assert legit["admitted"] is True and legit["outcome"] == "pass"
+    assert legit["reasons"] == []
+
     # -- missing source binding: a genuine proof with no source -> refusal.
     no_src = case("no-src", [genuine], source=None)
     assert no_src["admitted"] is False and no_src["outcome"] == "hold"

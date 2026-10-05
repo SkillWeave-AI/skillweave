@@ -242,7 +242,7 @@ def test_readme_only_graph_is_refused_even_with_full_exclusions(tmp_path):
         "analyzed": True,
         "coverage": [_coverage_entry("README.md", files, analysis)],
         "exclusions": [
-            {"path": p, "justification": f"excluded {p}", "bounded": "declared scope"}
+            {"path": p, "justification": f"excluded {p}", "bounded": "*.py"}
             for p in ("pkg/module.py", "pkg/util.py")
         ],
     }
@@ -414,7 +414,7 @@ def test_justified_bounded_exclusion_is_admitted(tmp_path):
         "coverage": [_coverage_entry("pkg/module.py", files, analysis)],
         "exclusions": [
             {"path": "pkg/util.py", "justification": "generated constant table",
-             "bounded": "generated/*.py"},
+             "bounded": "pkg/util.py"},
             {"path": "README.md", "justification": "documentation only",
              "bounded": "narrative paths"},
         ],
@@ -480,6 +480,103 @@ def test_na_without_bounding_scope_fails(tmp_path):
     result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
     assert result.admitted is False
     assert any("not bounded" in r for r in result.reasons)
+
+
+def test_false_bounded_exclusion_of_executable_file_fails(tmp_path):
+    """Reproduction of the reviewed defect: an executable source file is
+    excluded as ``not_applicable`` with a narrative-sounding justification,
+    but the declared bound (``README.md``) does not cover it. A non-empty
+    justification string is not an independent justification -- the bound
+    must actually cover the excluded path, and the source bytes refute the
+    narrative reason (``pkg/util.py`` contains executable ``VALUE = 'util'``).
+    """
+    files = _source_tree(tmp_path)
+    analysis = _analysis_for(files)
+    proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [_coverage_entry("pkg/module.py", files, analysis)],
+        "exclusions": [
+            {"path": "pkg/util.py",
+             "justification": "Narrative documentation only; no executable code",
+             "bounded": "README.md"},
+            {"path": "README.md", "justification": "documentation only",
+             "bounded": "narrative paths"},
+        ],
+    }
+    result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
+    assert result.admitted is False
+    assert result.gate_state == GateState.FAIL
+    assert any("does not cover" in r for r in result.reasons), result.reasons
+    # The executable file is not silently accepted as bounded-excluded.
+    assert "pkg/util.py" not in result.exclusions
+
+
+def test_bound_not_covering_a_sibling_glob_fails(tmp_path):
+    """A bound that names one file never covers a *different* file, even when
+    the justification text is plausible. Only a genuinely-covering bound
+    (literal path, directory prefix, matching glob or a matching predicate
+    descriptor) is an independent justification."""
+    files = _source_tree(tmp_path)
+    analysis = _analysis_for(files)
+    proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [_coverage_entry("pkg/module.py", files, analysis)],
+        "exclusions": [
+            {"path": "pkg/util.py", "justification": "generated constant table",
+             "bounded": "pkg/module.py"},
+            {"path": "README.md", "justification": "documentation only",
+             "bounded": "narrative paths"},
+        ],
+    }
+    result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
+    assert result.admitted is False
+    assert any("does not cover" in r for r in result.reasons), result.reasons
+
+
+def test_genuinely_covering_glob_bound_is_admitted(tmp_path):
+    """Positive control: the same executable file excluded with a bound that
+    genuinely covers it (a ``*.py`` glob) is admitted, so the fix refuses only
+    false bounds and preserves legitimate positive exclusions."""
+    files = _source_tree(tmp_path)
+    analysis = _analysis_for(files)
+    proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [_coverage_entry("pkg/module.py", files, analysis)],
+        "exclusions": [
+            {"path": "pkg/util.py", "justification": "generated constant table",
+             "bounded": "*.py"},
+            {"path": "README.md", "justification": "documentation only",
+             "bounded": "narrative paths"},
+        ],
+    }
+    result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
+    assert result.admitted is True
+    assert result.exclusions == {
+        "pkg/util.py": "generated constant table",
+        "README.md": "documentation only",
+    }
+
+
+def test_literal_path_bound_is_admitted(tmp_path):
+    """Positive control: a bound that names the exact excluded path covers it."""
+    files = _source_tree(tmp_path)
+    analysis = _analysis_for(files)
+    proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [_coverage_entry("pkg/module.py", files, analysis)],
+        "exclusions": [
+            {"path": "pkg/util.py", "justification": "generated constant table",
+             "bounded": "pkg/util.py"},
+            {"path": "README.md", "justification": "documentation only",
+             "bounded": "narrative paths"},
+        ],
+    }
+    result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
+    assert result.admitted is True
 
 
 def test_missing_source_input_fails(tmp_path):
