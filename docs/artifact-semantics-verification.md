@@ -100,21 +100,37 @@ understanding of the graph is:
   bound scope that actually *covers* the excluded path, **and** a reason that
   is independently checkable against the real source name and bytes.
 * **Independent exclusion-reason authority.** Matching the bound to the path
-  does not establish the *reason*. The stated justification is classified as
-  a **narrative / no-code** claim, a **generated / vendored** claim, or a
-  **generic** claim, and each is checked independently
-  (`_independent_reason_check`):
-  * A narrative claim is checked against the real source: if the bytes for the
-    excluded path look like executable source (a code suffix, a `#!` shebang,
-    or a `def`/`class`/`import`/`from` declaration) the claim is
-    **contradicted** and refused -- e.g. `settings.py` containing `LIMIT = 7`
-    excluded as "narrative documentation only; no executable code". A
-    narrative claim over genuinely non-code bytes (a README, a data file) is
-    admitted.
-  * A generated/vendored claim with no independent provenance is
-    **unsupported** and refused.
-  * A generic justification that is not source-bound is not independently
-    checkable and fails closed.
+  does not establish the *reason*, and the reason is never established by the
+  justification's *wording* either -- the outcome for a file must not depend on
+  which keyword the author typed. The authority is the real source **name and
+  bytes** (`_independent_reason_check` -> `_is_documentation`):
+  * A **generated / vendored / third-party / codegen** claim asserts a
+    provenance the source cannot confirm, so it is **unsupported** and refused
+    (`_GENERATED_REASON_KEYWORDS`) regardless of the bound or the bytes.
+  * Otherwise the file is admitted as a bounded exclusion only when it is
+    independently established as **documentation** from the real source:
+    * no real bytes, a binary body, or bytes that cannot be decoded -> nothing
+      can be established, so it fails closed;
+    * a **code name** (a recognised source suffix, `_CODE_SUFFIXES`) is
+      executable by name and fails closed even when its body happens not to
+      trip a byte marker;
+    * a **text body** is classified by its own bytes (`_classify_text_body` +
+      `_CODE_LINE_PATTERNS`). A body carrying a recognised code line -- a
+      shebang, an import/declaration, an assignment, a shell builtin or common
+      executable, a pipeline, SQL, an embedded `<script>`/`<?php`, a call, a
+      block close -- is **code** and is **contradicted** and refused, even
+      under a documentation suffix. A prose body (a README, a markdown
+      overview, a plain-text licence, notes) is documentation.
+  * Consequences: `settings.py` containing `LIMIT = 7` excluded as "narrative
+    documentation only" is refused; so is a no-suffix `settings` with
+    `LIMIT = 7`, a no-suffix `run` with `rm -rf "$WORK"`, an
+    `engine_copy.txt` containing a `def`, a `migrate.sql` with `DROP TABLE`, a
+    `page.html` with a script fetch, a `Makefile` piping `curl` to `sh`, a
+    `.md` whose bytes are a shell script, and code in other languages without a
+    code suffix -- none of these is admitted on the strength of its name or the
+    author's wording. Conversely a genuinely narrative `OVERVIEW.md` with the
+    justification "Project overview text for readers" -- no "documentation"
+    keyword at all -- is admitted, and a plain-text licence is admitted.
   * When the resolver cannot return the real source bytes for the excluded
     path (no resolver, missing file, non-bytes), nothing can be independently
     established, so the exclusion is refused rather than trusted.

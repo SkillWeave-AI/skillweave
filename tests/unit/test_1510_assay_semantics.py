@@ -688,8 +688,9 @@ def test_installed_wheel_native_consumer_enforces_semantics(tmp_path):
     # -- positive: a legitimate bounded exclusion of a *non-code* file is
     #    admitted (the fix is not a blanket refusal of all exclusions). A real
     #    data file is excluded with a source-bound reason and a bound naming its
-    #    own path; it is independently proved non-executable by its real
-    #    bytes/suffix, while a code file in the same tree is genuinely analyzed.
+    #    own path; it is independently proved non-executable by its real bytes
+    #    (a non-code name and a data body), while a code file in the same tree
+    #    is genuinely analyzed.
     data_src = tmp_path / "data-src"
     data_files = {
         "config/settings.json": b'{"limit": 7}\n',
@@ -737,7 +738,9 @@ def test_installed_wheel_native_consumer_enforces_semantics(tmp_path):
                for r in generated["reasons"]), generated["reasons"]
 
     # -- a *generic* justification that is not source-bound is refused: a
-    #    non-empty string is not an independently checkable reason.
+    #    non-empty string is not an independent reason, and the real source
+    #    (an executable ``.py`` file) refutes the exclusion regardless of the
+    #    wording.
     generic_proof = {
         "version": VERSION,
         "analyzed": True,
@@ -752,8 +755,79 @@ def test_installed_wheel_native_consumer_enforces_semantics(tmp_path):
     }
     generic = case("generic", [artifact(generic_proof, commit=COMMIT)])
     assert generic["admitted"] is False and generic["outcome"] == "hold"
-    assert any("not independently checkable" in r
+    assert any("contradicted exclusion reason" in r
                for r in generic["reasons"]), generic["reasons"]
+
+    # -- positive: the wording-independence the review demanded. A genuinely
+    #    narrative OVERVIEW.md excluded with "Project overview text for readers"
+    #    -- a phrasing *without* any "documentation" keyword -- is admitted
+    #    because the verdict is the file's real bytes, not the justification's
+    #    vocabulary. A plain-text licence is admitted under the same rule.
+    wording_src = tmp_path / "wording-src"
+    wording_files = {
+        "pkg/util.py": b"VALUE = 'util'\n",
+        "OVERVIEW.md": b"# Overview\n\nWhat the project does, in prose.\n",
+        "LICENSE": b"MIT License\n\nPermission is hereby granted, free of charge.\n",
+    }
+    write_source_tree(wording_src, wording_files)
+    wording_analysis = write_analysis_tree(tmp_path / "wording-analysis", wording_files)
+    wording_analysis_text = {k: v.decode() for k, v in wording_analysis.items()}
+    for name, path, justification in (
+        ("wording-overview", "OVERVIEW.md", "Project overview text for readers"),
+        ("wording-licence", "LICENSE", "release notes for humans, non-code narrative"),
+    ):
+        wording_proof = {
+            "version": VERSION,
+            "analyzed": True,
+            "coverage": [coverage_entry("pkg/util.py", wording_files, wording_analysis)],
+            "exclusions": [
+                {"path": path, "justification": justification, "bounded": path},
+            ],
+        }
+        admitted = _run_installed(venv_dir, tmp_path, name, {
+            "artifacts": [artifact(wording_proof, commit=COMMIT)],
+            "analysis": wording_analysis_text,
+            "source_root": str(wording_src),
+            "commit": COMMIT,
+        })
+        assert admitted["admitted"] is True, (name, admitted["reasons"])
+        assert admitted["outcome"] == "pass"
+        assert admitted["reasons"] == []
+
+    # -- negative: a doc-suffix file whose *bytes* are an executable script, and
+    #    code without a recognised code suffix, are both refuted from the real
+    #    source even under a plausible narrative justification.
+    bypass_src = tmp_path / "bypass-src"
+    bypass_files = {
+        "pkg/util.py": b"VALUE = 'util'\n",
+        "notes.md": b"#!/bin/sh\nexec rm -rf /\n",
+        "settings": b"LIMIT = 7\n",
+    }
+    write_source_tree(bypass_src, bypass_files)
+    bypass_analysis = write_analysis_tree(tmp_path / "bypass-analysis", bypass_files)
+    bypass_analysis_text = {k: v.decode() for k, v in bypass_analysis.items()}
+    for name, path in (("bypass-doc-script", "notes.md"),
+                       ("bypass-nosuffix", "settings")):
+        bypass_proof = {
+            "version": VERSION,
+            "analyzed": True,
+            "coverage": [coverage_entry("pkg/util.py", bypass_files, bypass_analysis)],
+            "exclusions": [
+                {"path": path,
+                 "justification": "Narrative documentation only; no executable code",
+                 "bounded": path},
+            ],
+        }
+        refused = _run_installed(venv_dir, tmp_path, name, {
+            "artifacts": [artifact(bypass_proof, commit=COMMIT)],
+            "analysis": bypass_analysis_text,
+            "source_root": str(bypass_src),
+            "commit": COMMIT,
+        })
+        assert refused["admitted"] is False, (name, refused["reasons"])
+        assert refused["outcome"] == "hold"
+        assert any("contradicted exclusion reason" in r
+                   for r in refused["reasons"]), (name, refused["reasons"])
 
     # -- missing source binding: a genuine proof with no source -> refusal.
     no_src = case("no-src", [genuine], source=None)

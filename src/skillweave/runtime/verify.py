@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -320,21 +321,6 @@ def _bound_covers(bounded: Any, path: str) -> bool:
     return False
 
 
-#: Suffixes whose files are documentation/data, never executable source.
-_NON_EXECUTABLE_SUFFIXES: frozenset[str] = frozenset({
-    ".md", ".rst", ".txt", ".adoc", ".markdown", ".json", ".yaml", ".yml",
-    ".toml", ".ini", ".cfg", ".csv", ".tsv", ".lock", ".png", ".jpg",
-    ".jpeg", ".gif", ".svg", ".ico", ".pdf", ".woff", ".woff2", ".ttf",
-})
-
-#: Justification phrases that assert a file is narrative / has no code. These
-#: are only independently checkable against the source *name and bytes*; a
-#: claim of "no executable code" over a file whose bytes are code is refuted.
-_NARRATIVE_REASON_KEYWORDS: tuple[str, ...] = (
-    "narrative", "documentation", "doc-only", "docs only", "doc only",
-    "no executable", "not executable", "non-executable", "not code", "no code",
-    "prose", "commentary", "readme",
-)
 #: Justification phrases that assert a file is generated/vendored (specifically
 #: not hand-authored source). Unsupported without independent provenance.
 _GENERATED_REASON_KEYWORDS: tuple[str, ...] = (
@@ -350,65 +336,144 @@ _CODE_SUFFIXES: frozenset[str] = frozenset({
 })
 
 
-def _looks_like_executable_source(content: Any, path: str) -> bool:
-    """Whether *content* is plausibly executable code rather than narrative.
+#: Markers that a *decoded text* body is executable code, independent of the
+#: file name. A doc suffix cannot be trusted blindly (a ``.md`` file whose body
+#: is a shell script) and an unknown suffix cannot be trusted blindly either, so
+#: several language families are recognised: a shebang/interpreter line, a shell
+#: control/pipeline token, a brace-language declaration, an executable command,
+#: an assignment, a call, or SQL/embedded code. The list is deliberately general
+#: (never the six literal names a review happened to name), and the default when
+#: a text body cannot be classified as *documentation* is to treat it as
+#: executable (fail closed).
+_CODE_LINE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^#!\s*\S"),                                   # shebang
+    re.compile(r"^#\s*(?:include|define|pragma|import)\b"),    # C preprocessor
+    re.compile(r"^(?:package|using)\s+[\w.:]+"),               # C#/Go/C++
+    re.compile(r"^(?:public|private|protected|internal)\s+\w"),  # C#/Java accessor
+    re.compile(r"^(?:fn|func|def|class|interface|struct|enum|impl|trait|"
+               r"module|namespace|object)\s+\w"),              # declarations
+    re.compile(r"^(?:import|from|use|require|include)\s+\S"),   # imports
+    re.compile(r"^(?:let|const|var|val|static|final|mutable|"
+               r"volatile)\s+\w"),                             # declarations
+    re.compile(r"^(?:if|elif|else|for|while|switch|case|do|try|catch|except|"
+               r"finally|return|yield|raise|throw|break|continue|exit|"
+               r"break|goto)\b"),                              # control flow
+    re.compile(r"^(?:echo|printf|export|source|eval|exec|set|unset|read|cd|"
+               r"test|local|declare|trap|wait|shift|return)\b"),  # shell builtins
+    re.compile(r"^(?:curl|wget|sudo|apt|apt-get|brew|npm|npx|yarn|pnpm|pip|"
+               r"pip3|gem|cargo|go|make|cmake|gcc|g\+\+|clang|cc|javac|mvn|"
+               r"gradle|git|docker|kubectl|terraform|ansible|rm|mv|cp|mkdir|"
+               r"rmdir|chmod|chown|ln|touch|cat|sed|awk|grep|find|xargs|"
+               r"kill|pkill|mount|umount|dd|tar|zip|unzip|ssh|scp|rsync|"
+               r"systemctl|service|ssh-keygen|openssl)\b"),    # common executables
+    re.compile(r"^[A-Za-z_][\w.-]*\s*\+?=\s*\S"),              # assignment (a = b, a += b)
+    re.compile(r"^\S+\s*\|+\s*\S"),                            # pipeline a | b
+    re.compile(r"^(?:DROP|CREATE|ALTER|INSERT|UPDATE|DELETE|GRANT|REVOKE|"
+               r"SELECT|TRUNCATE|REPLACE|MERGE)\b", re.IGNORECASE),  # SQL
+    re.compile(r"^(?:<script|<\?php|<%|\{%)", re.IGNORECASE),  # embedded code
+    re.compile(r"^[A-Za-z_][\w.]*\s*\("),                      # function/method call
+    re.compile(r"^(?:\}|\);|\)\s*;|\]|\);?$|end\b)"),         # block/statement close
+)
 
-    Independent of the exclusion's own claim. Uses the file suffix plus real
-    bytes: a code suffix, or a shebang, or a python ``def``/``class``/``import``
-    declaration, all mark executable source. A ``.md``/``.md``-suffix file is
-    documentation even though its bytes also contain letters.
+
+def _code_line_hit(line: str) -> bool:
+    stripped = line.strip()
+    return any(p.match(stripped) for p in _CODE_LINE_PATTERNS)
+
+
+def _is_binary(content: Any) -> bool:
+    """Whether *content* is binary (a NUL byte in the leading bytes)."""
+    return isinstance(content, (bytes, bytearray)) and b"\x00" in bytes(content)[:8192]
+
+
+def _classify_text_body(content: Any) -> str:
+    """Classify real *text* bytes as ``code``, ``narrative`` or ``unclassified``.
+
+    Decided from the bytes themselves, never the file name: a body carrying a
+    recognised code line is ``code``; a decodable text body without such a line
+    is ``narrative`` (prose, including a licence or a plain-text overview);
+    undecodable bytes cannot be shown to be documentation and are
+    ``unclassified`` (which fails closed at the call site).
     """
-    suffix = PurePosixPath(path).suffix.lower()
-    if suffix in _NON_EXECUTABLE_SUFFIXES:
-        return False
     if not isinstance(content, (bytes, bytearray)):
-        # The name alone says code; without bytes we cannot refute a code name.
-        return suffix in _CODE_SUFFIXES
-    if suffix in _CODE_SUFFIXES:
-        return True
+        return "unclassified"
     try:
-        text = bytes(content).decode("utf-8", "replace")
-    except Exception:  # noqa: BLE001 - undecodable bytes are not provably code
-        return False
+        text = bytes(content).decode("utf-8")
+    except UnicodeDecodeError:
+        return "unclassified"
     for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("#!"):
-            return True
-        if stripped.startswith(("def ", "class ", "import ", "from ")):
-            return True
-    return False
+        if line.strip() and _code_line_hit(line):
+            return "code"
+    return "narrative"
 
 
-def _classify_exclusion_reason(justification: str) -> str:
-    """Classify an exclusion justification as ``narrative``, ``generated`` or
-    ``generic`` -- the claim the verifier must independently check."""
-    low = justification.lower()
-    if any(k in low for k in _NARRATIVE_REASON_KEYWORDS):
-        return "narrative"
-    if any(k in low for k in _GENERATED_REASON_KEYWORDS):
-        return "generated"
-    return "generic"
+def _is_documentation(content: Any, path: str) -> tuple[bool, str]:
+    """Whether *content* is independently established as documentation.
+
+    Returns ``(is_documentation, reason_when_not)``. The authority is the real
+    source -- its name **and** its bytes -- never the exclusion's own claim and
+    never a suffix allowlist that would trust a doc suffix blindly:
+
+    * no real bytes -> nothing can be established, so it fails closed;
+    * a binary body is not prose (documentation is text), so it fails closed;
+    * a *code* name (a recognised source suffix) is executable by name, so it
+      fails closed even if its body happens not to trip a byte marker;
+    * a text body is classified by its own bytes -- a body carrying a code line
+      is *code* and refutes a narrative claim even under a doc suffix, while a
+      prose body (a README, a markdown overview, a plain-text licence) is
+      documentation regardless of which wording the justification happens to
+      use;
+    * bytes that cannot be decoded cannot be shown to be documentation and fail
+      closed.
+    """
+    if not isinstance(content, (bytes, bytearray)):
+        return False, "the excluded path is not resolvable as real bytes"
+    if _is_binary(content):
+        return False, (
+            "the excluded path is a binary file, not documentation "
+            "(contradicted exclusion reason)"
+        )
+    if PurePosixPath(path).suffix.lower() in _CODE_SUFFIXES:
+        return False, (
+            "the excluded path is executable source by name, not documentation "
+            "(contradicted exclusion reason)"
+        )
+    kind = _classify_text_body(content)
+    if kind == "code":
+        return False, (
+            "the excluded path's source bytes are executable, not documentation "
+            "(contradicted exclusion reason)"
+        )
+    if kind == "narrative":
+        return True, ""
+    return False, (
+        "the excluded path's bytes cannot be independently established as "
+        "documentation (contradicted exclusion reason)"
+    )
 
 
 def _independent_reason_check(
     path: str, justification: str, content: Any
 ) -> tuple[bool, str]:
-    """Whether the exclusion's *stated reason* is independently checkable.
+    """Whether the exclusion's *stated reason* is independently established.
 
-    Matching the bounded path alone does not establish the reason. When a
-    justification asserts a narrative/no-code or generated/vendored nature,
-    that claim is checked against the real source name and bytes -- never
-    against the justification itself. A narrative claim over executable code
-    (``settings.py`` containing ``LIMIT = 7``) is refuted; a generated claim
-    with no independent provenance is unsupported. A generic reason is not
-    independently checkable and fails closed. When the source bytes are
-    unavailable nothing can be independently established, so the exclusion is
-    refused rather than trusted.
+    Matching the bounded path alone does not establish the reason, and neither
+    does the justification's *wording* -- the outcome for a file must not depend
+    on which keyword the author typed. The authority is the real source name and
+    bytes. A reason that asserts a **generated/vendored/third-party** nature is
+    a specific provenance claim nothing in the source independently establishes,
+    so it fails closed (unsupported exclusion authority). A reason that asserts
+    (or that a bare path implies) that the file is not executable source is
+    checked against the real source: executable bytes under a doc-ish name, or a
+    code name whose bytes are opaque, refute it (contradicted exclusion reason).
+    A genuinely narrative file -- a README, a markdown overview, a plain-text
+    licence, prose that says "text for readers" rather than "documentation" --
+    is admitted regardless of the justification's phrasing. When the real source
+    bytes are unavailable nothing can be independently established, so the
+    exclusion is refused rather than trusted.
     """
-    kind = _classify_exclusion_reason(justification)
-    if kind == "generated":
+    low = justification.lower()
+    if any(k in low for k in _GENERATED_REASON_KEYWORDS):
         return False, (
             "exclusion reason claims a generated/vendored file but no "
             "independent provenance establishes it (unsupported exclusion "
@@ -424,17 +489,9 @@ def _independent_reason_check(
             "exclusion reason cannot be independently established: source "
             "content is not real bytes"
         )
-    if kind == "generic":
-        return False, (
-            "exclusion reason is not independently checkable source-bound "
-            "evidence (unsupported exclusion authority)"
-        )
-    # kind == "narrative": the source bytes must not be executable code.
-    if _looks_like_executable_source(content, path):
-        return False, (
-            "exclusion reason claims a narrative path but the source bytes for "
-            f"{path!r} are executable code (contradicted exclusion reason)"
-        )
+    is_doc, reason = _is_documentation(content, path)
+    if not is_doc:
+        return False, reason
     return True, ""
 
 
@@ -1073,13 +1130,14 @@ class ArtifactEvidenceVerifier:
         ``path`` is the file being excluded: the claimed *bounded* scope must
         actually cover it (a ``README.md`` bound on an executable
         ``settings.py`` is a false bound), *and* the stated reason must be
-        independently checkable against the real source. Matching the path
-        alone is not enough: an executable file excluded as "narrative /
-        documentation" -- even when correctly bounded to itself -- is refuted
-        by its own source bytes; a generated/vendored claim with no
-        independent provenance is unsupported. When the reason cannot be
-        independently established (no real source bytes, a generic reason)
-        the exclusion fails closed.
+        independently established from the real source **name and bytes**.
+        Matching the path alone is not enough, and neither is the justification
+        wording: an executable file excluded as "narrative / documentation" --
+        even when correctly bounded to itself -- is refuted by its own bytes,
+        and a code file whose bytes are opaque is refuted by its name; a
+        generated/vendored claim with no independent provenance is unsupported.
+        When the reason cannot be independently established (no real source
+        bytes) the exclusion fails closed.
         """
         justification = entry.get("justification", entry.get("reason"))
         bounded = entry.get("bounded", entry.get("scope"))

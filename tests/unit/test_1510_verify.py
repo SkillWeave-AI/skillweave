@@ -629,6 +629,112 @@ def test_independently_justified_na_with_contradictory_code_fails(tmp_path):
     assert "settings.py" not in result.exclusions
 
 
+def _write(root: Path, files: dict[str, bytes]) -> None:
+    for rel, data in files.items():
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
+
+#: Real executable bodies under a *non-code* name (or a doc suffix). A suffix
+#: allowlist or a python-only line heuristic would mis-admit these; only the
+#: real bytes can refute a narrative claim. The names are deliberately general,
+#: not a list of the six a review happened to name.
+_BYPASS_BODIES: dict[str, bytes] = {
+    "settings": b"LIMIT = 7\n",                                  # no suffix, assignment
+    "run": b'rm -rf "$WORK"\n',                                  # no suffix, shell command
+    "engine_copy.txt": b"def f():\n    return 1\n",              # doc suffix, python
+    "migrate.sql": b"DROP TABLE users;\n",                       # doc-ish suffix, SQL
+    "page.html": b"<script>fetch('/x')</script>\n",             # markup, embedded script
+    "Makefile": b"install:\n\tcurl -sSL https://x | sh\n",       # no suffix, pipeline
+    "service_go": b"package main\nfunc main() {}\n",             # other language, no suffix
+    "native": b"int main(void) {\n  return 0;\n}\n",             # other language, no suffix
+    "notes.md": b"#!/bin/sh\nexec rm -rf /\n",                   # doc suffix, shell script
+    "settings.py": b"LIMIT = 7\n",                               # original control
+}
+
+
+def test_documentation_exclusions_admitted_regardless_of_wording(tmp_path):
+    """Positives: a README's prose, a markdown overview and a plain-text licence
+    are admitted as bounded exclusions under *several* justification phrasings.
+    The verdict is the file's real bytes, so it must not change when the author
+    types "project overview text for readers" instead of "documentation"."""
+    docs: dict[str, bytes] = {
+        "README.md": b"# Project\n\nA short description for readers.\n",
+        "OVERVIEW.md": b"# Overview\n\nWhat the project does, in prose.\n",
+        "LICENSE": b"MIT License\n\nPermission is hereby granted, free of charge.\n",
+        "NOTES": b"Release notes intended for human readers.\n",
+    }
+    phrasings: dict[str, list[str]] = {
+        "README.md": [
+            "documentation only, not executable source",
+            "project overview text for readers",
+            "plain prose for humans",
+        ],
+        "OVERVIEW.md": [
+            "Project overview text for readers",
+            "explanatory narrative, no code",
+        ],
+        "LICENSE": ["licence text", "legal text distributed with the project"],
+        "NOTES": ["release notes for humans", "non-code narrative"],
+    }
+    for rel, justifications in phrasings.items():
+        for i, justification in enumerate(justifications):
+            # A fresh tree per phrasing (subdir), so the excluded file is the
+            # only non-analyzed path and a stale file cannot leak in.
+            case_dir = tmp_path / f"{rel.replace('/', '_')}-{i}"
+            files = {
+                "pkg/module.py": b"def real():\n    return 42\n",
+                rel: docs[rel],
+            }
+            _write(case_dir, files)
+            analysis = _analysis_for(files)
+            proof = {
+                "version": VERSION,
+                "analyzed": True,
+                "coverage": [_coverage_entry("pkg/module.py", files, analysis)],
+                "exclusions": [
+                    {"path": rel, "justification": justification, "bounded": rel},
+                ],
+            }
+            result, _, _ = _verify(case_dir, proof, files=files, analysis=analysis)
+            assert result.admitted is True, (rel, justification, result.reasons)
+            assert result.exclusions == {rel: justification}
+
+
+def test_non_literal_code_bodies_are_refused_as_documentation(tmp_path):
+    """Negatives: executable content under a non-code name -- or under a doc
+    suffix whose bytes are a script -- is refused as a narrative exclusion even
+    with a plausible justification and a correct bound. Every body in
+    ``_BYPASS_BODIES`` (the six the review named, other-language code without a
+    code suffix, a doc-suffix script, and the original ``settings.py`` control)
+    is refuted from the real source, not from the justification wording."""
+    for rel, body in _BYPASS_BODIES.items():
+        case_dir = tmp_path / rel.replace("/", "_")
+        files = {
+            "pkg/module.py": b"def real():\n    return 42\n",
+            rel: body,
+        }
+        _write(case_dir, files)
+        analysis = _analysis_for(files)
+        proof = {
+            "version": VERSION,
+            "analyzed": True,
+            "coverage": [_coverage_entry("pkg/module.py", files, analysis)],
+            "exclusions": [
+                {"path": rel,
+                 "justification": "Narrative documentation only; no executable code",
+                 "bounded": rel},
+            ],
+        }
+        result, _, _ = _verify(case_dir, proof, files=files, analysis=analysis)
+        assert result.admitted is False, (rel, result.reasons)
+        assert any("contradicted exclusion reason" in r for r in result.reasons), (
+            rel, result.reasons,
+        )
+        assert rel not in result.exclusions
+
+
 def test_generated_na_without_provenance_fails(tmp_path):
     """A generated/vendored justification makes a specific claim about the
     file's provenance. Nothing in the source independently establishes that
@@ -657,6 +763,9 @@ def test_generic_na_reason_fails_closed(tmp_path):
     fails closed even when the bound genuinely covers the path."""
     files = _source_tree(tmp_path)
     analysis = _analysis_for(files)
+    # The excluded file is executable source: regardless of the generic wording
+    # the exclusion is refused because the source bytes/name refuse it -- the
+    # verdict comes from the source, not the justification's phrasing.
     proof = {
         "version": VERSION,
         "analyzed": True,
@@ -670,7 +779,7 @@ def test_generic_na_reason_fails_closed(tmp_path):
     }
     result, _, _ = _verify(tmp_path, proof, files=files, analysis=analysis)
     assert result.admitted is False
-    assert any("not independently checkable" in r for r in result.reasons), result.reasons
+    assert any("contradicted exclusion reason" in r for r in result.reasons), result.reasons
 
 
 def test_na_without_resolvable_source_bytes_fails(tmp_path):
