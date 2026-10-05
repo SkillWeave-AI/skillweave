@@ -610,11 +610,13 @@ def test_native_streaming_path_authenticates_and_isolates_the_child(tmp_path):
 
     service, store, db = _native_service(tmp_path)
     authority = HostAuthorityService()
+    checkout = tmp_path / "attempt-checkout"
+    checkout.mkdir()
     worker_token = authority.issue_attempt_credential(
         run_id="run-prot", task_id="task-1", attempt=1,
-        scope={"paths": ["/work/out"], "mode": "rw"},
+        scope={"paths": [str(checkout / "probe.json")], "mode": "rw"},
     )
-    probe = tmp_path / "probe.json"
+    probe = checkout / "probe.json"
     child = (
         "import json, pathlib, sqlite3, sys\n"
         "db = pathlib.Path(sys.argv[1]); out = pathlib.Path(sys.argv[2]); res = {}\n"
@@ -630,6 +632,7 @@ def test_native_streaming_path_authenticates_and_isolates_the_child(tmp_path):
         run_id="run-prot", tool="opencode", model="m", subject_repo="r", subject_commit="c",
         created_at="2026-10-05T00:00:00Z",
         authority_service=authority, worker_token=worker_token,
+        output_root=str(checkout),
     )
     assert out["gate_state"] == "pass"
     assert out["durable"] is True
