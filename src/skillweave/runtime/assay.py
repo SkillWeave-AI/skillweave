@@ -37,6 +37,10 @@ class AssayState(str, Enum):
     PROBE = "probe"
     MEASURE = "measure"
     CLASSIFY = "classify"
+    #: SW-1510-VERIFY: the artifact-specific semantics verdict. Appended after
+    #: CLASSIFY (the completion-contract gate) so a native PASS must clear both
+    #: the process-completion gate and the artifact-analysis proof.
+    ARTIFACT_VERIFY = "artifact_verify"
     REMEDIATE = "remediate"
     ESCALATE_OR_SPLIT = "escalate_or_split"
     PASS = "pass"
@@ -61,8 +65,10 @@ class AssayState(str, Enum):
             cls.PROBE: [cls.MEASURE],
             cls.MEASURE: [cls.CLASSIFY],
             cls.CLASSIFY: [
-                cls.REMEDIATE, cls.ESCALATE_OR_SPLIT, cls.PASS, cls.HOLD,
+                cls.REMEDIATE, cls.ESCALATE_OR_SPLIT, cls.ARTIFACT_VERIFY,
+                cls.PASS, cls.HOLD,
             ],
+            cls.ARTIFACT_VERIFY: [cls.PASS, cls.HOLD, cls.REMEDIATE],
             cls.REMEDIATE: [cls.PROBE],
             cls.ESCALATE_OR_SPLIT: [cls.HYPOTHESIS, cls.HOLD],
             cls.PASS: [],

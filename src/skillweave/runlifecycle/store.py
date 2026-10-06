@@ -307,12 +307,15 @@ class RunStateStore:
     # -- pid staleness check ------------------------------------------------
 
     def verify_pid(self, run_id: str, pid: int) -> None:
-        """Raise :class:`StalePidError` when *pid* does not match the recorded one.
+        """Raise :class:`StalePidError` when *pid* is not the recorded process.
 
         This prevents killing a stale/reused PID that happens to have the same
         numeric value as a previous run's PID.  The caller must pass the PID
         they *believe* is the target; the store compares it against the PID
-        recorded at start time.
+        recorded at start time, and — when the launch recorded a native
+        process identity — re-verifies that identity against the live OS facts
+        so a recycled PID or a foreign worker is refused, not just a mismatch
+        of the number.
         """
         meta = self.read_metadata(run_id)
         if meta is None:
@@ -321,6 +324,20 @@ class RunStateStore:
             raise StalePidError(
                 f"pid mismatch for run {run_id}: recorded pid={meta.pid}, "
                 f"provided pid={pid}.  Refusing kill on stale/reused PID."
+            )
+
+        recorded_identity = (meta.metadata or {}).get("process_identity")
+        if not recorded_identity:
+            # Older records predate identity capture: the numeric PID match
+            # above is all that is available.
+            return
+        from skillweave.runtime import process_identity as _pid
+
+        check = _pid.verify(recorded_identity, pid)
+        if not check.ok and check.reason != _pid.REASON_NOT_ALIVE:
+            raise StalePidError(
+                f"process identity mismatch for run {run_id} pid {pid}: "
+                f"{check.reason} ({check.detail}).  Refusing kill."
             )
 
     # -- listing ------------------------------------------------------------

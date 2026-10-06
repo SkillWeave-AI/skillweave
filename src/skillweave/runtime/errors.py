@@ -25,6 +25,28 @@ class VersionConflictError(StoreError):
         )
 
 
+class ProcessIdentityError(StoreError):
+    """A cancellation refused because the recorded process identity did not
+    match the live process.
+
+    Raised *before* any signal is sent when the OS facts (creation instant,
+    exec image, argument vector) show the target is a recycled PID, a stale
+    command, a foreign worker, or no longer observable.  The verification
+    ``reason`` is carried so a caller can distinguish "definitely not ours"
+    from "unknown, not confirmed terminated".
+    """
+
+    def __init__(self, run_id, pid, reason, verification=None):
+        self.run_id = run_id
+        self.pid = pid
+        self.reason = reason
+        self.verification = verification
+        super().__init__(
+            f"refusing to signal run '{run_id}' pid {pid}: "
+            f"process identity verification failed ({reason})"
+        )
+
+
 class KillOutcomeError(StoreError):
     """A kill request could not be durably reconciled to a terminal outcome.
 

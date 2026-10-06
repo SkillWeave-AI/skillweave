@@ -188,6 +188,22 @@ def _build_parser(prog: str = "skillweave") -> argparse.ArgumentParser:
         add_help=False,
     )
 
+    # `cancel` subcommand -- identity-verified native cancellation
+    subparsers.add_parser(
+        "cancel",
+        help="Cancel an owned run after verifying its process identity",
+        parents=[runlifecycle_cli.build_cancel_parser()],
+        add_help=False,
+    )
+
+    # `resume` subcommand -- launch a new identified attempt
+    subparsers.add_parser(
+        "resume",
+        help="Resume a run by launching a new identified attempt",
+        parents=[runlifecycle_cli.build_resume_parser()],
+        add_help=False,
+    )
+
     return parser
 
 
@@ -239,6 +255,10 @@ def main(
         return runlifecycle_cli.main_inspect(subcommand_argv(args_list))
     elif args.command == "kill":
         return runlifecycle_cli.main_kill(subcommand_argv(args_list))
+    elif args.command == "cancel":
+        return runlifecycle_cli.main_cancel(subcommand_argv(args_list))
+    elif args.command == "resume":
+        return runlifecycle_cli.main_resume(subcommand_argv(args_list))
     else:
         parser.print_help()
         return 1
@@ -252,7 +272,7 @@ def subcommand_argv(args_list: Sequence[str]) -> list:
     from the subcommand's own index is correct for both call styles.
     """
     for index, token in enumerate(args_list):
-        if token in ("onboard", "entry", "dispatch", "run", "rework", "planning-sync", "assess", "start", "inspect", "kill"):
+        if token in ("onboard", "entry", "dispatch", "run", "rework", "planning-sync", "assess", "start", "inspect", "kill", "cancel", "resume"):
             return list(args_list[index + 1:])
     return []
 

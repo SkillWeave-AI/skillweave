@@ -47,13 +47,47 @@ from skillweave.runtime.store import SQLiteRunStore  # noqa: E402
 from skillweave.runtime.journal import EventJournal  # noqa: E402
 from skillweave.runtime.registry import RawArtifactStore  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _assay_evidence import (  # noqa: E402
+    genuine_artifact,
+    reader_for,
+    write_analysis_tree,
+    write_source_tree,
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
+#: A real, 40-hex commit the artifact and the source resolver both bind to.
+COMMIT = "a724d32a724d32a724d32a724d32a724d32a724d"
+
 #: The ordered Assay drill phases, in the append-only order the engine defines.
-_DRILL_PHASES = ("pin", "hypothesis", "probe", "measure", "classify")
+#: ARTIFACT_VERIFY (SW-1510-VERIFY) sits between CLASSIFY and the terminal: the
+#: native PASS is withheld unless artifact-specific semantics admit the proof.
+_DRILL_PHASES = ("pin", "hypothesis", "probe", "measure", "classify", "artifact_verify")
 
 #: A real, bounded probe that exits 0 and writes non-empty stdout.
 _PASS_PROBE = [sys.executable, "-c", "print('assay-probe-output')"]
+
+
+def _evidence(base: Path) -> dict:
+    """A genuine artifact proof bound to a real source tree + analysis bytes.
+
+    SW-1510-VERIFY: the native Assay PASS consumer now requires real
+    artifact-specific semantics, so every assay positive control supplies a
+    proof graph whose file/analysis digests are recomputed from the bytes on
+    disk here -- never a self-declared pass.
+    """
+    from skillweave.runtime.verify import FilesystemSourceResolver
+
+    src = Path(base) / "src-tree"
+    ana = Path(base) / "analysis"
+    files = write_source_tree(src)
+    analysis = write_analysis_tree(ana, files)
+    return {
+        "artifact_evidence": [genuine_artifact(files, analysis, commit=COMMIT)],
+        "source_resolver": FilesystemSourceResolver(src, commit=COMMIT),
+        "analysis_reader": reader_for(analysis),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -79,19 +113,20 @@ def _phase_names(assay_block):
 
 
 def _run_assay(service, command=None, *, run_id="assay-1", task_id=None,
-               attempt=1, policy="unicorn"):
+               attempt=1, policy="unicorn", evidence=None):
     return service.execute(
         list(command or _PASS_PROBE),
         run_id=run_id,
         tool="opencode",
         model="model-assay",
         subject_repo="skillweave",
-        subject_commit="deadbeef",
+        subject_commit=COMMIT,
         created_at="2026-10-05T00:00:00Z",
         methodology="assay",
         autonomy_policy=policy,
         task_id=task_id,
         attempt=attempt,
+        **(evidence or {}),
     )
 
 
@@ -99,9 +134,10 @@ def _run_assay(service, command=None, *, run_id="assay-1", task_id=None,
 # Criterion 1: real bounded subprocess + persisted ordered phases
 # ---------------------------------------------------------------------------
 
-def test_assay_run_persists_ordered_phases_with_run_task_attempt():
+def test_assay_run_persists_ordered_phases_with_run_task_attempt(tmp_path):
     service, store, journal, raw = _service()
-    result = _run_assay(service, run_id="assay-c1", task_id="task-77", attempt=3)
+    result = _run_assay(service, run_id="assay-c1", task_id="task-77", attempt=3,
+                        evidence=_evidence(tmp_path))
 
     assert result.methodology == "assay"
     assert result.assay is not None
@@ -115,12 +151,21 @@ def test_assay_run_persists_ordered_phases_with_run_task_attempt():
         assert payload["task_id"] == "task-77"
         assert payload["attempt"] == 3
 
-    # The five drill phases appear in the append-only order, then a terminal.
+    # The drill phases appear in the append-only order, then a terminal.
     names = _phase_names(block)
-    assert names[:5] == list(_DRILL_PHASES)
-    assert names[5] in ("pass", "hold")
+    assert names[:6] == list(_DRILL_PHASES)
+    assert names[6] in ("pass", "hold")
     assert block["outcome"] == "pass"
-    assert names[5] == "pass"
+    assert names[6] == "pass"
+
+    # SW-1510-VERIFY: the artifact-semantics phase is recorded and admitted,
+    # and it is what turned the completion PASS into a native PASS.
+    artifact_verify = _phase(block, "artifact_verify")
+    assert artifact_verify["completion_gate_state"] == "pass"
+    assert artifact_verify["artifact_admitted"] is True
+    assert artifact_verify["reasons"] == []
+    assert artifact_verify["subject_commit"] == COMMIT
+    assert block["artifact_evidence"]["admitted"] is True
 
     # The PROBE is a real bounded subprocess: a distinct pid and exit code.
     probe = _phase(block, "probe")
@@ -141,9 +186,10 @@ def test_assay_run_persists_ordered_phases_with_run_task_attempt():
     assert seqs == sorted(seqs)
 
 
-def test_probe_facts_stay_distinct_from_verification_and_gate():
+def test_probe_facts_stay_distinct_from_verification_and_gate(tmp_path):
     service, store, journal, raw = _service()
-    result = _run_assay(service, run_id="assay-distinct")
+    result = _run_assay(service, run_id="assay-distinct",
+                        evidence=_evidence(tmp_path))
 
     block = result.assay
     probe = _phase(block, "probe")
@@ -176,18 +222,27 @@ def test_cli_then_snapshot_and_replay_agree(tmp_path, capsys):
 
     db = str(tmp_path / "cli.db")
     art = str(tmp_path / "cli-art")
+    src = tmp_path / "cli-src"
+    ana = tmp_path / "cli-analysis"
+    files = write_source_tree(src)
+    analysis = write_analysis_tree(ana, files)
+    evidence_file = tmp_path / "cli-evidence.json"
+    evidence_file.write_text(json.dumps(genuine_artifact(files, analysis, commit=COMMIT)))
 
     rc = run_cli.main([
         "--tool", "opencode",
         "--model", "model-assay",
         "--subject-repo", "skillweave",
-        "--subject-commit", "deadbeef",
+        "--subject-commit", COMMIT,
         "--methodology", "assay",
         "--autonomy-policy", "unicorn",
         "--task-id", "task-cli",
         "--attempt", "2",
         "--db-path", db,
         "--artifacts-path", art,
+        "--artifact-evidence", str(evidence_file),
+        "--source-root", str(src),
+        "--analysis-root", str(ana),
         "--",
         *_PASS_PROBE,
     ])
@@ -198,6 +253,9 @@ def test_cli_then_snapshot_and_replay_agree(tmp_path, capsys):
     assert payload["assay"]["outcome"] == "pass"
     assert payload["assay"]["task_id"] == "task-cli"
     assert payload["assay"]["attempt"] == 2
+    # The installed-entry path admits the genuine artifact and records why.
+    assert payload["assay"]["artifact_evidence"]["admitted"] is True
+    assert payload["assay"]["artifact_evidence"]["subject_commit"] == COMMIT
 
     # A *separate* service instance reads the same persisted view (the replay).
     service, store, journal, raw = _service(db, art)
@@ -220,12 +278,16 @@ def test_mcp_status_and_create_agree_with_cli(tmp_path):
 
     db = str(tmp_path / "mcp.db")
     art = str(tmp_path / "mcp-art")
+    src = tmp_path / "mcp-src"
+    ana = tmp_path / "mcp-analysis"
+    files = write_source_tree(src)
+    analysis = write_analysis_tree(ana, files)
 
     created = json.loads(mcp_server.create_run(
         tool="opencode",
         model="model-assay",
         subject_repo="skillweave",
-        subject_commit="deadbeef",
+        subject_commit=COMMIT,
         # The MCP surface takes one shell-style string and shlex-splits it, so
         # the probe is expressed without quoting: it prints 42 and exits 0.
         command=f"{sys.executable} -c print(42)",
@@ -235,9 +297,13 @@ def test_mcp_status_and_create_agree_with_cli(tmp_path):
         autonomy_policy="unicorn",
         task_id="task-mcp",
         attempt=1,
+        artifact_evidence=json.dumps(genuine_artifact(files, analysis, commit=COMMIT)),
+        source_root=str(src),
+        analysis_root=str(ana),
     ))
     assert created["methodology"] == "assay"
     assert created["assay"]["outcome"] == "pass"
+    assert created["assay"]["artifact_evidence"]["admitted"] is True
     run_id = created["run_id"]
 
     status = json.loads(mcp_server.status_run(run_id, db_path=db))
@@ -305,11 +371,12 @@ def test_incompatible_registered_binding_has_a_named_reason():
     ) is None
 
 
-def test_assay_never_silently_runs_as_ralph_and_ralph_has_no_assay_block():
+def test_assay_never_silently_runs_as_ralph_and_ralph_has_no_assay_block(tmp_path):
     service, store, journal, raw = _service()
-    assay = _run_assay(service, run_id="assay-explicit")
+    assay = _run_assay(service, run_id="assay-explicit", evidence=_evidence(tmp_path))
     assert assay.methodology == "assay"
     assert assay.assay is not None
+    assert assay.assay["outcome"] == "pass"
     assert store.get_run("assay-explicit").metadata["methodology"] == "assay"
 
     ralph = service.execute(
@@ -413,13 +480,14 @@ def test_a_probe_cannot_self_declare_a_pass():
     assert result.verification["gate_state"] == "fail"
 
 
-def test_conservative_policy_holds_even_when_the_gate_passes():
+def test_conservative_policy_holds_even_when_the_gate_passes(tmp_path):
     # A real, gate-passing probe. Under a policy that cannot author the
     # terminal transition the outcome is HOLD with a reason -- never a
     # self-declared pass. The run's own lane still advances (the gate passed);
     # the *methodology outcome* is what the policy withholds.
     service, store, journal, raw = _service()
-    result = _run_assay(service, run_id="assay-cons", policy="conservative")
+    result = _run_assay(service, run_id="assay-cons", policy="conservative",
+                        evidence=_evidence(tmp_path))
     assert result.gate_state == "pass"
     assert result.assay["outcome"] == "hold"
     assert result.assay["reason"]
@@ -434,6 +502,20 @@ def _venv_site(venv_dir: Path) -> Path:
     matches = sorted(venv_dir.glob("lib/python*/site-packages"))
     assert matches, f"no venv site-packages under {venv_dir}"
     return matches[0]
+
+
+def _clean_env() -> dict:
+    """A subprocess environment with ``PYTHONPATH`` removed.
+
+    The lane runs the tests with ``PYTHONPATH`` pointing at the accepted-SDK
+    site-packages, which *also* carries a ``skillweave`` install. An inherited
+    ``PYTHONPATH`` makes ``pip`` report "already installed with the same
+    version" and skip the freshly-built wheel, so the venv never gets the
+    console script. Build/install subprocesses therefore clear ``PYTHONPATH``.
+    """
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    return env
 
 
 def _build_wheel(work: Path) -> Path:
@@ -452,7 +534,7 @@ def _build_wheel(work: Path) -> Path:
     proc = subprocess.run(
         [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-index",
          "--no-build-isolation", "-w", str(work / "dist"), str(work)],
-        cwd=str(work), capture_output=True, text=True,
+        cwd=str(work), capture_output=True, text=True, env=_clean_env(),
     )
     assert proc.returncode == 0, proc.stderr
     wheels = sorted((work / "dist").glob("skillweave-*.whl"))
@@ -462,13 +544,14 @@ def _build_wheel(work: Path) -> Path:
 
 def _install_into_fresh_venv(work: Path, wheel: Path) -> Path:
     venv_dir = work / "venv"
+    env = _clean_env()
     subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True,
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, env=env)
     site = _venv_site(venv_dir)
     subprocess.run(
         [str(venv_dir / "bin" / "pip"), "install", "--no-deps", "--no-index",
          str(wheel)],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, env=env,
     )
     # The offline install cannot fetch PyYAML (a declared runtime dependency).
     # Make the dependency available to the isolated interpreter without
@@ -495,9 +578,15 @@ def test_installed_wheel_console_script_runs_native_assay(tmp_path):
     db = tmp_path / "installed.db"
     art = tmp_path / "installed-art"
 
-    env = dict(os.environ)
+    src = tmp_path / "installed-src"
+    ana = tmp_path / "installed-analysis"
+    files = write_source_tree(src)
+    analysis = write_analysis_tree(ana, files)
+    evidence_file = tmp_path / "installed-evidence.json"
+    evidence_file.write_text(json.dumps(genuine_artifact(files, analysis, commit=COMMIT)))
+
+    env = _clean_env()
     # Prove the *installed* package is exercised: drop any source-tree path.
-    env.pop("PYTHONPATH", None)
     env["TMPDIR"] = str(tmp_path / "tmp")
     (tmp_path / "tmp").mkdir(exist_ok=True)
 
@@ -507,13 +596,16 @@ def test_installed_wheel_console_script_runs_native_assay(tmp_path):
             "--tool", "opencode",
             "--model", "model-assay",
             "--subject-repo", "skillweave",
-            "--subject-commit", "deadbeef",
+            "--subject-commit", COMMIT,
             "--methodology", "assay",
             "--autonomy-policy", "unicorn",
             "--task-id", "task-installed",
             "--attempt", "2",
             "--db-path", str(db),
             "--artifacts-path", str(art),
+            "--artifact-evidence", str(evidence_file),
+            "--source-root", str(src),
+            "--analysis-root", str(ana),
             "--",
             sys.executable, "-c", "print('installed-assay-probe')",
         ],
@@ -524,9 +616,11 @@ def test_installed_wheel_console_script_runs_native_assay(tmp_path):
 
     assert payload["methodology"] == "assay"
     assert payload["assay"]["outcome"] == "pass"
+    # The genuinely-bound artifact is what the *installed* entry admitted.
+    assert payload["assay"]["artifact_evidence"]["admitted"] is True
     assert payload["assay"]["task_id"] == "task-installed"
     assert payload["assay"]["attempt"] == 2
-    assert [p["phase"] for p in payload["assay"]["phases"]][:5] == list(_DRILL_PHASES)
+    assert [p["phase"] for p in payload["assay"]["phases"]][:6] == list(_DRILL_PHASES)
     assert payload["assay"]["child_execution"]["exit_code"] == 0
     run_id = payload["run_id"]
 
@@ -549,7 +643,7 @@ def test_installed_wheel_console_script_runs_native_assay(tmp_path):
         ).fetchall()
         phases = [json.loads(r[0]).get("phase") for r in phase_rows]
         phases = [p for p in phases if p]
-        assert phases[:5] == list(_DRILL_PHASES)
+        assert phases[:6] == list(_DRILL_PHASES)
         assert phases[-1] == "pass"
     finally:
         conn.close()
@@ -564,8 +658,7 @@ def test_installed_wheel_refuses_unknown_methodology(tmp_path):
     venv_dir = _install_into_fresh_venv(work, wheel)
     script = venv_dir / "bin" / "skillweave"
 
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
+    env = _clean_env()
     env["TMPDIR"] = str(tmp_path / "tmp")
     (tmp_path / "tmp").mkdir(exist_ok=True)
 
