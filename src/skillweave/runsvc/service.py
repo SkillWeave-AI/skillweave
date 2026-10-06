@@ -2305,6 +2305,12 @@ class RunApplicationService:
         root_run_id = source_lineage.get("root_run_id") or source.run_id
         next_attempt = int(source_lineage.get("attempt") or 1) + 1
 
+        # SW-1510-BUDGET: inherit the source run's task identity so the retry
+        # is bounded by the same owner envelope and task aggregate.  An explicit
+        # caller-supplied task_id (e.g. from the MCP or CLI) overrides this.
+        if task_id is None:
+            task_id = source_lineage.get("task_id")
+
         idem = idempotency_key or ("restart:" + run_id)
         attempts = dict((source.metadata or {}).get("restart_attempts") or {})
 
