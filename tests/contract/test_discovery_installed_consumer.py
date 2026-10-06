@@ -29,6 +29,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "adapter" / "discovery"
+SKILL_MANIFEST = ROOT / "skills" / "skillweave-discovery" / "capability.yaml"
 
 
 @pytest.fixture(scope="session")
@@ -76,11 +77,12 @@ _PROBE = '''
 import asyncio, json, sys
 from pathlib import Path
 
-target, fixtures, project = sys.argv[1], sys.argv[2], sys.argv[3]
+target, fixtures, project, skill_manifest = sys.argv[1:5]
 sys.path[:] = [p for p in sys.path if p not in ("", ".")]
 sys.path.insert(0, fixtures)
 sys.path.insert(0, target)
 
+import yaml
 import skillweave
 import skillweave.discovery as D
 from skillweave.studio.hooks.facade import run_hooks
@@ -89,6 +91,32 @@ report = {"skillweave_file": skillweave.__file__,
           "hook_module": D.DISCOVERY_HOOK_MODULE}
 
 root = Path(project)
+
+# -- the shipped *skill* declaration, materialized by the installed code -----
+# This is the AC4/AC8 seam: the Markdown skill's declared boundary is bound to
+# the packaged hook, and the installed Core is what turns that declaration into
+# a binding the real engine loads.
+_manifest = yaml.safe_load(Path(skill_manifest).read_text())
+_manifest["studio_binding"] = {
+    **_manifest["studio_binding"],
+    "config": {
+        "provider": "duckduckgo",
+        "adapter_id": "external-discovery-search",
+        "adapter_factories": [
+            "external_discovery_adapter:discovery_success_factory"
+        ],
+        "query": "installed skill-declared research",
+    },
+}
+D.materialize_skill_binding(_manifest, root)
+res_skill = asyncio.run(run_hooks("discovery", "pre", project_root=str(root),
+                                  include_auto_discovered=False))
+_skill_binding, _skill_result = res_skill.results[0]
+report["skill_declared_module"] = _skill_binding.module
+report["skill_declared_status"] = _skill_result.status
+report["skill_declared_message"] = _skill_result.message
+report["skill_declared_has_artifact"] = bool(_skill_result.artifacts) and Path(
+    _skill_result.artifacts[0]).exists()
 
 # -- installed external adapter -> typed success through the real engine -----
 D.write_discovery_binding(
@@ -153,7 +181,8 @@ def _probe(installed_core, project_dir: Path) -> dict:
     _, target = installed_core
     project_dir.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
-        [sys.executable, "-c", _PROBE, str(target), str(FIXTURES), str(project_dir)],
+        [sys.executable, "-c", _PROBE, str(target), str(FIXTURES), str(project_dir),
+         str(SKILL_MANIFEST)],
         cwd=str(project_dir), capture_output=True, text=True,
         env={"PATH": "/usr/bin:/bin", "PYTHONPATH": ""},
     )
@@ -176,6 +205,20 @@ class TestInstalledDiscoveryConsumer:
         for module in ("__init__.py", "lifecycle_search.py",
                        "lifecycle_hook.py", "binding.py"):
             assert module in shipped, f"wheel is missing discovery/{module}: {shipped}"
+
+    def test_the_shipped_skill_declaration_drives_the_installed_engine(
+        self, installed_core, tmp_path
+    ):
+        """AC4/AC8: the Markdown skill's declared boundary runs on the install.
+
+        The skill manifest shipped in this checkout is the declaration; the
+        *installed* Core is what reads it and drives the registry-backed typed
+        search through the real ``run_hooks`` path.
+        """
+        report = _probe(installed_core, tmp_path / "proj0")
+        assert report["skill_declared_module"] == report["hook_module"], report
+        assert report["skill_declared_status"] == "pass", report
+        assert report["skill_declared_has_artifact"] is True, report
 
     def test_installed_import_resolves_to_the_target(self, installed_core, tmp_path):
         report = _probe(installed_core, tmp_path / "proj1")

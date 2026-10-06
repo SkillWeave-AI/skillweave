@@ -23,3 +23,18 @@ keywords:
 - empathy
 - problem-validation
 - opportunity
+# The declared lifecycle boundary of this prompt skill's Phase 2 (Research).
+# This is data, not a command: the consumer materializes it into
+# .skillweave/hooks/discovery-pre.yaml (skillweave.discovery.materialize_skill_binding),
+# and the Studio hook engine loads the source-owned DiscoveryResearchHook at
+# discovery/pre, driving registry-backed typed search -- so the Markdown facade
+# actually reaches the AdapterRegistry instead of only describing it. The block
+# embeds no credential value and denies egress by default.
+studio_binding:
+  phase: discovery
+  position: pre
+  module: skillweave.discovery.lifecycle_hook.DiscoveryResearchHook
+  name: skillweave-discovery-research
+  config:
+    provider: duckduckgo
+    allow_network: false

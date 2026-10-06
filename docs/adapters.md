@@ -227,12 +227,56 @@ boundary -- the Studio hook engine:
   and returns a hook `pass`/`fail`. It sets **no** `gate_override`: a hook is not
   gate authority.
 * `skillweave.discovery.binding` -- the source-owned binding descriptor a
-  consumer materializes into `.skillweave/hooks/discovery-pre.yaml`. It embeds
-  no credential value and denies egress by default.
+  consumer materializes into `.skillweave/hooks/discovery-pre.yaml`, plus the
+  reader (`binding_from_skill_manifest` / `materialize_skill_binding`) that
+  turns the *skill's own declaration* into that descriptor. It embeds no
+  credential value and denies egress by default.
 
 The binding is data, not a script in a foreign home: it names the packaged class
 `skillweave.discovery.lifecycle_hook.DiscoveryResearchHook`, so the engine
 imports it straight from the installed wheel.
+
+### The exact criterion-driven path addition
+
+The prompt skill itself now **declares** its lifecycle consumer. Its manifest
+`skills/skillweave-discovery/capability.yaml` carries a single data field:
+
+```yaml
+studio_binding:
+  phase: discovery
+  position: pre
+  module: skillweave.discovery.lifecycle_hook.DiscoveryResearchHook
+  name: skillweave-discovery-research
+  config:
+    provider: duckduckgo
+    allow_network: false
+```
+
+This is the whole addition, and it is deliberately a *declaration*, not a
+mechanism:
+
+* it binds the Markdown facade's **Phase 2 (Research)** boundary to the packaged
+  hook — so the skill's declared boundary is what the consumer materializes, not
+  a binding invented outside the skill;
+* it is **data**, never a host command: the value names the source-owned class,
+  which the engine imports from the installed wheel. No executable is embedded,
+  so the shipped `SKILL.md` stays host-neutral;
+* the reader is conservative and **fails closed** — a block naming a different
+  phase/position/module, an unknown config key, or a smuggled credential value
+  is refused (`AdapterError` with an attributable `asset`), and the produced
+  descriptor is re-validated through the engine's own `BindingConfig` schema
+  before it is written;
+* it **preserves the declared boundaries**: it creates no `WorkContract`, holds
+  no gate authority, replaces no SDK contract, and (like the bare descriptor)
+  denies egress and embeds no credential value. The Capacium `kind`/delivery
+  vocabulary never appears here — the block is runtime category + transport
+  binding only, independent of any package format.
+
+The declaration round-trips through `CapaciumManifestSync` (unknown top-level
+keys are preserved), so it does not read as a manifest drift, and it needs no
+native CLI/process/store change: `materialize_skill_binding(skill_manifest,
+project_root)` writes `.skillweave/hooks/discovery-pre.yaml`, the exact path the
+Studio loader already reads.
 
 Everything fails closed -- each is an asserted counterexample, not a claim:
 
@@ -263,7 +307,8 @@ execution*: `self_approving` is always `False` and `is_authority` is always
 | Installed artifact: external adapters register with no vendor edit | `tests/contract/test_installed_adapter_extension.py` |
 | Council is a real registry consumer | `tests/contract/test_adapter_council_search.py` |
 | Discovery lifecycle consumer (real `run_hooks` path; outage/unknown/malformed) | `tests/contract/test_discovery_lifecycle_consumer.py` |
-| Discovery consumer on the **installed** artifact | `tests/contract/test_discovery_installed_consumer.py` |
+| Markdown Discovery skill **declares** its consumer; declaration drives the engine + is closed data | `tests/contract/test_discovery_skill_binding.py` |
+| Discovery consumer on the **installed** artifact (incl. the skill declaration) | `tests/contract/test_discovery_installed_consumer.py` |
 | Router/harness decision & admission semantics preserved | `tests/contract/test_adapter_router_harness_semantics.py` |
 | SDK adapter schema contract set | `skillweave-sdk/tests/contract/test_adapter_contract_set.py` |
 

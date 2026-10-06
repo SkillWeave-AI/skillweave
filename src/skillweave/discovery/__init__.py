@@ -48,8 +48,11 @@ from .binding import (
     DISCOVERY_BINDING_FILENAME,
     DISCOVERY_BINDING_PATH,
     DISCOVERY_HOOK_NAME,
+    SKILL_BINDING_KEY,
+    binding_from_skill_manifest,
     discovery_binding_dict,
     discovery_binding_yaml,
+    materialize_skill_binding,
     write_discovery_binding,
 )
 
@@ -67,7 +70,10 @@ __all__ = [
     "DISCOVERY_BINDING_FILENAME",
     "DISCOVERY_BINDING_PATH",
     "DISCOVERY_HOOK_NAME",
+    "SKILL_BINDING_KEY",
     "discovery_binding_dict",
     "discovery_binding_yaml",
     "write_discovery_binding",
+    "binding_from_skill_manifest",
+    "materialize_skill_binding",
 ]
