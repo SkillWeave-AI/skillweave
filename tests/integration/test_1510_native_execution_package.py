@@ -61,6 +61,43 @@ pytestmark = pytest.mark.skipif(
     reason=f"native execution package imports unavailable: {_IMPORT_ERROR}",
 )
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _assay_evidence import (  # noqa: E402
+    genuine_artifact,
+    reader_for,
+    write_analysis_tree,
+    write_source_tree,
+)
+
+#: A real, 40-hex subject commit the artifact proof and the source resolver
+#: both bind to (SW-1510-VERIFY refuses a non-40-hex commit outright).
+_COMMIT = "d34dbeefd34dbeefd34dbeefd34dbeefd34dbeef"
+
+
+def _genuine_evidence(base, *, commit=_COMMIT):
+    """A real artifact proof bound to an on-disk source tree + analysis bytes.
+
+    SW-1510-VERIFY: the native Assay PASS consumer now requires artifact-specific
+    semantics, so each assay positive control supplies a proof graph whose file
+    and per-path analysis digests are recomputed from the bytes written here.
+    """
+    from skillweave.runtime.verify import FilesystemSourceResolver
+
+    src = Path(base) / "evidence-src"
+    ana = Path(base) / "evidence-analysis"
+    files = write_source_tree(src)
+    analysis = write_analysis_tree(ana, files)
+    artifact = genuine_artifact(files, analysis, commit=commit)
+    return {
+        "artifact_evidence": [artifact],
+        "artifact_json": json.dumps([artifact]),
+        "source_resolver": FilesystemSourceResolver(src, commit=commit),
+        "analysis_reader": reader_for(analysis),
+        "commit": commit,
+        "src": src,
+        "ana": ana,
+    }
+
 
 def _py(code: str) -> list[str]:
     return [sys.executable, "-c", code]
@@ -160,11 +197,15 @@ def test_installed_cli_entry_persists_native_assay_and_replay_agrees(tmp_path, c
     streams = str(tmp_path / "cli-streams")
     art = str(tmp_path / "cli-art")
 
+    ev = _genuine_evidence(tmp_path / "cli-ev")
+    evidence_file = tmp_path / "cli-evidence.json"
+    evidence_file.write_text(ev["artifact_json"])
+
     rc = run_cli.main([
         "--tool", "opencode",
         "--model", "model-assay",
         "--subject-repo", "skillweave",
-        "--subject-commit", "deadbeef",
+        "--subject-commit", ev["commit"],
         "--methodology", "assay",
         "--autonomy-policy", "unicorn",
         "--task-id", "task-native",
@@ -172,6 +213,9 @@ def test_installed_cli_entry_persists_native_assay_and_replay_agrees(tmp_path, c
         "--db-path", db,
         "--stream-root", streams,
         "--artifacts-path", art,
+        "--artifact-evidence", str(evidence_file),
+        "--source-root", str(ev["src"]),
+        "--analysis-root", str(ev["ana"]),
         "--",
         sys.executable, "-c", "print('native-entry-ok')",
     ])
@@ -182,8 +226,10 @@ def test_installed_cli_entry_persists_native_assay_and_replay_agrees(tmp_path, c
     assert payload["methodology"] == "assay"
     assert payload["assay"]["task_id"] == "task-native"
     assert payload["assay"]["outcome"] == "pass"
+    # The genuine artifact proof is what the native entry admitted.
+    assert payload["assay"]["artifact_evidence"]["admitted"] is True
     assert [p["phase"] for p in payload["assay"]["phases"]] == [
-        "pin", "hypothesis", "probe", "measure", "classify", "pass",
+        "pin", "hypothesis", "probe", "measure", "classify", "artifact_verify", "pass",
     ]
     # The durable collector the CLI now drives left real evidence on disk.
     assert payload["stream"]["durable"] is True
@@ -225,11 +271,13 @@ def test_mcp_native_entry_persists_durable_stream_and_agrees(tmp_path):
     streams = str(tmp_path / "mcp-streams")
     art = str(tmp_path / "mcp-art")
 
+    ev = _genuine_evidence(tmp_path / "mcp-ev")
+
     created = json.loads(mcp_server.create_run(
         tool="opencode",
         model="model-assay",
         subject_repo="skillweave",
-        subject_commit="deadbeef",
+        subject_commit=ev["commit"],
         # The MCP surface shlex-splits one shell-style string, so the probe is
         # expressed without inner quoting: it prints a token and exits 0.
         command="%s -c print(9001)" % sys.executable,
@@ -240,9 +288,14 @@ def test_mcp_native_entry_persists_durable_stream_and_agrees(tmp_path):
         task_id="task-mcp-native",
         attempt=1,
         stream_root=streams,
+        artifact_evidence=ev["artifact_json"],
+        source_root=str(ev["src"]),
+        analysis_root=str(ev["ana"]),
     ))
     assert created["methodology"] == "assay"
     assert created["stream"]["durable"] is True
+    assert "assay" in created
+    assert created["assay"]["artifact_evidence"]["admitted"] is True
     run_id = created["run_id"]
 
     root = Path(streams)
@@ -396,6 +449,7 @@ def test_protected_triple_declared_scope_holds_or_confines(tmp_path):
     )
 
     escaped = outside / "escaped.txt"
+    ev = _genuine_evidence(tmp_path / "scope-ev")
     child = (
         "import json, os, pathlib, sys\n"
         "res = {}\n"
@@ -423,7 +477,7 @@ def test_protected_triple_declared_scope_holds_or_confines(tmp_path):
     call = lambda: svc.execute_streaming_native(  # noqa: E731
         argv,
         run_id=run_id, tool="opencode", model="m",
-        subject_repo="r", subject_commit="c",
+        subject_repo="r", subject_commit=ev["commit"],
         task_id=task_id, attempt=attempt,
         created_at="2026-10-05T00:00:00Z",
         methodology="assay", autonomy_policy="unicorn",
@@ -431,6 +485,9 @@ def test_protected_triple_declared_scope_holds_or_confines(tmp_path):
         assay_actor_token=token, assay_envelope=envelope,
         declared_writes=["out"], output_root=str(checkout),
         require_identity=True,
+        artifact_evidence=ev["artifact_evidence"],
+        source_resolver=ev["source_resolver"],
+        analysis_reader=ev["analysis_reader"],
     )
 
     if not _HAS_CHECKOUT_CONFINEMENT:
@@ -468,11 +525,60 @@ def test_protected_triple_declared_scope_holds_or_confines(tmp_path):
 # ---------------------------------------------------------------------------
 
 _MCP_DRIVER = r'''
-import asyncio, json, os
+import asyncio, hashlib, json, os
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 
 here = os.environ["MCP_WORK"]
+
+# Build a real artifact proof over a real on-disk source tree + per-path
+# analysis bytes, so the native MCP Assay PASS is admitted on genuine
+# semantics (SW-1510-VERIFY) rather than an omitted/placeholder graph.
+COMMIT = "d34dbeef" * 5
+src = os.path.join(here, "ev-src")
+ana = os.path.join(here, "ev-ana")
+files = {
+    "pkg/module.py": b"def real():\n    return 42\n",
+    "pkg/util.py": b"VALUE = 'util'\n",
+    "README.md": b"# readme\n",
+}
+analysis = {}
+for rel, data in files.items():
+    path = os.path.join(src, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "wb").write(data)
+    blob = ("analysis of %s: %d bytes" % (rel, len(data))).encode()
+    analysis[rel] = blob
+    apath = os.path.join(ana, rel)
+    os.makedirs(os.path.dirname(apath), exist_ok=True)
+    open(apath, "wb").write(blob)
+
+def _sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+coverage = [
+    {"path": rel, "disposition": "analyzed",
+     "content_sha256": _sha(files[rel]), "analysis_digest": _sha(analysis[rel])}
+    for rel in files if not rel.endswith(".md")
+]
+proof = {
+    "version": "evidence-receipt-v1", "analyzed": True, "coverage": coverage,
+    "exclusions": [{"path": "README.md",
+                    "justification": "documentation only, not executable source",
+                    "bounded": "narrative paths (*.md)"}],
+}
+art = {
+    "artifact_id": "art-1", "sha256": "0" * 64, "schema_version": "1",
+    "producer_command": "analyze", "subject_repo": "skillweave",
+    "subject_commit": COMMIT, "created_at": "2026-10-05T00:00:00Z",
+    "evidence_type": "artifact", "purpose": "artifact analysis proof",
+    "metadata": {"artifact_verifier": proof},
+}
+_body = json.dumps({k: v for k, v in art.items() if k != "sha256"},
+                   sort_keys=True, separators=(",", ":")).encode()
+art["sha256"] = hashlib.sha256(_body).hexdigest()
+evidence = json.dumps([art])
+
 server_env = dict(os.environ)
 server_env["PYTHONPATH"] = os.environ["SKILLWEAVE_SRC"] + os.pathsep + os.environ["SDK_SRC"]
 server_env["PYTHONUNBUFFERED"] = "1"
@@ -491,13 +597,16 @@ async def main():
             print("TOOLS", ",".join(sorted(t.name for t in tools.tools)))
             call = await session.call_tool("create_run", {
                 "tool": "opencode", "model": "m",
-                "subject_repo": "r", "subject_commit": "c",
+                "subject_repo": "skillweave", "subject_commit": COMMIT,
                 "command": os.environ["MCP_PY"] + " -c \"print('mcp-transport-ok')\"",
                 "db_path": os.path.join(here, "run.db"),
                 "artifacts_path": os.path.join(here, "artifacts"),
                 "methodology": "assay", "autonomy_policy": "unicorn",
                 "task_id": "task-transport", "attempt": 1,
                 "stream_root": os.path.join(here, "streams"),
+                "artifact_evidence": evidence,
+                "source_root": src,
+                "analysis_root": ana,
             })
             payload = json.loads(call.content[0].text)
             print("CREATE", payload["run_id"], payload["gate_state"], payload["stream"]["durable"])

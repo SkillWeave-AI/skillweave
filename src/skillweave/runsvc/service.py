@@ -41,7 +41,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 
 def _runtime_attr(submodule: str, *names: str):
@@ -238,6 +238,9 @@ class RunApplicationService:
         output_root: Optional[str] = None,
         assay_actor_token: Optional[str] = None,
         assay_envelope: Optional[Any] = None,
+        artifact_evidence: Optional[Sequence[Any]] = None,
+        source_resolver: Optional[Any] = None,
+        analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
     ) -> RunExecution:
         """Run ``command`` through the six-stage integration path.
 
@@ -654,6 +657,9 @@ class RunApplicationService:
                 gate_state=gate_state,
                 verdict_receipt=verdict_receipt,
                 pre_state=assay_pre_state,
+                artifact_evidence=artifact_evidence,
+                source_resolver=source_resolver,
+                analysis_reader=analysis_reader,
             )
 
         final_run = self.store.get_run(run_id)
@@ -1303,6 +1309,120 @@ class RunApplicationService:
             "policy_name": binding.policy_name,
         }
 
+    def _verify_artifact_evidence(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        artifact_evidence: Optional[Sequence[Any]],
+        source_resolver: Optional[Any],
+        analysis_reader: Optional[Callable[[str], Optional[bytes]]],
+    ) -> tuple[list[dict[str, Any]], list[str], bool]:
+        """Verify every artifact's analysis proof graph at the native PASS consumer.
+
+        This is the real Assay PASS ingestion seam, not a helper nobody calls.
+        For each artifact it runs
+        :class:`skillweave.runtime.verify.ArtifactEvidenceVerifier` against the
+        real source (`source_resolver`) and the real analysis bytes
+        (`analysis_reader`). The raw verdict is persisted as its own addressable
+        evidence receipt (``artifact-verify-<run_id>``) so CLI/MCP/replay read
+        the same decision, and it is returned to the drill, which refuses the
+        native PASS unless *every* artifact is admitted.
+
+        No artifact evidence supplied is itself a refusal with a raw reason
+        (``artifact_evidence_missing``): a native Assay run may not bypass
+        artifact-specific semantics by omitting the proof graph. Missing source,
+        a partial graph and schema formatting repair are never fabricated into
+        an admission.
+        """
+        ArtifactEvidenceVerifier = _runtime_attr(
+            "verify", "ArtifactEvidenceVerifier"
+        )
+        verifier = ArtifactEvidenceVerifier()
+
+        verdicts: list[dict[str, Any]] = []
+        if not artifact_evidence:
+            verdicts.append(
+                {
+                    "artifact_id": "",
+                    "admitted": False,
+                    "gate_state": _runtime_attr("verify", "GateState").FAIL,
+                    "reasons": [
+                        "artifact_evidence_missing: a native Assay PASS requires "
+                        "artifact-specific analysis proof; none was supplied"
+                    ],
+                    "schema_authority": "",
+                }
+            )
+        else:
+            for artifact in artifact_evidence:
+                result = verifier.verify(
+                    artifact,
+                    resolver=source_resolver,
+                    analysis_reader=analysis_reader,
+                )
+                verdict = {"artifact_id": "", **result.to_dict()}
+                if isinstance(artifact, dict):
+                    verdict["artifact_id"] = str(artifact.get("artifact_id", ""))
+                verdicts.append(verdict)
+
+        admitted = bool(verdicts) and all(v.get("admitted") for v in verdicts)
+        reasons: list[str] = []
+        for v in verdicts:
+            label = v.get("artifact_id") or "artifact"
+            for reason in v.get("reasons", []):
+                reasons.append(f"{label}: {reason}")
+
+        # Persist the raw artifact-semantics verdict as its own record, so the
+        # decision (and the raw refusal reasons / exact source pins) is durable
+        # and reconstructable by CLI/MCP/replay -- never only returned in memory.
+        try:
+            import hashlib as _hashlib
+
+            ArtifactReceipt = _runtime_attr("registry", "ArtifactReceipt")
+            EvidenceQuality = _runtime_attr("registry", "EvidenceQuality")
+            EvidenceType = _runtime_attr("registry", "EvidenceType")
+            body = _json.dumps(
+                {"admitted": admitted, "verdicts": verdicts},
+                sort_keys=True,
+            ).encode("utf-8")
+            digest = _hashlib.sha256(body).hexdigest()
+            receipt = ArtifactReceipt(
+                artifact_id=f"artifact-verify-{run_id}",
+                sha256=digest,
+                schema_version="1",
+                producer_command="artifact-evidence-verifier",
+                subject_repo="",
+                subject_commit=(
+                    source_resolver.commit() if source_resolver is not None else ""
+                ),
+                created_at=datetime.now(timezone.utc).isoformat(),
+                evidence_type=EvidenceType.ARTIFACT.value,
+                purpose=(
+                    f"artifact-specific semantics for native assay run '{run_id}'"
+                ),
+                method="artifact-evidence-verifier",
+                system_source="runsvc",
+                quality=EvidenceQuality(),
+                metadata={
+                    "run_id": run_id,
+                    "task_id": task_id or run_id,
+                    "attempt": int(attempt),
+                    "admitted": admitted,
+                    "gate_state": (
+                        "pass" if admitted else _runtime_attr("verify", "GateState").FAIL
+                    ),
+                    "reasons": list(reasons),
+                    "verdicts": verdicts,
+                },
+            )
+            self.store.save_evidence(receipt)
+        except Exception:  # noqa: BLE001 - verdict receipt is best-effort durability
+            pass
+
+        return verdicts, reasons, admitted
+
     def _run_assay_drill(
         self,
         *,
@@ -1314,17 +1434,30 @@ class RunApplicationService:
         gate_state: str,
         verdict_receipt: dict[str, Any],
         pre_state: dict[str, Any],
+        artifact_evidence: Optional[Sequence[Any]] = None,
+        source_resolver: Optional[Any] = None,
+        analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
     ) -> dict[str, Any]:
         """Close the native Assay drill after the real probe has run.
 
         The PROBE phase carries the real, already-executed bounded subprocess's
         measured facts (pid/exit/signal/termination — never a verdict);
         MEASURE binds its captured bytes; CLASSIFY is the completion contract's
-        gate; the outcome is PASS only when the gate PASSes *and* the policy can
-        author the terminal transition. Every phase is journaled with the
-        run/task/attempt triple. A terminal phase the autonomy policy cannot
-        author is recorded as a HOLD outcome — a self-declared pass is
-        impossible here.
+        gate *and* the artifact-semantics verdict; the outcome is PASS only when
+        both the completion contract PASSes *and* the artifact-specific
+        semantics admit the proof graph *and* the policy can author the terminal
+        transition. Every phase is journaled with the run/task/attempt triple.
+
+        SW-1510-VERIFY: an artifact-specific proof graph is now mandatory. The
+        artifact evidence (`artifact_evidence`) is verified against the real
+        source (`source_resolver`) and the real analysis artifacts
+        (`analysis_reader`); an empty/narrative-only/README-only graph, an
+        unsupported ``analyzed`` flag, a substituted source field, a phantom or
+        uncovered file, an unjustified N/A, and — critically — an *omitted*
+        proof graph (no evidence supplied at all) each fail the drill. Missing
+        source, a partial graph or a schema repair can never be turned into a
+        PASS here. A terminal phase the autonomy policy cannot author is
+        recorded as a HOLD outcome — a self-declared pass is impossible.
         """
         AssayState = _runtime_attr("assay", "AssayState")
         PolicyBlockedError = _runtime_attr("assay", "PolicyBlockedError")
@@ -1336,7 +1469,28 @@ class RunApplicationService:
         phase_events = pre_state["phase_events"]
 
         raw_bytes = result.stdout or b""
-        gate_is_pass = gate_state == _runtime_attr("verify", "GateState").PASS
+        completion_gate_is_pass = (
+            gate_state == _runtime_attr("verify", "GateState").PASS
+        )
+
+        # SW-1510-VERIFY: artifact-specific semantics are a hard, non-optional
+        # precondition of a native Assay PASS. Each artifact's proof graph is
+        # verified against the real source and the real analysis bytes and its
+        # raw verdict is persisted as its own addressable receipt. No evidence
+        # supplied is itself a refusal — omission is not a bypass.
+        (
+            artifact_verdicts,
+            artifact_reasons,
+            artifact_admitted,
+        ) = self._verify_artifact_evidence(
+            run_id=run_id,
+            task_id=task_id,
+            attempt=attempt,
+            artifact_evidence=artifact_evidence,
+            source_resolver=source_resolver,
+            analysis_reader=analysis_reader,
+        )
+        gate_is_pass = completion_gate_is_pass and artifact_admitted
 
         def record(state: Any, evidence: dict[str, Any]) -> None:
             payload, sequence = self._assay_phase_event(
@@ -1380,6 +1534,23 @@ class RunApplicationService:
             },
         )
 
+        # SW-1510-VERIFY: the artifact-semantics verdict, with its raw reasons
+        # and the exact source pins preserved. This is what turns a completion
+        # gate PASS into (or withholds) a native Assay PASS.
+        record(
+            AssayState.ARTIFACT_VERIFY,
+            {
+                "evidence_type": "decision",
+                "completion_gate_state": gate_state,
+                "artifact_admitted": artifact_admitted,
+                "reasons": list(artifact_reasons),
+                "subject_commit": (
+                    source_resolver.commit() if source_resolver is not None else ""
+                ),
+                "verdicts": artifact_verdicts,
+            },
+        )
+
         # Outcome. A pass (i.e. the gate) requires a terminal phase the policy
         # authorises; if the policy cannot author it, the outcome is HOLD — a
         # self-declared pass is impossible here. The engine itself enforces
@@ -1392,6 +1563,7 @@ class RunApplicationService:
             AssayState.PROBE,
             AssayState.MEASURE,
             AssayState.CLASSIFY,
+            AssayState.ARTIFACT_VERIFY,
         ]
         if gate_is_pass:
             try:
@@ -1413,6 +1585,16 @@ class RunApplicationService:
             except Exception:  # noqa: BLE001
                 pass
             outcome = "hold"
+            if not completion_gate_is_pass:
+                outcome_reason = "completion contract did not pass"
+            else:
+                # The completion gate passed but the artifact-specific
+                # semantics did not: the native PASS is withheld with the raw
+                # refusal reasons, never repaired into a pass.
+                outcome_reason = (
+                    "artifact-specific semantics refused: "
+                    + "; ".join(artifact_reasons)
+                )
 
         record(
             AssayState.PASS if outcome == "pass" else AssayState.HOLD,
@@ -1433,6 +1615,17 @@ class RunApplicationService:
             "outcome": outcome,
             "reason": outcome_reason,
             "gate_state": gate_state,
+            # SW-1510-VERIFY: the completion contract and the artifact-specific
+            # semantics stay separate facts; the native outcome requires both.
+            "completion_gate_state": gate_state,
+            "artifact_evidence": {
+                "admitted": artifact_admitted,
+                "reasons": list(artifact_reasons),
+                "subject_commit": (
+                    source_resolver.commit() if source_resolver is not None else ""
+                ),
+                "verdicts": artifact_verdicts,
+            },
             "child_execution": {
                 "pid": result.pid,
                 "exit_code": result.exit_code,
@@ -2336,6 +2529,9 @@ class RunApplicationService:
         output_root: Optional[str] = None,
         assay_actor_token: Optional[str] = None,
         assay_envelope: Optional[Any] = None,
+        artifact_evidence: Optional[Sequence[Any]] = None,
+        source_resolver: Optional[Any] = None,
+        analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
     ) -> dict[str, Any]:
         """Protected native execution whose output is durably streamed.
 
@@ -2766,6 +2962,9 @@ class RunApplicationService:
                 gate_state=gate_state,
                 verdict_receipt=verdict_receipt,
                 pre_state=assay_pre_state,
+                artifact_evidence=artifact_evidence,
+                source_resolver=source_resolver,
+                analysis_reader=analysis_reader,
             )
 
         out = {
