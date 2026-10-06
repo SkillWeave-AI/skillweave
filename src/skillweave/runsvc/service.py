@@ -80,6 +80,29 @@ def _is_full_sha(value: Any) -> bool:
     return True
 
 
+#: The subject kind whose base is a Git commit (``RepositorySubject``). Only
+#: this kind carries a ``commit`` that an executor receipt can be checked
+#: against; a content/configuration/deployment/incident subject never has a Git
+#: base and is never forced to synthesize one.
+_BOUND_GIT_SUBJECT_KIND = "repository"
+
+
+def _work_contract_bound_base(work_contract: Any) -> Optional[str]:
+    """The Git base an exact-source binding pins, or ``None`` when unpinned.
+
+    An exact-source binding exists when the run is executed under a model
+    :class:`~skillweave.dispatch.work_contract.WorkContract` whose subject is
+    the **repository (Git)** variant: its ``commit`` is the expected base the
+    executor receipt must match. A non-Git subject (content / configuration /
+    deployment / incident) carries no Git base and therefore pins nothing here.
+    """
+    subject = getattr(work_contract, "subject", None)
+    if getattr(subject, "kind", None) != _BOUND_GIT_SUBJECT_KIND:
+        return None
+    commit = getattr(subject, "commit", None)
+    return commit if isinstance(commit, str) and commit else None
+
+
 @dataclass(frozen=True)
 class _MethodologyBinding:
     """A resolved, validated methodology binding for one run.
@@ -249,9 +272,11 @@ class RunApplicationService:
         SDK run-snapshot and attempt-event contracts carry. ``task_id``
         defaults to ``run_id`` for the single-task legacy path.
 
-        ``subject_commit`` must be a full 40-hex Git SHA: the receipt binds the
-        run to an *exact* immutable base, so an abbreviated, mis-formatted or
-        fabricated commit is refused before any run state is written.
+        When an *exact-source binding* is present -- a ``work_contract`` whose
+        subject is the repository (Git) variant -- ``subject_commit`` must match
+        that bound base and be a full 40-hex SHA, so a tampered or abbreviated
+        commit is refused before any run state is written. A bare call with no
+        bound base is not a tamper and is not subjected to the check.
 
         When ``authority_service`` is supplied, the host authenticates the
         worker at *ingress*: ``worker_token`` must verify against the host
@@ -312,18 +337,24 @@ class RunApplicationService:
             autonomy_policy=autonomy_policy,
         )
 
-        # Bind the run to an *exact* source base before any state is written. A
-        # short/abbreviated or non-hex commit is refused at this execute/receipt
-        # seam, so a receipt can never record a tampered or fabricated subject
-        # (criterion 3). This is the same full-40-hex discipline the hosted
-        # ``RepositorySubject`` applies; it sits after the pre-existing
-        # methodology/identity refusals so their precedence is unchanged, and
-        # strictly before the first ``create_run``/``transition`` write.
-        if not _is_full_sha(subject_commit):
+        # Where an *exact-source binding* exists, the receipt must match the
+        # base that binding pins -- refuse a mismatch, or a commit that is not a
+        # full 40-hex SHA. The binding is the run's WorkContract repository
+        # subject (the same Git base the dispatch/sequence carries). A bare
+        # ``execute`` with NO bound base is not a tamper: it behaves exactly as
+        # before (criterion 3 applies at a bound hop, not to every caller).
+        # This sits after the pre-existing methodology/identity refusals so
+        # their precedence is unchanged, and strictly before the first
+        # ``create_run``/``transition`` write.
+        bound_base = _work_contract_bound_base(work_contract)
+        if bound_base is not None and (
+            not _is_full_sha(subject_commit) or subject_commit != bound_base
+        ):
             raise RunIntegrationError(
                 "subject",
-                f"subject_commit must be a full 40-hex SHA, got {subject_commit!r}; "
-                f"refusing to bind a receipt to a non-immutable base",
+                f"subject_commit {subject_commit!r} does not match the bound "
+                f"base {bound_base!r}; refusing to bind a receipt to a "
+                f"tampered or non-immutable subject",
             )
 
         run_command = _runtime_attr("runner_adapter", "run_command")
@@ -2008,9 +2039,11 @@ class RunApplicationService:
         ``methodology`` / ``autonomy_policy`` / ``session_schedule`` are carried
         as three *separate* fields, exactly as on the bounded path, so the
         streaming sibling preserves the same three-field intent and never
-        conflates them. ``subject_commit`` must be a full 40-hex SHA: the
-        receipt binds the streamed attempt to an exact immutable base, so a
-        short or fabricated commit is refused before any run state is written.
+        conflates them. When an exact-source binding is present (a
+        ``work_contract`` with a repository subject), ``subject_commit`` must
+        match that bound base and be a full 40-hex SHA, so a short or tampered
+        commit is refused before any run state is written; a bare streaming call
+        with no bound base is not subjected to the check.
 
         Scope/envelope enforcement and the native Assay methodology are
         *composed independently* by the owning lane; this method exposes the
@@ -2062,16 +2095,20 @@ class RunApplicationService:
 
         created_at = created_at or datetime.now(timezone.utc).isoformat()
 
-        # Bind the run to an *exact* source base before any state is written,
-        # exactly as the bounded ``execute`` path does and at the same point in
-        # the preflight order (after the methodology/identity refusals, before
-        # the first ``create_run``/``transition``): a short/fabricated commit is
-        # refused, so a receipt can never record a tampered subject.
-        if not _is_full_sha(subject_commit):
+        # Where an exact-source binding exists, the receipt must match the base
+        # that binding pins -- exactly as the bounded ``execute`` path checks,
+        # at the same point in the preflight order (after the methodology/
+        # identity refusals, before the first ``create_run``/``transition``). A
+        # bare streaming call with no bound base is not a tamper.
+        bound_base = _work_contract_bound_base(work_contract)
+        if bound_base is not None and (
+            not _is_full_sha(subject_commit) or subject_commit != bound_base
+        ):
             raise RunIntegrationError(
                 "subject",
-                f"subject_commit must be a full 40-hex SHA, got {subject_commit!r}; "
-                f"refusing to bind a receipt to a non-immutable base",
+                f"subject_commit {subject_commit!r} does not match the bound "
+                f"base {bound_base!r}; refusing to bind a receipt to a "
+                f"tampered or non-immutable subject",
             )
 
         EventType = _runtime_attr("journal", "EventType")

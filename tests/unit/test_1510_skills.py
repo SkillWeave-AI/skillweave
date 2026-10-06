@@ -71,6 +71,7 @@ from skillweave.dispatch.contracts import (  # noqa: E402
 from skillweave.dispatch.work_contract import (  # noqa: E402
     SUBJECT_CONFIGURATION,
     ConfigurationSubject,
+    RepositorySubject,
     WorkContract,
 )
 from skillweave.runsvc import RunApplicationService, RunIntegrationError  # noqa: E402
@@ -138,6 +139,25 @@ def _service():
     journal = EventJournal(":memory:")
     raw = RawArtifactStore(None)
     return RunApplicationService(store, journal, raw), store, journal, raw
+
+
+class _Auth:
+    """A minimal host authority stub that authenticates a bound worker.
+
+    A run *under a work contract* is an auth-scoped launch: the caller supplies
+    an authenticated worker credential. This stub returns a no-role credential
+    bound to the presented run, exactly as the scope-lane stub does. The
+    bound-base refusal fires in preflight, strictly before the scope/isolation
+    machinery, so no real confinement capability is required to observe it.
+    """
+
+    def __init__(self, run_id: str) -> None:
+        self._run_id = run_id
+
+    def verify_credential(self, token):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(roles=set(), attempt_key=(self._run_id, "a"))
 
 
 def _compile(sequence: dict) -> dict:
@@ -586,6 +606,21 @@ def test_unsupported_envelope_version_is_refused():
 # Criterion 3: one source-owned fixture traverses the whole chain
 # ---------------------------------------------------------------------------
 
+def _repository_bound_contract(base: str) -> WorkContract:
+    """A work contract whose subject pins the exact fixture base.
+
+    This is the *exact-source binding* the receipt hop compares against: the
+    contract's repository subject carries the expected commit, and the executor
+    must bind a receipt to that same base (a mismatch is refused). Mirrors the
+    Git dispatch lane's ``RepositorySubject``.
+    """
+    return WorkContract(
+        id="SW-1510-SKILLS-1",
+        subject=RepositorySubject(repo="skillweave/skillweave", commit=base),
+        authority="ops",
+    )
+
+
 def test_fixture_is_source_owned_and_pins_the_base():
     for path in (
         PRD_JSON,
@@ -739,8 +774,9 @@ def test_chain_execute_produces_receipt_bound_to_source_and_base():
 
 
 def test_chain_execute_refuses_a_tampered_short_source_base():
-    # Criterion 3: the exact-source binding is refused at the execute/receipt
-    # seam when the base is not a full 40-hex SHA. A tampered/abbreviated commit
+    # Criterion 3: WHERE an exact-source binding exists (the run's WorkContract
+    # repository subject pins the expected base), the execute/receipt seam
+    # refuses a base that is not a full 40-hex SHA. A tampered/abbreviated commit
     # must never be bound into a receipt.
     service, store, journal, raw = _service()
     with pytest.raises(RunIntegrationError) as excinfo:
@@ -755,7 +791,58 @@ def test_chain_execute_refuses_a_tampered_short_source_base():
             methodology="assay",
             autonomy_policy="unicorn",
             session_schedule="batch",
+            authority_service=_Auth("sw1510-skills-short"),
+            worker_token="tok",
+            work_contract=_repository_bound_contract(FIXTURE_BASE),
         )
     assert excinfo.value.stage == "subject"
     # The refusal fails closed before any receipt exists.
     assert store.get_evidence("runsvc-sw1510-skills-short") is None
+
+
+def test_chain_execute_refuses_a_base_that_mismatches_the_binding():
+    # Criterion 3: at a bound hop a *full-length but different* base is a tamper
+    # too -- the receipt must bind the exact base the contract pins, not merely
+    # any well-formed SHA. This is the mismatch half of the binding check.
+    service, store, journal, raw = _service()
+    other_full = "0" * 40
+    assert FIXTURE_BASE != other_full and len(other_full) == 40
+    with pytest.raises(RunIntegrationError) as excinfo:
+        service.execute(
+            [sys.executable, "-c", "print('must not run')"],
+            run_id="sw1510-skills-mismatch",
+            tool="native",
+            model="declared-methodology",
+            subject_repo="skillweave/skillweave",
+            subject_commit=other_full,
+            created_at="2026-10-05T00:00:00Z",
+            methodology="assay",
+            autonomy_policy="unicorn",
+            authority_service=_Auth("sw1510-skills-mismatch"),
+            worker_token="tok",
+            work_contract=_repository_bound_contract(FIXTURE_BASE),
+        )
+    assert excinfo.value.stage == "subject"
+    assert store.get_evidence("runsvc-sw1510-skills-mismatch") is None
+
+
+def test_chain_bare_execute_with_no_bound_base_behaves_as_before():
+    # The strict base check is scoped to a *bound* hop (criterion 3). With no
+    # exact-source binding present, a synthetic short commit is NOT a tamper and
+    # the bare execute behaves exactly as before: it runs and produces a receipt
+    # recording the caller's value. This is the boundary the controller named --
+    # do not reintroduce a global 40-hex gate.
+    service, store, journal, raw = _service()
+    result = service.execute(
+        [sys.executable, "-c", "print('unbound-ok')"],
+        run_id="sw1510-skills-unbound",
+        tool="native",
+        model="declared-methodology",
+        subject_repo="r",
+        subject_commit="c",
+        created_at="2026-10-05T00:00:00Z",
+        methodology="assay",
+        autonomy_policy="unicorn",
+    )
+    assert b"unbound-ok" in result.raw_bytes
+    assert result.receipt.subject_commit == "c"
