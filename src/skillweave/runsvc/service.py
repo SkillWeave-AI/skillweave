@@ -1763,6 +1763,7 @@ class RunApplicationService:
         attempt: Optional[int] = None,
         task_id: Optional[str] = None,
         restarted_from: Optional[dict[str, Any]] = None,
+        reservation_envelope: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Start *command* as a detached background process.
 
@@ -1801,13 +1802,37 @@ class RunApplicationService:
         # ``restarted_from`` -- it is never the same attempt "restarted" by a
         # bare database transition.  ``root_run_id`` ties the attempt chain
         # together; ``attempt`` is monotonically increasing within the chain.
+        effective_task_id = task_id or rid
+        effective_attempt = int(attempt) if attempt is not None else 1
         lineage: dict[str, Any] = {
             "root_run_id": root_run_id or rid,
             "parent_run_id": parent_run_id,
-            "attempt": int(attempt) if attempt is not None else 1,
-            "task_id": task_id,
+            "attempt": effective_attempt,
+            "task_id": effective_task_id,
             "restarted_from": dict(restarted_from) if restarted_from else None,
         }
+
+        # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the detached
+        # child is launched.  The async/restart path must be admitted through
+        # the same reservation gate as the synchronous execute paths.  The
+        # envelope is resolved via fallback_task_scope inheritance (the ingress
+        # is responsible for persisting the owner envelope).  On launch failure
+        # the slot is cancelled; on child completion the wrapper completes it.
+        reservation_rec = None
+        scope_id = f"{effective_task_id}/attempt-{effective_attempt}"
+        if self.reservation_store is not None:
+            try:
+                reservation_rec = self.reservation_store.reserve(
+                    run_id=rid,
+                    task_id=effective_task_id,
+                    attempt=effective_attempt,
+                    scope_id=scope_id,
+                    idempotency_key=f"start_async:{rid}:{scope_id}",
+                    envelope=reservation_envelope,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RunIntegrationError(
+                    "reservation", f"async reservation refused: {exc}") from exc
 
         # Store initial lifecycle metadata BEFORE launching the child, so the
         # wrapper starts at version 2 (not version 1).  This prevents a race
@@ -1829,17 +1854,28 @@ class RunApplicationService:
 
         # Build the detached wrapper script that writes completion/error
         # back to the same kernel store.
+        reservation_id_arg = (reservation_rec.reservation_id
+                              if reservation_rec is not None else "")
         wrapper_src = (
             "import subprocess, sys, json, os, signal\n"
             "rid = sys.argv[1]\n"
             "db_path = sys.argv[2]\n"
-            "cmd = sys.argv[3:]\n"
+            "reservation_id = sys.argv[3]\n"
+            "cmd = sys.argv[4:]\n"
             "from skillweave.runtime.store import SQLiteRunStore, RunStateModel, CompletionReconciler\n"
             "from skillweave.runtime.journal import EventJournal\n"
+            "from skillweave.runtime.reservation import ReservationStore\n"
             "store = SQLiteRunStore(db_path)\n"
             "journal = EventJournal(db_path)\n"
+            "reservation_store = ReservationStore(db_path) if reservation_id else None\n"
             "journal.append(rid, event_type='started',\n"
             "    payload={'command': cmd})\n"
+            "def _complete_reservation():\n"
+            "    if reservation_store is not None and reservation_id:\n"
+            "        try:\n"
+            "            reservation_store.complete(reservation_id)\n"
+            "        except Exception:\n"
+            "            pass\n"
             "def _complete(lifecycle, event_type, payload, key, reason):\n"
             "    CompletionReconciler(\n"
             "        store, rid,\n"
@@ -1858,11 +1894,13 @@ class RunApplicationService:
             "        {'lifecycle_state': 'succeeded' if rc == 0 else 'failed', 'exit_code': rc},\n"
             "        'finished', {'returncode': rc, 'stdout_preview': stdout_text[:1024]},\n"
             "        'wrapper:finish:' + rid + ':' + str(rc), 'wrapper: process completed')\n"
+            "    _complete_reservation()\n"
             "except Exception as exc:\n"
             "    _complete(\n"
             "        {'lifecycle_state': 'failed', 'exit_code': -1},\n"
             "        'error', {'error': str(exc)},\n"
             "        'wrapper:error:' + rid, 'wrapper: error: ' + str(exc))\n"
+            "    _complete_reservation()\n"
             "finally:\n"
             "    store.close()\n"
             "    journal.close()\n"
@@ -1880,15 +1918,25 @@ class RunApplicationService:
             if _sp not in _pp:
                 _env["PYTHONPATH"] = _pp + ":" + _sp if _pp else _sp
 
-        proc = subprocess.Popen(
-            [sys.executable, "-c", wrapper_src, rid, db_path] + list(command),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=child_cwd,
-            env=_env,
-        )
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", wrapper_src, rid, db_path,
+                 reservation_id_arg] + list(command),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=child_cwd,
+                env=_env,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Launch failure: cancel the reservation slot before propagating.
+            if reservation_rec is not None and self.reservation_store is not None:
+                try:
+                    self.reservation_store.cancel(reservation_rec.reservation_id)
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
+            raise RunIntegrationError("launch", f"async Popen failed: {exc}") from exc
 
         now = datetime.now(timezone.utc).isoformat()
 
@@ -2221,6 +2269,7 @@ class RunApplicationService:
         project_root: Optional[Path] = None,
         cwd: Optional[Path] = None,
         _env: Optional[dict[str, str]] = None,
+        reservation_envelope: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Launch a NEW identified attempt that continues *run_id*.
 
@@ -2319,6 +2368,7 @@ class RunApplicationService:
             attempt=next_attempt,
             task_id=task_id,
             restarted_from=restarted_from,
+            reservation_envelope=reservation_envelope,
         )
         result["parent_run_id"] = run_id
         result["root_run_id"] = root_run_id

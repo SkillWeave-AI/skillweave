@@ -125,6 +125,7 @@ def start_async(
     project_root: Optional[Path] = None,
     run_id: Optional[str] = None,
     cwd: Optional[Path] = None,
+    reservation_envelope: Optional[Any] = None,
 ) -> RunHandle:
     """Start *command* as a detached background process.
 
@@ -181,6 +182,7 @@ def start_async(
         cwd=Path(child_cwd),
         project_root=root,
         _env=env,
+        reservation_envelope=reservation_envelope,
     )
 
     return RunHandle(
@@ -455,6 +457,7 @@ def restart_attempt(
     project_root: Optional[Path] = None,
     cwd: Optional[Path] = None,
     idempotency_key: Optional[str] = None,
+    reservation_envelope: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Launch a NEW identified attempt that continues *run_id*.
 
@@ -489,6 +492,7 @@ def restart_attempt(
         cwd=cwd or root,
         idempotency_key=idempotency_key,
         _env=env,
+        reservation_envelope=reservation_envelope,
     )
 
 
@@ -497,6 +501,7 @@ def _service_for(project_root: Optional[Path]):
     from skillweave.runtime.store import SQLiteRunStore
     from skillweave.runtime.journal import EventJournal
     from skillweave.runtime.registry import RawArtifactStore
+    from skillweave.runtime.reservation import ReservationStore
     from skillweave.runsvc.service import RunApplicationService
 
     root = Path(project_root or Path.cwd()).resolve()
@@ -504,7 +509,8 @@ def _service_for(project_root: Optional[Path]):
     (root / ".skillweave").mkdir(parents=True, exist_ok=True)
     kernel_store = SQLiteRunStore(db_path)
     service = RunApplicationService(
-        kernel_store, EventJournal(kernel_store), RawArtifactStore()
+        kernel_store, EventJournal(kernel_store), RawArtifactStore(),
+        reservation_store=ReservationStore(db_path),
     )
     return kernel_store, service, root
 
