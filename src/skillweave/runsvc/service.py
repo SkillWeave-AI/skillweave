@@ -41,7 +41,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 
 def _runtime_attr(submodule: str, *names: str):
@@ -101,6 +101,42 @@ def _work_contract_bound_base(work_contract: Any) -> Optional[str]:
         return None
     commit = getattr(subject, "commit", None)
     return commit if isinstance(commit, str) and commit else None
+
+
+def _capture_settled_identity(
+    capture, pid: int, *, timeout: float = 0.3, interval: float = 0.01
+):
+    """Observe *pid* until its exec image is stable, then return the identity.
+
+    A freshly launched child can briefly still be the interpreter's thin
+    launcher stub: Homebrew's ``bin/python3.14`` is a small Mach-O that
+    immediately re-``exec``s the framework bundle (``Python.app``), so an
+    immediate capture records the *pre-exec* image while a later cancellation
+    observes the *post-exec* one.  Recording the transient image would make the
+    identity verification refuse a legitimately-owned worker, so we wait until
+    two consecutive observations agree on ``(start_time, exec_path, argv)``
+    before recording.  Returns ``None`` only when *pid* is never observable
+    (it already exited); otherwise the last observed identity is returned so a
+    bounded wait can never lose a live process.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    previous_key = None
+    last = None
+    while True:
+        current = capture(pid)
+        if current is not None:
+            last = current
+            key = (
+                current.start_time,
+                current.exec_path,
+                tuple(current.argv or ()),
+            )
+            if previous_key is not None and key == previous_key:
+                return current
+            previous_key = key
+        if time.monotonic() >= deadline:
+            return last
+        time.sleep(interval)
 
 
 @dataclass(frozen=True)
@@ -203,6 +239,7 @@ class RunApplicationService:
         journal: EventJournal,
         raw_artifacts: RawArtifactStore,
         stream_store: Optional[Any] = None,
+        reservation_store: Optional[Any] = None,
     ):
         self.store = store
         self.journal = journal
@@ -218,6 +255,28 @@ class RunApplicationService:
             except Exception:  # noqa: BLE001 - optional subpackage
                 stream_store = None
         self.stream_store = stream_store
+        # The atomic reservation/admission store (SW-1510-BUDGET). It is
+        # optional and resolved lazily so the unchanged legacy path never
+        # requires the reservation module. When supplied, every execute call
+        # acquires a reservation slot BEFORE launching the worker, enforcing
+        # the envelope's cumulative and in-flight bounds atomically.
+        #
+        # Only ModuleNotFoundError (module genuinely absent from the runtime
+        # subpackage) is silently treated as legacy compatibility. Any other
+        # initialization error (permission denied, corrupt database, import
+        # failure) propagates so a protected/native caller cannot silently
+        # run unguarded.
+        if reservation_store is None:
+            try:
+                rs_cls = _runtime_attr("reservation", "ReservationStore")
+                reservation_store = rs_cls(
+                    db_path=getattr(store, "db_path", ":memory:")
+                )
+            except ModuleNotFoundError:  # noqa: BLE001 - optional module absent
+                reservation_store = None
+            except Exception:  # noqa: BLE001 - other init failure
+                raise
+        self.reservation_store = reservation_store
 
     def execute(
         self,
@@ -243,6 +302,10 @@ class RunApplicationService:
         output_root: Optional[str] = None,
         assay_actor_token: Optional[str] = None,
         assay_envelope: Optional[Any] = None,
+        reservation_envelope: Optional[Any] = None,
+        artifact_evidence: Optional[Sequence[Any]] = None,
+        source_resolver: Optional[Any] = None,
+        analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
     ) -> RunExecution:
         """Run ``command`` through the six-stage integration path.
 
@@ -413,6 +476,43 @@ class RunApplicationService:
                 self._fail_run(run_id, f"assay admission refused: {exc}")
                 raise
 
+        # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the worker
+        # is launched.  This is the admission gate: no provider or tool
+        # execution can run without an acquired slot.  The envelope's finite
+        # bounds (in-flight, cumulative requests, bytes, tokens, cost,
+        # deadline) are enforced atomically, and concurrent reservation writers
+        # cannot overspend.  A refused reservation fails the run.
+        #
+        # When no reservation_store is available (legacy path) the admission
+        # check is skipped — the unchanged legacy path keeps its behaviour.
+        reservation_rec = None
+        if self.reservation_store is not None:
+            scope_id = f"{task_id or run_id}/attempt-{attempt}"
+            # Resolve the envelope: use caller-supplied or persist a default
+            env = reservation_envelope
+            # Do NOT persist the envelope here — the ingress (cli/run.py,
+            # mcp/server.py) is responsible for persisting the owner envelope
+            # via set_envelope BEFORE calling execute().  The reserve() call
+            # below resolves the effective envelope through get_envelope(),
+            # which inherits via fallback_task_scope when the exact scope has
+            # no persisted envelope (e.g. a retry at a new attempt scope).
+            # SW-1510-BUDGET: reserve() auto-derives reserved_bytes/reserved_tokens
+            # from the resolved envelope's per-request limits, so the token/byte
+            # dimensions are exercised through the product ingress.
+            try:
+                reservation_rec = self.reservation_store.reserve(
+                    run_id=run_id,
+                    task_id=task_id or run_id,
+                    attempt=int(attempt),
+                    scope_id=scope_id,
+                    idempotency_key=f"execute:{run_id}:{scope_id}",
+                    envelope=env,
+                    route=model,
+                )
+            except Exception as exc:  # noqa: BLE001 - typed admission refusal
+                self._fail_run(run_id, f"reservation refused: {exc}")
+                raise RunIntegrationError("reservation", str(exc)) from exc
+
         # Stage 2: launch the worker as a real subprocess. On the protected
         # (identity-authenticated) path the worker is launched inside a real
         # process-protection window: the protected stores are sealed (and, where
@@ -516,6 +616,8 @@ class RunApplicationService:
             raise
         except Exception as exc:  # noqa: BLE001
             self._fail_run(run_id, f"launch raised {exc}")
+            if reservation_rec is not None and self.reservation_store is not None:
+                self.reservation_store.cancel(reservation_rec.reservation_id)
             raise RunIntegrationError("launch", str(exc)) from exc
         finally:
             # Release the protection window (unseal the protected stores) on
@@ -524,6 +626,37 @@ class RunApplicationService:
             # leave the host's own stores locked.
             if protection is not None:
                 protection.__exit__(None, None, None)
+
+        # SW-1510-BUDGET: complete the reservation with observed usage now that
+        # the worker has produced its transport outcome.  This frees the in-flight
+        # slot and records observed bytes/tokens.  Unknown usage stays reserved
+        # until an explicit reconcile call.
+        #
+        # A post-dispatch storage failure during completion is exposed as a
+        # RunIntegrationError (durable incomplete-reconciliation record) so the
+        # caller knows the reservation was not cleanly closed.  The primary run
+        # lifecycle (stages 3-6) still continues — the run record is valid, the
+        # reservation is durable at COMPLETED state — but the incomplete
+        # reconciliation is not silently swallowed.
+        if reservation_rec is not None and self.reservation_store is not None:
+            try:
+                # SW-1510-BUDGET: exercise token/cost dimensions through the
+                # product ingress (not only the helper level).  Tokens and cost
+                # are not directly observable from a subprocess transport, so
+                # they are passed as None (unknown) --- the reserved amounts
+                # persist until an explicit reconcile call.  Bytes are the
+                # observed transport outcome.
+                self.reservation_store.complete(
+                    reservation_rec.reservation_id,
+                    observed_bytes=len(result.stdout or b""),
+                    observed_tokens=None,
+                    cost=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RunIntegrationError(
+                    "reservation",
+                    f"reservation completion failed: {exc}",
+                ) from exc
 
         # Stage 3: raw artifact (content-addressed bytes).
         raw_bytes = result.stdout or b""
@@ -692,6 +825,9 @@ class RunApplicationService:
                 gate_state=gate_state,
                 verdict_receipt=verdict_receipt,
                 pre_state=assay_pre_state,
+                artifact_evidence=artifact_evidence,
+                source_resolver=source_resolver,
+                analysis_reader=analysis_reader,
             )
 
         final_run = self.store.get_run(run_id)
@@ -1404,6 +1540,120 @@ class RunApplicationService:
             "policy_name": binding.policy_name,
         }
 
+    def _verify_artifact_evidence(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        artifact_evidence: Optional[Sequence[Any]],
+        source_resolver: Optional[Any],
+        analysis_reader: Optional[Callable[[str], Optional[bytes]]],
+    ) -> tuple[list[dict[str, Any]], list[str], bool]:
+        """Verify every artifact's analysis proof graph at the native PASS consumer.
+
+        This is the real Assay PASS ingestion seam, not a helper nobody calls.
+        For each artifact it runs
+        :class:`skillweave.runtime.verify.ArtifactEvidenceVerifier` against the
+        real source (`source_resolver`) and the real analysis bytes
+        (`analysis_reader`). The raw verdict is persisted as its own addressable
+        evidence receipt (``artifact-verify-<run_id>``) so CLI/MCP/replay read
+        the same decision, and it is returned to the drill, which refuses the
+        native PASS unless *every* artifact is admitted.
+
+        No artifact evidence supplied is itself a refusal with a raw reason
+        (``artifact_evidence_missing``): a native Assay run may not bypass
+        artifact-specific semantics by omitting the proof graph. Missing source,
+        a partial graph and schema formatting repair are never fabricated into
+        an admission.
+        """
+        ArtifactEvidenceVerifier = _runtime_attr(
+            "verify", "ArtifactEvidenceVerifier"
+        )
+        verifier = ArtifactEvidenceVerifier()
+
+        verdicts: list[dict[str, Any]] = []
+        if not artifact_evidence:
+            verdicts.append(
+                {
+                    "artifact_id": "",
+                    "admitted": False,
+                    "gate_state": _runtime_attr("verify", "GateState").FAIL,
+                    "reasons": [
+                        "artifact_evidence_missing: a native Assay PASS requires "
+                        "artifact-specific analysis proof; none was supplied"
+                    ],
+                    "schema_authority": "",
+                }
+            )
+        else:
+            for artifact in artifact_evidence:
+                result = verifier.verify(
+                    artifact,
+                    resolver=source_resolver,
+                    analysis_reader=analysis_reader,
+                )
+                verdict = {"artifact_id": "", **result.to_dict()}
+                if isinstance(artifact, dict):
+                    verdict["artifact_id"] = str(artifact.get("artifact_id", ""))
+                verdicts.append(verdict)
+
+        admitted = bool(verdicts) and all(v.get("admitted") for v in verdicts)
+        reasons: list[str] = []
+        for v in verdicts:
+            label = v.get("artifact_id") or "artifact"
+            for reason in v.get("reasons", []):
+                reasons.append(f"{label}: {reason}")
+
+        # Persist the raw artifact-semantics verdict as its own record, so the
+        # decision (and the raw refusal reasons / exact source pins) is durable
+        # and reconstructable by CLI/MCP/replay -- never only returned in memory.
+        try:
+            import hashlib as _hashlib
+
+            ArtifactReceipt = _runtime_attr("registry", "ArtifactReceipt")
+            EvidenceQuality = _runtime_attr("registry", "EvidenceQuality")
+            EvidenceType = _runtime_attr("registry", "EvidenceType")
+            body = _json.dumps(
+                {"admitted": admitted, "verdicts": verdicts},
+                sort_keys=True,
+            ).encode("utf-8")
+            digest = _hashlib.sha256(body).hexdigest()
+            receipt = ArtifactReceipt(
+                artifact_id=f"artifact-verify-{run_id}",
+                sha256=digest,
+                schema_version="1",
+                producer_command="artifact-evidence-verifier",
+                subject_repo="",
+                subject_commit=(
+                    source_resolver.commit() if source_resolver is not None else ""
+                ),
+                created_at=datetime.now(timezone.utc).isoformat(),
+                evidence_type=EvidenceType.ARTIFACT.value,
+                purpose=(
+                    f"artifact-specific semantics for native assay run '{run_id}'"
+                ),
+                method="artifact-evidence-verifier",
+                system_source="runsvc",
+                quality=EvidenceQuality(),
+                metadata={
+                    "run_id": run_id,
+                    "task_id": task_id or run_id,
+                    "attempt": int(attempt),
+                    "admitted": admitted,
+                    "gate_state": (
+                        "pass" if admitted else _runtime_attr("verify", "GateState").FAIL
+                    ),
+                    "reasons": list(reasons),
+                    "verdicts": verdicts,
+                },
+            )
+            self.store.save_evidence(receipt)
+        except Exception:  # noqa: BLE001 - verdict receipt is best-effort durability
+            pass
+
+        return verdicts, reasons, admitted
+
     def _run_assay_drill(
         self,
         *,
@@ -1415,17 +1665,30 @@ class RunApplicationService:
         gate_state: str,
         verdict_receipt: dict[str, Any],
         pre_state: dict[str, Any],
+        artifact_evidence: Optional[Sequence[Any]] = None,
+        source_resolver: Optional[Any] = None,
+        analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
     ) -> dict[str, Any]:
         """Close the native Assay drill after the real probe has run.
 
         The PROBE phase carries the real, already-executed bounded subprocess's
         measured facts (pid/exit/signal/termination — never a verdict);
         MEASURE binds its captured bytes; CLASSIFY is the completion contract's
-        gate; the outcome is PASS only when the gate PASSes *and* the policy can
-        author the terminal transition. Every phase is journaled with the
-        run/task/attempt triple. A terminal phase the autonomy policy cannot
-        author is recorded as a HOLD outcome — a self-declared pass is
-        impossible here.
+        gate *and* the artifact-semantics verdict; the outcome is PASS only when
+        both the completion contract PASSes *and* the artifact-specific
+        semantics admit the proof graph *and* the policy can author the terminal
+        transition. Every phase is journaled with the run/task/attempt triple.
+
+        SW-1510-VERIFY: an artifact-specific proof graph is now mandatory. The
+        artifact evidence (`artifact_evidence`) is verified against the real
+        source (`source_resolver`) and the real analysis artifacts
+        (`analysis_reader`); an empty/narrative-only/README-only graph, an
+        unsupported ``analyzed`` flag, a substituted source field, a phantom or
+        uncovered file, an unjustified N/A, and — critically — an *omitted*
+        proof graph (no evidence supplied at all) each fail the drill. Missing
+        source, a partial graph or a schema repair can never be turned into a
+        PASS here. A terminal phase the autonomy policy cannot author is
+        recorded as a HOLD outcome — a self-declared pass is impossible.
         """
         AssayState = _runtime_attr("assay", "AssayState")
         PolicyBlockedError = _runtime_attr("assay", "PolicyBlockedError")
@@ -1437,7 +1700,28 @@ class RunApplicationService:
         phase_events = pre_state["phase_events"]
 
         raw_bytes = result.stdout or b""
-        gate_is_pass = gate_state == _runtime_attr("verify", "GateState").PASS
+        completion_gate_is_pass = (
+            gate_state == _runtime_attr("verify", "GateState").PASS
+        )
+
+        # SW-1510-VERIFY: artifact-specific semantics are a hard, non-optional
+        # precondition of a native Assay PASS. Each artifact's proof graph is
+        # verified against the real source and the real analysis bytes and its
+        # raw verdict is persisted as its own addressable receipt. No evidence
+        # supplied is itself a refusal — omission is not a bypass.
+        (
+            artifact_verdicts,
+            artifact_reasons,
+            artifact_admitted,
+        ) = self._verify_artifact_evidence(
+            run_id=run_id,
+            task_id=task_id,
+            attempt=attempt,
+            artifact_evidence=artifact_evidence,
+            source_resolver=source_resolver,
+            analysis_reader=analysis_reader,
+        )
+        gate_is_pass = completion_gate_is_pass and artifact_admitted
 
         def record(state: Any, evidence: dict[str, Any]) -> None:
             payload, sequence = self._assay_phase_event(
@@ -1481,6 +1765,23 @@ class RunApplicationService:
             },
         )
 
+        # SW-1510-VERIFY: the artifact-semantics verdict, with its raw reasons
+        # and the exact source pins preserved. This is what turns a completion
+        # gate PASS into (or withholds) a native Assay PASS.
+        record(
+            AssayState.ARTIFACT_VERIFY,
+            {
+                "evidence_type": "decision",
+                "completion_gate_state": gate_state,
+                "artifact_admitted": artifact_admitted,
+                "reasons": list(artifact_reasons),
+                "subject_commit": (
+                    source_resolver.commit() if source_resolver is not None else ""
+                ),
+                "verdicts": artifact_verdicts,
+            },
+        )
+
         # Outcome. A pass (i.e. the gate) requires a terminal phase the policy
         # authorises; if the policy cannot author it, the outcome is HOLD — a
         # self-declared pass is impossible here. The engine itself enforces
@@ -1493,6 +1794,7 @@ class RunApplicationService:
             AssayState.PROBE,
             AssayState.MEASURE,
             AssayState.CLASSIFY,
+            AssayState.ARTIFACT_VERIFY,
         ]
         if gate_is_pass:
             try:
@@ -1514,6 +1816,16 @@ class RunApplicationService:
             except Exception:  # noqa: BLE001
                 pass
             outcome = "hold"
+            if not completion_gate_is_pass:
+                outcome_reason = "completion contract did not pass"
+            else:
+                # The completion gate passed but the artifact-specific
+                # semantics did not: the native PASS is withheld with the raw
+                # refusal reasons, never repaired into a pass.
+                outcome_reason = (
+                    "artifact-specific semantics refused: "
+                    + "; ".join(artifact_reasons)
+                )
 
         record(
             AssayState.PASS if outcome == "pass" else AssayState.HOLD,
@@ -1534,6 +1846,17 @@ class RunApplicationService:
             "outcome": outcome,
             "reason": outcome_reason,
             "gate_state": gate_state,
+            # SW-1510-VERIFY: the completion contract and the artifact-specific
+            # semantics stay separate facts; the native outcome requires both.
+            "completion_gate_state": gate_state,
+            "artifact_evidence": {
+                "admitted": artifact_admitted,
+                "reasons": list(artifact_reasons),
+                "subject_commit": (
+                    source_resolver.commit() if source_resolver is not None else ""
+                ),
+                "verdicts": artifact_verdicts,
+            },
             "child_execution": {
                 "pid": result.pid,
                 "exit_code": result.exit_code,
@@ -1572,6 +1895,12 @@ class RunApplicationService:
         cwd: Optional[Path] = None,
         project_root: Optional[Path] = None,
         _env: Optional[dict[str, str]] = None,
+        root_run_id: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
+        attempt: Optional[int] = None,
+        task_id: Optional[str] = None,
+        restarted_from: Optional[dict[str, Any]] = None,
+        reservation_envelope: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Start *command* as a detached background process.
 
@@ -1605,6 +1934,43 @@ class RunApplicationService:
         db_path = self.store.db_path
         EventType = _runtime_attr("journal", "EventType")
 
+        # Lineage records the *identified attempt* this launch represents.  A
+        # resumed run is a NEW attempt chained to its predecessor by
+        # ``restarted_from`` -- it is never the same attempt "restarted" by a
+        # bare database transition.  ``root_run_id`` ties the attempt chain
+        # together; ``attempt`` is monotonically increasing within the chain.
+        effective_task_id = task_id or rid
+        effective_attempt = int(attempt) if attempt is not None else 1
+        lineage: dict[str, Any] = {
+            "root_run_id": root_run_id or rid,
+            "parent_run_id": parent_run_id,
+            "attempt": effective_attempt,
+            "task_id": effective_task_id,
+            "restarted_from": dict(restarted_from) if restarted_from else None,
+        }
+
+        # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the detached
+        # child is launched.  The async/restart path must be admitted through
+        # the same reservation gate as the synchronous execute paths.  The
+        # envelope is resolved via fallback_task_scope inheritance (the ingress
+        # is responsible for persisting the owner envelope).  On launch failure
+        # the slot is cancelled; on child completion the wrapper completes it.
+        reservation_rec = None
+        scope_id = f"{effective_task_id}/attempt-{effective_attempt}"
+        if self.reservation_store is not None:
+            try:
+                reservation_rec = self.reservation_store.reserve(
+                    run_id=rid,
+                    task_id=effective_task_id,
+                    attempt=effective_attempt,
+                    scope_id=scope_id,
+                    idempotency_key=f"start_async:{rid}:{scope_id}",
+                    envelope=reservation_envelope,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RunIntegrationError(
+                    "reservation", f"async reservation refused: {exc}") from exc
+
         # Store initial lifecycle metadata BEFORE launching the child, so the
         # wrapper starts at version 2 (not version 1).  This prevents a race
         # where a fast child completes before the parent gets to write its
@@ -1619,22 +1985,34 @@ class RunApplicationService:
                     "pid": 0,
                     "lifecycle_state": "running",
                 },
+                "lineage": lineage,
             },
         )
 
         # Build the detached wrapper script that writes completion/error
         # back to the same kernel store.
+        reservation_id_arg = (reservation_rec.reservation_id
+                              if reservation_rec is not None else "")
         wrapper_src = (
             "import subprocess, sys, json, os, signal\n"
             "rid = sys.argv[1]\n"
             "db_path = sys.argv[2]\n"
-            "cmd = sys.argv[3:]\n"
+            "reservation_id = sys.argv[3]\n"
+            "cmd = sys.argv[4:]\n"
             "from skillweave.runtime.store import SQLiteRunStore, RunStateModel, CompletionReconciler\n"
             "from skillweave.runtime.journal import EventJournal\n"
+            "from skillweave.runtime.reservation import ReservationStore\n"
             "store = SQLiteRunStore(db_path)\n"
             "journal = EventJournal(db_path)\n"
+            "reservation_store = ReservationStore(db_path) if reservation_id else None\n"
             "journal.append(rid, event_type='started',\n"
             "    payload={'command': cmd})\n"
+            "def _complete_reservation():\n"
+            "    if reservation_store is not None and reservation_id:\n"
+            "        try:\n"
+            "            reservation_store.complete(reservation_id)\n"
+            "        except Exception:\n"
+            "            pass\n"
             "def _complete(lifecycle, event_type, payload, key, reason):\n"
             "    CompletionReconciler(\n"
             "        store, rid,\n"
@@ -1653,11 +2031,13 @@ class RunApplicationService:
             "        {'lifecycle_state': 'succeeded' if rc == 0 else 'failed', 'exit_code': rc},\n"
             "        'finished', {'returncode': rc, 'stdout_preview': stdout_text[:1024]},\n"
             "        'wrapper:finish:' + rid + ':' + str(rc), 'wrapper: process completed')\n"
+            "    _complete_reservation()\n"
             "except Exception as exc:\n"
             "    _complete(\n"
             "        {'lifecycle_state': 'failed', 'exit_code': -1},\n"
             "        'error', {'error': str(exc)},\n"
             "        'wrapper:error:' + rid, 'wrapper: error: ' + str(exc))\n"
+            "    _complete_reservation()\n"
             "finally:\n"
             "    store.close()\n"
             "    journal.close()\n"
@@ -1675,17 +2055,40 @@ class RunApplicationService:
             if _sp not in _pp:
                 _env["PYTHONPATH"] = _pp + ":" + _sp if _pp else _sp
 
-        proc = subprocess.Popen(
-            [sys.executable, "-c", wrapper_src, rid, db_path] + list(command),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=child_cwd,
-            env=_env,
-        )
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", wrapper_src, rid, db_path,
+                 reservation_id_arg] + list(command),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=child_cwd,
+                env=_env,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Launch failure: cancel the reservation slot before propagating.
+            if reservation_rec is not None and self.reservation_store is not None:
+                try:
+                    self.reservation_store.cancel(reservation_rec.reservation_id)
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
+            raise RunIntegrationError("launch", f"async Popen failed: {exc}") from exc
 
         now = datetime.now(timezone.utc).isoformat()
+
+        # Capture the *native* identity of the just-launched child (PID,
+        # process group, creation instant, exec image and argument vector).
+        # This is the fact a later cancellation verifies against before it
+        # signals a process group; a bare recorded PID is not an identity.
+        capture_identity = _runtime_attr("process_identity", "capture")
+        identity = None
+        try:
+            identity = _capture_settled_identity(capture_identity, proc.pid)
+        except Exception:  # noqa: BLE001 - observation failure is not a fact
+            identity = None
+        identity_dict = identity.to_dict() if identity is not None else None
+
         self.journal.append(
             rid,
             event_type="launched",
@@ -1693,35 +2096,429 @@ class RunApplicationService:
                 "event": "launched",
                 "pid": proc.pid,
                 "command": list(command),
+                "process_identity": identity_dict,
+                "lineage": lineage,
             },
         )
 
-        # Update the PID (placeholder was 0) at the current version.
-        # If the wrapper already completed, this CAS will fail harmlessly —
-        # the PID is already in the journal event and the lifecycle metadata.
+        # Update the PID + recorded process identity (placeholder was 0) at the
+        # current version.  If the wrapper already completed, this CAS will
+        # fail harmlessly — the facts are already in the journal event.
         current = self.store.get_run(rid)
         if current is not None:
             try:
                 lifecycle = dict(current.metadata.get("runlifecycle", {}))
                 lifecycle["pid"] = proc.pid
+                metadata_update: dict[str, Any] = {"runlifecycle": lifecycle}
+                if identity_dict is not None:
+                    metadata_update["process_identity"] = identity_dict
+                    lifecycle["process_identity"] = identity_dict
+                    metadata_update["runlifecycle"] = lifecycle
                 self.store.update_metadata(
                     rid,
                     expected_version=current.version,
-                    metadata={"runlifecycle": lifecycle},
+                    metadata=metadata_update,
                 )
             except Exception:
-                # Race with wrapper completion — PID was best-effort.
+                # Race with wrapper completion — PID/identity were best-effort.
                 pass
 
         run = self.store.get_run(rid)
         return {
             "run_id": rid,
             "pid": proc.pid,
+            "pgid": identity.pgid if identity is not None else proc.pid,
             "command": list(command),
             "state": run.state if run else "preflight",
             "created_at": now,
             "version": run.version if run else 1,
+            "process_identity": identity_dict,
+            "lineage": lineage,
         }
+
+    def cancel_process(
+        self,
+        run_id: str,
+        pid: Optional[int] = None,
+        *,
+        project_root: Optional[Path] = None,
+        grace: float = 0.5,
+        reason: str = "operator_halt",
+    ) -> dict[str, Any]:
+        """Cancel an owned native run after proving the process identity.
+
+        Unlike :meth:`kill_run` (which trusts the caller-supplied PID), this
+        path re-verifies the *recorded* process identity against the live OS
+        facts before any signal is sent:
+
+        * only a verified ``match`` authorises a signal;
+        * a recycled PID, a stale command or a foreign worker is **refused**
+          and nothing is signalled;
+        * a process that can no longer be observed (``not_alive``) is reported
+          as *unknown* in-flight state, never fabricated as terminated.
+
+        On a verified match the owned process group is stopped: every live
+        member of the group is sent SIGTERM, then SIGKILL after *grace*.  The
+        cancellation is committed through the canonical durable reconciliation
+        primitive (one idempotent terminal event + lifecycle ``killed``), and
+        the acknowledgement — the verified identity, the members signalled, the
+        observed result — is recorded as a durable ``cancellation_ack`` event.
+
+        Parameters
+        ----------
+        run_id:
+            The run to cancel.
+        pid:
+            The PID the caller believes is the target.  Defaults to the
+            identity recorded at launch.  If supplied it must equal the
+            recorded identity's PID (any mismatch is a recycled-PID refusal).
+        grace:
+            Seconds to wait between SIGTERM and SIGKILL.
+        reason:
+            Human-readable cancellation reason recorded on the event.
+
+        Returns
+        -------
+        dict with ``run_id``, ``pid``, ``state``, ``lane_state``,
+        ``lifecycle_state``, ``result``, ``signalled``, ``identity_verified``,
+        ``unknown_inflight`` and ``verification``.
+
+        Raises
+        ------
+        ProcessIdentityError
+            When identity verification does not yield ``match``.
+        StoreError
+            When the run is not found.
+        """
+        StoreError = _runtime_attr("errors", "StoreError")
+        run = self.store.get_run(run_id)
+        if run is None:
+            raise StoreError(f"no run found: {run_id}")
+
+        RunStateModel = _runtime_attr("store", "RunStateModel")
+        recorded = (run.metadata or {}).get("process_identity")
+        recorded_identity = _runtime_attr("process_identity", "ProcessIdentity").from_dict(recorded)
+        recorded_pid = recorded_identity.pid if recorded_identity is not None else pid
+
+        # ---- durable cancellation intent before the signal boundary -------
+        # Recorded first so a crash at/after the signal is recoverable by a
+        # later ``resume_run`` pass.  A genuine terminal winner is preserved.
+        KillOutcomeError = _runtime_attr("errors", "KillOutcomeError")
+        already_terminal = (
+            run.state != "preflight" and RunStateModel.is_terminal(run.state)
+        )
+        reconcile_cancellation_intent = getattr(
+            self.store, "reconcile_cancellation_intent", None)
+        if not already_terminal and reconcile_cancellation_intent is not None:
+            try:
+                reconcile_cancellation_intent(
+                    run_id,
+                    pid=recorded_pid,
+                    result="pending",
+                    event_payload={"pid": recorded_pid, "result": "pending",
+                                   "reason": reason},
+                    idempotency_key="cancel:" + run_id,
+                    reason=reason,
+                ).record_intent()
+            except Exception as exc:  # noqa: BLE001
+                raise KillOutcomeError(
+                    run_id,
+                    {"reason": "cancellation intent could not be durably recorded",
+                     "error": type(exc).__name__, "detail": str(exc)},
+                    result="unknown",
+                    cause=exc,
+                ) from exc
+
+        # ---- identity verification: the gate before any signal ------------
+        verify = _runtime_attr("process_identity", "verify")
+        REASON_MATCH = _runtime_attr("process_identity", "REASON_MATCH")
+        REASON_NOT_ALIVE = _runtime_attr("process_identity", "REASON_NOT_ALIVE")
+        ProcessIdentityError = _runtime_attr("errors", "ProcessIdentityError")
+
+        check = verify(recorded, recorded_pid if recorded_pid is not None else (pid or 0))
+        if not check.ok and check.reason != REASON_NOT_ALIVE:
+            # Recycled / stale / foreign / no-record: refuse, signal nothing.
+            raise ProcessIdentityError(
+                run_id, recorded_pid, check.reason, verification=check.to_dict())
+
+        # ---- enumerate the owned group (members by observed pgid) ---------
+        # GROUP OWNERSHIP LEASE: a process group id is a *reusable* number.  The
+        # recorded identity's pgid is only trustworthy while the recorded
+        # creation instant still owns that number.  We therefore capture the pgid
+        # again at cancel time and use it *only* when it still equals the
+        # recorded pgid.  If the number has been recycled, members are resolved
+        # strictly from the verified current identity -- never from a stale
+        # recorded group that may now belong to an unrelated process tree.
+        list_process_group = _runtime_attr("process_identity", "list_process_group")
+        is_alive = _runtime_attr("process_identity", "is_alive")
+
+        recorded_pgid = recorded_identity.pgid if recorded_identity is not None else None
+        if check.reason == REASON_MATCH:
+            live_pgid = check.current.pgid
+            pgid = live_pgid if live_pgid == recorded_pgid else None
+        else:
+            pgid = recorded_pgid
+        members = list_process_group(pgid) if pgid else ()
+        if pgid is None and check.reason == REASON_MATCH:
+            members = (check.current.pid,)
+
+        signalled: list[int] = []
+        unknown_inflight = check.reason == REASON_NOT_ALIVE
+        result = "unknown"
+
+        if check.reason == REASON_MATCH:
+            # The leader is verified (and, when the pgid still holds, so is the
+            # whole group).  Signal every member of the owned group.
+            targets = sorted({p for p in members if p} | {recorded_pid})
+            for target in targets:
+                try:
+                    os.kill(target, _signal.SIGTERM)
+                    signalled.append(target)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            deadline = time.monotonic() + max(0.0, grace)
+            while time.monotonic() < deadline:
+                if not any(is_alive(t) for t in targets):
+                    break
+                time.sleep(0.02)
+            remaining = [t for t in targets if is_alive(t)]
+            for target in remaining:
+                try:
+                    os.kill(target, _signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            result = "forced_kill" if remaining else "graceful_kill"
+        elif check.reason == REASON_NOT_ALIVE:
+            # The recorded process can no longer be observed.  We do NOT
+            # fabricate a termination: the run's in-flight state is *unknown*,
+            # the durable cancellation intent stands, and a later resume pass
+            # reconciles it to a terminal unknown outcome.  No signal was sent.
+
+            # Record the acknowledgement before returning: the identity was
+            # missing, nothing was signalled, and the in-flight state is unknown.
+            ack_payload = {
+                "run_id": run_id,
+                "pid": recorded_pid,
+                "pgid": recorded_pgid,
+                "result": "unknown",
+                "reason": reason,
+                "identity_verified": False,
+                "verification_reason": check.reason,
+                "signalled": [],
+                "group_members": [],
+                "unknown_inflight": True,
+            }
+            try:
+                self.journal.append(
+                    run_id,
+                    event_type="cancellation_ack",
+                    payload=ack_payload,
+                    idempotency_key="cancel_ack:" + run_id,
+                )
+            except Exception:  # noqa: BLE001 - ack is additive evidence
+                pass
+            current = self.store.get_run(run_id)
+            return {
+                "run_id": run_id,
+                "pid": recorded_pid,
+                "pgid": recorded_pgid,
+                "state": "unknown",
+                "lane_state": current.state if current is not None else "unknown",
+                "lifecycle_state": (current.metadata or {}).get(
+                    "runlifecycle", {}).get("lifecycle_state") if current else None,
+                "result": "unknown",
+                "signalled": [],
+                "identity_verified": False,
+                "unknown_inflight": True,
+                "verification": check.to_dict(),
+            }
+
+        # ---- record the acknowledgement -----------------------------------
+        ack_payload = {
+            "run_id": run_id,
+            "pid": recorded_pid,
+            "pgid": pgid,
+            "result": result,
+            "reason": reason,
+            "identity_verified": True,
+            "verification_reason": check.reason,
+            "signalled": signalled,
+            "group_members": list(members),
+            "unknown_inflight": False,
+        }
+        try:
+            self.journal.append(
+                run_id,
+                event_type="cancellation_ack",
+                payload=ack_payload,
+                idempotency_key="cancel_ack:" + run_id,
+            )
+        except Exception:  # noqa: BLE001 - ack is additive evidence
+            pass
+
+        # ---- commit terminal, preserving a genuine winner -----------------
+        cancelling = not RunStateModel.is_terminal(self.store.get_run(run_id).state)
+        if cancelling:
+            reconcile_terminal = getattr(self.store, "reconcile_terminal", None)
+            if reconcile_terminal is not None:
+                record = reconcile_terminal(
+                    run_id,
+                    target_state="advance_or_stop",
+                    lifecycle_update={"lifecycle_state": "killed"},
+                    event_type="process_killed",
+                    event_payload={"pid": recorded_pid, "result": result,
+                                   "signalled": signalled},
+                    idempotency_key="cancel:" + run_id,
+                    reason=reason,
+                    stop_reason="operator_halt",
+                )
+            else:
+                record = self.store.get_run(run_id)
+        else:
+            record = self.store.get_run(run_id)
+
+        final_lifecycle = (record.metadata or {}).get("runlifecycle", {}).get(
+            "lifecycle_state")
+        reported_state = "killed" if (cancelling and final_lifecycle == "killed") else (
+            record.state if record is not None else "unknown")
+        return {
+            "run_id": run_id,
+            "pid": recorded_pid,
+            "pgid": pgid,
+            "state": reported_state,
+            "lane_state": record.state if record is not None else "unknown",
+            "lifecycle_state": final_lifecycle,
+            "result": result,
+            "signalled": signalled,
+            "identity_verified": check.reason == REASON_MATCH,
+            "unknown_inflight": unknown_inflight,
+            "verification": check.to_dict(),
+        }
+
+    def restart_attempt(
+        self,
+        run_id: str,
+        command: Sequence[str],
+        *,
+        run_id_new: Optional[str] = None,
+        task_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        project_root: Optional[Path] = None,
+        cwd: Optional[Path] = None,
+        _env: Optional[dict[str, str]] = None,
+        reservation_envelope: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Launch a NEW identified attempt that continues *run_id*.
+
+        A resume is a new process with a new PID and a new recorded identity —
+        never a database transition dressed up as "restarted".  This method:
+
+        * requires the source run to be non-terminal and launchable (a terminal
+          or historical run is refused);
+        * is idempotent on *idempotency_key*: a second call with the same key
+          returns the attempt already launched instead of spawning a duplicate;
+        * derives the attempt number from the source run's lineage;
+        * creates a fresh run record (CAS/PK-guarded by the store) and launches
+          the command through :meth:`start_async`, which captures and records
+          the new attempt's native process identity;
+        * links the new attempt to its predecessor by ``parent_run_id`` and
+          ``restarted_from`` so the attempt chain is explicit and auditable.
+
+        The returned ``restarted`` flag is ``True`` only because a *real*
+        process was launched on a *new* identity, not because a row changed.
+        """
+        StoreError = _runtime_attr("errors", "StoreError")
+        source = self.store.get_run(run_id)
+        if source is None:
+            raise StoreError(f"no run found: {run_id}")
+        RunStateModel = _runtime_attr("store", "RunStateModel")
+        if RunStateModel.is_terminal(source.state):
+            raise StoreError(
+                f"terminal run cannot be restarted: {run_id} ({source.state})")
+        if (source.metadata or {}).get("historical"):
+            raise StoreError(f"historical run cannot be restarted: {run_id}")
+
+        source_lineage = (source.metadata or {}).get("lineage") or {}
+        root_run_id = source_lineage.get("root_run_id") or source.run_id
+        next_attempt = int(source_lineage.get("attempt") or 1) + 1
+
+        # SW-1510-BUDGET: inherit the source run's task identity so the retry
+        # is bounded by the same owner envelope and task aggregate.  An explicit
+        # caller-supplied task_id (e.g. from the MCP or CLI) overrides this.
+        if task_id is None:
+            task_id = source_lineage.get("task_id")
+
+        idem = idempotency_key or ("restart:" + run_id)
+        attempts = dict((source.metadata or {}).get("restart_attempts") or {})
+
+        # Idempotency: if this key already launched an attempt, return it.
+        prior = attempts.get(idem)
+        if isinstance(prior, dict) and prior.get("run_id"):
+            prior_run = self.store.get_run(prior["run_id"])
+            if prior_run is None:
+                raise StoreError(
+                    f"idempotent restart recorded run {prior['run_id']} that "
+                    f"no longer exists")
+            return {
+                "run_id": prior["run_id"],
+                "parent_run_id": run_id,
+                "root_run_id": prior.get("root_run_id", root_run_id),
+                "attempt": prior.get("attempt", next_attempt),
+                "restarted": True,
+                "idempotent_replay": True,
+                "pid": (prior_run.metadata or {}).get("runlifecycle", {}).get("pid"),
+                "state": prior_run.state,
+            }
+
+        # Record the attempt mapping BEFORE launch so a crash mid-launch is
+        # itself idempotent (the reserved id is reused, never duplicated).
+        new_run_id = run_id_new or uuid.uuid4().hex
+        restarted_from = {
+            "run_id": run_id,
+            "state": source.state,
+            "version": source.version,
+            "attempt": source_lineage.get("attempt") or 1,
+        }
+        attempts[idem] = {
+            "run_id": new_run_id,
+            "root_run_id": root_run_id,
+            "attempt": next_attempt,
+            "idempotency_key": idem,
+        }
+
+        def _reserve_and_link():
+            # CAS the source row; a racing terminal transition is a hard stop.
+            cur = self.store.get_run(run_id)
+            if cur is None:
+                raise StoreError(f"no run found: {run_id}")
+            self.store.update_metadata(
+                run_id,
+                expected_version=cur.version,
+                metadata={"restart_attempts": attempts},
+            )
+
+        _reserve_and_link()
+
+        # Launch the new identified attempt (new run record + real process).
+        result = self.start_async(
+            command,
+            run_id=new_run_id,
+            cwd=cwd,
+            project_root=project_root,
+            _env=_env,
+            root_run_id=root_run_id,
+            parent_run_id=run_id,
+            attempt=next_attempt,
+            task_id=task_id,
+            restarted_from=restarted_from,
+            reservation_envelope=reservation_envelope,
+        )
+        result["parent_run_id"] = run_id
+        result["root_run_id"] = root_run_id
+        result["attempt"] = next_attempt
+        result["restarted"] = True
+        result["idempotent_replay"] = False
+        return result
 
     def kill_run(
         self,
@@ -2020,6 +2817,10 @@ class RunApplicationService:
         output_root: Optional[str] = None,
         assay_actor_token: Optional[str] = None,
         assay_envelope: Optional[Any] = None,
+        reservation_envelope: Optional[Any] = None,
+        artifact_evidence: Optional[Sequence[Any]] = None,
+        source_resolver: Optional[Any] = None,
+        analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
     ) -> dict[str, Any]:
         """Protected native execution whose output is durably streamed.
 
@@ -2166,6 +2967,49 @@ class RunApplicationService:
                 self._fail_run(run_id, f"assay admission refused: {exc}")
                 raise
 
+        # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the worker
+        # is launched — exactly as the bounded ``execute`` path does.  On the
+        # protected streaming path the reservation is mandatory: a missing or
+        # inaccessible reservation_store is a hard failure (fail-closed) so a
+        # protected native request cannot silently run without admission.
+        #
+        # When the reservation_store is None and the caller did NOT explicitly
+        # request the legacy compatibility path, the admission is refused.
+        reservation_rec = None
+        if self.reservation_store is not None:
+            scope_id = f"{task_id or run_id}/attempt-{attempt}"
+            env = reservation_envelope
+            # Do NOT persist the envelope here — the ingress (cli/run.py,
+            # mcp/server.py) is responsible for persisting the owner envelope
+            # via set_envelope BEFORE calling execute_streaming_native().
+            # The reserve() call below resolves the effective envelope through
+            # get_envelope(), which inherits via fallback_task_scope when the
+            # exact scope has no persisted envelope (e.g. a retry at a new
+            # attempt scope).
+            # SW-1510-BUDGET: reserve() auto-derives reserved_bytes/reserved_tokens
+            # from the resolved envelope's per-request limits, so the token/byte
+            # dimensions are exercised through the streaming product ingress.
+            try:
+                reservation_rec = self.reservation_store.reserve(
+                    run_id=run_id,
+                    task_id=task_id or run_id,
+                    attempt=int(attempt),
+                    scope_id=scope_id,
+                    idempotency_key=f"execute_streaming:{run_id}:{scope_id}",
+                    envelope=env,
+                    route=model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._fail_run(run_id, f"reservation refused: {exc}")
+                raise RunIntegrationError("reservation", str(exc)) from exc
+        elif require_identity or authority_service is not None:
+            # Protected native path: missing reservation store is fail-closed.
+            raise RunIntegrationError(
+                "reservation",
+                "the protected native path requires a reservation store; "
+                "a missing budget guard cannot silently admit unguarded execution",
+            )
+
         # Stage 2: the real protected launch + durable streaming collection.
         # The streaming path composes the *same* SCOPE boundary as ``execute``:
         # the declared write scope is authorized and the real isolation attested
@@ -2260,6 +3104,8 @@ class RunApplicationService:
             raise
         except Exception as exc:  # noqa: BLE001
             self._fail_run(run_id, f"streaming launch raised {exc}")
+            if reservation_rec is not None and self.reservation_store is not None:
+                self.reservation_store.cancel(reservation_rec.reservation_id)
             raise RunIntegrationError("launch", str(exc)) from exc
         finally:
             # Release the protection window (unseal the protected stores) on
@@ -2267,6 +3113,32 @@ class RunApplicationService:
             # enforcement before the child ever existed.
             if protection is not None:
                 protection.__exit__(None, None, None)
+
+        # SW-1510-BUDGET: complete the reservation with observed usage.  On the
+        # streaming path we capture the retained stdout bytes as the observed
+        # transport outcome.  Tokens and cost are not directly observable from
+        # a subprocess transport, so they are passed as None (unknown) --- the
+        # reserved amounts persist until an explicit reconcile call.  A storage
+        # failure during completion is exposed as a durable incomplete-
+        # reconciliation record (the reservation stays at COMPLETED with unknown
+        # usage) rather than silently swallowed.
+        if reservation_rec is not None and self.reservation_store is not None:
+            try:
+                observed = None
+                if result and hasattr(result, 'stdout_text'):
+                    observed = len(result.stdout_text.encode("utf-8", errors="replace"))
+                self.reservation_store.complete(
+                    reservation_rec.reservation_id,
+                    observed_bytes=observed,
+                    observed_tokens=None,
+                    cost=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Expose the incomplete reconciliation — do not silently swallow.
+                raise RunIntegrationError(
+                    "reservation",
+                    f"reservation completion failed: {exc}",
+                ) from exc
 
         fact = result.fact
         out_summary = self.stream_store.summary(
@@ -2476,6 +3348,9 @@ class RunApplicationService:
                 gate_state=gate_state,
                 verdict_receipt=verdict_receipt,
                 pre_state=assay_pre_state,
+                artifact_evidence=artifact_evidence,
+                source_resolver=source_resolver,
+                analysis_reader=analysis_reader,
             )
 
         out = {

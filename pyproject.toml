@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,12 +10,19 @@ readme = "README.md"
 authors = [
     {name = "LangeVC.com"},
 ]
-license = {text = "Apache-2.0"}
+# PEP 639: SPDX license expression + explicit license files. The setuptools
+# build-system floor above is raised to >=77.0.0 because a string license and
+# `license-files` are only honoured by PEP 639-compatible backends. The
+# deprecated `License ::` classifier is dropped for the same reason: PEP 639
+# forbids it alongside `license`.
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "License :: OSI Approved :: Apache Software License",
+    # PEP 639: the `License ::` classifier is mutually exclusive with the
+    # SPDX `license` expression above, so it is intentionally not declared.
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",

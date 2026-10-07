@@ -54,6 +54,7 @@ class TestAssayStates:
         assert AssayState.PROBE.value == "probe"
         assert AssayState.MEASURE.value == "measure"
         assert AssayState.CLASSIFY.value == "classify"
+        assert AssayState.ARTIFACT_VERIFY.value == "artifact_verify"
         assert AssayState.REMEDIATE.value == "remediate"
         assert AssayState.ESCALATE_OR_SPLIT.value == "escalate_or_split"
         assert AssayState.PASS.value == "pass"
@@ -74,7 +75,11 @@ class TestAssayStates:
         assert AssayState.legal_transitions(AssayState.MEASURE) == [AssayState.CLASSIFY]
         assert sorted(AssayState.legal_transitions(AssayState.CLASSIFY)) == sorted([
             AssayState.REMEDIATE, AssayState.ESCALATE_OR_SPLIT,
-            AssayState.PASS, AssayState.HOLD,
+            AssayState.ARTIFACT_VERIFY, AssayState.PASS, AssayState.HOLD,
+        ])
+        # SW-1510-VERIFY: the artifact-specific semantics verdict gates PASS.
+        assert sorted(AssayState.legal_transitions(AssayState.ARTIFACT_VERIFY)) == sorted([
+            AssayState.PASS, AssayState.HOLD, AssayState.REMEDIATE,
         ])
         assert AssayState.legal_transitions(AssayState.REMEDIATE) == [AssayState.PROBE]
         assert sorted(AssayState.legal_transitions(AssayState.ESCALATE_OR_SPLIT)) == sorted([

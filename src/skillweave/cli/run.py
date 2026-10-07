@@ -104,6 +104,39 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--artifact-evidence",
+        dest="artifact_evidence",
+        default=None,
+        help=(
+            "Path to a JSON file carrying the native Assay artifact proof "
+            "graph(s) (one evidence artifact object or a list). Each artifact "
+            "must bind real file/blob/analysis evidence for the source named by "
+            "--source-root. SW-1510-VERIFY: omitting this on an assay run is "
+            "itself a refusal -- the native PASS is withheld, never bypassed."
+        ),
+    )
+    parser.add_argument(
+        "--source-root",
+        dest="source_root",
+        default=None,
+        help=(
+            "Read-only source tree the artifact coverage is bound to (real "
+            "file content digests + listed files). Required to admit an "
+            "artifact: a missing source never becomes a PASS."
+        ),
+    )
+    parser.add_argument(
+        "--analysis-root",
+        dest="analysis_root",
+        default=None,
+        help=(
+            "Directory holding the per-path analysis artifacts referenced by "
+            "the proof graph (resolved at <analysis-root>/<path>). Used to "
+            "independently recompute each analysis_digest; a missing artifact "
+            "is a refusal."
+        ),
+    )
+    parser.add_argument(
         "--rework",
         action="store_true",
         help="Draft rework briefs from failed gates",
@@ -134,6 +167,58 @@ def _default_stream_root(db_path: str) -> str:
     return os.path.join(db_dir, "streams")
 
 
+def _load_artifact_evidence(artifact_evidence: Optional[str]) -> Optional[list]:
+    """Load the declared artifact proof graph(s) from a JSON file.
+
+    Accepts either a single evidence-artifact object or a list of them. ``None``
+    (no ``--artifact-evidence``) is passed through unchanged, so the drill's own
+    omission refusal -- not a CLI-side default -- is what withholds the PASS.
+    """
+    if not artifact_evidence:
+        return None
+    with open(artifact_evidence, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    if isinstance(payload, dict):
+        return [payload]
+    if isinstance(payload, list):
+        return payload
+    raise ValueError("--artifact-evidence must be a JSON object or a list of objects")
+
+
+def _build_source_resolver(source_root: Optional[str], subject_commit: str):
+    """A read-only resolver over ``--source-root`` bound to the subject commit.
+
+    Returns ``None`` when no source root is named: the drill then refuses the
+    artifact for want of a source binding rather than fabricating one.
+    """
+    if not source_root:
+        return None
+    from skillweave.runtime.verify import FilesystemSourceResolver
+
+    return FilesystemSourceResolver(source_root, commit=subject_commit)
+
+
+def _build_analysis_reader(analysis_root: Optional[str]):
+    """Read a coverage path's analysis artifact bytes from ``--analysis-root``.
+
+    ``None`` when no root is given, so the verifier refuses with a raw
+    "no analysis artifact is available" reason instead of inventing bytes.
+    """
+    if not analysis_root:
+        return None
+    root = os.path.abspath(analysis_root)
+
+    def _reader(path: str):
+        candidate = os.path.join(root, path)
+        try:
+            with open(candidate, "rb") as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+    return _reader
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -156,6 +241,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from skillweave.runtime.journal import EventJournal
     from skillweave.runtime.registry import RawArtifactStore
     from skillweave.runtime.stream import DurableStreamStore
+    from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope
     from skillweave.runsvc.service import RunApplicationService
 
     store = SQLiteRunStore(args.db_path)
@@ -171,8 +257,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stream_root = args.stream_root or _default_stream_root(args.db_path)
     stream_store = DurableStreamStore(root=stream_root)
 
-    svc = RunApplicationService(store, journal, raw_artifacts, stream_store)
+    # SW-1510-BUDGET: wire the atomic reservation store explicitly so the
+    # installed `skillweave run` entry is bound to the budget guard.
+    reservation_store = ReservationStore(args.db_path)
+    svc = RunApplicationService(
+        store, journal, raw_artifacts, stream_store,
+        reservation_store=reservation_store,
+    )
     run_id = generate_run_id()
+
+    # SW-1510-BUDGET: Check for an existing owner envelope for this task scope
+    # across ALL runs first.  If the host has pre-configured a finite envelope
+    # (e.g. max_requests=1), honour it — never overwrite with unlimited.
+    # Only create the explicit owner-authorized unlimited envelope when no
+    # owner envelope exists for this task scope.
+    task_id = args.task_id or run_id
+    scope_id = f"{task_id}/attempt-{args.attempt}"
+    existing = reservation_store.get_envelope_for_task_scope(task_id)
+    if existing is not None:
+        owner_env = existing
+    else:
+        owner_env = ReservationEnvelope()
+        reservation_store.set_envelope(run_id, scope_id, owner_env)
 
     try:
         # The native streaming entry authenticates the worker at ingress and,
@@ -180,6 +286,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # checkout before spawning. With no authority service supplied it is the
         # unchanged legacy path (identity optional), but the output is still
         # durably streamed. Public result fields below are preserved verbatim.
+        artifact_evidence = _load_artifact_evidence(args.artifact_evidence)
+        source_resolver = _build_source_resolver(args.source_root, args.subject_commit)
+        analysis_reader = _build_analysis_reader(args.analysis_root)
+
         execution = svc.execute_streaming_native(
             command=command,
             run_id=run_id,
@@ -189,9 +299,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             subject_commit=args.subject_commit,
             methodology=args.methodology,
             autonomy_policy=args.autonomy_policy,
-            task_id=args.task_id or run_id,
+            task_id=task_id,
             attempt=args.attempt,
             output_root=args.output_root,
+            reservation_envelope=owner_env,
+            artifact_evidence=artifact_evidence,
+            source_resolver=source_resolver,
+            analysis_reader=analysis_reader,
         )
 
         result_obj = execution["result"]
