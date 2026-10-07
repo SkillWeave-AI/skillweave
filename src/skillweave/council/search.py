@@ -1,13 +1,26 @@
 """Web Search integration for SkillWeave Council.
 
-7 search providers:
+Six providers are served through one extension point -- the adapter registry in
+:mod:`skillweave.adapters` -- not through a chain of ``elif`` branches:
+
 - DuckDuckGo Lite (free, no key, requests-based HTML parsing)
 - Serper (Google results via API key)
 - SerpApi (Google/Bing/Yahoo via API key)
-- Google CSE (Custom Search Engine via API key + CX)
 - Tavily (LLM-optimized search via API key)
 - Brave (privacy-focused via API key)
-- Perplexity (AI-powered search via MCP cookies or API key)
+- Perplexity (AI-powered search, via an initialized MCP stdio binding or a
+  direct HTTP binding -- two transports for one provider)
+
+:meth:`WebSearch.search` stays a **compatible formatted-string wrapper**: Council
+still receives the same context string it always did. Internally it now resolves
+the provider through the registry, invokes it as a typed
+:class:`~skillweave.adapters.outcomes.SearchOutcome`, and renders that outcome.
+
+There is **no silent fallback**: an unrecognised provider name fails closed and
+is reported, rather than being quietly served by DuckDuckGo. Perplexity's MCP
+binding is launched only from an explicit command binding supplied by the caller
+(``SearchConfig.mcp_command``); the reader never constructs a floating
+``git+``/URL install.
 
 Includes: relevance reranking, full content fetching via Jina Reader.
 """
@@ -16,13 +29,21 @@ import asyncio
 import json
 import os
 import re
-import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import quote_plus
+
+from skillweave.adapters import (
+    AdapterRegistry,
+    SEARCH_OPERATION,
+    SEARCH_PROVIDER_SPECS,
+    SearchOutcome,
+    SearchResultRecord,
+    build_search_registry,
+)
 
 
 @dataclass
@@ -43,6 +64,30 @@ class SearchConfig:
     full_content_results: int = 3
     hybrid_search: bool = True
     api_key: str | None = None
+    #: Explicit MCP stdio launch command for the Perplexity MCP binding. When
+    #: unset, the Perplexity MCP transport is not attempted (never a floating
+    #: install).
+    mcp_command: list[str] | None = None
+    #: Environment variable names forwarded to the owned MCP child.
+    mcp_env_allowlist: tuple[str, ...] = ()
+
+
+# ── provider -> adapter id, and the reverse, derived from the one registry ──
+# These maps are *derived* from SEARCH_PROVIDER_SPECS: the registry is the
+# single source of truth for which providers exist, and Council only names one.
+
+_PROVIDER_TO_ADAPTER: dict[str, str] = {}
+_ADAPTER_TO_PROVIDER: dict[str, str] = {}
+_SPEC_BY_ADAPTER: dict[str, object] = {}
+for _key, _spec in SEARCH_PROVIDER_SPECS.items():
+    _PROVIDER_TO_ADAPTER.setdefault(_spec.provider, _spec.adapter_id)
+    _ADAPTER_TO_PROVIDER[_spec.adapter_id] = _spec.provider
+    _SPEC_BY_ADAPTER[_spec.adapter_id] = _spec
+
+
+def search_registry() -> AdapterRegistry:
+    """Build the shared search registry (all providers, one extension point)."""
+    return build_search_registry()
 
 
 class WebSearch:
@@ -63,6 +108,14 @@ class WebSearch:
         "1yr": "year",
         "any": None,
     }
+
+    def __init__(self, registry: Optional[AdapterRegistry] = None) -> None:
+        self._registry = registry if registry is not None else search_registry()
+
+    @property
+    def registry(self) -> AdapterRegistry:
+        """The extension registry every provider is registered through."""
+        return self._registry
 
     async def search(self, query: str, config: SearchConfig | None = None) -> str:
         """Execute search and return formatted context string for council prompts."""
@@ -94,393 +147,74 @@ class WebSearch:
 
         return self._format_context(results, config.time_range)
 
-    async def _search_provider(self, query: str, config: SearchConfig) -> list[SearchResult]:
-        """Dispatch to the configured search provider."""
-        provider = config.provider.lower()
-        if provider == "duckduckgo":
-            return await self._search_duckduckgo(query, config)
-        elif provider == "serper":
-            return await self._search_serper(query, config)
-        elif provider == "serpapi":
-            return await self._search_serpapi(query, config)
-        elif provider == "tavily":
-            return await self._search_tavily(query, config)
-        elif provider == "brave":
-            return await self._search_brave(query, config)
-        elif provider == "perplexity":
-            return await self._search_perplexity(query, config)
-        else:
-            return await self._search_duckduckgo(query, config)
+    # ── registry dispatch ────────────────────────────────────────────────
 
-    # ── DuckDuckGo Lite (requests-based, no duckduckgo_search package) ───
+    def _adapter_id_for(self, provider: str, config: Optional[SearchConfig] = None) -> str:
+        """Resolve a provider name to its registered adapter id, or fail.
 
-    async def _search_duckduckgo(self, query: str, config: SearchConfig) -> list[SearchResult]:
-        """DuckDuckGo via HTML instant answer API — free, no API key, no external package."""
-        results = []
-        try:
-            loop = asyncio.get_event_loop()
-            # Use DuckDuckGo Lite HTML endpoint
-            encoded = quote_plus(query)
-            url = f"https://lite.duckduckgo.com/lite/?q={encoded}"
-            req = urllib.request.Request(url, headers={
-                "User-Agent": "SkillWeave-Council/0.8 (https://github.com/typelicious/SkillWeave)"
-            })
-            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=15))
-            html = resp.read().decode("utf-8", errors="replace")
-
-            # Parse HTML results
-            results = self._parse_duckduckgo_lite(html)
-
-        except urllib.error.HTTPError as e:
-            results.append(SearchResult(
-                title=f"DuckDuckGo Error: HTTP {e.code}",
-                url="",
-                snippet=str(e),
-                source="error",
-            ))
-        except Exception as e:
-            results.append(SearchResult(
-                title="DuckDuckGo Search Failed",
-                url="",
-                snippet=f"DuckDuckGo search unavailable: {e}",
-                source="error",
-            ))
-
-        return results if results else [SearchResult(
-            title="DuckDuckGo Search Failed",
-            url="",
-            snippet="DuckDuckGo returned no results. Try another provider or rephrase query.",
-            source="error",
-        )]
-
-    def _parse_duckduckgo_lite(self, html: str) -> list[SearchResult]:
-        """Parse DuckDuckGo Lite HTML results."""
-        results = []
-        # DDG Lite: result blocks are <a class="result-link"> with sibling <td class="result-snippet">
-        # Pattern: <a[^>]*class="[^"]*result-link[^"]*"[^>]*href="([^"]*)"[^>]*>(.*?)</a>
-        links = re.findall(
-            r'<a[^>]*class="[^"]*result-link[^"]*"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
-            html, re.DOTALL
-        )
-        snippets = re.findall(
-            r'<td[^>]*class="[^"]*result-snippet[^"]*"[^>]*>(.*?)</td>',
-            html, re.DOTALL
-        )
-        for i, (href, title_html) in enumerate(links):
-            url = href
-            if "uddg=" in url:
-                from urllib.parse import unquote
-                real_match = re.search(r'uddg=([^&]+)', url)
-                if real_match:
-                    url = unquote(real_match.group(1))
-            title = re.sub(r'<[^>]+>', '', title_html).strip()
-            snippet = ""
-            if i < len(snippets):
-                snippet = re.sub(r'<[^>]+>', '', snippets[i]).strip()
-            if title:
-                results.append(SearchResult(
-                    title=title,
-                    url=url,
-                    snippet=snippet[:500],
-                    source="web",
-                ))
-        return results
-
-    # ── Serper ────────────────────────────────────────────────────────
-
-    async def _search_serper(self, query: str, config: SearchConfig) -> list[SearchResult]:
-        """Serper.dev — Google search results. Requires API key."""
-        if not config.api_key:
-            return [SearchResult(title="Serper Error", url="", snippet="SERPER_API_KEY not set.", source="error")]
-
-        results = []
-        try:
-            body = json.dumps({"q": query, "num": config.max_results}).encode()
-            req = urllib.request.Request(
-                "https://google.serper.dev/search",
-                data=body,
-                headers={"X-API-KEY": config.api_key, "Content-Type": "application/json"}
-            )
-            loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=15))
-            data = json.loads(resp.read())
-
-            for r in data.get("organic", []):
-                results.append(SearchResult(
-                    title=r.get("title", ""),
-                    url=r.get("link", ""),
-                    snippet=r.get("snippet", ""),
-                    source="web",
-                    date=r.get("date", ""),
-                ))
-        except Exception as e:
-            results.append(SearchResult(title="Serper Error", url="", snippet=str(e), source="error"))
-        return results
-
-    # ── SerpApi ──────────────────────────────────────────────────────
-
-    async def _search_serpapi(self, query: str, config: SearchConfig) -> list[SearchResult]:
-        """SerpApi — Google/Bing/Yahoo results. Requires SERPAPI_API_KEY."""
-        if not config.api_key:
-            return [SearchResult(title="SerpApi Error", url="", snippet="SERPAPI_API_KEY not set.", source="error")]
-
-        results = []
-        try:
-            params = {
-                "q": query,
-                "api_key": config.api_key,
-                "num": config.max_results,
-                "engine": "google",
-            }
-            qs = "&".join(f"{k}={quote_plus(str(v))}" for k, v in params.items())
-            url = f"https://serpapi.com/search?{qs}"
-            req = urllib.request.Request(url)
-            loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=15))
-            data = json.loads(resp.read())
-
-            for r in data.get("organic_results", []):
-                results.append(SearchResult(
-                    title=r.get("title", ""),
-                    url=r.get("link", ""),
-                    snippet=r.get("snippet", ""),
-                    source="web",
-                    date=r.get("date", ""),
-                ))
-        except Exception as e:
-            results.append(SearchResult(title="SerpApi Error", url="", snippet=str(e), source="error"))
-        return results
-
-    # ── Tavily ────────────────────────────────────────────────────────
-
-    async def _search_tavily(self, query: str, config: SearchConfig) -> list[SearchResult]:
-        """Tavily — purpose-built for LLMs. Requires API key."""
-        if not config.api_key:
-            return [SearchResult(title="Tavily Error", url="", snippet="TAVILY_API_KEY not set.", source="error")]
-
-        results = []
-        try:
-            body = json.dumps({
-                "query": query,
-                "max_results": config.max_results,
-                "search_depth": "advanced",
-                "include_raw_content": False,
-            }).encode()
-            req = urllib.request.Request(
-                "https://api.tavily.com/search",
-                data=body,
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {config.api_key}"}
-            )
-            loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=15))
-            data = json.loads(resp.read())
-
-            for r in data.get("results", []):
-                results.append(SearchResult(
-                    title=r.get("title", ""),
-                    url=r.get("url", ""),
-                    snippet=r.get("content", ""),
-                    source="web",
-                ))
-        except Exception as e:
-            results.append(SearchResult(title="Tavily Error", url="", snippet=str(e), source="error"))
-        return results
-
-    # ── Brave ─────────────────────────────────────────────────────────
-
-    async def _search_brave(self, query: str, config: SearchConfig) -> list[SearchResult]:
-        """Brave Search — privacy-focused. Requires API key."""
-        if not config.api_key:
-            return [SearchResult(title="Brave Error", url="", snippet="BRAVE_API_KEY not set.", source="error")]
-
-        results = []
-        try:
-            url = f"https://api.search.brave.com/res/v1/web/search?q={quote_plus(query)}&count={config.max_results}"
-            req = urllib.request.Request(url, headers={
-                "Accept": "application/json",
-                "X-Subscription-Token": config.api_key,
-            })
-            loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=15))
-            data = json.loads(resp.read())
-
-            for r in data.get("web", {}).get("results", []):
-                results.append(SearchResult(
-                    title=r.get("title", ""),
-                    url=r.get("url", ""),
-                    snippet=r.get("description", ""),
-                    source="web",
-                    date=r.get("page_age", ""),
-                ))
-        except Exception as e:
-            results.append(SearchResult(title="Brave Error", url="", snippet=str(e), source="error"))
-        return results
-
-    # ── Perplexity (via MCP Server — no API key, uses PERPLEXITY_COOKIES) ───
-
-    async def _search_perplexity(self, query: str, config: SearchConfig) -> list[SearchResult]:
-        """Perplexity via MCP server (helallao/perplexity-ai). Requires PERPLEXITY_COOKIES env var.
-
-        Uses the `perplexity_search` MCP tool via subprocess.
-        Falls back to direct API call if PERPLEXITY_API_KEY is set.
+        No silent fallback: an unknown provider raises rather than being served
+        by DuckDuckGo. A provider served by more than one transport (Perplexity
+        has an MCP stdio binding and an HTTP binding) is disambiguated by the
+        configured binding: an explicit MCP launch command selects the MCP
+        transport, otherwise the HTTP binding is used.
         """
-        # Prefer MCP-based search (cookie auth, no API key)
-        if os.environ.get("PERPLEXITY_COOKIES") and not config.api_key:
-            return await self._search_perplexity_mcp(query, config)
+        provider = provider.lower()
+        if provider == "perplexity" and config is not None and config.mcp_command:
+            adapter_id = "perplexity-search-mcp"
+        else:
+            adapter_id = _PROVIDER_TO_ADAPTER.get(provider)
+        if adapter_id is None or adapter_id not in self._registry:
+            raise ValueError(
+                f"unknown search provider {provider!r}; registered providers: "
+                f"{sorted({_ADAPTER_TO_PROVIDER[i] for i in self._registry.ids()})}"
+            )
+        return adapter_id
 
-        # Fallback to direct API key
-        if not config.api_key:
-            return [SearchResult(title="Perplexity Error", url="", snippet="PERPLEXITY_COOKIES or PERPLEXITY_API_KEY not set.", source="error")]
+    async def search_outcome(self, query: str, config: SearchConfig | None = None) -> SearchOutcome:
+        """Return the typed :class:`SearchOutcome` for a query (no formatting).
 
-        return await self._search_perplexity_api(query, config)
+        This is the seam the registry-backed backend and the Council wrapper
+        share, so a caller can obtain a typed result rather than a formatted
+        string.
+        """
+        if config is None:
+            config = SearchConfig()
+        config = self._apply_defaults(config)
+        adapter_id = self._adapter_id_for(config.provider, config)
+        entry = self._registry.get(adapter_id)
+        argument = self._backend_argument(query, config, adapter_id)
+        return await entry.backend.invoke(SEARCH_OPERATION, argument, {})
 
-    async def _search_perplexity_mcp(self, query: str, config: SearchConfig) -> list[SearchResult]:
-        """Call Perplexity MCP server via subprocess (uvx)."""
-        results = []
-        try:
-            mcp_result = await self._call_perplexity_mcp("perplexity_search", {"query": query})
-            if mcp_result.get("error"):
-                return [SearchResult(title="Perplexity MCP Error", url="", snippet=mcp_result["error"], source="error")]
+    async def _search_provider(self, query: str, config: SearchConfig) -> list[SearchResult]:
+        """Dispatch to the configured search provider through the registry."""
+        outcome = await self.search_outcome(query, config)
+        if outcome.status != "success":
+            return [SearchResult(
+                title=f"{config.provider.title()} Error",
+                url="",
+                snippet=(
+                    f"{config.provider} search did not succeed "
+                    f"(status={outcome.status}"
+                    + (f", code={outcome.error_code}" if outcome.error_code else "")
+                    + ")."
+                ),
+                source="error",
+            )]
+        return [_to_search_result(r) for r in outcome.results]
 
-            # MCP returns structured search results
-            content = mcp_result.get("content", "")
-            citations = mcp_result.get("citations", [])
-
-            for i, citation in enumerate(citations[:config.max_results]):
-                results.append(SearchResult(
-                    title=citation.get("title", f"Source {i+1}"),
-                    url=citation.get("url", ""),
-                    snippet=citation.get("snippet", "")[:500],
-                    source="web",
-                ))
-
-            # Add synthesized answer
-            if content:
-                results.insert(0, SearchResult(
-                    title=f"Perplexity: {query[:80]}",
-                    url="",
-                    snippet=content[:1000],
-                    source="web",
-                ))
-
-        except Exception as e:
-            results.append(SearchResult(title="Perplexity MCP Error", url="", snippet=str(e), source="error"))
-        return results
-
-    async def _call_perplexity_mcp(self, tool_name: str, arguments: dict) -> dict:
-        """Call a Perplexity MCP tool via subprocess (uvx)."""
-        import subprocess
-        loop = asyncio.get_event_loop()
-
-        mcp_request = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": arguments,
-            },
+    def _backend_argument(self, query: str, config: SearchConfig, adapter_id: str) -> dict:
+        """The argument mapping handed to a search backend."""
+        argument: dict = {
+            "query": query,
+            "max_results": config.max_results,
+            "time_range": config.time_range,
+            "api_key": config.api_key,
         }
-
-        env = os.environ.copy()
-        cmd = ["uvx", "--from", "perplexity-api[mcp] @ git+https://github.com/helallao/perplexity-ai", "perplexity-mcp"]
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(json.dumps(mcp_request).encode() + b"\n"),
-                timeout=30.0,
-            )
-            if proc.returncode != 0:
-                return {"error": f"MCP process exited with {proc.returncode}: {stderr.decode()[:200]}"}
-
-            response = json.loads(stdout.decode())
-            if "error" in response:
-                return {"error": response["error"].get("message", str(response["error"]))}
-
-            return response.get("result", response)
-        except asyncio.TimeoutError:
-            return {"error": "Perplexity MCP call timed out (30s)"}
-        except FileNotFoundError:
-            return {"error": "uvx not found — install with 'brew install uv'"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    async def _search_perplexity_api(self, query: str, config: SearchConfig) -> list[SearchResult]:
-        """Perplexity via direct API call (PERPLEXITY_API_KEY)."""
-        results = []
-        try:
-            body = {
-                "model": "sonar-pro",
-                "messages": [
-                    {"role": "system", "content": "Search the web and provide results. Return concise summaries with URLs."},
-                    {"role": "user", "content": query},
-                ],
-                "search_recency_filter": self.PERPLEXITY_TIME_MAP.get(config.time_range),
-                "max_tokens": 2000,
-                "temperature": 0.2,
-                "return_related_questions": False,
-            }
-            body = {k: v for k, v in body.items() if v is not None}
-
-            data = json.dumps(body).encode()
-            req = urllib.request.Request(
-                "https://api.perplexity.ai/chat/completions",
-                data=data,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {config.api_key}",
-                }
-            )
-            loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=30))
-            result = json.loads(resp.read())
-
-            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            citations = result.get("citations", [])
-
-            for i, citation in enumerate(citations[:config.max_results]):
-                results.append(SearchResult(
-                    title=f"Source {i+1}",
-                    url=citation,
-                    snippet="Referenced in Perplexity search results",
-                    source="web",
-                ))
-
-            if content:
-                results.insert(0, SearchResult(
-                    title=f"Perplexity: {query[:80]}",
-                    url="",
-                    snippet=content[:1000],
-                    source="web",
-                ))
-
-        except urllib.error.HTTPError as e:
-            error_body = ""
-            try:
-                error_body = e.read().decode("utf-8", errors="replace")[:200]
-            except Exception:
-                pass
-            results.append(SearchResult(
-                title=f"Perplexity Error: HTTP {e.code}",
-                url="",
-                snippet=f"Perplexity API returned {e.code}: {error_body}",
-                source="error",
-            ))
-        except Exception as e:
-            results.append(SearchResult(
-                title="Perplexity Error",
-                url="",
-                snippet=str(e),
-                source="error",
-            ))
-        return results
+        spec = _SPEC_BY_ADAPTER.get(adapter_id)
+        if spec is not None and spec.transport == "mcp-stdio":
+            argument["command"] = config.mcp_command
+            argument["env_allowlist"] = config.mcp_env_allowlist
+        return argument
 
     # ── Helpers ───────────────────────────────────────────────────────
 
@@ -579,3 +313,14 @@ class WebSearch:
         if not config.api_key and config.provider in env_map:
             config.api_key = os.environ.get(env_map[config.provider])
         return config
+
+
+def _to_search_result(record: SearchResultRecord) -> SearchResult:
+    """Turn one typed record into the legacy ``SearchResult`` shape."""
+    return SearchResult(
+        title=record.title,
+        url=record.url,
+        snippet=record.snippet,
+        source=record.source,
+        date=record.date,
+    )
