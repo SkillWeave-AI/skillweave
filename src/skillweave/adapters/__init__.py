@@ -18,6 +18,20 @@ from .descriptor import (
     OperationBinding,
     PackageRef,
 )
+from .format_readers import (
+    CAPACIUM_DIALECT,
+    CAPACIUM_DIALECT_VERSION,
+    LOCAL_DIALECT,
+    AdapterBinding,
+    CapaciumFormatReader,
+    FormatReaderError,
+    LocalRegistrationReader,
+    PackageFormatReader,
+    ReaderRegistry,
+    UnadmittedMemberError,
+    UnsupportedDialectError,
+    default_reader_registry,
+)
 from .mcp_client import MCP_PROTOCOL_VERSION, McpClientError, McpStdioClient
 from .outcomes import (
     AVAILABILITY_STATES,
@@ -74,6 +88,19 @@ __all__ = [
     "MCP_PROTOCOL_VERSION",
     "McpClientError",
     "McpStdioClient",
+    # Package-format readers (Capacium optional standard / delivery only).
+    "FormatReaderError",
+    "UnsupportedDialectError",
+    "UnadmittedMemberError",
+    "AdapterBinding",
+    "PackageFormatReader",
+    "LocalRegistrationReader",
+    "CapaciumFormatReader",
+    "ReaderRegistry",
+    "default_reader_registry",
+    "LOCAL_DIALECT",
+    "CAPACIUM_DIALECT",
+    "CAPACIUM_DIALECT_VERSION",
     "CREDENTIAL_REFERENCE_SCHEMA_VERSION",
     "SEARCH_OUTCOME_SCHEMA_VERSION",
     "SEARCH_OUTCOME_CONTRACT",

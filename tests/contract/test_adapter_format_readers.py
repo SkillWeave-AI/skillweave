@@ -227,3 +227,33 @@ def test_future_reader_plugs_in_without_a_core_edit():
 
 def test_default_registry_admits_local_and_capacium_only():
     assert set(default_reader_registry().dialects()) == {"local", "capacium"}
+
+
+def test_format_reader_api_is_re_exported_from_the_package_root():
+    """The full adapter API is discoverable at ``skillweave.adapters``.
+
+    A consumer that imports the package root must find the package-format
+    readers there, not only under ``skillweave.adapters.format_readers``.
+    """
+    import skillweave.adapters as pkg
+    import skillweave.adapters.format_readers as mod
+
+    for name in (
+        "AdapterBinding",
+        "CapaciumFormatReader",
+        "FormatReaderError",
+        "LocalRegistrationReader",
+        "PackageFormatReader",
+        "ReaderRegistry",
+        "UnadmittedMemberError",
+        "UnsupportedDialectError",
+        "default_reader_registry",
+        "LOCAL_DIALECT",
+        "CAPACIUM_DIALECT",
+        "CAPACIUM_DIALECT_VERSION",
+    ):
+        assert hasattr(pkg, name), f"{name} missing from skillweave.adapters"
+        assert name in pkg.__all__, f"{name} not declared in skillweave.adapters.__all__"
+        assert getattr(pkg, name) is getattr(mod, name), (
+            f"{name} at the package root is not the format_readers object"
+        )

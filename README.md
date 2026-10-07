@@ -157,6 +157,23 @@ Convene multiple AI models for research, code review, or architecture decisions:
   request, and fewer than the minimum distinct answering models is a *degraded*
   run — never reported as consensus.
 
+### Adapters & extension registry
+
+Add or swap a search provider, register a local tool, or read a package-format
+manifest through **one** neutral extension point, with no vendor edit:
+
+- **Provider swap** is a data change; the zero-key DuckDuckGo default needs no
+  credential, and a keyed provider is selected by name.
+- **Local tools** register directly (no package format); **Capacium** is an
+  optional, versioned package-format reader whose `kind` stays opaque.
+- **Fail-closed** admission: an unapproved adapter, a denied egress, a missing
+  credential and an unknown provider are distinct, attributable refusals.
+
+See **[docs/adapters.md](docs/adapters.md)** for the consumer-facing guide
+(provider swap, zero-key defaults, local tool and connector-pack examples,
+package-author vs consumer responsibilities, and the conformance matrix). Every
+claim there is backed by a machine check under `tests/contract/`.
+
 ### Testing
 
 5-level test pyramid with automatic gate decisions:
