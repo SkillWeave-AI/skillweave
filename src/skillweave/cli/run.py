@@ -241,6 +241,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from skillweave.runtime.journal import EventJournal
     from skillweave.runtime.registry import RawArtifactStore
     from skillweave.runtime.stream import DurableStreamStore
+    from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope
     from skillweave.runsvc.service import RunApplicationService
 
     store = SQLiteRunStore(args.db_path)
@@ -256,8 +257,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stream_root = args.stream_root or _default_stream_root(args.db_path)
     stream_store = DurableStreamStore(root=stream_root)
 
-    svc = RunApplicationService(store, journal, raw_artifacts, stream_store)
+    # SW-1510-BUDGET: wire the atomic reservation store explicitly so the
+    # installed `skillweave run` entry is bound to the budget guard.
+    reservation_store = ReservationStore(args.db_path)
+    svc = RunApplicationService(
+        store, journal, raw_artifacts, stream_store,
+        reservation_store=reservation_store,
+    )
     run_id = generate_run_id()
+
+    # SW-1510-BUDGET: Check for an existing owner envelope for this task scope
+    # across ALL runs first.  If the host has pre-configured a finite envelope
+    # (e.g. max_requests=1), honour it — never overwrite with unlimited.
+    # Only create the explicit owner-authorized unlimited envelope when no
+    # owner envelope exists for this task scope.
+    task_id = args.task_id or run_id
+    scope_id = f"{task_id}/attempt-{args.attempt}"
+    existing = reservation_store.get_envelope_for_task_scope(task_id)
+    if existing is not None:
+        owner_env = existing
+    else:
+        owner_env = ReservationEnvelope()
+        reservation_store.set_envelope(run_id, scope_id, owner_env)
 
     try:
         # The native streaming entry authenticates the worker at ingress and,
@@ -278,9 +299,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             subject_commit=args.subject_commit,
             methodology=args.methodology,
             autonomy_policy=args.autonomy_policy,
-            task_id=args.task_id or run_id,
+            task_id=task_id,
             attempt=args.attempt,
             output_root=args.output_root,
+            reservation_envelope=owner_env,
             artifact_evidence=artifact_evidence,
             source_resolver=source_resolver,
             analysis_reader=analysis_reader,

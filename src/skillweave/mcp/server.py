@@ -42,6 +42,7 @@ def _get_run_svc(db_path=".skillweave/store.db", artifacts_path=".skillweave/art
     from skillweave.runtime.journal import EventJournal
     from skillweave.runtime.registry import RawArtifactStore
     from skillweave.runtime.stream import DurableStreamStore
+    from skillweave.runtime.reservation import ReservationStore
     from skillweave.runsvc.service import RunApplicationService
     store = _get_store(db_path)
     journal = EventJournal(db_path)
@@ -51,7 +52,14 @@ def _get_run_svc(db_path=".skillweave/store.db", artifacts_path=".skillweave/art
     # read-only surface (status/replay) that names no stream root gets the
     # memory-only store and therefore creates no files as a side effect.
     stream_store = DurableStreamStore(root=stream_root) if stream_root else None
-    return RunApplicationService(store, journal, raw_artifacts, stream_store)
+    # SW-1510-BUDGET: wire the atomic reservation store explicitly so the MCP
+    # entry is bound to the budget guard.  Every MCP create_run acquires a
+    # reservation slot; cumulative usage is tracked.
+    reservation_store = ReservationStore(db_path)
+    return RunApplicationService(
+        store, journal, raw_artifacts, stream_store,
+        reservation_store=reservation_store,
+    )
 
 def _artifact_evidence_list(artifact_evidence: str):
     """Parse the MCP-supplied artifact proof graph(s); ``None`` when absent."""
@@ -111,6 +119,19 @@ def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, co
         db_path, artifacts_path, stream_root or _default_stream_root(db_path)
     )
     run_id = generate_run_id()
+    # SW-1510-BUDGET: Check for an existing owner envelope for this task scope
+    # across ALL runs first.  If the host has pre-configured a finite envelope,
+    # honour it — never overwrite with unlimited.  Only create the explicit
+    # owner-authorized unlimited envelope when no owner envelope exists.
+    from skillweave.runtime.reservation import ReservationEnvelope as _ReservationEnvelope
+    effective_task_id = task_id or run_id
+    scope_id = f"{effective_task_id}/attempt-{attempt}"
+    existing = svc.reservation_store.get_envelope_for_task_scope(effective_task_id)
+    if existing is not None:
+        owner_env = existing
+    else:
+        owner_env = _ReservationEnvelope()
+        svc.reservation_store.set_envelope(run_id, scope_id, owner_env)
 
     cmd_list = shlex.split(command)
     execution = svc.execute_streaming_native(
@@ -122,9 +143,10 @@ def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, co
         subject_commit=subject_commit,
         methodology=methodology,
         autonomy_policy=autonomy_policy,
-        task_id=task_id or run_id,
+        task_id=effective_task_id,
         attempt=attempt,
         output_root=output_root or None,
+        reservation_envelope=owner_env,
         artifact_evidence=_artifact_evidence_list(artifact_evidence),
         source_resolver=_source_binding(source_root, subject_commit),
         analysis_reader=_analysis_binding(analysis_root),

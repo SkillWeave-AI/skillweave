@@ -199,6 +199,7 @@ class RunApplicationService:
         journal: EventJournal,
         raw_artifacts: RawArtifactStore,
         stream_store: Optional[Any] = None,
+        reservation_store: Optional[Any] = None,
     ):
         self.store = store
         self.journal = journal
@@ -214,6 +215,28 @@ class RunApplicationService:
             except Exception:  # noqa: BLE001 - optional subpackage
                 stream_store = None
         self.stream_store = stream_store
+        # The atomic reservation/admission store (SW-1510-BUDGET). It is
+        # optional and resolved lazily so the unchanged legacy path never
+        # requires the reservation module. When supplied, every execute call
+        # acquires a reservation slot BEFORE launching the worker, enforcing
+        # the envelope's cumulative and in-flight bounds atomically.
+        #
+        # Only ModuleNotFoundError (module genuinely absent from the runtime
+        # subpackage) is silently treated as legacy compatibility. Any other
+        # initialization error (permission denied, corrupt database, import
+        # failure) propagates so a protected/native caller cannot silently
+        # run unguarded.
+        if reservation_store is None:
+            try:
+                rs_cls = _runtime_attr("reservation", "ReservationStore")
+                reservation_store = rs_cls(
+                    db_path=getattr(store, "db_path", ":memory:")
+                )
+            except ModuleNotFoundError:  # noqa: BLE001 - optional module absent
+                reservation_store = None
+            except Exception:  # noqa: BLE001 - other init failure
+                raise
+        self.reservation_store = reservation_store
 
     def execute(
         self,
@@ -238,6 +261,7 @@ class RunApplicationService:
         output_root: Optional[str] = None,
         assay_actor_token: Optional[str] = None,
         assay_envelope: Optional[Any] = None,
+        reservation_envelope: Optional[Any] = None,
         artifact_evidence: Optional[Sequence[Any]] = None,
         source_resolver: Optional[Any] = None,
         analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
@@ -379,6 +403,43 @@ class RunApplicationService:
                 self._fail_run(run_id, f"assay admission refused: {exc}")
                 raise
 
+        # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the worker
+        # is launched.  This is the admission gate: no provider or tool
+        # execution can run without an acquired slot.  The envelope's finite
+        # bounds (in-flight, cumulative requests, bytes, tokens, cost,
+        # deadline) are enforced atomically, and concurrent reservation writers
+        # cannot overspend.  A refused reservation fails the run.
+        #
+        # When no reservation_store is available (legacy path) the admission
+        # check is skipped — the unchanged legacy path keeps its behaviour.
+        reservation_rec = None
+        if self.reservation_store is not None:
+            scope_id = f"{task_id or run_id}/attempt-{attempt}"
+            # Resolve the envelope: use caller-supplied or persist a default
+            env = reservation_envelope
+            # Do NOT persist the envelope here — the ingress (cli/run.py,
+            # mcp/server.py) is responsible for persisting the owner envelope
+            # via set_envelope BEFORE calling execute().  The reserve() call
+            # below resolves the effective envelope through get_envelope(),
+            # which inherits via fallback_task_scope when the exact scope has
+            # no persisted envelope (e.g. a retry at a new attempt scope).
+            # SW-1510-BUDGET: reserve() auto-derives reserved_bytes/reserved_tokens
+            # from the resolved envelope's per-request limits, so the token/byte
+            # dimensions are exercised through the product ingress.
+            try:
+                reservation_rec = self.reservation_store.reserve(
+                    run_id=run_id,
+                    task_id=task_id or run_id,
+                    attempt=int(attempt),
+                    scope_id=scope_id,
+                    idempotency_key=f"execute:{run_id}:{scope_id}",
+                    envelope=env,
+                    route=model,
+                )
+            except Exception as exc:  # noqa: BLE001 - typed admission refusal
+                self._fail_run(run_id, f"reservation refused: {exc}")
+                raise RunIntegrationError("reservation", str(exc)) from exc
+
         # Stage 2: launch the worker as a real subprocess. On the protected
         # (identity-authenticated) path the worker is launched inside a real
         # process-protection window: the protected stores are sealed (and, where
@@ -482,6 +543,8 @@ class RunApplicationService:
             raise
         except Exception as exc:  # noqa: BLE001
             self._fail_run(run_id, f"launch raised {exc}")
+            if reservation_rec is not None and self.reservation_store is not None:
+                self.reservation_store.cancel(reservation_rec.reservation_id)
             raise RunIntegrationError("launch", str(exc)) from exc
         finally:
             # Release the protection window (unseal the protected stores) on
@@ -490,6 +553,37 @@ class RunApplicationService:
             # leave the host's own stores locked.
             if protection is not None:
                 protection.__exit__(None, None, None)
+
+        # SW-1510-BUDGET: complete the reservation with observed usage now that
+        # the worker has produced its transport outcome.  This frees the in-flight
+        # slot and records observed bytes/tokens.  Unknown usage stays reserved
+        # until an explicit reconcile call.
+        #
+        # A post-dispatch storage failure during completion is exposed as a
+        # RunIntegrationError (durable incomplete-reconciliation record) so the
+        # caller knows the reservation was not cleanly closed.  The primary run
+        # lifecycle (stages 3-6) still continues — the run record is valid, the
+        # reservation is durable at COMPLETED state — but the incomplete
+        # reconciliation is not silently swallowed.
+        if reservation_rec is not None and self.reservation_store is not None:
+            try:
+                # SW-1510-BUDGET: exercise token/cost dimensions through the
+                # product ingress (not only the helper level).  Tokens and cost
+                # are not directly observable from a subprocess transport, so
+                # they are passed as None (unknown) --- the reserved amounts
+                # persist until an explicit reconcile call.  Bytes are the
+                # observed transport outcome.
+                self.reservation_store.complete(
+                    reservation_rec.reservation_id,
+                    observed_bytes=len(result.stdout or b""),
+                    observed_tokens=None,
+                    cost=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RunIntegrationError(
+                    "reservation",
+                    f"reservation completion failed: {exc}",
+                ) from exc
 
         # Stage 3: raw artifact (content-addressed bytes).
         raw_bytes = result.stdout or b""
@@ -1669,6 +1763,7 @@ class RunApplicationService:
         attempt: Optional[int] = None,
         task_id: Optional[str] = None,
         restarted_from: Optional[dict[str, Any]] = None,
+        reservation_envelope: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Start *command* as a detached background process.
 
@@ -1707,13 +1802,37 @@ class RunApplicationService:
         # ``restarted_from`` -- it is never the same attempt "restarted" by a
         # bare database transition.  ``root_run_id`` ties the attempt chain
         # together; ``attempt`` is monotonically increasing within the chain.
+        effective_task_id = task_id or rid
+        effective_attempt = int(attempt) if attempt is not None else 1
         lineage: dict[str, Any] = {
             "root_run_id": root_run_id or rid,
             "parent_run_id": parent_run_id,
-            "attempt": int(attempt) if attempt is not None else 1,
-            "task_id": task_id,
+            "attempt": effective_attempt,
+            "task_id": effective_task_id,
             "restarted_from": dict(restarted_from) if restarted_from else None,
         }
+
+        # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the detached
+        # child is launched.  The async/restart path must be admitted through
+        # the same reservation gate as the synchronous execute paths.  The
+        # envelope is resolved via fallback_task_scope inheritance (the ingress
+        # is responsible for persisting the owner envelope).  On launch failure
+        # the slot is cancelled; on child completion the wrapper completes it.
+        reservation_rec = None
+        scope_id = f"{effective_task_id}/attempt-{effective_attempt}"
+        if self.reservation_store is not None:
+            try:
+                reservation_rec = self.reservation_store.reserve(
+                    run_id=rid,
+                    task_id=effective_task_id,
+                    attempt=effective_attempt,
+                    scope_id=scope_id,
+                    idempotency_key=f"start_async:{rid}:{scope_id}",
+                    envelope=reservation_envelope,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RunIntegrationError(
+                    "reservation", f"async reservation refused: {exc}") from exc
 
         # Store initial lifecycle metadata BEFORE launching the child, so the
         # wrapper starts at version 2 (not version 1).  This prevents a race
@@ -1735,17 +1854,28 @@ class RunApplicationService:
 
         # Build the detached wrapper script that writes completion/error
         # back to the same kernel store.
+        reservation_id_arg = (reservation_rec.reservation_id
+                              if reservation_rec is not None else "")
         wrapper_src = (
             "import subprocess, sys, json, os, signal\n"
             "rid = sys.argv[1]\n"
             "db_path = sys.argv[2]\n"
-            "cmd = sys.argv[3:]\n"
+            "reservation_id = sys.argv[3]\n"
+            "cmd = sys.argv[4:]\n"
             "from skillweave.runtime.store import SQLiteRunStore, RunStateModel, CompletionReconciler\n"
             "from skillweave.runtime.journal import EventJournal\n"
+            "from skillweave.runtime.reservation import ReservationStore\n"
             "store = SQLiteRunStore(db_path)\n"
             "journal = EventJournal(db_path)\n"
+            "reservation_store = ReservationStore(db_path) if reservation_id else None\n"
             "journal.append(rid, event_type='started',\n"
             "    payload={'command': cmd})\n"
+            "def _complete_reservation():\n"
+            "    if reservation_store is not None and reservation_id:\n"
+            "        try:\n"
+            "            reservation_store.complete(reservation_id)\n"
+            "        except Exception:\n"
+            "            pass\n"
             "def _complete(lifecycle, event_type, payload, key, reason):\n"
             "    CompletionReconciler(\n"
             "        store, rid,\n"
@@ -1764,11 +1894,13 @@ class RunApplicationService:
             "        {'lifecycle_state': 'succeeded' if rc == 0 else 'failed', 'exit_code': rc},\n"
             "        'finished', {'returncode': rc, 'stdout_preview': stdout_text[:1024]},\n"
             "        'wrapper:finish:' + rid + ':' + str(rc), 'wrapper: process completed')\n"
+            "    _complete_reservation()\n"
             "except Exception as exc:\n"
             "    _complete(\n"
             "        {'lifecycle_state': 'failed', 'exit_code': -1},\n"
             "        'error', {'error': str(exc)},\n"
             "        'wrapper:error:' + rid, 'wrapper: error: ' + str(exc))\n"
+            "    _complete_reservation()\n"
             "finally:\n"
             "    store.close()\n"
             "    journal.close()\n"
@@ -1786,15 +1918,25 @@ class RunApplicationService:
             if _sp not in _pp:
                 _env["PYTHONPATH"] = _pp + ":" + _sp if _pp else _sp
 
-        proc = subprocess.Popen(
-            [sys.executable, "-c", wrapper_src, rid, db_path] + list(command),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=child_cwd,
-            env=_env,
-        )
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", wrapper_src, rid, db_path,
+                 reservation_id_arg] + list(command),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=child_cwd,
+                env=_env,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Launch failure: cancel the reservation slot before propagating.
+            if reservation_rec is not None and self.reservation_store is not None:
+                try:
+                    self.reservation_store.cancel(reservation_rec.reservation_id)
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
+            raise RunIntegrationError("launch", f"async Popen failed: {exc}") from exc
 
         now = datetime.now(timezone.utc).isoformat()
 
@@ -2127,6 +2269,7 @@ class RunApplicationService:
         project_root: Optional[Path] = None,
         cwd: Optional[Path] = None,
         _env: Optional[dict[str, str]] = None,
+        reservation_envelope: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Launch a NEW identified attempt that continues *run_id*.
 
@@ -2161,6 +2304,12 @@ class RunApplicationService:
         source_lineage = (source.metadata or {}).get("lineage") or {}
         root_run_id = source_lineage.get("root_run_id") or source.run_id
         next_attempt = int(source_lineage.get("attempt") or 1) + 1
+
+        # SW-1510-BUDGET: inherit the source run's task identity so the retry
+        # is bounded by the same owner envelope and task aggregate.  An explicit
+        # caller-supplied task_id (e.g. from the MCP or CLI) overrides this.
+        if task_id is None:
+            task_id = source_lineage.get("task_id")
 
         idem = idempotency_key or ("restart:" + run_id)
         attempts = dict((source.metadata or {}).get("restart_attempts") or {})
@@ -2225,6 +2374,7 @@ class RunApplicationService:
             attempt=next_attempt,
             task_id=task_id,
             restarted_from=restarted_from,
+            reservation_envelope=reservation_envelope,
         )
         result["parent_run_id"] = run_id
         result["root_run_id"] = root_run_id
@@ -2529,6 +2679,7 @@ class RunApplicationService:
         output_root: Optional[str] = None,
         assay_actor_token: Optional[str] = None,
         assay_envelope: Optional[Any] = None,
+        reservation_envelope: Optional[Any] = None,
         artifact_evidence: Optional[Sequence[Any]] = None,
         source_resolver: Optional[Any] = None,
         analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
@@ -2653,6 +2804,49 @@ class RunApplicationService:
                 self._fail_run(run_id, f"assay admission refused: {exc}")
                 raise
 
+        # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the worker
+        # is launched — exactly as the bounded ``execute`` path does.  On the
+        # protected streaming path the reservation is mandatory: a missing or
+        # inaccessible reservation_store is a hard failure (fail-closed) so a
+        # protected native request cannot silently run without admission.
+        #
+        # When the reservation_store is None and the caller did NOT explicitly
+        # request the legacy compatibility path, the admission is refused.
+        reservation_rec = None
+        if self.reservation_store is not None:
+            scope_id = f"{task_id or run_id}/attempt-{attempt}"
+            env = reservation_envelope
+            # Do NOT persist the envelope here — the ingress (cli/run.py,
+            # mcp/server.py) is responsible for persisting the owner envelope
+            # via set_envelope BEFORE calling execute_streaming_native().
+            # The reserve() call below resolves the effective envelope through
+            # get_envelope(), which inherits via fallback_task_scope when the
+            # exact scope has no persisted envelope (e.g. a retry at a new
+            # attempt scope).
+            # SW-1510-BUDGET: reserve() auto-derives reserved_bytes/reserved_tokens
+            # from the resolved envelope's per-request limits, so the token/byte
+            # dimensions are exercised through the streaming product ingress.
+            try:
+                reservation_rec = self.reservation_store.reserve(
+                    run_id=run_id,
+                    task_id=task_id or run_id,
+                    attempt=int(attempt),
+                    scope_id=scope_id,
+                    idempotency_key=f"execute_streaming:{run_id}:{scope_id}",
+                    envelope=env,
+                    route=model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._fail_run(run_id, f"reservation refused: {exc}")
+                raise RunIntegrationError("reservation", str(exc)) from exc
+        elif require_identity or authority_service is not None:
+            # Protected native path: missing reservation store is fail-closed.
+            raise RunIntegrationError(
+                "reservation",
+                "the protected native path requires a reservation store; "
+                "a missing budget guard cannot silently admit unguarded execution",
+            )
+
         # Stage 2: the real protected launch + durable streaming collection.
         # The streaming path composes the *same* SCOPE boundary as ``execute``:
         # the declared write scope is authorized and the real isolation attested
@@ -2747,6 +2941,8 @@ class RunApplicationService:
             raise
         except Exception as exc:  # noqa: BLE001
             self._fail_run(run_id, f"streaming launch raised {exc}")
+            if reservation_rec is not None and self.reservation_store is not None:
+                self.reservation_store.cancel(reservation_rec.reservation_id)
             raise RunIntegrationError("launch", str(exc)) from exc
         finally:
             # Release the protection window (unseal the protected stores) on
@@ -2754,6 +2950,32 @@ class RunApplicationService:
             # enforcement before the child ever existed.
             if protection is not None:
                 protection.__exit__(None, None, None)
+
+        # SW-1510-BUDGET: complete the reservation with observed usage.  On the
+        # streaming path we capture the retained stdout bytes as the observed
+        # transport outcome.  Tokens and cost are not directly observable from
+        # a subprocess transport, so they are passed as None (unknown) --- the
+        # reserved amounts persist until an explicit reconcile call.  A storage
+        # failure during completion is exposed as a durable incomplete-
+        # reconciliation record (the reservation stays at COMPLETED with unknown
+        # usage) rather than silently swallowed.
+        if reservation_rec is not None and self.reservation_store is not None:
+            try:
+                observed = None
+                if result and hasattr(result, 'stdout_text'):
+                    observed = len(result.stdout_text.encode("utf-8", errors="replace"))
+                self.reservation_store.complete(
+                    reservation_rec.reservation_id,
+                    observed_bytes=observed,
+                    observed_tokens=None,
+                    cost=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Expose the incomplete reconciliation — do not silently swallow.
+                raise RunIntegrationError(
+                    "reservation",
+                    f"reservation completion failed: {exc}",
+                ) from exc
 
         fact = result.fact
         out_summary = self.stream_store.summary(
