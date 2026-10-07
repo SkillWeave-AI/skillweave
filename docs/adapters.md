@@ -310,6 +310,7 @@ execution*: `self_approving` is always `False` and `is_authority` is always
 | Markdown Discovery skill **declares** its consumer; declaration drives the engine + is closed data | `tests/contract/test_discovery_skill_binding.py` |
 | Discovery consumer on the **installed** artifact (incl. the skill declaration) | `tests/contract/test_discovery_installed_consumer.py` |
 | Router/harness decision & admission semantics preserved | `tests/contract/test_adapter_router_harness_semantics.py` |
+| Core descriptor/outcome versions pinned to the SDK-owned schema `const` | `tests/contract/test_adapter_schema_authority.py` |
 | SDK adapter schema contract set | `skillweave-sdk/tests/contract/test_adapter_contract_set.py` |
 
 ## Not in scope (follow-ups)
