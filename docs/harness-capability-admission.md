@@ -187,3 +187,7 @@ still-mandatory gate. Until that gate exists, treat every snapshot as carrying
   skipping, so the shape contract can never be reported green by omission.
 - `tests/integration/test_harness_adapter.py` — the surrounding adapter suite,
   including the lockstep vocabulary and eager-closure (layering) checks.
+
+The OpenClaude plugin's *headless transport* — clean allowlisted environment,
+typed stream-json lifecycle, and the prompt/tool/plugin/stderr controls — is
+documented separately in `docs/headless-openclaude-adapter.md`.

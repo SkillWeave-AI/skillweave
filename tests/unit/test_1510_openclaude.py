@@ -1,0 +1,583 @@
+"""SW-1510-OPENCLAUDE: a scoped headless OpenClaude adapter.
+
+OpenClaude stays an *explicitly selected* user adapter with a host-neutral core
+contract, and ``dontAsk`` is never blanket tool authorization.
+
+Every case here drives the real consumer wiring, not a helper name:
+
+* criterion 1 launches a *real child process* (``sys.executable``) through
+  ``runtime.runner_adapter`` with the environment the routing adapter actually
+  produced, and reads the child's own ``os.environ`` back - proving the ambient
+  alternate-provider key is absent in the launched process, not merely absent
+  from a returned dict.
+* criterion 2 classifies the three typed headless events (permission denial,
+  ``input_required``, worker exit) and proves ``input_required`` maps to the
+  shared lifecycle ``blocked_input`` result rather than a silent REPL wait.
+* criterion 3 measures stderr backpressure on a real capped run and drives the
+  missing-plugin / missing-tool / oversized-prompt fixtures through the plugin's
+  own refusal path with an injected launch counter that must stay at zero.
+
+No provider, network or socket call is made; the unit-suite hermetic boundary
+(tests/unit/conftest.py) blocks sockets and clears provider env vars, and every
+launch here is either an injected counter or a local ``sys.executable``.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+_src = Path(__file__).resolve().parent.parent.parent / "src"
+if str(_src) not in sys.path:
+    sys.path.insert(0, str(_src))
+
+import pytest  # noqa: E402
+
+from skillweave.routing.harness_adapter import (  # noqa: E402
+    AMBIENT_PROVIDER_ENV_KEYS,
+    DEFAULT_MAX_PROMPT_BYTES,
+    HEADLESS_ENV_ALLOWLIST,
+    HEADLESS_EVENT_INPUT_REQUIRED,
+    HEADLESS_EVENT_PERMISSION_DENIED,
+    HEADLESS_EVENT_RAW,
+    HEADLESS_EVENT_WORKER_EXIT,
+    PERMISSION_MODE_DEFAULT,
+    PERMISSION_MODE_DONT_ASK,
+    AdapterRequest,
+    CapabilityRequirement,
+    HarnessAdapterError,
+    NativeRequirements,
+    OpenClaudeAdapter,
+    assert_not_observer_owned,
+    classify_headless_event,
+    clean_launch_environment,
+    headless_terminal_status,
+    parse_headless_events,
+)
+from skillweave.runtime import runner_adapter as ra  # noqa: E402
+
+# The same host-binding / snapshot shape SW-1510-CAP established: a real offline
+# executable on disk whose sha256 is taken from the bytes.
+SKILL_DIGEST = "a" * 64
+NATIVE_TOOLS = ("Read", "Bash", "Edit", "Agent", "Skill", "Task")
+
+
+def _digest(path):
+    import hashlib
+
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _shape_digest(value):
+    import hashlib
+
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+class _Host:
+    """A real on-disk fake harness plus the configurations that pin to it."""
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.binary = self.root / "fake-worker"
+        self.binary.write_text("#!/bin/sh\necho fake-harness-ready\nexit 0\n")
+        self.binary.chmod(0o700)
+        self.plugin = self.root / "plugin.json"
+        self.plugin.write_text('{"name":"fixture-worker","version":"1"}')
+        self.model = "fixture-model"
+        self.coordinator_config = {
+            "mode": "bare", "tools": list(NATIVE_TOOLS), "model": self.model,
+        }
+        self.child_config = {
+            "mode": "bare", "tools": list(NATIVE_TOOLS), "model": self.model,
+        }
+
+    def config_digest(self):
+        return _shape_digest([self.coordinator_config, self.child_config, "bare"])
+
+    def binding(self):
+        return {
+            "binary_path": str(self.binary),
+            "binary_sha256": _digest(self.binary),
+            "binary_version": "fixture-1",
+            "plugin_path": str(self.plugin),
+            "plugin_sha256": _digest(self.plugin),
+            "mode": "bare",
+            "model": self.model,
+            "coordinator_config": self.coordinator_config,
+            "child_worker_config": self.child_config,
+            "config_digest": self.config_digest(),
+        }
+
+    def snapshot(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        binding = self.binding()
+        stage = {
+            "skill_digest": SKILL_DIGEST,
+            "runtime_config_digest": binding["config_digest"],
+            "observer": "fixture-host-collector",
+        }
+        return {
+            "schema_version": "1.0.0",
+            "snapshot_id": "cap-1510-oc",
+            "revision": "1",
+            "measured_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            "subject": "openclaude",
+            "issuer": "fixture-host-collector",
+            "limits": {},
+            "readiness": "unknown",
+            "evidence_level": "run-attested",
+            "capabilities": {
+                "declared": {"tools": list(NATIVE_TOOLS)},
+                "detected": {
+                    "coordinator_tools": list(NATIVE_TOOLS),
+                    "child_worker_tools": list(NATIVE_TOOLS),
+                },
+                "run_attested": {
+                    "workflow_stages": {
+                        "skill-expanded": dict(stage),
+                        "codebase-analyzed": dict(stage),
+                    },
+                    "native_expansion": dict(stage),
+                },
+                "host_binding": binding,
+            },
+        }
+
+
+class _Counter:
+    """An injected launch seam that counts calls and touches no provider."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, plan):
+        self.calls.append(tuple(argv))
+        return _StubResult(succeeded=True)
+
+
+class _StubResult:
+    def __init__(self, succeeded):
+        self.succeeded = succeeded
+
+
+def _native_plan(exe):
+    adapter = OpenClaudeAdapter(executable=str(exe))
+    return adapter, adapter.plan(
+        AdapterRequest(
+            run_id="oc-1510",
+            role="ops",
+            requirement=CapabilityRequirement(
+                complexity=0, capabilities=("native-tool",)
+            ),
+            work=b"/understand",
+        )
+    )
+
+
+def _headless_plan(exe, gateway_env=None, permission_mode=PERMISSION_MODE_DEFAULT):
+    adapter = OpenClaudeAdapter(
+        executable=str(exe),
+        permission_mode=permission_mode,
+        gateway_env=gateway_env,
+    )
+    plan = adapter.plan(
+        AdapterRequest(
+            run_id="oc-1510",
+            role="ops",
+            requirement=CapabilityRequirement(complexity=0),
+            work=b"do the thing",
+        )
+    )
+    return adapter, plan
+
+
+def _needs():
+    return NativeRequirements(
+        skill_name="understand",
+        skill_digest=SKILL_DIGEST,
+        required_tools=("Agent", "Skill"),
+        required_stages=("skill-expanded", "codebase-analyzed"),
+    )
+
+
+def _leaky_base_env():
+    env = {"PATH": "/usr/bin", "HOME": "/tmp"}
+    for key in AMBIENT_PROVIDER_ENV_KEYS:
+        env[key] = "ambient-" + key
+    return env
+
+
+# -- criterion 1: clean allowlisted env + pinned settings; ambient cannot redirect --
+
+def test_clean_launch_environment_drops_every_ambient_provider_key():
+    env = clean_launch_environment(base_env=_leaky_base_env())
+    for key in AMBIENT_PROVIDER_ENV_KEYS:
+        assert key not in env, f"ambient provider key {key} leaked into the child env"
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_pinned_gateway_settings_are_the_only_extra_keys():
+    env = clean_launch_environment(
+        base_env=_leaky_base_env(),
+        pinned_env={"APPROVED_GATEWAY_BASE_URL": "https://gw.example/v1"},
+    )
+    assert env["APPROVED_GATEWAY_BASE_URL"] == "https://gw.example/v1"
+    assert set(env) <= set(HEADLESS_ENV_ALLOWLIST) | {"APPROVED_GATEWAY_BASE_URL"}
+    for key in AMBIENT_PROVIDER_ENV_KEYS:
+        assert key not in env
+
+
+def test_pinning_an_ambient_provider_key_is_refused_fail_closed():
+    with pytest.raises(HarnessAdapterError) as exc:
+        clean_launch_environment(
+            base_env=_leaky_base_env(),
+            pinned_env={"OPENROUTER_API_KEY": "pinned-leak"},
+        )
+    assert exc.value.asset == "OPENROUTER_API_KEY"
+
+
+def test_adapter_launch_environment_keeps_pinned_gateway_drops_ambient():
+    adapter, _plan = _headless_plan(
+        "openclaude",
+        gateway_env={"APPROVED_GATEWAY_BASE_URL": "https://gw.example/v1"},
+    )
+    env = adapter.launch_environment(base_env=_leaky_base_env())
+    assert env["APPROVED_GATEWAY_BASE_URL"] == "https://gw.example/v1"
+    for key in AMBIENT_PROVIDER_ENV_KEYS:
+        assert key not in env
+
+
+def test_gateway_env_constructor_refuses_an_ambient_provider_key():
+    with pytest.raises(HarnessAdapterError) as exc:
+        OpenClaudeAdapter(gateway_env={"ANTHROPIC_API_KEY": "leak"})
+    assert exc.value.asset == "ANTHROPIC_API_KEY"
+
+
+def test_runtime_build_child_environment_allowlist_drops_ambient_keeps_pinned():
+    env = ra.build_child_environment(
+        env_allowlist=["PATH", "HOME"],
+        extra_env={"APPROVED_GATEWAY_BASE_URL": "https://gw.example/v1"},
+        base_env=_leaky_base_env(),
+    )
+    assert env == {
+        "PATH": "/usr/bin",
+        "HOME": "/tmp",
+        "APPROVED_GATEWAY_BASE_URL": "https://gw.example/v1",
+    }
+
+
+@pytest.mark.parametrize("where", ["allowlist", "extra"])
+def test_child_env_refuses_an_ambient_provider_key(where):
+    if where == "allowlist":
+        kwargs = {"env_allowlist": ["PATH", "OPENAI_API_KEY"]}
+    else:
+        kwargs = {"env_allowlist": ["PATH"], "extra_env": {"OPENAI_API_KEY": "x"}}
+    with pytest.raises(ValueError):
+        ra.build_child_environment(base_env=_leaky_base_env(), **kwargs)
+
+
+def _child_env_probe(env=None, env_allowlist=None):
+    """Launch a real child and read back which provider keys it can see."""
+    keys = list(AMBIENT_PROVIDER_ENV_KEYS)
+    script = (
+        "import json, os\n"
+        f"keys = {keys!r}\n"
+        "print(json.dumps({k: (k in os.environ) for k in keys}))\n"
+        'print("PATH" in os.environ)\n'
+    )
+    result = ra.run_command(
+        [sys.executable, "-c", script],
+        run_id="oc-1510-env",
+        subject_repo="skillweave",
+        subject_commit="seed",
+        tool="openclaude",
+        model="fixture-model",
+        env=env,
+        env_allowlist=env_allowlist,
+    )
+    seen, has_path = result.stdout.decode().splitlines()
+    return result, json.loads(seen), has_path == "True"
+
+
+def test_launched_child_process_cannot_see_ambient_provider_keys():
+    # The real consumer wiring: the routing adapter produces the child env, the
+    # runtime launches the child with it, and the child's own os.environ is read
+    # back. A helper name would not prove this; the process does.
+    adapter, _plan = _headless_plan(
+        "openclaude",
+        gateway_env={"APPROVED_GATEWAY_BASE_URL": "https://gw.example/v1"},
+    )
+    child_env = adapter.launch_environment(base_env=_leaky_base_env())
+    # Manual mode: only the explicitly handed env is used (no ambient inherit).
+    result, seen, has_path = _child_env_probe(env=child_env, env_allowlist=[])
+    assert result.succeeded is True, result.message
+    assert has_path is True
+    assert not any(seen.values()), f"ambient provider key reached the child: {seen}"
+
+
+def test_allowlist_mode_inherits_only_allowlisted_keys_in_the_child():
+    # Allowlist mode drops ambient keys on the *runtime* side too, reading from
+    # an explicit base rather than the ambient shell.
+    import os
+
+    saved = {k: os.environ.get(k) for k in AMBIENT_PROVIDER_ENV_KEYS}
+    try:
+        for k in AMBIENT_PROVIDER_ENV_KEYS:
+            os.environ[k] = "ambient-" + k
+        result, seen, _ = _child_env_probe(
+            env={"APPROVED_GATEWAY_BASE_URL": "https://gw.example/v1"},
+            env_allowlist=["PATH", "HOME"],
+        )
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert result.succeeded is True, result.message
+    assert not any(seen.values()), f"ambient provider key reached the child: {seen}"
+
+
+# -- criterion 2: typed headless lifecycle events, no silent REPL wait ----------
+
+def test_initial_permission_denial_is_a_typed_event():
+    event = classify_headless_event(
+        {"type": "system", "subtype": "permission_denied", "tool": "Bash"}
+    )
+    assert event["kind"] == HEADLESS_EVENT_PERMISSION_DENIED
+    assert event["payload"]["tool"] == "Bash"
+
+
+def test_input_required_is_a_typed_event():
+    event = classify_headless_event({"type": "input_required", "prompt": "approve?"})
+    assert event["kind"] == HEADLESS_EVENT_INPUT_REQUIRED
+
+
+def test_worker_exit_is_a_typed_event():
+    event = classify_headless_event({"type": "result", "subtype": "exit", "code": 0})
+    assert event["kind"] == HEADLESS_EVENT_WORKER_EXIT
+
+
+def test_an_unrecognised_object_is_surfaced_never_dropped():
+    event = classify_headless_event({"type": "assistant", "text": "hi"})
+    assert event["kind"] not in (
+        HEADLESS_EVENT_PERMISSION_DENIED,
+        HEADLESS_EVENT_INPUT_REQUIRED,
+        HEADLESS_EVENT_WORKER_EXIT,
+    )
+    assert event["payload"]["text"] == "hi"
+
+
+def test_a_non_object_event_is_refused_fail_closed():
+    with pytest.raises(HarnessAdapterError) as exc:
+        classify_headless_event("a bare string is not a typed event")
+    assert exc.value.asset == "event"
+
+
+def test_parse_headless_events_surfaces_raw_lines_in_order():
+    events = parse_headless_events(
+        [
+            json.dumps({"type": "system", "subtype": "permission_denied"}),
+            "not json at all",
+            json.dumps({"type": "result"}),
+        ]
+    )
+    assert [e["kind"] for e in events] == [
+        HEADLESS_EVENT_PERMISSION_DENIED,
+        HEADLESS_EVENT_RAW,
+        HEADLESS_EVENT_WORKER_EXIT,
+    ]
+
+
+def test_input_required_maps_to_blocked_input_not_a_wait():
+    from skillweave.trace.contracts import JobStatus, TaskVerdict
+
+    status = headless_terminal_status(
+        [{"kind": HEADLESS_EVENT_PERMISSION_DENIED}, {"kind": HEADLESS_EVENT_INPUT_REQUIRED}]
+    )
+    assert status["terminal"] == HEADLESS_EVENT_INPUT_REQUIRED
+    lifecycle = status["lifecycle"]
+    assert lifecycle.job_status is JobStatus.BLOCKED_INPUT
+    assert lifecycle.task_verdict is TaskVerdict.BLOCKED
+
+
+def test_worker_exit_wins_over_earlier_markers():
+    status = headless_terminal_status(
+        [{"kind": HEADLESS_EVENT_INPUT_REQUIRED}, {"kind": HEADLESS_EVENT_WORKER_EXIT}]
+    )
+    assert status["terminal"] == HEADLESS_EVENT_WORKER_EXIT
+
+
+def test_a_stream_with_no_terminal_marker_is_not_terminal():
+    assert headless_terminal_status([{"kind": "event"}]) is None
+
+
+def test_build_command_is_explicitly_noninteractive_headless():
+    adapter, plan = _headless_plan("openclaude")
+    argv = list(adapter.build_command(plan))
+    assert argv[0] == "openclaude"
+    assert "--print" in argv
+    assert argv[argv.index("--input-format") + 1] == "stream-json"
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert argv[argv.index("--permission-mode") + 1] == PERMISSION_MODE_DEFAULT
+    # The model comes from the router's decision, never chosen by the plugin.
+    assert argv[argv.index("--model") + 1] == plan.strategy.model_mix[0]
+
+
+def test_dontask_is_refused_on_a_plan_that_was_not_admitted_native():
+    adapter, plan = _headless_plan("openclaude", permission_mode=PERMISSION_MODE_DONT_ASK)
+    counter = _Counter()
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(plan, launch=counter)
+    assert counter.calls == [], "dontAsk must be refused before any launch"
+    assert exc.value.asset == "permission_mode"
+
+
+def test_dontask_is_allowed_once_the_plan_is_admitted_native(tmp_path):
+    # The scoped case: dontAsk is not blanket authorization, but it *is* honoured
+    # for a plan whose native-tool handshake actually passed.
+    host = _Host(tmp_path)
+    adapter = OpenClaudeAdapter(
+        executable=str(host.binary), permission_mode=PERMISSION_MODE_DONT_ASK
+    )
+    plan = adapter.plan(
+        AdapterRequest(
+            run_id="oc-1510",
+            role="ops",
+            requirement=CapabilityRequirement(
+                complexity=0, capabilities=("native-tool",)
+            ),
+            work=b"/understand",
+        )
+    )
+    counter = _Counter()
+    outcome = adapter.execute(
+        plan,
+        launch=counter,
+        capability_snapshot=host.snapshot(),
+        native_requirements=_needs(),
+        host_binding=host.binding(),
+    )
+    assert len(counter.calls) == 1
+    argv = counter.calls[0]
+    assert argv[argv.index("--permission-mode") + 1] == PERMISSION_MODE_DONT_ASK
+    assert outcome.succeeded is True
+
+
+# -- criterion 3: controlled failure fixtures; no observer-owned writes ---------
+
+def test_missing_plugin_is_a_controlled_failure_with_zero_launch():
+    adapter, plan = _headless_plan("openclaude")
+    counter = _Counter()
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(plan, launch=counter, missing_plugins=["understand"])
+    assert counter.calls == []
+    assert exc.value.asset == "plugin:understand"
+
+
+def test_missing_tool_is_a_controlled_failure_with_zero_launch():
+    adapter, plan = _headless_plan("openclaude")
+    counter = _Counter()
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(
+            plan,
+            launch=counter,
+            required_tools=["Bash"],
+            available_tools=["Read"],
+        )
+    assert counter.calls == []
+    assert exc.value.asset == "tool:Bash"
+
+
+def test_oversized_prompt_is_refused_not_truncated():
+    adapter, plan = _headless_plan("openclaude")
+    counter = _Counter()
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(
+            plan,
+            launch=counter,
+            prompt=b"x" * (DEFAULT_MAX_PROMPT_BYTES + 1),
+        )
+    assert counter.calls == []
+    assert exc.value.asset == "prompt"
+
+
+def test_a_prompt_at_the_cap_is_accepted():
+    adapter, plan = _headless_plan("openclaude")
+    counter = _Counter()
+    outcome = adapter.execute(
+        plan, launch=counter, prompt=b"x" * DEFAULT_MAX_PROMPT_BYTES
+    )
+    assert len(counter.calls) == 1
+    assert outcome.succeeded is True
+
+
+def test_stderr_backpressure_caps_retained_bytes_and_is_flagged():
+    cap = 512
+    script = (
+        "import sys\n"
+        "sys.stderr.write('e' * 50000)\n"
+        "sys.stderr.flush()\n"
+        "print('done')\n"
+    )
+    result = ra.run_command(
+        [sys.executable, "-c", script],
+        run_id="oc-1510-bp",
+        subject_repo="skillweave",
+        subject_commit="seed",
+        tool="openclaude",
+        model="fixture-model",
+        stderr_retain_limit=cap,
+    )
+    assert result.stderr_exceeded_cap is True
+    assert result.stderr_backpressure_events > 0
+    assert len(result.stderr) <= cap
+    assert result.stderr_observed_bytes > cap
+    # A controlled, defined failure - not a silent success.
+    assert result.succeeded is False
+    assert result.metadata["stderr_backpressure_events"] == result.stderr_backpressure_events
+
+
+def test_stderr_within_cap_is_unaffected():
+    script = "import sys; sys.stderr.write('small')\n"
+    result = ra.run_command(
+        [sys.executable, "-c", script],
+        run_id="oc-1510-bp2",
+        subject_repo="skillweave",
+        subject_commit="seed",
+        tool="openclaude",
+        model="fixture-model",
+        stderr_retain_limit=4096,
+    )
+    assert result.stderr_exceeded_cap is False
+    assert result.stderr_backpressure_events == 0
+    assert result.stderr == b"small"
+    assert result.succeeded is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["frames.jsonl", "facts.jsonl", "cursor.json", "observer.json", "meta.json"],
+)
+def test_adapter_cannot_write_an_observer_owned_file(name, tmp_path):
+    target = tmp_path / name
+    with pytest.raises(HarnessAdapterError) as exc:
+        assert_not_observer_owned(str(target))
+    assert exc.value.asset == "observer_state"
+
+
+def test_adapter_cannot_write_inside_an_observer_root(tmp_path):
+    root = tmp_path / "observer-state"
+    root.mkdir()
+    with pytest.raises(HarnessAdapterError) as exc:
+        assert_not_observer_owned(str(root / "scratch.txt"), observer_roots=[str(root)])
+    assert exc.value.asset == "observer_state"
+
+
+def test_an_ordinary_worker_path_is_permitted(tmp_path):
+    target = tmp_path / "worktree" / "notes.txt"
+    assert assert_not_observer_owned(str(target)) == str(target)

@@ -1,0 +1,123 @@
+# The scoped headless OpenClaude adapter (SW-1510-OPENCLAUDE)
+
+OpenClaude stays an **explicitly selected** user adapter on top of the
+host-neutral core contract (SW-158). This document describes the headless
+transport it declares, the environment it launches a child in, and the
+fail-closed controls around prompts, tools, plugins and stderr.
+
+The core (`HarnessAdapter`, `HarnessPlan`, `admit_native_plan`) names no
+concrete harness. Everything OpenClaude-specific lives in the plugin class
+`OpenClaudeAdapter` in `src/skillweave/routing/harness_adapter.py`; the runtime
+half that actually launches a process lives in
+`src/skillweave/runtime/runner_adapter.py`.
+
+## 1. Clean allowlisted environment; ambient keys cannot redirect traffic
+
+A model request must reach the **approved gateway**, never an ambient alternate
+provider that happens to be set in the parent shell. Two cooperating helpers
+enforce this on both sides of the seam:
+
+- `routing.harness_adapter.clean_launch_environment(*, base_env, pinned_env, allowlist)`
+  — inherits **only** the allowlisted keys (`PATH`, `HOME`, `LANG`, `LC_ALL`,
+  `TMPDIR`, `SYSTEMROOT`, `PYTHONPATH`) from the base environment, then adds the
+  caller's **pinned** gateway settings (for example
+  `APPROVED_GATEWAY_BASE_URL`). Every ambient provider credential is dropped.
+- `runtime.runner_adapter.build_child_environment(*, env_allowlist, extra_env, base_env)`
+  — the runtime-side mirror used by `start_process`/`run_command` and friends.
+
+`OpenClaudeAdapter.launch_environment()` returns the allowlisted environment,
+and the plugin's `gateway_env` pin is validated in the constructor.
+
+The eight ambient provider keys are named once, in
+`AMBIENT_PROVIDER_ENV_KEYS` (mirrored in both modules and in
+`routing.faigate_adapter.detect_providers`):
+
+`FAIGATE_API_KEY`, `OPENROUTER_API_KEY`, `CLAWROUTER_API_KEY`, `KILO_API_KEY`,
+`OMNIROUTE_API_KEY`, `NINEROUTER_API_KEY`, `OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`.
+
+Fail closed: an ambient provider key placed in the allowlist, in `extra_env`, or
+in a pinned `gateway_env` is **refused** rather than silently honoured — pinning
+must not become a back door for the very key the allowlist drops.
+
+`env_allowlist=None` preserves the historical inherit behaviour, so existing
+callers and tests are unaffected; only callers that opt into the allowlist lose
+the ambient environment.
+
+## 2. Headless execution and typed lifecycle events
+
+`OpenClaudeAdapter.build_command` emits an explicit, non-interactive argv:
+
+```
+<executable> --print --input-format stream-json --output-format stream-json \
+             --permission-mode <mode> [--model <mixed-model>]
+```
+
+`--print` drives one headless pass with **no REPL fallback**. The model comes
+from the router's decision (`plan.strategy.model_mix[0]`), never from the plugin.
+
+The child's stream-json lifecycle is read as typed events:
+
+- `classify_headless_event(payload)` — an **initial permission denial**
+  (`permission_denied`), an **input request** (`input_required`) or a **worker
+  exit**. Anything else is a benign `event` (surfaced, never dropped). A payload
+  that is not a JSON object is refused (fail closed).
+- `parse_headless_events(lines)` — one event per line; a non-JSON line is a
+  visible `raw` event.
+- `headless_terminal_status(events)` — worker exit wins; otherwise an
+  `input_required` request is terminal and returns the shared lifecycle
+  `blocked_input` result (`skillweave.trace.contracts.blocked_input_result`), so
+  a headless adapter **never waits** on a child that wants input; otherwise a
+  permission denial is its own typed terminal.
+
+### `dontAsk` is scoped, not blanket authorization
+
+`PERMISSION_MODE_DEFAULT` (`"default"`) is the fail-closed default. `dontAsk`
+must be opted in and is **refused** by `validate_permission_mode(native_admitted=...)`
+unless the plan actually required and passed the measured native-tool
+handshake. `dontAsk` on a raw-command plan is refused before any launch.
+
+## 3. Controlled failure fixtures
+
+All of these run **before** the injected `launch` seam is reached, so a refusal
+performs zero work:
+
+- `check_surface(...)` — a missing **plugin** (named before a missing tool) or
+  missing **tool** is refused, naming the asset (`plugin:<name>` / `tool:<name>`).
+- `check_prompt_size(work, *, max_bytes=DEFAULT_MAX_PROMPT_BYTES)` — an
+  oversized prompt is refused rather than truncated (a truncated prompt is a
+  *different request*).
+- `assert_not_observer_owned(target, *, observer_roots=())` — the adapter may
+  not write observer-owned state: `frames.jsonl`, `facts.jsonl`, `cursor.json`,
+  `observer.json`, `meta.json`, or anything under an explicit observer root. The
+  target is realpath-resolved first, so a symlink cannot smuggle a write in.
+- **stderr backpressure** — `run_command(..., stderr_retain_limit=N)` caps the
+  retained stderr; bytes beyond the cap are counted
+  (`stderr_backpressure_events`, `stderr_observed_bytes`, `stderr_exceeded_cap`)
+  rather than buffered whole. The stream is *drained*, never deadlocked, and a
+  capped run reads as a controlled failure (`succeeded is False`).
+
+## 4. Data contracts consumed
+
+- `attempt-event-v1` — produced by the OpenClaude adapter, consumed by the run
+  service (durable stream, SW-1510-STREAM).
+- `capability-snapshot-v1` — produced by OpenClaude, consumed by preflight
+  (native admission, `docs/harness-capability-admission.md`).
+
+## Verification
+
+- `tests/unit/test_1510_openclaude.py` — drives the real consumer wiring:
+  - a **real child process** is launched through `runtime.runner_adapter` with
+    the environment the routing adapter produced, and the child's own
+    `os.environ` is read back to prove no ambient provider key reached it;
+  - the typed permission-denial / `input_required` / worker-exit events,
+    including `input_required` → `blocked_input`;
+  - missing plugin/tool and oversized-prompt fixtures with an injected launch
+    counter that stays at `0`;
+  - stderr backpressure on a real capped run;
+  - `assert_not_observer_owned` for every observer-owned file.
+- `tests/unit/test_runner_adapter.py` — the runtime half (process, cancel,
+  timeout, signal/exit distinction, batch stop, lane binding, cold-start).
+- `tests/unit/test_1510_cap.py` — the native capability admission gate.
+- `tests/integration/test_harness_adapter.py` — the adapter suite, including the
+  headless argv and the eager-closure (layering) checks.

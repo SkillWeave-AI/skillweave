@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -88,6 +89,73 @@ HARNESS_CAPABILITIES: tuple[str, ...] = (
 #: compatibility (see :meth:`HarnessAdapter.execute`): the gate refuses only
 #: when native execution is *claimed as required*, never silently.
 NATIVE_TOOL_CAPABILITY = "native-tool"
+
+
+# ── The headless transport boundary (SW-1510-OPENCLAUDE) ───────────────────
+#
+# A headless adapter is driven by explicit argv, not by an interactive REPL.
+# The plugin owns the argv, but the *vocabulary* of headless operation is a
+# provider-neutral contract declared once here (data, never a branch in core):
+#
+# * ``HEADLESS_INPUT_FORMAT_STREAM_JSON`` — the child is told to read its work
+#   as structured JSON on stdin, so a request for more input is a typed event
+#   rather than a silent terminal read.
+# * ``HEADLESS_OUTPUT_FORMAT_STREAM_JSON`` — the child emits one JSON object
+#   per line on stdout, so initial permission denial, an ``input_required``
+#   request and a worker exit are all typed and parseable.
+# * ``HEADLESS_PRINT_ARGV`` — the argv fragment that puts the child in
+#   non-interactive "print" mode with no REPL fallback.
+# * The declared permission modes. A headless run must name the permission
+#   posture it is launched under. ``dontAsk`` is a *scoped* posture for work
+#   that has already been admitted by a measured capability handshake; it is
+#   **not** blanket tool authorization, so a plan that names it without the
+#   native-tool admission handshake is refused (:func:`resolve_permission_mode`).
+HEADLESS_INPUT_FORMAT_STREAM_JSON = "stream-json"
+HEADLESS_OUTPUT_FORMAT_STREAM_JSON = "stream-json"
+HEADLESS_PRINT_ARGV: tuple[str, ...] = ("--print",)
+
+#: The declared headless permission postures. ``default`` requires interactive
+#: approval for each tool (refused for a declared headless run that cannot
+#: answer); ``dontAsk`` proceeds without per-tool prompts *only* under an
+#: admitted native plan; ``acceptEdits``/``bypassPermissions`` are explicitly
+#: not offered because they are blanket authorization this adapter refuses.
+PERMISSION_MODE_DEFAULT = "default"
+PERMISSION_MODE_DONT_ASK = "dontAsk"
+HEADLESS_PERMISSION_MODES: tuple[str, ...] = (
+    PERMISSION_MODE_DEFAULT,
+    PERMISSION_MODE_DONT_ASK,
+)
+
+#: The typed lifecycle marker the headless child emits for a request for more
+#: input. A worker that emits it must be answered or reported ``input_required``;
+#: the adapter never blocks on a bare terminal read.
+HEADLESS_INPUT_REQUIRED_MARKER = "input_required"
+#: The typed marker for an initial permission denial: the child refused a tool
+#: because the launch posture did not authorize it. Distinct from ``dontAsk``:
+#: a denial is evidence the posture was *not* blanket authorization.
+HEADLESS_PERMISSION_DENIED_MARKER = "permission_denied"
+
+#: Environment keys that redirect a model request away from the approved
+#: gateway. A clean launch environment must not carry an ambient alternate
+#: provider key: the parent resolves its provider through the gateway and hands
+#: the child only the pinned, allowlisted keys. This tuple is the *ambient*
+#: credential set a child must not silently inherit.
+AMBIENT_PROVIDER_ENV_KEYS: tuple[str, ...] = (
+    "FAIGATE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "CLAWROUTER_API_KEY",
+    "KILO_API_KEY",
+    "OMNIROUTE_API_KEY",
+    "NINEROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+)
+
+#: The names of the callable surfaces on the *lifecycle* contract this module
+#: imports back into. Declared as data so the eager-import-closure test can be
+#: told which names a plugin is allowed to reach without re-introducing a
+#: module-level cross-package import (the ``runtime`` subpackage is optional).
+_LIFECYCLE_BLOCKED_INPUT = "blocked_input_result"
 
 
 # ── The dispatch strategies the router may choose ──────────────────────────
@@ -1542,6 +1610,260 @@ def register_plugins(
     return registry
 
 
+# ── Headless transport helpers (SW-1510-OPENCLAUDE) ────────────────────────
+#
+# Provider-neutral helpers a headless adapter plugin reuses. They name no
+# concrete harness: the plugin supplies its own executable and pins its own
+# gateway environment, while the *semantics* of headless operation — a clean
+# allowlisted environment, a declared permission posture, and typed events for
+# permission denial / input requests / worker exit — live here as data.
+
+#: The only ambient environment keys a headless child may inherit. Everything
+#: else — including every ambient alternate provider credential — is dropped,
+#: so a key present in the parent shell cannot redirect the child's model
+#: traffic away from the approved gateway. ``PATH``/``HOME``/``LANG`` are the
+#: minimal process necessities; the child's provider routing is supplied by the
+#: parent's *pinned* gateway settings, not by inheritance.
+HEADLESS_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "SYSTEMROOT",
+    "PYTHONPATH",
+)
+
+#: The typed headless lifecycle markers a stream-json worker emits.
+HEADLESS_EVENT_PERMISSION_DENIED = "permission_denied"
+HEADLESS_EVENT_INPUT_REQUIRED = "input_required"
+HEADLESS_EVENT_WORKER_EXIT = "worker_exit"
+HEADLESS_EVENT_RAW = "raw"
+HEADLESS_EVENT_OTHER = "event"
+
+_PERMISSION_DENIED_MARKERS = (
+    "permission_denied",
+    "permissiondenied",
+    "permission-denied",
+    "not permitted",
+    "permission not granted",
+)
+_INPUT_REQUIRED_MARKERS = (
+    "input_required",
+    "inputrequired",
+    "input-required",
+    "needs_input",
+)
+_WORKER_EXIT_MARKERS = ("result", "exit", "done", "complete")
+
+#: The default cap on prompt bytes handed to a headless child on stdin. An
+#: oversized prompt is refused before launch rather than truncated: a silently
+#: truncated prompt would be a *different request*, not a smaller one.
+DEFAULT_MAX_PROMPT_BYTES = 1024 * 1024
+
+#: Observer-owned state the adapter must never write: the durable stream store's
+#: files and the observer's own record. A worker that could rewrite these could
+#: forge its own evidence trail.
+OBSERVER_OWNED_FILENAMES: tuple[str, ...] = (
+    "frames.jsonl",
+    "facts.jsonl",
+    "cursor.json",
+    "observer.json",
+    "meta.json",
+)
+
+
+def _matches(haystack: str, needles: Sequence[str]) -> bool:
+    return any(needle in haystack for needle in needles)
+
+
+def clean_launch_environment(
+    *,
+    base_env: Optional[Mapping[str, str]] = None,
+    pinned_env: Optional[Mapping[str, str]] = None,
+    allowlist: Sequence[str] = HEADLESS_ENV_ALLOWLIST,
+) -> dict[str, str]:
+    """Build the child launch environment from an explicit allowlist.
+
+    Only ``allowlist`` keys are carried over from ``base_env`` (default
+    ``os.environ``); every other ambient key — most importantly every ambient
+    alternate provider credential — is dropped, so a key present in the parent
+    shell cannot redirect the child's model traffic. ``pinned_env`` are the
+    parent's *approved gateway* settings and are the only non-allowlisted keys
+    added. A pinned key that is itself an ambient provider key is refused:
+    pinning must not be a back door for the very key the allowlist drops.
+    """
+    base = os.environ if base_env is None else base_env
+    env = {str(k): str(base[k]) for k in allowlist if k in base}
+    if pinned_env:
+        for key, value in pinned_env.items():
+            name = str(key)
+            if name in AMBIENT_PROVIDER_ENV_KEYS:
+                raise HarnessAdapterError(
+                    f"pinned launch environment may not set ambient provider "
+                    f"key {name!r}; route the child through the approved "
+                    "gateway instead",
+                    asset=name,
+                )
+            env[name] = str(value)
+    return env
+
+
+def classify_headless_event(payload: Any) -> dict[str, Any]:
+    """Classify one parsed stream-json object into a typed headless event.
+
+    Recognises the three typed lifecycle markers a headless worker emits: an
+    initial *permission denial*, an *input request* (``input_required``) and a
+    *worker exit*. Anything else is a benign ``event`` — it is surfaced, never
+    silently swallowed and never mistaken for a typed marker. A payload that is
+    not a JSON object is refused (fail closed): a bare string cannot be read as
+    a typed event.
+    """
+    if not isinstance(payload, Mapping):
+        raise HarnessAdapterError(
+            "a headless stream event must be a JSON object",
+            asset="event",
+        )
+    tokens = []
+    for key in ("type", "subtype", "status", "event"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            tokens.append(value.strip().lower())
+    joined = " ".join(tokens)
+    if _matches(joined, _PERMISSION_DENIED_MARKERS):
+        kind = HEADLESS_EVENT_PERMISSION_DENIED
+    elif _matches(joined, _INPUT_REQUIRED_MARKERS):
+        kind = HEADLESS_EVENT_INPUT_REQUIRED
+    elif _matches(joined, _WORKER_EXIT_MARKERS):
+        kind = HEADLESS_EVENT_WORKER_EXIT
+    else:
+        kind = HEADLESS_EVENT_OTHER
+    return {"kind": kind, "payload": dict(payload)}
+
+
+def parse_headless_events(lines: Iterable[str]) -> list[dict[str, Any]]:
+    """Parse headless stream-json lines into typed events, in order.
+
+    A line that is not a JSON object is surfaced as a ``raw`` event (visible,
+    never dropped and never mistaken for a typed marker). Precedence of the
+    typed terminal markers is decided by :func:`headless_terminal_status`.
+    """
+    events: list[dict[str, Any]] = []
+    for line in lines:
+        stripped = line.strip() if isinstance(line, str) else ""
+        if not stripped:
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            events.append({"kind": HEADLESS_EVENT_RAW, "line": stripped})
+            continue
+        events.append(classify_headless_event(parsed))
+    return events
+
+
+def headless_terminal_status(
+    events: Sequence[Mapping[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """The typed terminal outcome of a headless event stream, or ``None``.
+
+    A worker *exit* is terminal and wins. Failing that, an ``input_required``
+    request is terminal as a typed ``blocked_input`` lifecycle result (from the
+    shared lifecycle contract) — the child is waiting, and a headless adapter
+    must never wait on it. Failing that, a permission denial is reported as its
+    own typed terminal. A stream with none of those is ``None`` (not terminal).
+    """
+    kinds = [event.get("kind") for event in events]
+    if HEADLESS_EVENT_WORKER_EXIT in kinds:
+        return {"terminal": HEADLESS_EVENT_WORKER_EXIT}
+    if HEADLESS_EVENT_INPUT_REQUIRED in kinds:
+        from skillweave.trace.contracts import blocked_input_result
+
+        return {
+            "terminal": HEADLESS_EVENT_INPUT_REQUIRED,
+            "lifecycle": blocked_input_result(()),
+        }
+    if HEADLESS_EVENT_PERMISSION_DENIED in kinds:
+        return {"terminal": HEADLESS_EVENT_PERMISSION_DENIED}
+    return None
+
+
+def check_prompt_size(
+    work: bytes, *, max_bytes: int = DEFAULT_MAX_PROMPT_BYTES
+) -> int:
+    """Refuse an oversized prompt before launch; return its size otherwise."""
+    size = len(work or b"")
+    if size > max_bytes:
+        raise HarnessAdapterError(
+            f"prompt of {size} bytes exceeds the headless cap of {max_bytes} "
+            "bytes; refusing rather than truncating the request",
+            asset="prompt",
+        )
+    return size
+
+
+def check_surface(
+    *,
+    required_tools: Iterable[str] = (),
+    available_tools: Iterable[str] = (),
+    required_plugins: Iterable[str] = (),
+    available_plugins: Iterable[str] = (),
+) -> dict[str, list[str]]:
+    """Refuse a missing plugin or tool before launch (a controlled fixture).
+
+    A native headless run needs its installed plugins and its tools present.
+    The check is data-in/data-out — a missing plugin is named before a missing
+    tool, and the refusal names the first missing asset so it is attributable.
+    Returns the observed surface otherwise.
+    """
+    avail_tools = {str(t) for t in available_tools}
+    avail_plugins = {str(p) for p in available_plugins}
+    missing_plugins = sorted(str(p) for p in required_plugins if str(p) not in avail_plugins)
+    if missing_plugins:
+        raise HarnessAdapterError(
+            f"missing required plugin(s) {missing_plugins}",
+            asset=f"plugin:{missing_plugins[0]}",
+        )
+    missing_tools = sorted(str(t) for t in required_tools if str(t) not in avail_tools)
+    if missing_tools:
+        raise HarnessAdapterError(
+            f"missing required tool(s) {missing_tools}",
+            asset=f"tool:{missing_tools[0]}",
+        )
+    return {"tools": sorted(avail_tools), "plugins": sorted(avail_plugins)}
+
+
+def assert_not_observer_owned(
+    target: str, *, observer_roots: Sequence[str] = ()
+) -> str:
+    """Refuse a write target that is observer-owned; return it otherwise.
+
+    The adapter may not write observer-owned state: the durable stream store's
+    files (``frames.jsonl``/``facts.jsonl``/``cursor.json``/``meta.json``), the
+    observer's own record, or anything under an explicit observer root. The
+    target is realpath-resolved first, so a symlink cannot smuggle a write in.
+    """
+    if not isinstance(target, str) or not target.strip():
+        raise HarnessAdapterError(
+            "write target must be a non-empty path",
+            asset="target",
+        )
+    resolved = os.path.realpath(os.path.abspath(target))
+    if os.path.basename(resolved) in OBSERVER_OWNED_FILENAMES:
+        raise HarnessAdapterError(
+            f"refusing to write observer-owned file {resolved!r}",
+            asset="observer_state",
+        )
+    for root in observer_roots:
+        rr = os.path.realpath(os.path.abspath(root))
+        if resolved == rr or resolved.startswith(rr + os.sep):
+            raise HarnessAdapterError(
+                f"refusing to write inside observer root {rr!r}",
+                asset="observer_state",
+            )
+    return target
+
+
 # ── A plugin: the OpenClaude harness ───────────────────────────────────────
 
 class OpenClaudeAdapter(HarnessAdapter):
@@ -1553,8 +1875,18 @@ class OpenClaudeAdapter(HarnessAdapter):
     plugin with a different name, a different capability set, and a different
     argv is registered and driven identically, with no change to any core code.
 
-    ``capabilities`` and ``executable`` are injectable so a caller can declare
-    the plugin's real, machine-observed surface without editing the class.
+    ``capabilities``, ``executable`` and ``gateway_env`` are injectable so a
+    caller can declare the plugin's real, machine-observed surface without
+    editing the class. ``gateway_env`` is the parent's *pinned* gateway setting
+    (base URL / approved key); it is the only non-allowlisted environment the
+    child receives (see :meth:`launch_environment`).
+
+    The transport is **headless** (SW-1510-OPENCLAUDE): the child is driven by
+    explicit argv (``--print``, ``--input-format stream-json``,
+    ``--output-format stream-json``), its permission posture is declared
+    explicitly, and its lifecycle (initial permission denial, an
+    ``input_required`` request, worker exit) is a typed event. There is no
+    interactive REPL fallback, so the adapter never silently waits for input.
     """
 
     #: The plugin's own identity. Opaque to the generic core: the interface
@@ -1580,6 +1912,9 @@ class OpenClaudeAdapter(HarnessAdapter):
         self,
         executable: str = "openclaude",
         capabilities: Optional[Iterable[str]] = None,
+        *,
+        permission_mode: str = PERMISSION_MODE_DEFAULT,
+        gateway_env: Optional[Mapping[str, str]] = None,
     ) -> None:
         if not isinstance(executable, str) or not executable.strip():
             raise HarnessAdapterError(
@@ -1587,6 +1922,25 @@ class OpenClaudeAdapter(HarnessAdapter):
                 asset="executable",
             )
         self._executable = executable.strip()
+        if permission_mode not in HEADLESS_PERMISSION_MODES:
+            raise HarnessAdapterError(
+                f"unknown headless permission mode {permission_mode!r} "
+                f"(expected one of {list(HEADLESS_PERMISSION_MODES)})",
+                asset="permission_mode",
+            )
+        self._permission_mode = permission_mode
+        # Pinned gateway environment: the only non-allowlisted keys the child
+        # gets. Validated here so an ambient provider key can never be pinned in.
+        self._gateway_env: dict[str, str] = {}
+        if gateway_env:
+            for key, value in gateway_env.items():
+                name = str(key)
+                if name in AMBIENT_PROVIDER_ENV_KEYS:
+                    raise HarnessAdapterError(
+                        f"gateway_env may not set ambient provider key {name!r}",
+                        asset=name,
+                    )
+                self._gateway_env[name] = str(value)
         declared = (
             self.DEFAULT_CAPABILITIES
             if capabilities is None
@@ -1609,19 +1963,143 @@ class OpenClaudeAdapter(HarnessAdapter):
     def executable(self) -> str:
         return self._executable
 
+    @property
+    def permission_mode(self) -> str:
+        return self._permission_mode
+
+    @property
+    def gateway_env(self) -> dict[str, str]:
+        return dict(self._gateway_env)
+
     def capabilities(self) -> frozenset[str]:
         return self._capabilities
 
     def build_command(self, plan: HarnessPlan) -> Sequence[str]:
-        """The plugin's transport argv: its executable, and the router's model.
+        """The plugin's headless transport argv for an accepted plan.
+
+        The argv is explicit and non-interactive: ``--print`` drives one
+        headless pass with no REPL fallback, ``--input-format stream-json`` /
+        ``--output-format stream-json`` make the stdin request and the stdout
+        lifecycle structured, and ``--permission-mode <mode>`` declares the
+        posture the child runs under (never *omitted*, so a run can never fall
+        back to an accidental interactive approval surface).
 
         The model is the router's primary cast member from
         ``plan.strategy.model_mix`` — read from the decision, never chosen here.
         """
-        command = [self._executable]
+        command = [
+            self._executable,
+            *HEADLESS_PRINT_ARGV,
+            "--input-format",
+            HEADLESS_INPUT_FORMAT_STREAM_JSON,
+            "--output-format",
+            HEADLESS_OUTPUT_FORMAT_STREAM_JSON,
+            "--permission-mode",
+            self._permission_mode,
+        ]
         if plan.strategy.model_mix:
             command += ["--model", plan.strategy.model_mix[0]]
         return command
+
+    def launch_environment(
+        self, *, base_env: Optional[Mapping[str, str]] = None
+    ) -> dict[str, str]:
+        """The clean, allowlisted environment the headless child is launched in.
+
+        Only :data:`HEADLESS_ENV_ALLOWLIST` keys are inherited from the ambient
+        shell, plus this plugin's pinned ``gateway_env``. Ambient alternate
+        provider keys therefore cannot reach the child and cannot redirect its
+        model traffic away from the approved gateway.
+        """
+        return clean_launch_environment(
+            base_env=base_env, pinned_env=self._gateway_env
+        )
+
+    def validate_permission_mode(self, *, native_admitted: bool) -> str:
+        """Return the permission posture, refusing ``dontAsk`` without admission.
+
+        ``dontAsk`` is a *scoped* posture for work already admitted by the
+        measured native-tool handshake. It is **not** blanket tool
+        authorization: naming it on a plan that has not been admitted as a
+        native plan is refused here, before any launch.
+        """
+        if self._permission_mode == PERMISSION_MODE_DONT_ASK and not native_admitted:
+            raise HarnessAdapterError(
+                "permission mode 'dontAsk' is scoped to an admitted native-tool "
+                "plan, not blanket tool authorization; admit the plan (or use "
+                f"{PERMISSION_MODE_DEFAULT!r}) before launching",
+                asset="permission_mode",
+            )
+        return self._permission_mode
+
+    def execute(
+        self,
+        plan: HarnessPlan,
+        *,
+        launch: Any,
+        capability_snapshot: Any = None,
+        native_requirements: Any = None,
+        host_binding: Any = None,
+        prompt: Optional[bytes] = None,
+        required_tools: Iterable[str] = (),
+        available_tools: Optional[Iterable[str]] = None,
+        required_plugins: Iterable[str] = (),
+        available_plugins: Iterable[str] = (),
+        max_prompt_bytes: int = DEFAULT_MAX_PROMPT_BYTES,
+        allow_prompt_overflow: bool = False,
+        missing_plugins: Iterable[str] = (),
+    ) -> HarnessOutcome:
+        """Launch a headless plan through the injected ``launch`` seam.
+
+        Wraps the generic :meth:`HarnessAdapter.execute` with the headless,
+        fail-closed admission steps, all *before* any launch:
+
+        1. The generic native-tool admission runs first (if the plan requires
+           it) — a refusal performs zero work.
+        2. The declared tool/plugin surface is checked; a missing plugin or tool
+           is a controlled refusal naming the asset.
+        3. The prompt is size-checked; an oversized prompt is refused rather
+           than truncated.
+        4. ``dontAsk`` is refused unless the plan was admitted as native — it
+           is not blanket tool authorization.
+
+        Only then is the child launched. ``missing_plugins``/``allow_prompt_overflow``
+        drive the controlled failure fixtures.
+        """
+        if missing_plugins:
+            check_surface(required_plugins=missing_plugins)
+        if required_tools:
+            check_surface(
+                required_tools=required_tools,
+                available_tools=available_tools or (),
+            )
+        if prompt is not None and not allow_prompt_overflow:
+            check_prompt_size(prompt, max_bytes=max_prompt_bytes)
+
+        admission = admit_native_plan(
+            plan,
+            capability_snapshot=capability_snapshot,
+            native_requirements=native_requirements,
+            host_binding=host_binding,
+        )
+        if not admission.admitted:
+            raise HarnessAdapterError(
+                "headless admission refused before launch: " + admission.reason,
+                asset=admission.asset,
+            )
+        # dontAsk is scoped to a plan that actually required (and passed) the
+        # native-tool handshake — not to any plan that merely got a raw-command
+        # ``admitted=True``. A raw-command plan is NOT native skill execution.
+        self.validate_permission_mode(
+            native_admitted=NATIVE_TOOL_CAPABILITY in plan.required_capabilities
+        )
+        return super().execute(
+            plan,
+            launch=launch,
+            capability_snapshot=capability_snapshot,
+            native_requirements=native_requirements,
+            host_binding=host_binding,
+        )
 
 
 __all__ = [
@@ -1653,4 +2131,28 @@ __all__ = [
     "HarnessAdapterRegistry",
     "register_plugins",
     "OpenClaudeAdapter",
+    # Headless transport vocabulary + helpers (SW-1510-OPENCLAUDE)
+    "HEADLESS_PRINT_ARGV",
+    "HEADLESS_INPUT_FORMAT_STREAM_JSON",
+    "HEADLESS_OUTPUT_FORMAT_STREAM_JSON",
+    "HEADLESS_ENV_ALLOWLIST",
+    "HEADLESS_PERMISSION_MODES",
+    "PERMISSION_MODE_DEFAULT",
+    "PERMISSION_MODE_DONT_ASK",
+    "AMBIENT_PROVIDER_ENV_KEYS",
+    "HEADLESS_EVENT_PERMISSION_DENIED",
+    "HEADLESS_EVENT_INPUT_REQUIRED",
+    "HEADLESS_EVENT_WORKER_EXIT",
+    "HEADLESS_EVENT_RAW",
+    "HEADLESS_INPUT_REQUIRED_MARKER",
+    "HEADLESS_PERMISSION_DENIED_MARKER",
+    "DEFAULT_MAX_PROMPT_BYTES",
+    "OBSERVER_OWNED_FILENAMES",
+    "clean_launch_environment",
+    "classify_headless_event",
+    "parse_headless_events",
+    "headless_terminal_status",
+    "check_prompt_size",
+    "check_surface",
+    "assert_not_observer_owned",
 ]
