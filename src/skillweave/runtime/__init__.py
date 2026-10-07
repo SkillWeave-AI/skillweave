@@ -29,14 +29,24 @@ from .preflight import (
     run_preflight,
 )
 from .semantic_repair import (
+    ALLOWED_ACTION,
+    ATTEMPT_EVENT_SCHEMA_ID,
+    ATTEMPT_EVENT_SCHEMA_VERSION,
     BoundedRepairer,
+    ErrorClass,
     HoldReason,
+    RepairAction,
     RepairAttempt,
     RepairOutcome,
+    UnsupportedAttemptEventVersion,
+    UnsupportedErrorClass,
+    allowed_action,
+    classify_error,
     collect_grounding_evidence,
     detect_surface_failure,
     language_of,
     repair_plan_from_grounding,
+    validate_attempt_event,
 )
 from .handoff import ColdStartBundle, HandoffBroker, HandoffOffer, HandoffError
 from .observer import (
