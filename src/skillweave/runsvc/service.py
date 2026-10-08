@@ -1487,7 +1487,14 @@ class RunApplicationService:
             f"http://{route_proof.approved_gateway_host}:"
             f"{route_proof.approved_gateway_port}"
         )
-        check_egress_gateway(approved_url)
+        try:
+            check_egress_gateway(approved_url)
+        except Exception as exc:
+            raise RunIntegrationError(
+                "route_lock",
+                f"egress gateway check failed for {approved_url!r}: {exc}; "
+                f"refusing to launch with an unapproved gateway (HOLD)",
+            ) from exc
 
         adapter = SandboxExecAdapter()
         if not adapter.available():
