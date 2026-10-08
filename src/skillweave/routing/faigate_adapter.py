@@ -1615,21 +1615,69 @@ def check_egress_gateway(url: str) -> None:
 
     Criterion 2: worker and child egress is restricted to the approved
     enforcing gateway at ``http://127.0.0.1:8090``.  Alternative loopback
-    routers (different ports, different hosts) and direct upstream URLs
-    are detected and refused.  When enforcement is absent — the URL does
-    not start with the approved gateway address — the check raises before
-    any paid admission.
+    routers (different ports, different hosts), suffix/subdomain attacks
+    (``127.0.0.1:8090.evil.com``), userinfo tricks, trailing-dot hosts,
+    IPv6/IPv4 aliases that are not the approved host:port, and direct
+    upstream URLs are detected and refused using exact URL parsing
+    (scheme, hostname, port).  When enforcement is absent the check
+    raises before any paid admission.
 
     Raises ``ModelNamespaceError`` with a description of the disallowed
     egress path.
     """
-    normalized = url.rstrip("/")
-    if not normalized.startswith(APPROVED_GATEWAY_URL):
+    from urllib.parse import urlparse
+
+    if not url:
         raise ModelNamespaceError(
             url,
-            f"egress URL {url!r} does not route through the approved gateway "
-            f"at {APPROVED_GATEWAY_URL}; alternative loopback or direct "
-            "upstream is not allowed",
+            f"egress URL is empty; approved gateway is "
+            f"{APPROVED_GATEWAY_URL}",
+        )
+
+    parsed = urlparse(url)
+
+    # Reject non-HTTP schemes (e.g. https, ftp, file)
+    if parsed.scheme != "http":
+        raise ModelNamespaceError(
+            url,
+            f"egress URL {url!r} uses scheme {parsed.scheme!r}; "
+            f"only http is allowed through the approved gateway "
+            f"at {APPROVED_GATEWAY_URL}",
+        )
+
+    # Reject userinfo (e.g. http://user:pass@127.0.0.1:8090)
+    if parsed.username is not None or parsed.password is not None:
+        raise ModelNamespaceError(
+            url,
+            f"egress URL {url!r} contains userinfo; "
+            f"approved gateway {APPROVED_GATEWAY_URL} "
+            f"must not have credentials",
+        )
+
+    # Exact hostname and port comparison
+    if parsed.hostname != APPROVED_GATEWAY_HOST:
+        raise ModelNamespaceError(
+            url,
+            f"egress URL {url!r} resolves to host {parsed.hostname!r}; "
+            f"only {APPROVED_GATEWAY_HOST!r} is the approved gateway host; "
+            "alternative loopback routers and direct upstream URLs are "
+            "not allowed",
+        )
+
+    # parsed.port returns None when no explicit port (defaults to scheme default)
+    # and raises ValueError when the port portion is non-numeric (e.g.
+    # "8090.evil.com" in a suffix-attack URL like 127.0.0.1:8090.evil.com).
+    try:
+        actual_port = parsed.port
+    except ValueError:
+        actual_port = None
+    if actual_port is None or actual_port != APPROVED_GATEWAY_PORT:
+        raise ModelNamespaceError(
+            url,
+            f"egress URL {url!r} uses port {actual_port!r}; "
+            f"only port {APPROVED_GATEWAY_PORT} is the approved "
+            f"gateway port; alternative loopback routers on different "
+            f"ports are not allowed",
         )
 
 

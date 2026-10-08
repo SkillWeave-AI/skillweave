@@ -235,37 +235,37 @@ class TestEgressGateway:
         """A Faigate-like router on a different port is refused."""
         with pytest.raises(ModelNamespaceError) as exc:
             check_egress_gateway("http://127.0.0.1:9090/v1")
-        assert "does not route through the approved gateway" in str(exc.value)
+        assert "port" in str(exc.value).lower()
 
     def test_different_host_is_refused(self):
         """A different loopback host is refused."""
         with pytest.raises(ModelNamespaceError) as exc:
             check_egress_gateway("http://127.0.0.2:8090/v1")
-        assert "does not route through the approved gateway" in str(exc.value)
+        assert "host" in str(exc.value).lower()
 
     def test_localhost_by_name_is_refused(self):
         """'localhost' by name is refused (only 127.0.0.1 is approved)."""
         with pytest.raises(ModelNamespaceError) as exc:
             check_egress_gateway("http://localhost:8090/v1")
-        assert "does not route through the approved gateway" in str(exc.value)
+        assert "host" in str(exc.value).lower()
 
     def test_direct_upstream_is_refused(self):
         """A direct upstream URL (e.g. api.openai.com) is refused."""
         with pytest.raises(ModelNamespaceError) as exc:
             check_egress_gateway("https://api.openai.com/v1")
-        assert "does not route through the approved gateway" in str(exc.value)
+        assert "scheme" in str(exc.value).lower()
 
     def test_different_loopback_router_is_refused(self):
         """OmniRoute on localhost:20128 is refused."""
         with pytest.raises(ModelNamespaceError) as exc:
             check_egress_gateway("http://localhost:20128/v1")
-        assert "does not route through the approved gateway" in str(exc.value)
+        assert "host" in str(exc.value).lower()
 
     def test_empty_url_is_refused(self):
         """An empty or malformed URL is refused."""
         with pytest.raises(ModelNamespaceError) as exc:
             check_egress_gateway("")
-        assert "does not route through the approved gateway" in str(exc.value)
+        assert "empty" in str(exc.value).lower()
 
     def test_bash_network_call_to_unapproved_host_is_refused(self):
         """A Bash network call to an unapproved host is caught by the check.
@@ -279,13 +279,13 @@ class TestEgressGateway:
         # before any network activity.
         with pytest.raises(ModelNamespaceError) as exc:
             check_egress_gateway("http://alternative-router.local/v1")
-        assert "does not route through the approved gateway" in str(exc.value)
+        assert "host" in str(exc.value).lower()
 
     def test_https_to_gateway_port_is_refused(self):
         """HTTPS to the gateway address is refused (only HTTP is approved)."""
         with pytest.raises(ModelNamespaceError) as exc:
             check_egress_gateway("https://127.0.0.1:8090/v1")
-        assert "does not route through the approved gateway" in str(exc.value)
+        assert "scheme" in str(exc.value).lower()
 
     def test_absent_enforcement_detected_before_admission(self):
         """When enforcement is absent (no URL check), the call is detected.
@@ -298,6 +298,64 @@ class TestEgressGateway:
         # If it raises, the run is HOLD before any provider is contacted.
         with pytest.raises(ModelNamespaceError):
             check_egress_gateway("http://192.168.1.100:8090/v1")
+
+    # --- Adversarial URL parsing tests (controller finding 2 on f36a3ea) ---
+
+    def test_suffix_host_is_refused(self):
+        """A suffix/subdomain attack (127.0.0.1:8090.evil.com) is refused.
+
+        The old prefix-match check would accept this URL because it starts
+        with ``http://127.0.0.1:8090``.  The exact URL parsing approach
+        must reject it.  Note that the hostname component resolves as
+        ``127.0.0.1`` so the check fails on the port (``8090.evil.com``),
+        not the hostname.
+        """
+        with pytest.raises(ModelNamespaceError) as exc:
+            check_egress_gateway("http://127.0.0.1:8090.evil.com/v1")
+        msg = str(exc.value).lower()
+        assert "port" in msg
+
+    def test_userinfo_is_refused(self):
+        """A URL with userinfo (http://user:pass@127.0.0.1:8090) is refused."""
+        with pytest.raises(ModelNamespaceError) as exc:
+            check_egress_gateway("http://user:pass@127.0.0.1:8090/v1")
+        assert "userinfo" in str(exc.value).lower() or "credential" in str(exc.value).lower()
+
+    def test_trailing_dot_host_is_refused(self):
+        """A trailing-dot host (127.0.0.1.:8090) is refused."""
+        with pytest.raises(ModelNamespaceError) as exc:
+            check_egress_gateway("http://127.0.0.1.:8090/v1")
+        assert "host" in str(exc.value).lower()
+
+    def test_ipv6_loopback_is_refused(self):
+        """IPv6 ::1 as host is refused (only 127.0.0.1 is approved)."""
+        with pytest.raises(ModelNamespaceError) as exc:
+            check_egress_gateway("http://[::1]:8090/v1")
+        assert "host" in str(exc.value).lower()
+
+    def test_ipv4_alias_192_168_is_refused(self):
+        """A private IPv4 address as host is refused."""
+        with pytest.raises(ModelNamespaceError) as exc:
+            check_egress_gateway("http://192.168.1.1:8090/v1")
+        assert "host" in str(exc.value).lower()
+
+    def test_http_scheme_is_required(self):
+        """Only http scheme is allowed; https/ftp are refused."""
+        with pytest.raises(ModelNamespaceError) as exc:
+            check_egress_gateway("ftp://127.0.0.1:8090/v1")
+        assert "scheme" in str(exc.value).lower()
+
+    def test_empty_url_is_refused_with_exact_parse(self):
+        """Empty URL is refused before URL parsing."""
+        with pytest.raises(ModelNamespaceError) as exc:
+            check_egress_gateway("")
+        assert "empty" in str(exc.value).lower()
+
+    def test_userinfo_no_password_is_refused(self):
+        """A URL with only a username (http://user@127.0.0.1:8090) is refused."""
+        with pytest.raises(ModelNamespaceError) as exc:
+            check_egress_gateway("http://user@127.0.0.1:8090/v1")
+        assert "userinfo" in str(exc.value).lower() or "credential" in str(exc.value).lower()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -531,15 +531,13 @@ class RunApplicationService:
                 self._fail_run(run_id, f"assay admission refused: {exc}")
                 raise
 
-        # SW-1510-ROUTE-LOCK: when a route proof is supplied, enforce egress
-        # gateway and OS confinement BEFORE the reservation (before paid
-        # admission).  The child's network egress is restricted to only the
-        # approved gateway host:port via sandbox-exec.
+        # SW-1510-ROUTE-LOCK: when a route proof is supplied, validate the
+        # route proof pin and approved-combination checks FIRST (pure logic,
+        # host-independent), so wrong-version and direct-provider bypass
+        # produce named HOLDs before any OS confinement check.  Only then
+        # check egress gateway and OS confinement availability.
         if route_proof is not None:
-            self._enforce_route_proof_egress(route_proof)
-            # SW-1510-ROUTE-LOCK (criterion 3): validate the route proof
-            # against the owner-controlled policy pin and verify the
-            # requested route is in the approved set.
+            # Criterion 3: pin validation (host-independent, pure logic).
             self._verify_route_proof_against_pin(route_proof)
             if model is not None:
                 from skillweave.routing.faigate_adapter import verify_approved_route
@@ -548,10 +546,16 @@ class RunApplicationService:
                     verify_approved_route(model)
                 except Exception as exc:
                     raise RunIntegrationError(
-                        "route_lock",
+                        "route_lock_direct_provider",
                         f"route {model!r} is not an approved BytePlus route; "
-                        f"refusing unapproved route (HOLD): {exc}",
+                        f"refusing unapproved route (HOLD: {exc})",
                     ) from exc
+            # Criterion 2: egress gateway check and OS confinement
+            # (may require sandbox-exec).  This runs after the pure-logic
+            # checks so that on a host without sandbox-exec the named HOLD
+            # reasons above still discriminate wrong-version from
+            # enforcement-unavailable.
+            self._enforce_route_proof_egress(route_proof)
 
         # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the worker
         # is launched.  This is the admission gate: no provider or tool
@@ -593,6 +597,12 @@ class RunApplicationService:
         # SW-1510-ROUTE-LOCK: log the route decision when the reservation
         # succeeded.  The model parameter is the requested route; the resolved
         # provider is always the approved gateway (faigate) for the lock path.
+        #
+        # answering_envelope_identity is explicitly None here because the
+        # provider response (which carries the answering model) has not yet
+        # been received at decision time — the child process has not launched.
+        # A later route_decision update below carries the answering identity
+        # from the response envelope when the provider reports it.
         if reservation_rec is not None:
             self._log_route_decision(
                 run_id,
@@ -601,6 +611,7 @@ class RunApplicationService:
                 requested_alias=model,
                 resolved_provider="faigate",
                 resolved_model=model,
+                answering_envelope_identity=None,
                 catalog_revision="",
                 policy_revision="",
             )
@@ -2257,15 +2268,13 @@ class RunApplicationService:
             "restarted_from": dict(restarted_from) if restarted_from else None,
         }
 
-        # SW-1510-ROUTE-LOCK: when a route proof is supplied, enforce egress
-        # gateway and OS confinement BEFORE the reservation (before paid
-        # admission).  The child's network egress is restricted to only the
-        # approved gateway host:port via sandbox-exec.
+        # SW-1510-ROUTE-LOCK: when a route proof is supplied, validate the
+        # route proof pin and approved-combination checks FIRST (pure logic,
+        # host-independent), so wrong-version and direct-provider bypass
+        # produce named HOLDs before any OS confinement check.  Only then
+        # check egress gateway and OS confinement availability.
         if route_proof is not None:
-            self._enforce_route_proof_egress(route_proof)
-            # SW-1510-ROUTE-LOCK (criterion 3): validate the route proof
-            # against the owner-controlled policy pin and verify the
-            # requested route is in the approved set.
+            # Criterion 3: pin validation (host-independent, pure logic).
             self._verify_route_proof_against_pin(route_proof)
             if route is not None:
                 from skillweave.routing.faigate_adapter import verify_approved_route
@@ -2273,10 +2282,16 @@ class RunApplicationService:
                     verify_approved_route(route)
                 except Exception as exc:
                     raise RunIntegrationError(
-                        "route_lock",
+                        "route_lock_direct_provider",
                         f"route {route!r} is not an approved BytePlus route; "
-                        f"refusing unapproved route (HOLD): {exc}",
+                        f"refusing unapproved route (HOLD: {exc})",
                     ) from exc
+            # Criterion 2: egress gateway check and OS confinement
+            # (may require sandbox-exec).  This runs after the pure-logic
+            # checks so that on a host without sandbox-exec the named HOLD
+            # reasons above still discriminate wrong-version from
+            # enforcement-unavailable.
+            self._enforce_route_proof_egress(route_proof)
 
         # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the detached
         # child is launched.  The async/restart path must be admitted through
@@ -2303,6 +2318,12 @@ class RunApplicationService:
 
         # SW-1510-ROUTE-LOCK: log the route decision when the reservation
         # succeeded, so the async path records the identity chain too.
+        #
+        # answering_envelope_identity is explicitly None because the async
+        # child has not launched yet — the provider response (which carries
+        # the answering model) is not available at decision time.  A later
+        # wrapper-completion or poll step should carry the answering identity
+        # when the provider reports it.
         if reservation_rec is not None and route is not None:
             self._log_route_decision(
                 rid,
@@ -2311,6 +2332,7 @@ class RunApplicationService:
                 requested_alias=route,
                 resolved_provider="faigate",
                 resolved_model=route,
+                answering_envelope_identity=None,
                 catalog_revision="",
                 policy_revision="",
             )
@@ -2833,6 +2855,12 @@ class RunApplicationService:
             self._verify_route_proof_against_pin(resolved_route_proof)
         # Emit a route_decision event for the new attempt on restart with
         # a route proof, so resume/restart records the identity chain.
+        #
+        # answering_envelope_identity is explicitly None because the restart
+        # has not launched the child yet — the provider response (which carries
+        # the answering model) is not available at decision time.  A later
+        # route_decision update should carry the answering identity when the
+        # provider reports it.
         if resolved_route_proof is not None and route is not None:
             self._log_route_decision(
                 run_id,
@@ -2841,6 +2869,7 @@ class RunApplicationService:
                 requested_alias=route,
                 resolved_provider="faigate",
                 resolved_model=route,
+                answering_envelope_identity=None,
                 catalog_revision=getattr(resolved_route_proof, "catalog_revision", ""),
                 policy_revision=getattr(resolved_route_proof, "policy_revision", ""),
             )
@@ -3346,15 +3375,13 @@ class RunApplicationService:
         CompletionContract = _runtime_attr("verify", "CompletionContract")
         GateState = _runtime_attr("verify", "GateState")
 
-        # SW-1510-ROUTE-LOCK: when a route proof is supplied, enforce egress
-        # gateway and OS confinement BEFORE the reservation (before paid
-        # admission).  The child's network egress is restricted to only the
-        # approved gateway host:port via sandbox-exec.
+        # SW-1510-ROUTE-LOCK: when a route proof is supplied, validate the
+        # route proof pin and approved-combination checks FIRST (pure logic,
+        # host-independent), so wrong-version and direct-provider bypass
+        # produce named HOLDs before any OS confinement check.  Only then
+        # check egress gateway and OS confinement availability.
         if route_proof is not None:
-            self._enforce_route_proof_egress(route_proof)
-            # SW-1510-ROUTE-LOCK (criterion 3): validate the route proof
-            # against the owner-controlled policy pin and verify the
-            # requested route is in the approved set.
+            # Criterion 3: pin validation (host-independent, pure logic).
             self._verify_route_proof_against_pin(route_proof)
             if model is not None:
                 from skillweave.routing.faigate_adapter import verify_approved_route
@@ -3362,10 +3389,16 @@ class RunApplicationService:
                     verify_approved_route(model)
                 except Exception as exc:
                     raise RunIntegrationError(
-                        "route_lock",
+                        "route_lock_direct_provider",
                         f"route {model!r} is not an approved BytePlus route; "
-                        f"refusing unapproved route (HOLD): {exc}",
+                        f"refusing unapproved route (HOLD: {exc})",
                     ) from exc
+            # Criterion 2: egress gateway check and OS confinement
+            # (may require sandbox-exec).  This runs after the pure-logic
+            # checks so that on a host without sandbox-exec the named HOLD
+            # reasons above still discriminate wrong-version from
+            # enforcement-unavailable.
+            self._enforce_route_proof_egress(route_proof)
 
         # Stage 1: Run — walk the lane to ``verify`` under CAS, as ``execute`` does.
         self.store.create_run(run_id)
@@ -3459,6 +3492,12 @@ class RunApplicationService:
 
         # SW-1510-ROUTE-LOCK: log the route decision when the reservation
         # succeeded, so the streaming path also records the identity chain.
+        #
+        # answering_envelope_identity is explicitly None here because the
+        # streaming child has not launched yet — the provider response (which
+        # carries the answering model) is not available at decision time.  A
+        # later route_decision update should carry the answering identity when
+        # the provider reports it.
         if reservation_rec is not None:
             self._log_route_decision(
                 run_id,
@@ -3467,6 +3506,7 @@ class RunApplicationService:
                 requested_alias=model,
                 resolved_provider="faigate",
                 resolved_model=model,
+                answering_envelope_identity=None,
                 catalog_revision="",
                 policy_revision="",
             )
