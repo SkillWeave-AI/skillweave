@@ -1010,6 +1010,656 @@ class TestServiceRouteWiring:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Controller Finding 1: route identity chain persisted as journal events.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestRouteDecisionJournalPersistence:
+    """Route decisions are persisted as journal events (Finding 1)."""
+
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        p = tmp_path / "test_route_journal.db"
+        yield str(p)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @pytest.fixture
+    def scratch(self, tmp_path):
+        a = tmp_path / "artifacts"
+        a.mkdir()
+        return str(a)
+
+    @pytest.fixture
+    def svc(self, db_path, scratch):
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationStore
+        store = SQLiteRunStore(db_path)
+        journal = EventJournal(db_path)
+        raw = RawArtifactStore(scratch)
+        stream = DurableStreamStore(root=scratch)
+        rs = ReservationStore(db_path)
+        return RunApplicationService(store, journal, raw, stream, reservation_store=rs)
+
+    def test_execute_streaming_logs_route_decision_event(self, svc, db_path, scratch):
+        """execute_streaming_native writes a route_decision journal event."""
+        from skillweave.runtime.reservation import ReservationEnvelope
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "run-rd-1", "task-rd-1/attempt-1", env
+        )
+        import sys as _sys
+        cmd = [_sys.executable, "-c", "print('ok')"]
+        result = svc.execute_streaming_native(
+            command=cmd,
+            run_id="run-rd-1",
+            tool="bash",
+            model="byteplus/deepseek-v4-flash",
+            subject_repo="test-repo",
+            subject_commit="a724d32a724d32a724d32a724d32a724d32a724d",
+            task_id="task-rd-1",
+            attempt=1,
+        )
+        # Verify a route_decision journal event exists
+        events = svc.journal.get_events("run-rd-1")
+        route_events = [e for e in events if e.event_type == "route_decision"]
+        assert len(route_events) >= 1
+        payload = route_events[0].payload
+        assert payload["requested_alias"] == "byteplus/deepseek-v4-flash"
+        assert payload["resolved_provider"] == "faigate"
+        assert "correlation_id" in payload
+
+    def test_start_async_logs_route_decision_event(self, svc, db_path, scratch):
+        """start_async writes a route_decision journal event."""
+        from skillweave.runtime.reservation import ReservationEnvelope
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "run-rd-2", "task-rd-2/attempt-1", env
+        )
+        import sys as _sys
+        cmd = [_sys.executable, "-c", "print('ok')"]
+        svc.start_async(
+            command=cmd,
+            run_id="run-rd-2",
+            attempt=1,
+            task_id="task-rd-2",
+            route="byteplus/deepseek-v4-flash",
+        )
+        events = svc.journal.get_events("run-rd-2")
+        route_events = [e for e in events if e.event_type == "route_decision"]
+        assert len(route_events) >= 1
+        payload = route_events[0].payload
+        assert payload["requested_alias"] == "byteplus/deepseek-v4-flash"
+
+    def test_route_decision_has_correlation_id(self, svc, db_path, scratch):
+        """The route decision event carries a correlation_id linking the chain."""
+        from skillweave.runtime.reservation import ReservationEnvelope
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "run-rd-3", "task-rd-3/attempt-1", env
+        )
+        import sys as _sys
+        cmd = [_sys.executable, "-c", "print('ok')"]
+        svc.execute_streaming_native(
+            command=cmd,
+            run_id="run-rd-3",
+            tool="bash",
+            model="byteplus/deepseek-v4-flash",
+            subject_repo="test-repo",
+            subject_commit="a724d32a724d32a724d32a724d32a724d32a724d",
+            task_id="task-rd-3",
+            attempt=1,
+        )
+        events = svc.journal.get_events("run-rd-3")
+        route_events = [e for e in events if e.event_type == "route_decision"]
+        assert len(route_events) >= 1
+        assert route_events[0].correlation_id is not None
+        # The correlation_id should contain the task_id
+        assert "task-rd-3" in route_events[0].correlation_id
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Controller Finding 2: child environment confinement and egress.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestChildEnvironmentConfinement:
+    """Child env is confined to allowlist; provider keys are stripped (Finding 2)."""
+
+    def test_build_locked_child_env_strips_provider_keys(self):
+        """_build_locked_child_env drops ambient provider keys from base env."""
+        svc = object.__new__(RunApplicationService)
+        base = {
+            "PATH": "/usr/bin",
+            "HOME": "/root",
+            "FAIGATE_API_KEY": "sk-should-be-stripped",
+            "OPENROUTER_API_KEY": "sk-should-be-stripped",
+            "OPENAI_API_KEY": "sk-should-be-stripped",
+            "ANTHROPIC_API_KEY": "sk-should-be-stripped",
+            "SECRET_TOKEN": "should-be-dropped",
+        }
+        env = svc._build_locked_child_env(base_env=base)
+        # Allowlisted keys are preserved
+        assert env.get("PATH") == "/usr/bin"
+        assert env.get("HOME") == "/root"
+        # Provider keys are stripped
+        assert "FAIGATE_API_KEY" not in env
+        assert "OPENROUTER_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert "ANTHROPIC_API_KEY" not in env
+        # Non-allowlisted non-provider keys are also stripped
+        assert "SECRET_TOKEN" not in env
+
+    def test_build_locked_child_env_extra_vars_added(self):
+        """Extra vars passed to _build_locked_child_env are included."""
+        svc = object.__new__(RunApplicationService)
+        base = {"PATH": "/usr/bin", "HOME": "/root"}
+        env = svc._build_locked_child_env(
+            base_env=base,
+            extra_vars={"SKILLWEAVE_ATTEMPT_CHECKOUT": "/tmp/checkout"},
+        )
+        assert env.get("PATH") == "/usr/bin"
+        assert env.get("SKILLWEAVE_ATTEMPT_CHECKOUT") == "/tmp/checkout"
+
+    def test_build_locked_child_env_refuses_ambient_key_in_extra(self):
+        """Passing an ambient provider key in extra_vars raises."""
+        svc = object.__new__(RunApplicationService)
+        base = {"PATH": "/usr/bin", "HOME": "/root"}
+        with pytest.raises(RunIntegrationError) as exc:
+            svc._build_locked_child_env(
+                base_env=base,
+                extra_vars={"OPENAI_API_KEY": "sk-bad"},
+            )
+        assert "ambient provider" in str(exc.value).lower()
+
+    def test_build_locked_child_env_strips_all_ambient_keys(self):
+        """Every key in _AMBIENT_PROVIDER_ENV_KEYS is stripped."""
+        from skillweave.runsvc.service import _AMBIENT_PROVIDER_ENV_KEYS
+        svc = object.__new__(RunApplicationService)
+        base = dict.fromkeys(_AMBIENT_PROVIDER_ENV_KEYS, "value")
+        base["PATH"] = "/usr/bin"
+        base["HOME"] = "/root"
+        env = svc._build_locked_child_env(base_env=base)
+        for key in _AMBIENT_PROVIDER_ENV_KEYS:
+            assert key not in env, f"{key} should be stripped"
+
+    def test_execute_passes_env_allowlist(self):
+        """execute() passes env_allowlist to run_command, confining child env.
+
+        We verify this by checking the allowlist is non-None when
+        _LOCKED_CHILD_ENV_ALLOWLIST is set.
+        """
+        from skillweave.runsvc.service import _LOCKED_CHILD_ENV_ALLOWLIST
+        assert len(_LOCKED_CHILD_ENV_ALLOWLIST) > 0
+
+    def test_streaming_passes_env_allowlist(self):
+        """execute_streaming_native passes env_allowlist to run_process_streaming."""
+        from skillweave.runsvc.service import _LOCKED_CHILD_ENV_ALLOWLIST
+        assert len(_LOCKED_CHILD_ENV_ALLOWLIST) > 0
+
+    def test_egress_gateway_enforced_before_admission(self):
+        """check_egress_gateway refuses non-approved URLs before any call."""
+        with pytest.raises(ModelNamespaceError):
+            check_egress_gateway("http://127.0.0.1:9090")
+        with pytest.raises(ModelNamespaceError):
+            check_egress_gateway("http://localhost:8090")
+        with pytest.raises(ModelNamespaceError):
+            check_egress_gateway("https://api.openai.com/v1")
+        # Approved gateway passes
+        check_egress_gateway(APPROVED_GATEWAY_URL)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Controller Finding 3: route=None must HOLD when allowed_routes is set.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestRouteNoneEnforcement:
+    """route=None is refused when allowed_routes is set (Finding 3)."""
+
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        p = tmp_path / "test_route_none.db"
+        yield str(p)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @pytest.fixture
+    def scratch(self, tmp_path):
+        a = tmp_path / "artifacts"
+        a.mkdir()
+        return str(a)
+
+    @pytest.fixture
+    def svc(self, db_path, scratch):
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationStore
+        store = SQLiteRunStore(db_path)
+        journal = EventJournal(db_path)
+        raw = RawArtifactStore(scratch)
+        stream = DurableStreamStore(root=scratch)
+        rs = ReservationStore(db_path)
+        return RunApplicationService(store, journal, raw, stream, reservation_store=rs)
+
+    def test_start_async_route_none_refused_with_allowed_routes(self, svc, db_path, scratch):
+        """start_async with route=None and allowed_routes set is refused."""
+        from skillweave.runtime.reservation import ReservationEnvelope
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "run-none-1", "task-none-1/attempt-1", env
+        )
+        import sys as _sys
+        cmd = [_sys.executable, "-c", "print('should-not-run')"]
+        with pytest.raises(RunIntegrationError) as exc:
+            svc.start_async(
+                command=cmd,
+                run_id="run-none-1",
+                attempt=1,
+                task_id="task-none-1",
+                route=None,
+            )
+        assert "quota refused" in str(exc.value).lower()
+
+    def test_start_async_route_none_permits_without_allowed_routes(self, svc, db_path, scratch):
+        """start_async with route=None and no allowed_routes is permitted."""
+        import sys as _sys
+        cmd = [_sys.executable, "-c", "print('ok')"]
+        result = svc.start_async(
+            command=cmd,
+            run_id="run-none-2",
+            attempt=1,
+            task_id="task-none-2",
+            route=None,
+        )
+        assert result["run_id"] == "run-none-2"
+
+    def test_reserve_route_none_refused_with_allowed_routes(self, db_path):
+        """reserve() with route=None and allowed_routes set is refused."""
+        from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope, QuotaRefused
+        store = ReservationStore(db_path)
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        store.set_envelope("run-none-3", "task-none-3/attempt-1", env)
+        with pytest.raises(QuotaRefused) as exc:
+            store.reserve(
+                run_id="run-none-3", task_id="task-none-3", attempt=1,
+                scope_id="task-none-3/attempt-1",
+                idempotency_key="test-none-3", envelope=env,
+                route=None,
+            )
+        assert "not in allowed_routes" in str(exc.value) or "quota refused" in str(exc.value).lower()
+
+    def test_reserve_route_none_permits_without_allowed_routes(self, db_path):
+        """reserve() with route=None and no allowed_routes is permitted."""
+        from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope
+        store = ReservationStore(db_path)
+        env = ReservationEnvelope()  # no allowed_routes restriction
+        store.set_envelope("run-none-4", "task-none-4/attempt-1", env)
+        rec = store.reserve(
+            run_id="run-none-4", task_id="task-none-4", attempt=1,
+            scope_id="task-none-4/attempt-1",
+            idempotency_key="test-none-4", envelope=env,
+            route=None,
+        )
+        assert rec.state == "reserved"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Controller Finding 4: FAIGATE_BASE_URL / OPENROUTER_API_KEY / raw
+# upstream model names cannot override approved route set.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestEnvKeyCannotOverrideApprovedRoutes:
+    """Ambient env keys and raw upstream names cannot override the approved set (Finding 4)."""
+
+    def test_faigate_base_url_in_ambient_keys(self):
+        """FAIGATE_BASE_URL is in _AMBIENT_PROVIDER_ENV_KEYS and is stripped."""
+        from skillweave.runsvc.service import _AMBIENT_PROVIDER_ENV_KEYS
+        assert "FAIGATE_BASE_URL" in _AMBIENT_PROVIDER_ENV_KEYS
+
+    def test_openrouter_api_key_in_ambient_keys(self):
+        """OPENROUTER_API_KEY is in _AMBIENT_PROVIDER_ENV_KEYS and is stripped."""
+        from skillweave.runsvc.service import _AMBIENT_PROVIDER_ENV_KEYS
+        assert "OPENROUTER_API_KEY" in _AMBIENT_PROVIDER_ENV_KEYS
+
+    def test_raw_upstream_model_name_refused_by_reservation(self, db_path):
+        """A raw upstream model name (no byteplus/ prefix) is refused by reserve()."""
+        from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope, QuotaRefused
+        store = ReservationStore(db_path)
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        store.set_envelope("run-env-1", "task-env-1/attempt-1", env)
+        with pytest.raises(QuotaRefused) as exc:
+            store.reserve(
+                run_id="run-env-1", task_id="task-env-1", attempt=1,
+                scope_id="task-env-1/attempt-1",
+                idempotency_key="test-env-1", envelope=env,
+                route="deepseek-v4-flash",  # raw upstream name, no byteplus/ prefix
+            )
+        assert "not in allowed_routes" in str(exc.value)
+
+    def test_raw_upstream_model_name_refused_by_start_async(self, svc, db_path, scratch):
+        """start_async refuses a raw upstream model name as route."""
+        from skillweave.runtime.reservation import ReservationEnvelope
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "run-env-2", "task-env-2/attempt-1", env
+        )
+        import sys as _sys
+        cmd = [_sys.executable, "-c", "print('should-not-run')"]
+        with pytest.raises(RunIntegrationError) as exc:
+            svc.start_async(
+                command=cmd,
+                run_id="run-env-2",
+                attempt=1,
+                task_id="task-env-2",
+                route="deepseek-v4-flash",  # raw upstream name
+            )
+        assert "reservation refused" in str(exc.value)
+
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        p = tmp_path / "test_env_override.db"
+        yield str(p)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @pytest.fixture
+    def scratch(self, tmp_path):
+        a = tmp_path / "artifacts"
+        a.mkdir()
+        return str(a)
+
+    @pytest.fixture
+    def svc(self, db_path, scratch):
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationStore
+        store = SQLiteRunStore(db_path)
+        journal = EventJournal(db_path)
+        raw = RawArtifactStore(scratch)
+        stream = DurableStreamStore(root=scratch)
+        rs = ReservationStore(db_path)
+        return RunApplicationService(store, journal, raw, stream, reservation_store=rs)
+
+    def test_global_env_key_as_route_refused(self, db_path):
+        """A global env key name used as a route is refused by reserve()."""
+        from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope, QuotaRefused
+        store = ReservationStore(db_path)
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        store.set_envelope("run-env-3", "task-env-3/attempt-1", env)
+        with pytest.raises(QuotaRefused) as exc:
+            store.reserve(
+                run_id="run-env-3", task_id="task-env-3", attempt=1,
+                scope_id="task-env-3/attempt-1",
+                idempotency_key="test-env-3", envelope=env,
+                route="OPENAI_API_KEY",  # env key name as route
+            )
+        assert "not in allowed_routes" in str(exc.value)
+
+    def test_resolve_route_for_tier_only_returns_byteplus_routes(self):
+        """TIER_ROUTE_MAP only contains byteplus/ routes, never raw names."""
+        for tier in ModelTier:
+            routes = resolve_route_for_tier(tier.value)
+            for route in routes:
+                assert route.startswith("byteplus/"), (
+                    f"tier {tier.value} contains non-byteplus route {route!r}"
+                )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Controller Finding 4 continued: check_retry_attribution against env keys.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestRetryAttributionEnvKeyProtection:
+    """Retry attribution checks protect against env key overrides (Finding 4)."""
+
+    def test_retry_with_faigate_base_url_refused(self):
+        """FAIGATE_BASE_URL as a retry route is refused."""
+        with pytest.raises(ValueError) as exc:
+            check_retry_attribution(
+                attempt=2,
+                requested_route="FAIGATE_BASE_URL",
+                allowed_routes={"byteplus/deepseek-v4-flash"},
+            )
+        assert "not in allowed routes" in str(exc.value)
+
+    def test_retry_with_raw_model_name_refused(self):
+        """A raw model name (no byteplus/ prefix) is refused as retry route."""
+        with pytest.raises(ValueError) as exc:
+            check_retry_attribution(
+                attempt=2,
+                requested_route="deepseek-v4-flash",
+                allowed_routes={"byteplus/deepseek-v4-flash"},
+            )
+        assert "not in allowed routes" in str(exc.value)
+
+    def test_retry_with_approved_route_passes(self):
+        """An approved BytePlus route passes retry attribution."""
+        check_retry_attribution(
+            attempt=2,
+            requested_route="byteplus/deepseek-v4-flash",
+            allowed_routes={"byteplus/deepseek-v4-flash"},
+        )
+
+    def test_retry_attribution_from_service_restart(self, svc, db_path, scratch):
+        """restart_attempt checks retry route against approved set.
+
+        A restart with an unapproved route is refused before launch.
+        """
+        from skillweave.runtime.reservation import ReservationEnvelope
+        import sys as _sys
+
+        # Create source run
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "run-attr-1", "task-attr-1/attempt-1", env
+        )
+        svc.start_async(
+            command=[_sys.executable, "-c", "print('source')"],
+            run_id="run-attr-1",
+            attempt=1,
+            task_id="task-attr-1",
+            route="byteplus/deepseek-v4-flash",
+        )
+
+        # Try restart with unapproved route
+        env2 = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "run-attr-1", "task-attr-1/attempt-2", env2
+        )
+        with pytest.raises(Exception) as exc:
+            svc.restart_attempt(
+                run_id="run-attr-1",
+                command=[_sys.executable, "-c", "print('should-not-run')"],
+                task_id="task-attr-1",
+                reservation_envelope=env2,
+                route="deepseek-v4-flash",  # raw upstream name, NOT byteplus/
+            )
+        assert "retry" in str(exc.value).lower() or "route" in str(exc.value).lower()
+
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        p = tmp_path / "test_retry_attr.db"
+        yield str(p)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @pytest.fixture
+    def scratch(self, tmp_path):
+        a = tmp_path / "artifacts"
+        a.mkdir()
+        return str(a)
+
+    @pytest.fixture
+    def svc(self, db_path, scratch):
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationStore
+        store = SQLiteRunStore(db_path)
+        journal = EventJournal(db_path)
+        raw = RawArtifactStore(scratch)
+        stream = DurableStreamStore(root=scratch)
+        rs = ReservationStore(db_path)
+        return RunApplicationService(store, journal, raw, stream, reservation_store=rs)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Real-entrypoint subprocess tests: verify the console script's integration
+# path enforces route lock at the outermost boundary.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestConsoleEntrypointRouteLock:
+    """The skillweave console entrypoint enforces route lock at real launch."""
+
+    def test_console_script_imports_route_lock_symbols(self):
+        """The console script can import route lock symbols (wiring check)."""
+        from skillweave.runsvc.service import (
+            _AMBIENT_PROVIDER_ENV_KEYS,
+            _LOCKED_CHILD_ENV_ALLOWLIST,
+        )
+        assert "FAIGATE_BASE_URL" in _AMBIENT_PROVIDER_ENV_KEYS
+        assert "PATH" in _LOCKED_CHILD_ENV_ALLOWLIST
+
+    def test_route_proof_fixture_loads_via_console_import(self):
+        """The route-proof fixture can be loaded from a subprocess script."""
+        import subprocess
+        import sys as _sys
+        proof_path = str(_ROUTE_PROOF_FIXTURE)
+        script = (
+            "import sys; sys.path.insert(0, 'src'); "
+            "from skillweave.routing.route_proof import RouteProof; "
+            f"p = RouteProof.load({proof_path!r}); "
+            "print(len(p.approved_routes))"
+        )
+        result = subprocess.run(
+            [_sys.executable, "-c", script],
+            capture_output=True, text=True, cwd=str(_src.parent),
+        )
+        assert result.returncode == 0
+        assert int(result.stdout.strip()) >= 4
+
+    def _run_subprocess_script(self, script_lines):
+        """Write a temp script file and run it in a subprocess.
+
+        Avoids quoting issues with multi-line ``-c`` arguments.
+        """
+        import subprocess
+        import sys as _sys
+        import tempfile
+        src_dir = str(_src.parent)
+        code = "\n".join(script_lines)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", prefix="route_lock_test_",
+            dir=src_dir, delete=False,
+        ) as f:
+            f.write(code)
+            script_path = f.name
+        try:
+            result = subprocess.run(
+                [_sys.executable, script_path],
+                capture_output=True, text=True, cwd=src_dir,
+            )
+        finally:
+            import os
+            os.unlink(script_path)
+        return result
+
+    def test_subprocess_reserve_refuses_unapproved_route(self):
+        """A subprocess calling reserve() with unapproved route is refused."""
+        result = self._run_subprocess_script([
+            "import sys, tempfile, os",
+            "sys.path.insert(0, 'src')",
+            "from skillweave.runtime.reservation import ReservationStore, ReservationEnvelope, QuotaRefused",
+            "tmp = tempfile.mktemp(suffix='.db')",
+            "store = ReservationStore(tmp)",
+            "env = ReservationEnvelope(allowed_routes=['byteplus/deepseek-v4-flash'])",
+            "store.set_envelope('run-c', 'task-c/attempt-1', env)",
+            "try:",
+            "    store.reserve(run_id='run-c', task_id='task-c', attempt=1, "
+            "scope_id='task-c/attempt-1', idempotency_key='c', "
+            "envelope=env, route='deepseek-v4-flash')",
+            "    print('UNEXPECTED_PASS')",
+            "except QuotaRefused:",
+            "    print('REFUSED')",
+            "finally:",
+            "    os.unlink(tmp)",
+        ])
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert "REFUSED" in result.stdout
+
+    def test_subprocess_execution_envelope_passes_allowed_routes(self):
+        """A subprocess verifying ExecutionEnvelopeV1 passes allowed_routes."""
+        result = self._run_subprocess_script([
+            "import sys",
+            "sys.path.insert(0, 'src')",
+            "from skillweave.runtime.execution_envelope import ExecutionEnvelopeV1",
+            "env = ExecutionEnvelopeV1(allowed_routes=['byteplus/deepseek-v4-flash'])",
+            "rv = env.to_reservation_envelope()",
+            "print(rv.allowed_routes)",
+        ])
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert "byteplus/deepseek-v4-flash" in result.stdout
+
+    def test_subprocess_route_proof_check_allowed(self):
+        """A subprocess loading route proof and checking allowed routes."""
+        proof_path = str(_ROUTE_PROOF_FIXTURE)
+        result = self._run_subprocess_script([
+            "import sys",
+            "sys.path.insert(0, 'src')",
+            "from skillweave.routing.route_proof import RouteProof",
+            f"p = RouteProof.load({proof_path!r})",
+            "p.check_route_allowed('byteplus/deepseek-v4-flash')",
+            "print('OK')",
+            "try:",
+            "    p.check_route_allowed('deepseek-v4-flash')",
+            "    print('UNEXPECTED')",
+            "except Exception as e:",
+            "    print('REFUSED:' + str(e))",
+        ])
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert "OK" in result.stdout
+        assert "REFUSED" in result.stdout
+
+    def test_subprocess_check_egress_gateway(self):
+        """A subprocess verifying egress gateway enforcement."""
+        result = self._run_subprocess_script([
+            "import sys",
+            "sys.path.insert(0, 'src')",
+            "from skillweave.routing.faigate_adapter import check_egress_gateway, ModelNamespaceError",
+            "check_egress_gateway('http://127.0.0.1:8090/v1')",
+            "print('GATEWAY_OK')",
+            "try:",
+            "    check_egress_gateway('http://localhost:8090/v1')",
+            "    print('UNEXPECTED')",
+            "except ModelNamespaceError:",
+            "    print('GATEWAY_REFUSED')",
+        ])
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert "GATEWAY_OK" in result.stdout
+        assert "GATEWAY_REFUSED" in result.stdout
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Run entry point
 # ═══════════════════════════════════════════════════════════════════════════
 

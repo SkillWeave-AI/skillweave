@@ -862,8 +862,20 @@ class ReservationStore:
         # 1b. Check route is allowed by the resolved envelope's allowed_routes.
         # This prevents a request from reaching an unapproved route even when
         # the envelope is otherwise unlimited.
+        #
+        # When the envelope has an explicit allowed_routes list (non-None),
+        # route=None is also refused: the caller must name a specific approved
+        # route (AC4).  When allowed_routes is None (no restriction),
+        # route=None is still permitted.
+        allowed = env.allowed_routes
         if route is not None:
             self.check_route_allowed(route, env)
+        elif allowed is not None:
+            raise QuotaRefused(
+                "route",
+                "route must not be None when allowed_routes is set",
+                detail={"allowed_routes": allowed},
+            )
 
         now = datetime.now(timezone.utc).isoformat()
         reservation_id = str(uuid.uuid4())

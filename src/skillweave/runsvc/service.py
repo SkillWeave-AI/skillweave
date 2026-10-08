@@ -86,6 +86,42 @@ def _is_full_sha(value: Any) -> bool:
 #: base and is never forced to synthesize one.
 _BOUND_GIT_SUBJECT_KIND = "repository"
 
+#: SW-1510-ROUTE-LOCK: The ambient provider env keys that must be stripped
+#: from the child launch environment when the lock is enabled. A child must
+#: never inherit an ambient alternate provider credential that would let it
+#: bypass the approved gateway.
+_AMBIENT_PROVIDER_ENV_KEYS: tuple[str, ...] = (
+    "FAIGATE_API_KEY",
+    "FAIGATE_BASE_URL",
+    "FAIGATE_HOST",
+    "FAIGATE_PORT",
+    "OPENROUTER_API_KEY",
+    "CLAWROUTER_API_KEY",
+    "KILO_API_KEY",
+    "KILO_BASE_URL",
+    "OMNIROUTE_API_KEY",
+    "OMNIROUTE_BASE_URL",
+    "NINEROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_BASE_URL",
+    "COUNCIL_MODEL",
+)
+
+#: SW-1510-ROUTE-LOCK: The only environment keys a child may inherit when the
+#: lock is enabled. Everything else is dropped so the child cannot redirect
+#: model traffic away from the approved gateway.
+_LOCKED_CHILD_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "SYSTEMROOT",
+    "PYTHONPATH",
+    "TERM",
+)
+
 
 def _work_contract_bound_base(work_contract: Any) -> Optional[str]:
     """The Git base an exact-source binding pins, or ``None`` when unpinned.
@@ -513,6 +549,21 @@ class RunApplicationService:
                 self._fail_run(run_id, f"reservation refused: {exc}")
                 raise RunIntegrationError("reservation", str(exc)) from exc
 
+        # SW-1510-ROUTE-LOCK: log the route decision when the reservation
+        # succeeded.  The model parameter is the requested route; the resolved
+        # provider is always the approved gateway (faigate) for the lock path.
+        if reservation_rec is not None:
+            self._log_route_decision(
+                run_id,
+                task_id=task_id or run_id,
+                correlation_id=f"{task_id or run_id}/attempt-{attempt}",
+                requested_alias=model,
+                resolved_provider="faigate",
+                resolved_model=model,
+                catalog_revision="",
+                policy_revision="",
+            )
+
         # Stage 2: launch the worker as a real subprocess. On the protected
         # (identity-authenticated) path the worker is launched inside a real
         # process-protection window: the protected stores are sealed (and, where
@@ -606,6 +657,7 @@ class RunApplicationService:
                 created_at=created_at,
                 cwd=child_cwd,
                 env=child_env,
+                env_allowlist=list(_LOCKED_CHILD_ENV_ALLOWLIST),
             )
         except scope_refusals:
             # A write-scope refusal (traversal/symlink/protected-store escape)
@@ -1105,6 +1157,91 @@ class RunApplicationService:
             tools=("Bash",),
         )
         return enforcement, declared
+
+    # ------------------------------------------------------------------
+    # SW-1510-ROUTE-LOCK helpers: route decision logging and child env
+    # confinement.  These are wired into the execution paths below.
+    # ------------------------------------------------------------------
+
+    def _log_route_decision(
+        self,
+        run_id: str,
+        *,
+        task_id: str,
+        correlation_id: str,
+        requested_alias: str,
+        resolved_provider: str = "faigate",
+        resolved_model: str = "",
+        answering_envelope_identity: Optional[str] = None,
+        catalog_revision: str = "",
+        policy_revision: str = "",
+    ) -> None:
+        """Create a ``RouteDecision`` and persist it as a journal event.
+
+        The full identity chain (correlation_id, requested_alias,
+        resolved_provider, resolved_model, answering_envelope_identity,
+        catalog_revision, policy_revision) is recorded so parent and nested
+        requests are linked through the journal.  When the routing module is
+        not available (optional subpackage) the decision is silently skipped
+        so the legacy path keeps its behaviour.
+        """
+        try:
+            from skillweave.routing.faigate_adapter import (
+                COUNCIL_POLICY_REVISION,
+                make_route_decision,
+            )
+            decision = make_route_decision(
+                correlation_id=correlation_id,
+                requested_alias=requested_alias,
+                resolved_provider=resolved_provider,
+                resolved_model=resolved_model or requested_alias,
+                answering_envelope_identity=answering_envelope_identity,
+                catalog_revision=catalog_revision or COUNCIL_POLICY_REVISION,
+                policy_revision=policy_revision or COUNCIL_POLICY_REVISION,
+            )
+            self.journal.append(
+                run_id,
+                event_type="route_decision",
+                payload=decision.to_dict(),
+                correlation_id=correlation_id,
+            )
+        except Exception:  # noqa: BLE001 - optional subpackage
+            pass
+
+    def _build_locked_child_env(
+        self,
+        *,
+        base_env: Optional[dict[str, str]] = None,
+        extra_vars: Optional[dict[str, str]] = None,
+    ) -> dict[str, str]:
+        """Build the child launch environment from the lock allowlist.
+
+        Only keys in ``_LOCKED_CHILD_ENV_ALLOWLIST`` are carried over from
+        ``base_env`` (default ``os.environ``); every other key — in
+        particular every ambient provider credential — is dropped.
+        ``extra_vars`` are the caller's own approved gateway settings and
+        are the only non-allowlisted keys added.  A key in ``extra_vars``
+        that matches an ambient provider key is refused so pinning cannot
+        be a back door for the very key the allowlist drops.
+        """
+        base = os.environ if base_env is None else base_env
+        env: dict[str, str] = {}
+        for k in _LOCKED_CHILD_ENV_ALLOWLIST:
+            v = base.get(k)
+            if v is not None:
+                env[k] = str(v)
+        if extra_vars:
+            for key, value in extra_vars.items():
+                name = str(key)
+                if name in _AMBIENT_PROVIDER_ENV_KEYS:
+                    raise RunIntegrationError(
+                        "route_lock",
+                        f"locked child env may not set ambient provider "
+                        f"key {name!r}; route the child through the approved "
+                        "gateway instead",
+                    )
+                env[name] = str(value)
+        return env
 
     def _fail_run(self, run_id: str, reason: str) -> None:
         """Mark a run terminal with a stop reason when a stage raises.
@@ -1973,6 +2110,20 @@ class RunApplicationService:
                 raise RunIntegrationError(
                     "reservation", f"async reservation refused: {exc}") from exc
 
+        # SW-1510-ROUTE-LOCK: log the route decision when the reservation
+        # succeeded, so the async path records the identity chain too.
+        if reservation_rec is not None and route is not None:
+            self._log_route_decision(
+                rid,
+                task_id=effective_task_id,
+                correlation_id=f"{effective_task_id}/attempt-{effective_attempt}",
+                requested_alias=route,
+                resolved_provider="faigate",
+                resolved_model=route,
+                catalog_revision="",
+                policy_revision="",
+            )
+
         # Store initial lifecycle metadata BEFORE launching the child, so the
         # wrapper starts at version 2 (not version 1).  This prevents a race
         # where a fast child completes before the parent gets to write its
@@ -2057,6 +2208,10 @@ class RunApplicationService:
             if _sp not in _pp:
                 _env["PYTHONPATH"] = _pp + ":" + _sp if _pp else _sp
 
+        # SW-1510-ROUTE-LOCK: confine the child launch environment to the
+        # locked allowlist so ambient provider credentials are stripped.
+        locked_env = self._build_locked_child_env(base_env=_env)
+
         try:
             proc = subprocess.Popen(
                 [sys.executable, "-c", wrapper_src, rid, db_path,
@@ -2066,7 +2221,7 @@ class RunApplicationService:
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
                 cwd=child_cwd,
-                env=_env,
+                env=locked_env,
             )
         except Exception as exc:  # noqa: BLE001
             # Launch failure: cancel the reservation slot before propagating.
@@ -3034,6 +3189,20 @@ class RunApplicationService:
                 "a missing budget guard cannot silently admit unguarded execution",
             )
 
+        # SW-1510-ROUTE-LOCK: log the route decision when the reservation
+        # succeeded, so the streaming path also records the identity chain.
+        if reservation_rec is not None:
+            self._log_route_decision(
+                run_id,
+                task_id=task_id or run_id,
+                correlation_id=f"{task_id or run_id}/attempt-{attempt}",
+                requested_alias=model,
+                resolved_provider="faigate",
+                resolved_model=model,
+                catalog_revision="",
+                policy_revision="",
+            )
+
         # Stage 2: the real protected launch + durable streaming collection.
         # The streaming path composes the *same* SCOPE boundary as ``execute``:
         # the declared write scope is authorized and the real isolation attested
@@ -3117,6 +3286,7 @@ class RunApplicationService:
                 stdout_retain_limit=stdout_retain_limit,
                 stderr_retain_limit=stderr_retain_limit,
                 cwd=child_cwd,
+                env_allowlist=list(_LOCKED_CHILD_ENV_ALLOWLIST),
                 extra_env=child_env,
                 wrap_command=wrap,
             )
