@@ -335,9 +335,25 @@ class TestVersionedSnapshotSurface:
         assert control.RUN_SNAPSHOT_VERSION == "run-snapshot-v1"
         assert control.SUPPORTED_SNAPSHOT_VERSIONS == frozenset({"run-snapshot-v1"})
 
-    def test_snapshot_v1_refuses_unknown_version(self):
+    def test_snapshot_v1_refuses_unknown_version(self, tmp_path):
+        # The refusal is *returned* as a structured error, never raised across
+        # the tool boundary, and names the versions actually supported.
+        result = control.snapshot_v1(
+            "any-run", version="run-snapshot-v9",
+            db_path=str(tmp_path / "store.db"),
+            artifacts_path=str(tmp_path / "artifacts"),
+        )
+        assert result["code"] == "unsupported_version"
+        assert result["run_id"] == "any-run"
+        assert result["version"] == "run-snapshot-v9"
+        assert result["supported"] == ["run-snapshot-v1"]
+        assert "run-snapshot-v9" in result["error"]
+
+    def test_snapshot_version_refused_is_still_constructible(self):
+        # The typed refusal remains part of the surface (other modules raise it);
+        # the tool boundary simply does not leak it.
         with pytest.raises(control.SnapshotVersionRefused) as exc:
-            control.snapshot_v1("any-run", version="run-snapshot-v9")
+            control._require_snapshot_version("run-snapshot-v9")
         assert "run-snapshot-v9" in str(exc.value)
 
     def test_service_refuses_unknown_version_by_name(self):
@@ -376,11 +392,167 @@ class TestVersionedSnapshotSurface:
 
     def test_snapshot_v1_unknown_run_is_absent_not_fabricated(self, tmp_path):
         db = str(tmp_path / "store.db")
-        result = control.snapshot_v1("no-such-run", db_path=db)
+        result = control.snapshot_v1(
+            "no-such-run", db_path=db, artifacts_path=str(tmp_path / "artifacts")
+        )
         assert result == {
-            "error": "Run not found", "run_id": "no-such-run",
-            "version": control.RUN_SNAPSHOT_VERSION,
+            "error": "Run not found", "code": "not_found",
+            "run_id": "no-such-run", "version": control.RUN_SNAPSHOT_VERSION,
+            "supported": [],
         }
+
+
+# ===========================================================================
+# Criterion 1 (first run): a fresh project cwd creates its store, never raises
+# ===========================================================================
+
+
+class TestFirstRunFromEmptyCwd:
+    """The control surface creates its store on first use, mirroring the CLI.
+
+    A fresh project has no ``.skillweave`` directory. The CLI ingress creates
+    it; the control surface must too, or every start/inspect call raises
+    ``sqlite3.OperationalError: unable to open database file``.
+    """
+
+    def test_get_run_service_creates_the_store_from_an_empty_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert not (tmp_path / ".skillweave").exists()
+
+        svc = control.get_run_service()  # defaults -> .skillweave/store.db
+        assert type(svc).__name__ == "RunApplicationService"
+        # The parent directory (and the db file) now exist on disk.
+        assert (tmp_path / ".skillweave").is_dir()
+        assert (tmp_path / ".skillweave" / "store.db").exists()
+
+    def test_control_status_from_an_empty_cwd_is_a_durable_read_not_a_crash(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        # No store existed a moment ago; the inspect must create it and return
+        # the durable not-found record -- not raise a sqlite error.
+        result = control.control_status("no-such-run")
+        assert result == {
+            "error": "Run not found", "code": "not_found",
+            "run_id": "no-such-run", "version": "", "supported": [],
+        }
+        assert (tmp_path / ".skillweave" / "store.db").exists()
+
+    def test_create_run_from_an_empty_cwd_succeeds(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert not (tmp_path / ".skillweave").exists()
+
+        payload = control.create_run_payload(
+            tool="opencode",
+            model="m",
+            subject_repo="skillweave",
+            subject_commit="d34dbeef" * 5,
+            command=f"{sys.executable} -c print(7)",
+            methodology="ralph",
+            task_id="t-first-run",
+            attempt=1,
+        )
+        assert "error" not in payload, payload
+        assert payload["run_id"]
+        # The durable locations were created under the fresh cwd: the run store
+        # (its parent directory made here) and the durable stream root (which the
+        # stream store creates itself). The raw artifact store is memory-backed,
+        # so no ``.skillweave/artifacts`` directory is written for a first run.
+        assert (tmp_path / ".skillweave" / "store.db").exists()
+        assert (tmp_path / ".skillweave" / "streams").is_dir()
+        assert not (tmp_path / ".skillweave" / "artifacts").exists()
+
+
+# ===========================================================================
+# Criterion 1 (structured refusals): a contract refusal is returned, not raised
+# ===========================================================================
+
+
+class TestStructuredContractRefusals:
+    """A contract refusal crosses the tool boundary as a structured dict.
+
+    The frozen ``run-snapshot-v1`` enum
+    (:data:`skillweave.mcp.control.SUPPORTED_SNAPSHOT_VERSIONS`) is deliberately
+    *not* widened to accommodate a run; a run whose trusted fields cannot be
+    expressed is refused by name and that refusal is returned.
+    """
+
+    def _collaborative_run(self, db, art, streams):
+        """A default-policy (``collaborative``) run -- unrepresentable in v1."""
+        payload = control.create_run_payload(
+            tool="opencode", model="m", subject_repo="skillweave",
+            subject_commit="d34dbeef" * 5,
+            command=f"{sys.executable} -c print(1)",
+            db_path=db, artifacts_path=art, stream_root=streams,
+            methodology="ralph", autonomy_policy="",  # -> 'collaborative'
+            task_id="t-collab", attempt=1,
+        )
+        return payload["run_id"]
+
+    def test_status_unknown_version_returns_structured_refusal(self, tmp_path):
+        result = control.control_status(
+            "any-run", version="run-snapshot-v9",
+            db_path=str(tmp_path / "store.db"),
+            artifacts_path=str(tmp_path / "artifacts"),
+        )
+        assert result == {
+            "error": result["error"], "code": "unsupported_version",
+            "run_id": "any-run", "version": "run-snapshot-v9",
+            "supported": ["run-snapshot-v1"],
+        }
+        assert "run-snapshot-v9" in result["error"]
+
+    def test_status_unrepresentable_run_returns_structured_refusal(self, tmp_path):
+        db = str(tmp_path / "store.db")
+        art = str(tmp_path / "artifacts")
+        streams = str(tmp_path / "streams")
+        run_id = self._collaborative_run(db, art, streams)
+
+        result = control.control_status(
+            run_id, version="run-snapshot-v1", db_path=db, artifacts_path=art
+        )
+        assert result["code"] == "snapshot_unavailable"
+        assert result["run_id"] == run_id
+        assert result["version"] == "run-snapshot-v1"
+        assert result["supported"] == ["run-snapshot-v1"]
+        # The refusal is *named*, not fabricated into a snapshot.
+        assert "schema_version" not in result
+
+    def test_frozen_mapping_is_not_widened_for_collaborative(self, tmp_path):
+        # The mapping itself stays frozen: 'collaborative' has no v1 enum slot.
+        from skillweave.runsvc import service as service_mod
+
+        assert service_mod.SUPPORTED_RUN_SNAPSHOT_VERSIONS == frozenset(
+            {"run-snapshot-v1"}
+        )
+        db = str(tmp_path / "store.db")
+        art = str(tmp_path / "artifacts")
+        streams = str(tmp_path / "streams")
+        run_id = self._collaborative_run(db, art, streams)
+        svc = control.get_run_service(db, art)
+        # The raw service still refuses by name -- the surface only *returns* it.
+        with pytest.raises(service_mod.RunSnapshotContractError):
+            svc.run_snapshot_v1(run_id, version="run-snapshot-v1")
+
+    def test_legacy_status_without_version_still_returns_the_snapshot(self, tmp_path):
+        # A 'collaborative' run is readable through the unversioned legacy read.
+        db = str(tmp_path / "store.db")
+        art = str(tmp_path / "artifacts")
+        streams = str(tmp_path / "streams")
+        run_id = self._collaborative_run(db, art, streams)
+        status = control.control_status(run_id, db_path=db, artifacts_path=art)
+        assert status["run_id"] == run_id
+        assert status["autonomy_policy"] == "collaborative"
+
+    def test_cancel_and_resume_not_found_are_structured(self, tmp_path):
+        # Explicit tmp paths so the test never writes into the repo cwd.
+        db = str(tmp_path / "store.db")
+        art = str(tmp_path / "artifacts")
+        cancel = control.control_cancel("ghost", db_path=db, artifacts_path=art)
+        assert cancel["code"] == "not_found"
+        assert cancel["error"] == "Run not found"
+        resume = control.control_resume("ghost", db_path=db, artifacts_path=art)
+        assert resume["code"] == "not_found"
 
 
 # ===========================================================================
