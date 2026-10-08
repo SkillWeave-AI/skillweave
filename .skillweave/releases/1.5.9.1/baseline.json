@@ -196,10 +196,10 @@
       "tests/gate_1312/gate-1312-manifest.json"
     ],
     "watched_digests": {
-      ".forgejo/workflows/contract-ci.yml": "efc00b540222b1e7cd9ef1e3c60f5f205247f3f3ba19f8fcbdae58b0086c1952",
+      ".forgejo/workflows/contract-ci.yml": "68cf32d66d8af7dc8bc2a5ab472dfd700bf0abf8e18afb75c2bf744d0854e366",
       "tests/gate_1312/gate-1312-manifest.json": "adce0f3eec49e513fda1e5a81b20fcb578872341459391a6b7a3c0f2aa496039"
     },
-    "digests_note": "tests/release/test_1591_baseline.py::test_watched_artifact_digests_unchanged enforces these digests. SW-1591-CI-001 repaired the YAML and re-pinned contract-ci.yml here, from the known-red bytes 3c059942fe80149fad6473ded3bba926402bb372a7162e046b69dc6006cdb480; the baseline test explicitly anticipates this deliberate re-pin. The gate-1312 manifest digest must never change (immutable historical artifact)."
+    "digests_note": "tests/release/test_1591_baseline.py::test_watched_artifact_digests_unchanged enforces these digests. SW-1591-CI-001 repaired the YAML and re-pinned contract-ci.yml here, from the known-red bytes 3c059942fe80149fad6473ded3bba926402bb372a7162e046b69dc6006cdb480; the baseline test explicitly anticipates this deliberate re-pin. The gate-1312 manifest digest must never change (immutable historical artifact). SW-1510-SDK-CI subsequently rewrote the same gate (repairing the cross-repository contract contradictions: the schema path, the canonical digest algorithm, the SDK pin and the installed-wheel ownership inventory, per criteria 1-3) and deliberately re-pinned contract-ci.yml here from efc00b540222b1e7cd9ef1e3c60f5f205247f3f3ba19f8fcbdae58b0086c1952 to 68cf32d66d8af7dc8bc2a5ab472dfd700bf0abf8e18afb75c2bf744d0854e366. The guard semantics are unchanged: the digest still pins the exact bytes and still fails on any later silent rewrite; only the recorded value moved with the intentional edit. The gate-1312 manifest digest is still immutable."
   },
   "mutation_policy": {
     "red_conditions_reproduced_before_mutation": true,
