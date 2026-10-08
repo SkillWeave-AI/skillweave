@@ -18,6 +18,17 @@ importable shape of the *installed* product module (never a stand-in handler):
 The real ``mcp`` package is absent on this host, so the genuinely-served
 transport proofs (which need it) skip rather than fabricate a transport, exactly
 as the accepted integration suite does.
+
+Stub vs live transport proof
+----------------------------
+``TestScopedHttpServingPath`` executes the *real* :func:`skillweave.mcp.control.serve`
+code path against an injected fake FastMCP module (the module's injectable
+``fastmcp_factory`` seam). Those assertions **pin the serving contract** -- the
+exact ``run(transport='streamable-http')`` call, the host/port settings, the
+loopback default and the pre-serve refusals -- and are **not** a live transport
+proof. The live proofs (``*_transport_initialize_and_list``) speak the MCP
+protocol to a real server and skip, naming the missing ``mcp`` package, when it
+is not importable.
 """
 
 from __future__ import annotations
@@ -51,6 +62,60 @@ def _child_env() -> dict:
         existing.insert(0, str(_SRC))
     env["PYTHONPATH"] = os.pathsep.join(existing)
     return env
+
+
+def _free_loopback_port() -> int:
+    import socket as _socket
+
+    with _socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class _FakeSettings:
+    """The ``settings`` object a FastMCP-shaped server exposes."""
+
+    def __init__(self) -> None:
+        self.host = None
+        self.port = None
+
+
+class _FakeServer:
+    """A FastMCP-shaped server that records how it was told to run.
+
+    It implements exactly the surface :func:`control.serve` touches -- a
+    ``tool()`` registration decorator, a ``settings`` object with host/port, and
+    a ``run`` that records its call -- so the serving code is exercised
+    unmodified.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.settings = _FakeSettings()
+        self.registered: list = []
+        self.run_calls: list = []
+
+    def tool(self):
+        def decorator(func):
+            self.registered.append(func)
+            return func
+
+        return decorator
+
+    def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+
+
+class _FakeFastMCPModule:
+    """A stand-in for ``mcp.server.fastmcp`` injected via the factory seam."""
+
+    def __init__(self) -> None:
+        self.servers: list = []
+
+    def FastMCP(self, name):  # noqa: N802 - mirrors the real attribute name
+        server = _FakeServer(name)
+        self.servers.append(server)
+        return server
 
 
 # ===========================================================================
@@ -363,10 +428,14 @@ class TestDependencyHonesty:
     def test_serve_refuses_when_dependency_missing(self):
         if control.mcp_available():
             pytest.skip("real mcp present; refusal path is host-specific")
+        # The scoped HTTP case supplies a valid loopback bind + token so the
+        # *dependency* refusal (not a bind refusal) is what is exercised.
         for call in (
             lambda: control.serve_legacy_stdio(),
             lambda: control.serve(transport="stdio"),
-            lambda: control.serve(transport="http", host="127.0.0.1", port=8765),
+            lambda: control.serve(
+                transport="http", host="127.0.0.1", port=8765, auth_token="tok"
+            ),
         ):
             with pytest.raises(control.McpDependencyUnavailable):
                 call()
@@ -419,6 +488,118 @@ class TestDependencyHonesty:
         ]
         # The installed origin is this checkout's src tree, not a stand-in.
         assert info["server_file"].endswith("skillweave/mcp/server.py")
+
+
+# ===========================================================================
+# Criterion 3: the scoped Streamable HTTP *serving path* (stub-pinned)
+# ===========================================================================
+
+
+class TestScopedHttpServingPath:
+    """Execute ``control.serve`` itself and pin what it would run.
+
+    These tests drive the real :func:`control.serve` through its documented
+    ``fastmcp_factory`` seam with a fake FastMCP module. They pin the serving
+    *contract* -- the transport argument, bind settings and refusals. They are
+    **not** a live transport proof; the live proof is
+    ``TestTransportNegotiation.test_real_scoped_http_*`` which skips without the
+    real ``mcp`` package.
+    """
+
+    def test_scoped_http_runs_streamable_http_with_settings(self):
+        module = _FakeFastMCPModule()
+        control.serve(
+            "http", host="127.0.0.1", port=8765, auth_token="tok",
+            fastmcp_factory=lambda: module,
+        )
+        assert len(module.servers) == 1, "serve must build exactly one server"
+        server = module.servers[0]
+        # The exact call the scoped transport makes: streamable-http.
+        assert server.run_calls == [((), {"transport": "streamable-http"})]
+        # Host/port are taken from the scoped settings, not left undefined.
+        assert server.settings.host == "127.0.0.1"
+        assert server.settings.port == 8765
+        # The server carries the product name and the six legacy tools.
+        assert server.name == control.SERVER_NAME
+        assert [fn.__name__ for fn in server.registered] == list(control.LEGACY_TOOLS)
+
+    def test_scoped_http_default_bind_is_loopback(self):
+        """With no host/port named, the default bind is loopback, never wildcard."""
+        module = _FakeFastMCPModule()
+        control.serve("http", auth_token="tok", fastmcp_factory=lambda: module)
+        server = module.servers[0]
+        assert server.settings.host == control.DEFAULT_HTTP_HOST == "127.0.0.1"
+        assert server.settings.port == control.DEFAULT_HTTP_PORT
+        assert server.run_calls == [((), {"transport": "streamable-http"})]
+
+    def test_non_loopback_bind_refused_without_opt_in(self):
+        module = _FakeFastMCPModule()
+        with pytest.raises(control.ScopedHttpRefused) as exc:
+            control.serve(
+                "http", host="0.0.0.0", auth_token="tok",
+                fastmcp_factory=lambda: module,
+            )
+        assert "non-loopback" in exc.value.reason
+        # Refused before any server is built: the factory was never invoked.
+        assert module.servers == []
+
+    def test_non_loopback_bind_allowed_only_with_explicit_opt_in(self):
+        module = _FakeFastMCPModule()
+        control.serve(
+            "http", host="0.0.0.0", port=9000, auth_token="tok", allow_remote=True,
+            fastmcp_factory=lambda: module,
+        )
+        server = module.servers[0]
+        assert server.settings.host == "0.0.0.0"
+        assert server.settings.port == 9000
+
+    def test_scope_token_required_before_serving(self, monkeypatch):
+        monkeypatch.delenv(control.HTTP_AUTH_ENV, raising=False)
+        module = _FakeFastMCPModule()
+        with pytest.raises(control.ScopedHttpRefused) as exc:
+            control.serve(
+                "http", host="127.0.0.1", port=8765,
+                fastmcp_factory=lambda: module,
+            )
+        assert "scope token" in exc.value.reason
+        assert module.servers == [], "no server may be built without a scope token"
+
+    def test_scope_token_comes_from_environment(self, monkeypatch):
+        monkeypatch.setenv(control.HTTP_AUTH_ENV, "env-token")
+        module = _FakeFastMCPModule()
+        control.serve("http", host="127.0.0.1", port=8765,
+                      fastmcp_factory=lambda: module)
+        assert len(module.servers) == 1
+
+    def test_require_scoped_bind_returns_effective_host_and_token(self, monkeypatch):
+        monkeypatch.delenv(control.HTTP_AUTH_ENV, raising=False)
+        host, token = control.require_scoped_bind("", auth_token="arg-token")
+        assert host == control.DEFAULT_HTTP_HOST
+        assert token == "arg-token"
+
+    def test_stdio_serving_path_does_not_request_http(self):
+        module = _FakeFastMCPModule()
+        control.serve("stdio", fastmcp_factory=lambda: module)
+        server = module.servers[0]
+        # stdio runs the bare server: no streamable-http transport argument.
+        assert server.run_calls == [((), {})]
+
+    def test_serve_scoped_http_wrapper_serves_http(self):
+        module = _FakeFastMCPModule()
+        control.serve_scoped_http(
+            host="127.0.0.1", port=8765, auth_token="tok",
+            fastmcp_factory=lambda: module,
+        )
+        assert module.servers[0].run_calls == [
+            ((), {"transport": "streamable-http"})
+        ]
+
+    def test_scoped_serve_refuses_when_dependency_missing(self, monkeypatch):
+        """With a valid bind but no injectable factory, the missing dep refuses."""
+        if control.mcp_available():
+            pytest.skip("real mcp present; refusal path is host-specific")
+        with pytest.raises(control.McpDependencyUnavailable):
+            control.serve("http", host="127.0.0.1", port=8765, auth_token="tok")
 
 
 # ===========================================================================
@@ -483,15 +664,11 @@ class TestTransportNegotiation:
         assert schema["version"] == control.CONTROL_VERSION
 
     @requires_real_mcp
-    def test_real_mcp_can_build_a_server_over_stdio(self, tmp_path, monkeypatch):
+    def test_real_mcp_can_build_a_server_over_stdio(self):
         """Where the real ``mcp`` package exists, a FastMCP server is buildable."""
         built = control._build_server(control.require_mcp())
         assert built is not None
-        # The real server exposes the product name and its tool registry.
-        names = None
-        registry = getattr(built, "_tool_manager", None)
-        assert registry is not None or hasattr(built, "list_tools")
-        del names
+        assert getattr(built, "name", control.SERVER_NAME) == control.SERVER_NAME
 
     def test_real_stdio_transport_initialize_and_list(self, tmp_path):
         """Drive the *real* product server over a real stdio MCP transport.
@@ -536,3 +713,73 @@ class TestTransportNegotiation:
         assert out["TOOLS"] == (
             "cancel_run,create_run,get_evidence,resume_run,review_run,status_run"
         )
+
+    def test_real_scoped_http_transport_initialize_list_and_call(self, tmp_path):
+        """Drive the *real* product server over scoped Streamable HTTP.
+
+        A subprocess serves :func:`control.serve_scoped_http` on a loopback port
+        with a scope token; a subprocess client speaks MCP over Streamable HTTP
+        (``initialize`` -> ``tools/list`` -> ``tools/call``). Skips -- naming the
+        missing package -- when the real ``mcp`` package is not importable,
+        rather than fabricating a transport.
+        """
+        if not control.mcp_available():
+            pytest.skip("real 'mcp' package not importable on this host")
+        pytest.importorskip("mcp")
+        pytest.importorskip("mcp.client.streamable_http")
+        port = _free_loopback_port()
+        token = "test-scope-token"
+        server_code = (
+            "from skillweave.mcp import control\n"
+            f"control.serve_scoped_http(host='127.0.0.1', port={port}, "
+            f"auth_token={token!r})\n"
+        )
+        client_driver = tmp_path / "http_driver.py"
+        client_driver.write_text(
+            "import asyncio, os\n"
+            "from mcp import ClientSession\n"
+            "from mcp.client.streamable_http import streamablehttp_client\n"
+            "URL = os.environ['URL']\n"
+            "HEADERS = {'Authorization': 'Bearer ' + os.environ['TOK']}\n"
+            "async def main():\n"
+            "    async with streamablehttp_client(URL, headers=HEADERS) as (r, w, _):\n"
+            "        async with ClientSession(r, w) as s:\n"
+            "            init = await s.initialize()\n"
+            "            tools = await s.list_tools()\n"
+            "            res = await s.call_tool('status_run', {\n"
+            "                'run_id': 'no-such-run', 'db_path': ':memory:'})\n"
+            "            print('INIT', init.serverInfo.name)\n"
+            "            print('TOOLS', ','.join(sorted(t.name for t in tools.tools)))\n"
+            "            print('CALL', res.content[0].text)\n"
+            "asyncio.run(main())\n"
+        )
+        env = _child_env()
+        env["URL"] = f"http://127.0.0.1:{port}/mcp"
+        env["TOK"] = token
+        server = subprocess.Popen(
+            [sys.executable, "-B", "-c", server_code],
+            env=env, cwd=str(tmp_path),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-B", str(client_driver)],
+                capture_output=True, text=True, env=env, cwd=str(tmp_path),
+                timeout=120,
+            )
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=10)
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        out = dict(
+            ln.split(" ", 1) for ln in proc.stdout.splitlines() if " " in ln
+        )
+        assert out["INIT"] == control.SERVER_NAME
+        assert out["TOOLS"] == (
+            "cancel_run,create_run,get_evidence,resume_run,review_run,status_run"
+        )
+        assert "Run not found" in out["CALL"]
