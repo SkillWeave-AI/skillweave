@@ -15,15 +15,21 @@ carries all six records, each resolvable back to raw bytes.
 """
 
 from .service import (
+    RUN_SNAPSHOT_VERSION,
+    SUPPORTED_RUN_SNAPSHOT_VERSIONS,
     RunApplicationService,
     RunExecution,
     RunExecutionError,
     RunIntegrationError,
+    RunSnapshotContractError,
 )
 
 __all__ = [
+    "RUN_SNAPSHOT_VERSION",
+    "SUPPORTED_RUN_SNAPSHOT_VERSIONS",
     "RunApplicationService",
     "RunExecution",
     "RunExecutionError",
     "RunIntegrationError",
+    "RunSnapshotContractError",
 ]
