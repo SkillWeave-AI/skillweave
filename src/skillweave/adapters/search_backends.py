@@ -727,7 +727,15 @@ def build_search_registry(
             ),
             transport=spec.transport,
             capabilities=tuple(spec.capabilities),
-            credential_refs=spec.credential_refs,
+            # Only declare credential_refs on the descriptor for egress
+            # transports.  Non-egress transports (e.g. mcp-stdio) handle
+            # credentials at the backend level and must not be gated here,
+            # which would alter substrate default behaviour.
+            credential_refs=(
+                spec.credential_refs
+                if spec.transport in ("http", "https", "http+json", "grpc")
+                else ()
+            ),
         )
         registry.register(descriptor, SearchAdapterBackend(spec), source="builtin_search")
     return registry

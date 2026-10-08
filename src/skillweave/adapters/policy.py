@@ -194,6 +194,20 @@ def admit_invocation(
     op = descriptor.operation(operation)
     needed_caps = set(op.required_capabilities) | set(required_capabilities)
 
+    # Egress is checked BEFORE credentials so that a default-deny egress policy
+    # is never masked by a credential refusal.  A caller that denies egress
+    # gets the egress refusal first, regardless of credential state.
+    if descriptor.transport in _EGRESS_TRANSPORTS:
+        if not policy.egress.allows(endpoint):
+            return AdmissionDecision(
+                admitted=False,
+                reason=(
+                    f"adapter {descriptor.id!r} transport {descriptor.transport!r} "
+                    f"cannot egress to endpoint {endpoint!r} under the policy"
+                ),
+                asset="egress",
+            )
+
     for ref in descriptor.credential_refs:
         state = reported.get(ref, "missing")
         if state != "available":
@@ -207,13 +221,6 @@ def admit_invocation(
                     ),
                     asset=f"credential:{ref}",
                 )
-
-    # Egress: only a transport that itself dials a remote endpoint (an http
-    # call) is checked against the egress policy. ``in-process`` / ``local`` /
-    # ``mcp-stdio`` do not dial an endpoint here -- an owned local child's own
-    # network use is the child's concern, and the launch itself is gated by the
-    # allowlist and the credential gate.
-    if descriptor.transport in _EGRESS_TRANSPORTS:
         if not policy.egress.allows(endpoint):
             return AdmissionDecision(
                 admitted=False,

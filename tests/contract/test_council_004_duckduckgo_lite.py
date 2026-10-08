@@ -399,9 +399,9 @@ class TestCriterion3_ConfiguredFallback:
                 egress=EgressPolicy(allow_network=False),
             )
             facade = AdapterFacade(registry, policy)
-            # The credential check runs before egress in admit_invocation,
-            # so we accept either a credential or egress refusal.
-            with pytest.raises(ValueError, match="credential|egress|network"):
+            # Egress is checked before credentials in admit_invocation,
+            # so with allow_network=False the egress refusal fires first.
+            with pytest.raises(ValueError, match="egress|network"):
                 facade.resolve(
                     category="search",
                     operation=SEARCH_OPERATION,
@@ -825,6 +825,7 @@ class TestControllerFinding5_CredentialAvailability:
         from skillweave.discovery.lifecycle_search import resolve_search_outcome
 
         # Call with a provider that requires a credential but no api_key.
+        # Egress is allowed so the credential check is exercised.
         # This should be refused before any live call.
         with pytest.raises(ValueError, match="missing|credential"):
             _run(
@@ -832,6 +833,8 @@ class TestControllerFinding5_CredentialAvailability:
                     "test query",
                     provider="serper",
                     api_key=None,
+                    allow_network=True,
+                    endpoint_allowlist=("google.serper.dev",),
                 )
             )
 
