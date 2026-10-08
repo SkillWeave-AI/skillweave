@@ -17,12 +17,18 @@ Framework config formats (verified against Capacium adapter source):
   opencode        mcp          {"type":"local","command":[],"enabled":true}
   claude-desktop  mcpServers   {command, args, env}
   ==============  ===========  ===========================================
+
+Write behaviour follows the Capacium adapter contract pattern:
+read existing -> setdefault(section) -> inject/replace named entry ->
+write. Unrelated top-level keys and sibling server entries are
+preserved. Only the entry with the same name is replaced.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +44,8 @@ __all__ = [
     "build_cursor_config",
     "build_opencode_config",
     "build_claude_desktop_config",
+    "_section_key_for_harness",
+    "_build_entry_for_harness",
 ]
 
 # ── The six declared frameworks from the Perplexity manifest capability.yaml
@@ -236,6 +244,74 @@ def generate_all_harness_configs(
     }
 
 
+def _section_key_for_harness(harness: str) -> str:
+    """Return the config section key for the given harness."""
+    if harness == "codex":
+        return "mcp_servers"
+    if harness == "opencode":
+        return "mcp"
+    return "mcpServers"
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    """Read a JSON file, returning {} if missing or unparseable."""
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _read_toml(path: Path) -> dict[str, Any]:
+    """Read a TOML file, returning {} if missing or unparseable."""
+    if not path.exists():
+        return {}
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except (ImportError, Exception):
+        return {}
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write a JSON file (write to temp, rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        suffix=".json", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_toml(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write a TOML file (write to temp, rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        suffix=".toml", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            _write_toml_level(f, data, "")
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def write_harness_config(
     harness: str,
     name: str = "perplexity",
@@ -243,6 +319,12 @@ def write_harness_config(
     command: str = "/fixture/perplexity-mcp",
 ) -> Path:
     """Write a harness config to a private scratch directory.
+
+    Follows the Capacium adapter contract pattern: read existing file
+    (if present), setdefault the section key, inject/replace only the
+    named entry, and write back. Unrelated top-level keys and sibling
+    server entries are preserved. Only the entry with the same *name*
+    is replaced.
 
     Never writes to real host config paths -- only to the specified
     *output_dir*. The output format is JSON for all frameworks except
@@ -258,35 +340,51 @@ def write_harness_config(
         The path to the written config file.
     """
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    config = generate_harness_config(harness, name, command)
+    section_key = _section_key_for_harness(harness)
+    entry = _build_entry_for_harness(harness, name, command)
 
-    if harness == "codex":
-        path = output_dir / f"{harness}.toml"
-        _write_toml_simple(path, config)
+    is_toml = harness == "codex"
+    suffix = ".toml" if is_toml else ".json"
+    path = output_dir / f"{harness}{suffix}"
+
+    # Read existing config ({} if missing)
+    if is_toml:
+        config = _read_toml(path)
     else:
-        path = output_dir / f"{harness}.json"
-        with open(path, "w") as f:
-            json.dump(config, f, indent=2)
+        config = _read_json(path)
+
+    # setdefault the section key, then inject/replace the named entry
+    servers = config.setdefault(section_key, {})
+    servers[name] = entry
+
+    # Atomic write
+    if is_toml:
+        _atomic_write_toml(path, config)
+    else:
+        _atomic_write_json(path, config)
+
     return path
 
 
+def _build_entry_for_harness(
+    harness: str, name: str, command: str
+) -> Any:
+    """Build the server entry dict for a given harness."""
+    if harness == "opencode":
+        return {
+            "type": "local",
+            "command": [command],
+            "enabled": True,
+            "env": {"PERPLEXITY_COOKIES": CREDENTIAL_REF},
+        }
+    return {
+        "command": command,
+        "args": [],
+        "env": {"PERPLEXITY_COOKIES": CREDENTIAL_REF},
+    }
+
+
 # ── TOML writer (lightweight, no external dependency)
-
-
-def _write_toml_simple(path: Path, data: dict[str, Any]) -> None:
-    """Write a simple nested-dict structure as TOML.
-
-    Handles the nesting depth needed for Codex configs:
-      [mcp_servers]
-      [mcp_servers.<name>]
-      command = "..."
-      args = []
-      [mcp_servers.<name>.env]
-      KEY = "value"
-    """
-    with open(path, "w") as f:
-        _write_toml_level(f, data, "")
 
 
 def _write_toml_level(
@@ -309,4 +407,4 @@ def _write_toml_level(
         elif isinstance(value, list):
             f.write(f"{key} = {_json.dumps(value)}\n")
         else:
-            f.write(f"{key} = {_json.dumps(str(value))}\n")
+            f.write(f"{key} = {_json.dumps(str(value), ensure_ascii=False)}\n")

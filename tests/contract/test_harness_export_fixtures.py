@@ -382,49 +382,120 @@ class TestCodexConfigShape:
 
 
 class TestUnrelatedEntryPreservation:
-    """C1: Adding an MCP entry must preserve unrelated entries and keys."""
+    """C1: write_harness_config preserves unrelated entries via read-merge.
 
-    def test_codex_unrelated_keys_survive(self):
-        """Codex config: unrelated top-level keys survive MCP entry injection."""
-        fixture = FIXTURE_FACTORIES["codex"]("perplexity")
-        config = fixture["config"]
-        # Simulate a config with an unrelated server and unrelated top-level key
-        config["_unrelated_key"] = "must survive"
-        config["mcp_servers"]["existing-server"] = {
-            "command": "/usr/bin/some-tool",
-            "args": [],
-            "env": {},
-        }
-        # Verify injection doesn't disturb unrelated entries
-        assert config["_unrelated_key"] == "must survive"
-        assert "existing-server" in config["mcp_servers"]
-        assert config["mcp_servers"]["existing-server"]["command"] == "/usr/bin/some-tool"
+    Pre-populates a real target file on disk for each harness with an
+    unrelated top-level key and an unrelated sibling MCP server, then
+    calls the production ``write_harness_config()`` and asserts both
+    survive. This tests the actual file I/O path, not an in-memory dict.
+    """
 
-    def test_opencode_unrelated_keys_survive(self):
-        """OpenCode config: unrelated servers and keys survive MCP injection."""
-        fixture = FIXTURE_FACTORIES["opencode"]("perplexity")
-        config = fixture["config"]
-        config["_unrelated_key"] = "must survive"
-        config["mcp"]["existing-server"] = {
-            "type": "local",
-            "command": ["/usr/bin/some-tool"],
-            "enabled": True,
-        }
-        assert config["_unrelated_key"] == "must survive"
-        assert "existing-server" in config["mcp"]
+    UNRELATED_KEY = "_unrelatedTopKey"
+    UNRELATED_VALUE = "SURVIVE"
+    SIBLING_SERVER = "existing-server"
+    SIBLING_ENTRY_JSON = {
+        "command": "/usr/bin/some-tool",
+        "args": [],
+        "env": {},
+    }
+    SIBLING_ENTRY_OPENCODE = {
+        "type": "local",
+        "command": ["/usr/bin/some-tool"],
+        "enabled": True,
+    }
 
-    def test_claude_desktop_unrelated_keys_survive(self):
-        """Claude Desktop config: unrelated keys survive injection."""
-        fixture = FIXTURE_FACTORIES["claude-desktop"]("perplexity")
-        config = fixture["config"]
-        config["_unrelated_key"] = "must survive"
-        config["mcpServers"]["existing-server"] = {
-            "command": "/usr/bin/some-tool",
-            "args": [],
-            "env": {},
+    @pytest.mark.parametrize("harness", [
+        "antigravity", "claude-code", "cursor", "claude-desktop"
+    ])
+    def test_mcpServers_harness_preserves_unrelated(self, harness, tmp_path):
+        """JSON harnesses using mcpServers: unrelated top-level key and sibling server survive."""
+        section = "mcpServers"
+        preexisting = {
+            self.UNRELATED_KEY: self.UNRELATED_VALUE,
+            section: {
+                self.SIBLING_SERVER: dict(self.SIBLING_ENTRY_JSON),
+            },
         }
-        assert config["_unrelated_key"] == "must survive"
-        assert "existing-server" in config["mcpServers"]
+        path = tmp_path / f"{harness}.json"
+        with open(path, "w") as f:
+            json.dump(preexisting, f, indent=2)
+
+        # Call production write — this should read-merge, not clobber
+        result = write_harness_config(harness, output_dir=str(tmp_path))
+
+        assert result == path
+        with open(path) as f:
+            written = json.load(f)
+        assert written[self.UNRELATED_KEY] == self.UNRELATED_VALUE, (
+            f"{harness}: unrelated top-level key was clobbered"
+        )
+        assert self.SIBLING_SERVER in written[section], (
+            f"{harness}: sibling server was clobbered"
+        )
+        assert "perplexity" in written[section], (
+            f"{harness}: perplexity entry was not added"
+        )
+
+    def test_codex_preserves_unrelated(self, tmp_path):
+        """Codex TOML: unrelated top-level key and sibling server survive."""
+        section = "mcp_servers"
+        path = tmp_path / "codex.toml"
+        # Write a pre-existing TOML file with an unrelated key and sibling server
+        toml_content = (
+            '_unrelatedTopKey = "SURVIVE"\n'
+            "\n"
+            "[mcp_servers]\n"
+            '[mcp_servers."existing-server"]\n'
+            'command = "/usr/bin/some-tool"\n'
+            "args = []\n"
+            "[mcp_servers.existing-server.env]\n"
+            "\n"
+        )
+        with open(path, "w") as f:
+            f.write(toml_content)
+
+        result = write_harness_config("codex", output_dir=str(tmp_path))
+
+        assert result == path
+        with open(path) as f:
+            raw = f.read()
+        assert self.UNRELATED_KEY in raw, (
+            "codex: unrelated top-level key was clobbered (not in output)"
+        )
+        assert self.SIBLING_SERVER in raw, (
+            "codex: sibling server was clobbered (not in output)"
+        )
+        assert "perplexity" in raw, (
+            "codex: perplexity entry was not added"
+        )
+
+    def test_opencode_preserves_unrelated(self, tmp_path):
+        """OpenCode JSON: unrelated top-level key and sibling server survive."""
+        section = "mcp"
+        preexisting = {
+            self.UNRELATED_KEY: self.UNRELATED_VALUE,
+            section: {
+                self.SIBLING_SERVER: dict(self.SIBLING_ENTRY_OPENCODE),
+            },
+        }
+        path = tmp_path / "opencode.json"
+        with open(path, "w") as f:
+            json.dump(preexisting, f, indent=2)
+
+        result = write_harness_config("opencode", output_dir=str(tmp_path))
+
+        assert result == path
+        with open(path) as f:
+            written = json.load(f)
+        assert written[self.UNRELATED_KEY] == self.UNRELATED_VALUE, (
+            "opencode: unrelated top-level key was clobbered"
+        )
+        assert self.SIBLING_SERVER in written[section], (
+            "opencode: sibling server was clobbered"
+        )
+        assert "perplexity" in written[section], (
+            "opencode: perplexity entry was not added"
+        )
 
 
 class TestQualifiedLauncherResolution:
