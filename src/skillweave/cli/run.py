@@ -137,6 +137,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--route-proof",
+        dest="route_proof",
+        default=None,
+        help=(
+            "Path to a route-proof JSON document that declares the approved "
+            "gateway, route set, and tier-to-route binding. When supplied, "
+            "egress is restricted to the approved routes (default-deny). "
+            "When absent, the legacy unlimited path is used."
+        ),
+    )
+    parser.add_argument(
         "--rework",
         action="store_true",
         help="Draft rework briefs from failed gates",
@@ -266,6 +277,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     run_id = generate_run_id()
 
+    # SW-1510-ROUTE-LOCK: load the route-proof document when supplied.
+    # When a route-proof is loaded, the approved routes become the exclusive
+    # set of permitted egress routes (default-deny).  When no route-proof is
+    # supplied, the legacy unlimited path is unchanged.
+    route_proof = None
+    if args.route_proof:
+        from skillweave.routing.route_proof import RouteProof
+        route_proof = RouteProof.load(args.route_proof)
+
     # SW-1510-BUDGET: Check for an existing owner envelope for this task scope
     # across ALL runs first.  If the host has pre-configured a finite envelope
     # (e.g. max_requests=1), honour it — never overwrite with unlimited.
@@ -278,6 +298,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         owner_env = existing
     else:
         owner_env = ReservationEnvelope()
+        # SW-1510-ROUTE-LOCK: when a route-proof is loaded, set allowed_routes
+        # on the envelope to the approved route set (default-deny).  An absent
+        # route-proof leaves the envelope unlimited (legacy path).
+        if route_proof is not None:
+            owner_env = ReservationEnvelope(
+                allowed_routes=sorted(route_proof.approved_routes),
+            )
         reservation_store.set_envelope(run_id, scope_id, owner_env)
 
     try:

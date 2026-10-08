@@ -36,6 +36,11 @@ from .harness import (  # noqa: F401
 # The Faigate adapter is the shared model-routing surface. It lives here (not
 # under council/) so both the council and the RunnerAdapter import the same
 # module. The ``council.faigate_adapter`` path remains as a back-compat shim.
+from .route_proof import (  # noqa: F401
+    RouteProof,
+    RouteProofError,
+)
+
 from .faigate_adapter import (  # noqa: F401
     CouncilProvider,
     FaigateProvider,
@@ -160,6 +165,8 @@ __all__ = [
     "tier_to_router",
     "tier_to_mode",
     "ResolutionRecord",
+    "RouteProof",
+    "RouteProofError",
     "HarnessSource",
     "HarnessError",
     "HarnessDetermination",

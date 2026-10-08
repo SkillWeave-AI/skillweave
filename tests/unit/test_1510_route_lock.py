@@ -53,6 +53,30 @@ from skillweave.routing.faigate_adapter import (  # noqa: E402
     ROUTER_PROFILES,
 )
 
+from skillweave.routing.route_proof import (  # noqa: E402
+    RouteProof,
+    RouteProofError,
+)
+
+from skillweave.runtime.reservation import (  # noqa: E402
+    ReservationStore,
+    ReservationEnvelope,
+    QuotaRefused,
+)
+
+from skillweave.runtime.execution_envelope import (  # noqa: E402
+    ExecutionEnvelopeV1,
+)
+
+from skillweave.runsvc.service import (  # noqa: E402
+    RunApplicationService,
+    RunIntegrationError,
+)
+
+from skillweave.runtime.store import SQLiteRunStore  # noqa: E402
+from skillweave.runtime.journal import EventJournal  # noqa: E402
+from skillweave.runtime.registry import RawArtifactStore  # noqa: E402
+
 from skillweave.dispatch.model_policy import (  # noqa: E402
     ModelTier,
     AllocationError,
@@ -591,6 +615,398 @@ class TestRouteLockIntegrity:
         """The policy revision constant is a non-empty string."""
         assert isinstance(COUNCIL_POLICY_REVISION, str)
         assert len(COUNCIL_POLICY_REVISION) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Route-proof document: loading, validation, and integration with
+# ReservationEnvelope / ExecutionEnvelopeV1.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+_ROUTE_PROOF_FIXTURE = (
+    Path(__file__).resolve().parent.parent / "fixtures" / "route-proof-byteplus-v1.json"
+)
+
+
+class TestRouteProofDocument:
+    """Route-proof document loading and validation through real paths."""
+
+    def test_load_route_proof_fixture(self):
+        """The fixture route-proof document loads without error."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        assert proof.schema_version == "route-proof-v1"
+        assert "byteplus/deepseek-v4-flash" in proof.approved_routes
+        assert "byteplus/deepseek-v4.1-flash" in proof.approved_routes
+        assert "byteplus/deepseek-v4-pro" in proof.approved_routes
+        assert "byteplus/deepseek-v4.1-pro" in proof.approved_routes
+        assert proof.approved_gateway_host == "127.0.0.1"
+        assert proof.approved_gateway_port == 8090
+
+    def test_route_proof_check_route_allowed_passes(self):
+        """check_route_allowed does not raise for an approved route."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        proof.check_route_allowed("byteplus/deepseek-v4-flash")
+        proof.check_route_allowed("byteplus/deepseek-v4-pro")
+
+    def test_route_proof_check_route_allowed_refuses_unapproved(self):
+        """check_route_allowed raises for an unapproved route."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        with pytest.raises(RouteProofError):
+            proof.check_route_allowed("byteplus/deepseek-v3")
+
+    def test_route_proof_check_route_allowed_refuses_bare_model(self):
+        """check_route_allowed refuses a bare model name (direct bypass)."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        with pytest.raises(RouteProofError):
+            proof.check_route_allowed("deepseek-v4-flash")
+
+    def test_route_proof_resolve_tier_flash(self):
+        """Tier resolution returns the correct route subset."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        routes = proof.resolve_allowed_routes_for_tier("flash")
+        assert "byteplus/deepseek-v4-flash" in routes
+        assert "byteplus/deepseek-v4.1-flash" in routes
+        assert "byteplus/deepseek-v4-pro" not in routes
+
+    def test_route_proof_resolve_tier_pro(self):
+        """Pro tier includes flash routes (escalation)."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        routes = proof.resolve_allowed_routes_for_tier("pro")
+        assert "byteplus/deepseek-v4-pro" in routes
+        assert "byteplus/deepseek-v4.1-pro" in routes
+        assert "byteplus/deepseek-v4-flash" in routes
+
+    def test_route_proof_unknown_tier_raises(self):
+        """An unknown tier raises RouteProofError."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        with pytest.raises(RouteProofError):
+            proof.resolve_allowed_routes_for_tier("unknown")
+
+    def test_route_proof_to_dict_round_trip(self):
+        """RouteProof serializes and deserializes faithfully."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        data = proof.to_dict()
+        restored = RouteProof.from_dict(data)
+        assert restored.approved_routes == proof.approved_routes
+        assert restored.tier_routes == proof.tier_routes
+        assert restored.approved_gateway_host == proof.approved_gateway_host
+        assert restored.approved_gateway_port == proof.approved_gateway_port
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ReservationEnvelope route enforcement: the reservation store checks
+# allowed_routes at reserve() time.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestReservationRouteEnforcement:
+    """The reservation store enforces allowed_routes at reserve() time."""
+
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        p = tmp_path / "test_route_reservation.db"
+        yield str(p)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def test_reserve_approved_route_passes(self, db_path):
+        """reserve() accepts a route in allowed_routes."""
+        store = ReservationStore(db_path)
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        store.set_envelope("run-1", "task-1/attempt-1", env)
+        rec = store.reserve(
+            run_id="run-1", task_id="task-1", attempt=1,
+            scope_id="task-1/attempt-1",
+            idempotency_key="test-1", envelope=env,
+            route="byteplus/deepseek-v4-flash",
+        )
+        assert rec.state == "reserved"
+
+    def test_reserve_unapproved_route_refused(self, db_path):
+        """reserve() refuses a route NOT in allowed_routes."""
+        store = ReservationStore(db_path)
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        store.set_envelope("run-2", "task-2/attempt-1", env)
+        with pytest.raises(QuotaRefused) as exc:
+            store.reserve(
+                run_id="run-2", task_id="task-2", attempt=1,
+                scope_id="task-2/attempt-1",
+                idempotency_key="test-2", envelope=env,
+                route="byteplus/deepseek-v3",
+            )
+        assert "not in allowed_routes" in str(exc.value)
+
+    def test_reserve_no_allowed_routes_permits_any(self, db_path):
+        """When allowed_routes is None, any route is accepted."""
+        store = ReservationStore(db_path)
+        env = ReservationEnvelope()  # no allowed_routes restriction
+        store.set_envelope("run-3", "task-3/attempt-1", env)
+        rec = store.reserve(
+            run_id="run-3", task_id="task-3", attempt=1,
+            scope_id="task-3/attempt-1",
+            idempotency_key="test-3", envelope=env,
+            route="any-route",
+        )
+        assert rec.state == "reserved"
+
+    def test_reserve_empty_allowed_routes_refuses_all(self, db_path):
+        """An empty allowed_routes list refuses all routes (default-deny)."""
+        store = ReservationStore(db_path)
+        env = ReservationEnvelope(allowed_routes=[])
+        store.set_envelope("run-4", "task-4/attempt-1", env)
+        with pytest.raises(QuotaRefused) as exc:
+            store.reserve(
+                run_id="run-4", task_id="task-4", attempt=1,
+                scope_id="task-4/attempt-1",
+                idempotency_key="test-4", envelope=env,
+                route="byteplus/deepseek-v4-flash",
+            )
+        assert "not in allowed_routes" in str(exc.value)
+
+    def test_reserve_route_from_route_proof_envelope(self, db_path):
+        """Envelope created from RouteProof.approved_routes enforces correctly."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        env = ReservationEnvelope(allowed_routes=sorted(proof.approved_routes))
+        store = ReservationStore(db_path)
+        store.set_envelope("run-5", "task-5/attempt-1", env)
+
+        # Approved route passes
+        store.reserve(
+            run_id="run-5", task_id="task-5", attempt=1,
+            scope_id="task-5/attempt-1",
+            idempotency_key="test-5a", envelope=env,
+            route="byteplus/deepseek-v4-flash",
+        )
+
+        # Unapproved route refused
+        with pytest.raises(QuotaRefused) as exc:
+            store.reserve(
+                run_id="run-5", task_id="task-5", attempt=1,
+                scope_id="task-5/attempt-1",
+                idempotency_key="test-5b", envelope=env,
+                route="byteplus/deepseek-v3",
+            )
+        assert "not in allowed_routes" in str(exc.value)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ExecutionEnvelopeV1 bridge: to_reservation_envelope() must pass through
+# allowed_routes in both branches.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestExecutionEnvelopeBridge:
+    """ExecutionEnvelopeV1.to_reservation_envelope passes allowed_routes."""
+
+    def test_enforcing_branch_passes_allowed_routes(self):
+        """Under enforcing policy, allowed_routes is passed through."""
+        env = ExecutionEnvelopeV1(
+            allowed_routes=["byteplus/deepseek-v4-flash"],
+            limit_policy="enforcing",
+        )
+        rv = env.to_reservation_envelope()
+        assert rv.allowed_routes == ["byteplus/deepseek-v4-flash"]
+
+    def test_observe_adapt_branch_passes_allowed_routes(self):
+        """Under observe_adapt policy, allowed_routes is passed through."""
+        env = ExecutionEnvelopeV1(
+            allowed_routes=["byteplus/deepseek-v4-flash"],
+            limit_policy="observe_adapt",
+        )
+        rv = env.to_reservation_envelope()
+        assert rv.allowed_routes == ["byteplus/deepseek-v4-flash"]
+
+    def test_none_allowed_routes_passes_through(self):
+        """When allowed_routes is None, it stays None."""
+        env = ExecutionEnvelopeV1(limit_policy="enforcing")
+        rv = env.to_reservation_envelope()
+        assert rv.allowed_routes is None
+
+    def test_from_dict_round_trip_preserves_allowed_routes(self):
+        """allowed_routes survives from_dict -> to_reservation_envelope."""
+        data = {
+            "allowed_routes": ["byteplus/deepseek-v4-flash", "byteplus/deepseek-v4-pro"],
+            "limit_policy": "enforcing",
+            "max_requests": 5,
+        }
+        env = ExecutionEnvelopeV1.from_dict(data)
+        rv = env.to_reservation_envelope()
+        assert rv.allowed_routes == ["byteplus/deepseek-v4-flash", "byteplus/deepseek-v4-pro"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RunApplicationService: the route is passed through to reserve() via the
+# start_async() and execute_streaming_native() paths.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestServiceRouteWiring:
+    """RunApplicationService wires route through start_async and execute."""
+
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        p = tmp_path / "test_svc_route.db"
+        yield str(p)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @pytest.fixture
+    def scratch(self, tmp_path):
+        a = tmp_path / "artifacts"
+        a.mkdir()
+        return str(a)
+
+    @pytest.fixture
+    def svc(self, db_path, scratch):
+        store = SQLiteRunStore(db_path)
+        journal = EventJournal(db_path)
+        raw = RawArtifactStore(scratch)
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationStore
+        stream = DurableStreamStore(root=scratch)
+        rs = ReservationStore(db_path)
+        return RunApplicationService(store, journal, raw, stream, reservation_store=rs)
+
+    def test_execute_streaming_native_passes_route_to_reserve(self, svc, db_path, scratch):
+        """execute_streaming_native passes model as route to reserve().
+
+        This test verifies the integration wiring: the ingress must persist
+        an envelope with allowed_routes, and the reserve() call inside
+        execute_streaming_native must check the route against it.
+        """
+        # Persist an envelope with allowed_routes for the task scope
+        from skillweave.runtime.reservation import ReservationEnvelope
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "test-run-e", "task-e/attempt-1", env
+        )
+
+        # A probe command that exits 0
+        import sys as _sys
+        cmd = [_sys.executable, "-c", "print('route-enforcement-stream')"]
+
+        # The model passed as route should be in allowed_routes -> passes
+        result = svc.execute_streaming_native(
+            command=cmd,
+            run_id="test-run-e",
+            tool="bash",
+            model="byteplus/deepseek-v4-flash",
+            subject_repo="test-repo",
+            subject_commit="a724d32a724d32a724d32a724d32a724d32a724d",
+            task_id="task-e",
+            attempt=1,
+        )
+        assert result["run_id"] == "test-run-e"
+        assert result["gate_state"] == "pass"
+
+    def test_execute_streaming_native_refuses_unapproved_route(self, svc, db_path, scratch):
+        """execute_streaming_native refuses when route is not in allowed_routes."""
+        from skillweave.runtime.reservation import ReservationEnvelope
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "test-run-f", "task-f/attempt-1", env
+        )
+
+        import sys as _sys
+        cmd = [_sys.executable, "-c", "print('should-not-run')"]
+
+        with pytest.raises(RunIntegrationError) as exc:
+            svc.execute_streaming_native(
+                command=cmd,
+                run_id="test-run-f",
+                tool="bash",
+                model="byteplus/deepseek-v3",  # NOT in allowed_routes
+                subject_repo="test-repo",
+                subject_commit="a724d32a724d32a724d32a724d32a724d32a724d",
+                task_id="task-f",
+                attempt=1,
+            )
+        assert "quota refused" in str(exc.value)
+
+    def test_start_async_passes_route_to_reserve(self, svc, db_path, scratch):
+        """start_async passes the route parameter through to reserve()."""
+        from skillweave.runtime.reservation import ReservationEnvelope
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "test-run-g", "task-g/attempt-1", env
+        )
+
+        import sys as _sys
+        cmd = [_sys.executable, "-c", "print('start-async-route')"]
+
+        # The route parameter is passed through to reserve() -> should pass
+        result = svc.start_async(
+            command=cmd,
+            run_id="test-run-g",
+            attempt=1,
+            task_id="task-g",
+            route="byteplus/deepseek-v4-flash",
+        )
+        assert result["run_id"] == "test-run-g"
+        assert result["state"] is not None
+
+    def test_start_async_refuses_unapproved_route(self, svc, db_path, scratch):
+        """start_async refuses when route is not in allowed_routes."""
+        from skillweave.runtime.reservation import ReservationEnvelope
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "test-run-h", "task-h/attempt-1", env
+        )
+
+        import sys as _sys
+        cmd = [_sys.executable, "-c", "print('should-not-run')"]
+
+        with pytest.raises(RunIntegrationError) as exc:
+            svc.start_async(
+                command=cmd,
+                run_id="test-run-h",
+                attempt=1,
+                task_id="task-h",
+                route="byteplus/deepseek-v3",  # NOT in allowed_routes
+            )
+        assert "async reservation refused" in str(exc.value)
+
+    def test_restart_attempt_checks_retry_attribution(self, svc, db_path, scratch):
+        """restart_attempt verifies retry attribution before launching."""
+        from skillweave.runtime.reservation import ReservationEnvelope
+        # First, create a source run that is non-terminal
+        import sys as _sys
+        cmd = [_sys.executable, "-c", "print('source-run')"]
+
+        # Create a run via start_async that we can restart
+        env = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "test-run-i", "task-i/attempt-1", env
+        )
+        source = svc.start_async(
+            command=cmd,
+            run_id="test-run-i",
+            attempt=1,
+            task_id="task-i",
+            route="byteplus/deepseek-v4-flash",
+        )
+
+        # Now try to restart with an envelope that has allowed_routes
+        env2 = ReservationEnvelope(allowed_routes=["byteplus/deepseek-v4-flash"])
+        svc.reservation_store.set_envelope(
+            "test-run-i", "task-i/attempt-2", env2
+        )
+
+        # The restart should pass because "restart" is checked against
+        # allowed_routes via AttemptAttribution
+        result = svc.restart_attempt(
+            run_id="test-run-i",
+            command=[_sys.executable, "-c", "print('restart-attempt')"],
+            task_id="task-i",
+            reservation_envelope=env2,
+            route="byteplus/deepseek-v4-flash",
+        )
+        assert result["restarted"] is True
+        assert result["attempt"] == 2
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -98,7 +98,7 @@ def _analysis_binding(analysis_root: str):
 
 
 @mcp.tool()
-def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, command: str, db_path: str = ".skillweave/store.db", artifacts_path: str = ".skillweave/artifacts", methodology: str = "ralph", autonomy_policy: str = "", task_id: str = "", attempt: int = 1, output_root: str = "", stream_root: str = "", artifact_evidence: str = "", source_root: str = "", analysis_root: str = "") -> str:
+def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, command: str, db_path: str = ".skillweave/store.db", artifacts_path: str = ".skillweave/artifacts", methodology: str = "ralph", autonomy_policy: str = "", task_id: str = "", attempt: int = 1, output_root: str = "", stream_root: str = "", artifact_evidence: str = "", source_root: str = "", analysis_root: str = "", route_proof: str = "") -> str:
     """Create and execute a new SkillWeave run.
 
     ``methodology`` is the declared methodology binding (default ``ralph``).
@@ -119,10 +119,14 @@ def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, co
         db_path, artifacts_path, stream_root or _default_stream_root(db_path)
     )
     run_id = generate_run_id()
-    # SW-1510-BUDGET: Check for an existing owner envelope for this task scope
-    # across ALL runs first.  If the host has pre-configured a finite envelope,
-    # honour it — never overwrite with unlimited.  Only create the explicit
-    # owner-authorized unlimited envelope when no owner envelope exists.
+    # SW-1510-ROUTE-LOCK: load the route-proof document when supplied.
+    # When a route-proof is loaded, the approved routes become the exclusive
+    # set of permitted egress routes (default-deny).
+    route_proof_obj = None
+    if route_proof:
+        from skillweave.routing.route_proof import RouteProof as _RouteProof
+        route_proof_obj = _RouteProof.load(route_proof)
+
     from skillweave.runtime.reservation import ReservationEnvelope as _ReservationEnvelope
     effective_task_id = task_id or run_id
     scope_id = f"{effective_task_id}/attempt-{attempt}"
@@ -130,7 +134,14 @@ def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, co
     if existing is not None:
         owner_env = existing
     else:
-        owner_env = _ReservationEnvelope()
+        # SW-1510-ROUTE-LOCK: when a route-proof is loaded, set allowed_routes
+        # on the envelope to the approved route set (default-deny).
+        if route_proof_obj is not None:
+            owner_env = _ReservationEnvelope(
+                allowed_routes=sorted(route_proof_obj.approved_routes),
+            )
+        else:
+            owner_env = _ReservationEnvelope()
         svc.reservation_store.set_envelope(run_id, scope_id, owner_env)
 
     cmd_list = shlex.split(command)

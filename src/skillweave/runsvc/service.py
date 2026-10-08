@@ -1901,6 +1901,7 @@ class RunApplicationService:
         task_id: Optional[str] = None,
         restarted_from: Optional[dict[str, Any]] = None,
         reservation_envelope: Optional[Any] = None,
+        route: Optional[str] = None,
     ) -> dict[str, Any]:
         """Start *command* as a detached background process.
 
@@ -1966,6 +1967,7 @@ class RunApplicationService:
                     scope_id=scope_id,
                     idempotency_key=f"start_async:{rid}:{scope_id}",
                     envelope=reservation_envelope,
+                    route=route,
                 )
             except Exception as exc:  # noqa: BLE001
                 raise RunIntegrationError(
@@ -2407,6 +2409,7 @@ class RunApplicationService:
         cwd: Optional[Path] = None,
         _env: Optional[dict[str, str]] = None,
         reservation_envelope: Optional[Any] = None,
+        route: Optional[str] = None,
     ) -> dict[str, Any]:
         """Launch a NEW identified attempt that continues *run_id*.
 
@@ -2441,6 +2444,26 @@ class RunApplicationService:
         source_lineage = (source.metadata or {}).get("lineage") or {}
         root_run_id = source_lineage.get("root_run_id") or source.run_id
         next_attempt = int(source_lineage.get("attempt") or 1) + 1
+
+        # SW-1510-ROUTE-LOCK: verify retry attribution before proceeding.
+        # Each restart attempt must carry valid attribution (attempt >= 1)
+        # and the requested route must be within the approved route set.
+        # When a reservation_envelope with allowed_routes is supplied, the
+        # retry route is checked against it.
+        from skillweave.dispatch.model_policy import AttemptAttribution, check_attempt_route
+        try:
+            attribution = AttemptAttribution(
+                attempt=next_attempt,
+                requested_route=route or "restart",
+                reserved_budget=0.0,
+            )
+            # When the envelope has allowed_routes, check the route against it.
+            if reservation_envelope is not None:
+                allowed = getattr(reservation_envelope, "allowed_routes", None)
+                if allowed is not None:
+                    check_attempt_route(attribution, allowed_routes=frozenset(allowed) if allowed else None)
+        except Exception as exc:
+            raise StoreError(f"restart retry attribution refused: {exc}") from exc
 
         # SW-1510-BUDGET: inherit the source run's task identity so the retry
         # is bounded by the same owner envelope and task aggregate.  An explicit
@@ -2512,6 +2535,7 @@ class RunApplicationService:
             task_id=task_id,
             restarted_from=restarted_from,
             reservation_envelope=reservation_envelope,
+            route=route,
         )
         result["parent_run_id"] = run_id
         result["root_run_id"] = root_run_id

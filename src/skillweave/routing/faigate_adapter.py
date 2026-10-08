@@ -787,7 +787,7 @@ FAIGATE_DEFAULT_PORT = "8090"
 
 
 class FaigateProvider(CouncilProvider):
-    def __init__(self, base_url: str | None = None, api_key: str | None = None, cache_ttl: float | None = None):
+    def __init__(self, base_url: str | None = None, api_key: str | None = None, cache_ttl: float | None = None, *, enforce_egress: bool = False):
         super().__init__()
         self.base_url = (base_url or os.environ.get(
             "FAIGATE_BASE_URL",
@@ -797,6 +797,12 @@ class FaigateProvider(CouncilProvider):
         self.api_key = api_key or os.environ.get("FAIGATE_API_KEY")
         if cache_ttl is not None:
             self._cache_ttl = cache_ttl
+        # SW-1510-ROUTE-LOCK: when egress enforcement is active, verify the
+        # resolved base_url routes through the approved gateway.  This catches
+        # alternative loopback routers and direct upstream URLs before any
+        # network call — even when the env-var config points elsewhere.
+        if enforce_egress:
+            check_egress_gateway(self.base_url)
         # If no explicit key, try reading from ~/.config/faigate/tokens.json
         if not self.api_key:
             token_file = os.path.expanduser("~/.config/faigate/tokens.json")
