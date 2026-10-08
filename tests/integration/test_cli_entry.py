@@ -587,6 +587,14 @@ def test_probe_end_to_end_reaches_hold_without_an_injected_adapter(tmp_path, mon
 
 def test_router_still_registers_every_subcommand():
     parser = _router_parser()
+    # Every mounted surface must stay registered: the delegation/entry
+    # surfaces plus the async run lifecycle (start/inspect/kill) and the
+    # identity-verified cancel/resume pair. ``support`` is the SW-1510-CLI
+    # criterion-2 published surface (the versioned support table + shared
+    # state interpretation). A REMAINDER positional or an option dest that
+    # collides with ``dest="command"`` (see ``test_router_delegates_to_run``)
+    # would drop one of these from the router *and* break the installed
+    # top-level dispatch.
     assert set(parser.choices) == {
         "entry",
         "dispatch",
@@ -595,6 +603,12 @@ def test_router_still_registers_every_subcommand():
         "planning-sync",
         "onboard",
         "assess",
+        "start",
+        "inspect",
+        "kill",
+        "cancel",
+        "resume",
+        "support",
     }
 
 
@@ -720,7 +734,7 @@ def test_product_version_matches_the_declared_release():
     test honest across releases, while the literal pin records what the
     published envelope said when the contract was written.
     """
-    assert product_version() == _pyproject_version() == "1.5.7"
+    assert product_version() == _pyproject_version() == "1.5.9"
 
 
 def _router_parser():

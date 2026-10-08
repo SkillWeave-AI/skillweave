@@ -463,8 +463,10 @@ class TestCLIParsers:
 
         parser = build_start_parser()
         args = parser.parse_args(["--", "echo", "hello"])
-        # nargs=REMAINDER includes the -- separator
-        assert args.command == ["--", "echo", "hello"]
+        # nargs=REMAINDER includes the -- separator.  The positional is named
+        # ``start_argv`` (not ``command``) so it cannot overwrite the router's
+        # ``add_subparsers(dest="command")`` value when mounted as a parent.
+        assert args.start_argv == ["--", "echo", "hello"]
         assert args.async_run is False
         assert args.run_id is None
 
@@ -474,6 +476,7 @@ class TestCLIParsers:
         parser = build_start_parser()
         args = parser.parse_args(["--async", "--", "echo", "hello"])
         assert args.async_run is True
+        assert args.start_argv == ["--", "echo", "hello"]
 
     def test_start_parser_explicit_run_id(self):
         from skillweave.runlifecycle.cli import build_start_parser

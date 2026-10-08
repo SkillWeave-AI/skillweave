@@ -359,6 +359,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "brief_path": brief_path,
             }
 
+        # SW-1510-CLI criterion 3: a native Assay PASS withheld by a *missing
+        # source binding* (or any artifact-semantics refusal) is a meaningful
+        # non-success, not a bare rc 0. The full result JSON is still emitted so
+        # automation can read the phases and the exact refusal reasons, but the
+        # exit code is nonzero so a wrapper cannot read a withheld PASS as
+        # success. This is deliberately scoped to the Assay methodology: a
+        # non-Assay run has no artifact-semantics block and keeps its rc 0.
+        assay_block = result_dict.get("assay")
+        if isinstance(assay_block, dict) and assay_block.get("outcome") == "hold":
+            sys.stdout.write(json.dumps(result_dict, sort_keys=True) + "\n")
+            reason = assay_block.get("reason") or "artifact-specific semantics refused"
+            sys.stderr.write(
+                json.dumps(
+                    {
+                        "error": f"assay native PASS withheld: {reason}",
+                        "run_id": execution["run_id"],
+                        "outcome": "hold",
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            return 1
+
         sys.stdout.write(json.dumps(result_dict, sort_keys=True) + "\n")
         return 0
 

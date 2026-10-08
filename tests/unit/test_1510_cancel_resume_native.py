@@ -415,7 +415,9 @@ class TestCliSurface:
         parser = build_resume_parser()
         args = parser.parse_args(["run-1", "--command", "echo hi", "--idempotency-key", "k1"])
         assert args.run_id == "run-1"
-        assert args.command == "echo hi"
+        # ``--command`` writes ``resume_command`` (not the router's
+        # ``dest="command"``); see the NOTE in ``build_resume_parser``.
+        assert args.resume_command == "echo hi"
         assert args.idempotency_key == "k1"
 
     def test_cli_cancel_reports_refusal_exit_code(self, tmp_path, monkeypatch, capsys):
