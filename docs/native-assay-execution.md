@@ -123,6 +123,24 @@ exposes:
 * **A namespaced, opt-in read shape.** `snapshot_v1(run_id)` emits the frozen
   `run-snapshot-v1` record; an unknown version name is *refused*
   (`SnapshotVersionRefused`), never coerced to a supported one.
+* **Structured refusals, never raised exceptions.** A control tool *returns* a
+  contract or storage refusal as a durable record —
+  `{"error", "code", "run_id", "version", "supported": [...]}` — and never
+  leaks an exception across the tool boundary. `code` is one of
+  `unsupported_version` (an unknown version name), `snapshot_unavailable` (a run
+  whose trusted fields cannot be expressed in the frozen enum — e.g. the
+  default `collaborative` policy has no `run-snapshot-v1` slot;
+  `SUPPORTED_SNAPSHOT_VERSIONS` is deliberately **not** widened), `not_found`,
+  or `storage_unavailable`. `control_cancel` additionally reports an unverified
+  process identity as `code == "identity_unverified"` with the verification
+  reason.
+* **First-run store creation.** The control surface creates the run store's
+  parent directory on first use, as the CLI ingress does, so a control call from
+  a fresh project cwd *creates* `.skillweave` rather than failing with `unable to
+  open database file`. The directory-backed stores do not need pre-creation -- a
+  durable stream store creates its own root and the raw artifact store is
+  memory-backed -- so an inspect-only call has no artifacts-directory side
+  effect on disk.
 * **An honest dependency diagnostic.** Serving needs the real `mcp` package.
   When it is absent the placeholder server reports `can_serve == False` with an
   explicit reason and refuses to run; `python -m skillweave.mcp.server` exits
