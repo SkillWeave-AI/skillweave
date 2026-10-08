@@ -805,6 +805,68 @@ class MCPPrincipalAuthority:
         )
         return token
 
+    def register_scope_token(
+        self,
+        scope_token: str,
+        *,
+        role: str = "controller",
+        client_id: str,
+        transport: str = "http",
+        run_ids: Iterable[str] = (),
+        allowed_roots: Iterable[str] = (),
+        allowed_argv0: Iterable[str] = (),
+        allowed_routes: Iterable[str] = (),
+        ttl_seconds: Optional[float] = None,
+    ) -> str:
+        """Register *scope_token* as a live session, returning it unchanged.
+
+        The scoped HTTP transport hands a scope token to the host, and the
+        request guard authenticates each request against it. For the middleware
+        to bind an *authenticated principal* into the per-operation authority,
+        the same token must resolve to a session here -- otherwise the HTTP
+        path could authenticate a request yet have no principal to authorize
+        it. This is the production issuance point for that: it stores only the
+        token's digest (never the raw value) and mints the same scoped session a
+        client would carry. The role is read from :data:`MCP_ROLE_SCOPES`, never
+        the wire.
+        """
+        if not isinstance(scope_token, str) or not scope_token:
+            raise UnauthenticatedPrincipal("a scope token is required")
+        if role not in MCP_ROLE_SCOPES:
+            raise RoleEscalationRefused(
+                f"unknown MCP role {role!r}; issuable roles are "
+                f"{sorted(MCP_ROLE_SCOPES)}",
+                extra={"requested_role": role},
+            )
+        if not isinstance(client_id, str) or not client_id:
+            raise UnauthenticatedPrincipal("a session requires a client_id")
+        if transport not in ("stdio", "http"):
+            raise UnauthenticatedPrincipal(f"unknown MCP transport {transport!r}")
+        scope = MCP_ROLE_SCOPES[role]
+        issued = _now_iso()
+        expires = None
+        if ttl_seconds is not None:
+            expires = (
+                datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+            ).isoformat()
+        self._by_digest[_token_digest(scope_token)] = _MCPSessionRecord(
+            token_digest=_token_digest(scope_token),
+            principal=f"mcp:{role}:{client_id}",
+            role=role,
+            client_id=client_id,
+            scopes=frozenset(scope["operations"]),
+            allowed_run_ids=frozenset(run_ids),
+            session_id=secrets.token_hex(8),
+            transport=transport,
+            issued_at=issued,
+            not_before=issued,
+            expires_at=expires,
+            allowed_roots=tuple(allowed_roots),
+            allowed_argv0=frozenset(allowed_argv0),
+            allowed_routes=tuple(allowed_routes),
+        )
+        return scope_token
+
     def revoke_token(self, token: str) -> None:
         """Test seam: revoke exactly one session token."""
         digest = _token_digest(token)
@@ -878,6 +940,7 @@ class MCPPrincipalAuthority:
         start_scope: str = "",
         provider_route: str = "",
         default_paths: Iterable[str] = (),
+        principal_override: Optional[MCPPrincipal] = None,
     ) -> MCPPrincipal:
         """Authorize *operation* for the principal behind *token*.
 
@@ -887,11 +950,22 @@ class MCPPrincipalAuthority:
         raise an :class:`MCPAuthError` with an auditable ``code``. Returns the
         verified principal only when the operation is permitted.
 
+        ``principal_override`` is the principal the *serving host* already
+        resolved for this exact token -- an HTTP request guard verifies the
+        bearer once and attaches the principal so the per-tool gate reuses it
+        rather than re-deriving it per call. It is honored only when it matches
+        ``token``'s own verified session (same session id); a mismatched
+        override is ignored, so a caller can never widen its own authority.
+
         ``default_paths`` names the server's own configured store paths, which a
         principal may always use; any *other* path must fall within the
         principal's bound roots or it is refused as injection.
         """
         principal = self.verify_session(token)
+        if principal_override is not None and (
+            getattr(principal_override, "session_id", None) == principal.session_id
+        ):
+            principal = principal_override
         scope = MCP_ROLE_SCOPES[principal.role]
         if operation not in scope["operations"]:
             raise MCPAuthError(

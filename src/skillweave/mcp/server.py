@@ -37,13 +37,29 @@ import os
 import sys
 
 from skillweave.mcp import control
-from skillweave.runtime.authority import (
-    EXECUTION_ENVELOPE_MCP_EXTENSION,
-    MCPAuthError,
-    MCPPrincipal,
-    MCPPrincipalAuthority,
-    UnauthenticatedPrincipal,
-)
+
+# GLE-020: ``skillweave.runtime`` is an *optional* subpackage, so this module
+# must not top-level import it (that would drag it into the eager closure). The
+# authority types the middleware uses are resolved lazily via PEP 562 -- the
+# same deferral ``skillweave/__init__.py`` uses -- so importing this module
+# never forces the optional subpackage while ``server.MCPAuthError`` (and the
+# other names) remain reachable exactly as before.
+_AUTHORITY_NAMES = frozenset({
+    "EXECUTION_ENVELOPE_MCP_EXTENSION",
+    "MCPAuthError",
+    "MCPPrincipal",
+    "MCPPrincipalAuthority",
+    "UnauthenticatedPrincipal",
+})
+
+
+def __getattr__(name: str):
+    if name in _AUTHORITY_NAMES:
+        from skillweave.runtime import authority as _authority
+
+        return getattr(_authority, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 try:
     from mcp.server.fastmcp import FastMCP as _RealFastMCP
@@ -55,6 +71,13 @@ except ImportError:  # pragma: no cover - exercised on a host without `mcp`
 #: stdio client runs under. There is no anonymous default: a stdio session that
 #: does not name its supervisor is refused at the authorization seam.
 SUPERVISOR_ENV = "SKILLWEAVE_MCP_SUPERVISOR"
+
+#: The documented non-zero exit code this module uses when it refuses to serve:
+#: the ``mcp`` dependency is absent, or a local stdio session named no explicit
+#: supervisor identity. The one-line diagnostic goes to stderr; the process
+#: exits with this code instead of raising a traceback. Operators may script
+#: against it.
+EXIT_REFUSED = 3
 
 #: Environment variable carrying a client's MCP session token (the credential
 #: the authority registry minted). An HTTP request presents the same token.
@@ -112,7 +135,7 @@ else:
 # Server-owned authorization middleware
 # ---------------------------------------------------------------------------
 
-def bind_authority(authority: MCPPrincipalAuthority) -> MCPPrincipalAuthority:
+def bind_authority(authority: "MCPPrincipalAuthority") -> "MCPPrincipalAuthority":
     """Bind the process-wide MCP authority. Only a live instance is accepted.
 
     Returns the bound authority so callers can issue sessions against it. A
@@ -121,7 +144,7 @@ def bind_authority(authority: MCPPrincipalAuthority) -> MCPPrincipalAuthority:
     """
     global _AUTHORITY
     if authority is None or not callable(getattr(authority, "serve_live", None)):
-        raise UnauthenticatedPrincipal(
+        raise _authority_module().UnauthenticatedPrincipal(
             "bind_authority requires a live MCPPrincipalAuthority"
         )
     _AUTHORITY = authority
@@ -133,10 +156,44 @@ def get_authority() -> "MCPPrincipalAuthority | None":
     return _AUTHORITY
 
 
-def _require_authority() -> MCPPrincipalAuthority:
+def _authority_module():
+    """The optional ``skillweave.runtime.authority`` module (lazy, GLE-020)."""
+    from skillweave.runtime import authority as _authority
+
+    return _authority
+
+
+def _bound_authority() -> "MCPPrincipalAuthority | None":
+    """The live authority bound to this process, or ``None``.
+
+    A bound object qualifies only when it carries ``serve_live``; a look-alike
+    without it is treated as *not bound* rather than trusted.
+    """
     authority = _AUTHORITY
     if authority is None or not callable(getattr(authority, "serve_live", None)):
-        raise UnauthenticatedPrincipal(
+        return None
+    return authority
+
+
+def _current_http_principal():
+    """The authenticated principal of the current HTTP request, or ``None``.
+
+    The HTTP request guard (:mod:`skillweave.mcp.control`) sets this per
+    request; over HTTP a protected tool call resolves its principal here, so
+    the per-tool gating sees the same authenticated principal it does over
+    stdio. Resolved lazily so importing this module never forces the optional
+    subpackage.
+    """
+    try:
+        return control.current_http_principal()
+    except Exception:  # noqa: BLE001 - absence is "no HTTP principal"
+        return None
+
+
+def _require_authority() -> "MCPPrincipalAuthority":
+    authority = _bound_authority()
+    if authority is None:
+        raise _authority_module().UnauthenticatedPrincipal(
             "no MCP authority is bound to this server; the host process must "
             "call bind_authority(...) before serving protected operations"
         )
@@ -157,7 +214,7 @@ def require_supervisor_identity() -> str:
     """The stdio supervisor principal, or an explicit refusal when unset."""
     identity = supervisor_identity()
     if not identity:
-        raise UnauthenticatedPrincipal(
+        raise _authority_module().UnauthenticatedPrincipal(
             f"local stdio requires an explicit supervisor identity; set "
             f"{SUPERVISOR_ENV} to name the supervising principal"
         )
@@ -190,14 +247,27 @@ def start_scope_for(*, task_id: str, attempt: int, run_id: str = "") -> str:
 def resolve_session_token(presented: str = "") -> str:
     """The session credential a protected call runs under.
 
-    A client may present a token in the call or in
-    :data:`SESSION_TOKEN_ENV`. When it presents neither, the token the
+    A client may present a token in the call, in :data:`SESSION_TOKEN_ENV`, or
+    -- over HTTP -- on the request's ``Authorization`` header, which the
+    request guard resolves for the call. When none is present the token the
     *production* stdio startup minted (:data:`_READY_SESSION_TOKEN`) resolves
-    the host-owned supervisor principal -- a local stdio client cannot mint it,
-    only the host binding did. An HTTP client has no such fallback and must
-    present its own credential.
+    the host-owned supervisor principal; a local stdio client cannot mint it,
+    only the host binding did.
     """
-    return presented or session_token_from_env() or (_READY_SESSION_TOKEN or "")
+    return (
+        presented
+        or session_token_from_env()
+        or _http_request_token()
+        or (_READY_SESSION_TOKEN or "")
+    )
+
+
+def _http_request_token() -> str:
+    """The current HTTP request's bearer token, or ``""`` outside a request."""
+    try:
+        return control.current_http_token()
+    except Exception:  # noqa: BLE001 - absence is "no HTTP credential"
+        return ""
 
 
 def gate_operation(
@@ -227,8 +297,8 @@ def gate_operation(
     an authority. Once an authority *is* bound, a caller that presents no
     resolvable credential is refused for **every** tool, not only review.
     """
-    authority = _AUTHORITY
-    if authority is None or not callable(getattr(authority, "serve_live", None)):
+    authority = _bound_authority()
+    if authority is None:
         return None, None
     token = resolve_session_token(presented_token)
     try:
@@ -244,7 +314,7 @@ def gate_operation(
             start_scope=start_scope,
             provider_route=provider_route,
         )
-    except MCPAuthError as exc:
+    except _authority_module().MCPAuthError as exc:
         return None, _auth_error_payload(exc)
     return principal, None
 
@@ -261,7 +331,7 @@ def authenticate_operation(
     approval_token: str = "",
     start_scope: str = "",
     provider_route: str = "",
-) -> MCPPrincipal:
+) -> "MCPPrincipal":
     """Resolve and authorize the principal for *operation* (the middleware).
 
     The single entry every protected MCP operation routes through. It (1)
@@ -273,6 +343,11 @@ def authenticate_operation(
     """
     authority = _require_authority()
     principal = authority.verify_session(session_token)
+    # Over HTTP the request guard already authenticated the bearer and attached
+    # the principal for *this* token; reuse it so the per-tool gate authorizes
+    # the same principal. ``authorize`` only honors it when it matches the
+    # token's own session, so this can never widen authority.
+    override = _current_http_principal()
     # Role escalation is refused FIRST: a caller asking for rights it does not
     # hold is refused even if it would otherwise pass the operation check.
     authority.refuse_role_escalation(principal, requested_role)
@@ -287,6 +362,7 @@ def authenticate_operation(
         start_scope=start_scope,
         provider_route=provider_route,
         default_paths=server_default_paths(),
+        principal_override=override,
     )
 
 
@@ -319,10 +395,10 @@ def authorize_provider_forwarding(
             default_paths=server_default_paths(),
         )
         facts = principal.to_envelope().get("scope", {}).get(
-            EXECUTION_ENVELOPE_MCP_EXTENSION, {}
+            _authority_module().EXECUTION_ENVELOPE_MCP_EXTENSION, {}
         )
         if facts.get("allowed_routes") and route not in facts["allowed_routes"]:
-            raise MCPAuthError(
+            raise _authority_module().MCPAuthError(
                 "unapproved_provider_route",
                 f"route {route!r} is not in the principal's approved routes",
                 role=principal.role,
@@ -335,14 +411,14 @@ def authorize_provider_forwarding(
     # Direct in-process caller (no bound session): the envelope is the policy.
     allowed = (envelope or {}).get("allowed_routes") or []
     if route in NON_FORWARDABLE_ROUTES:
-        raise MCPAuthError(
+        raise _authority_module().MCPAuthError(
             "token_passthrough_refused",
             f"refusing to forward a client credential to route {route!r}",
             action="forward",
             extra={"route": route},
         )
     if allowed and route not in allowed:
-        raise MCPAuthError(
+        raise _authority_module().MCPAuthError(
             "unapproved_provider_route",
             f"route {route!r} is not in the envelope's allowed_routes",
             action="forward",
@@ -362,7 +438,7 @@ def _get_run_svc(db_path=".skillweave/store.db", artifacts_path=".skillweave/art
     return control.get_run_service(db_path, artifacts_path, stream_root)
 
 
-def _auth_error_payload(exc: MCPAuthError) -> str:
+def _auth_error_payload(exc) -> str:
     """A structured, auditable refusal -- never a boolean or bare string."""
     return json.dumps({"status": "refused", **exc.to_dict()})
 
@@ -545,7 +621,7 @@ def review_run(run_id: str, verdict: str, comment: str, db_path: str = ".skillwe
             artifacts_path=artifacts_path,
             approval_token=approval_token,
         )
-    except MCPAuthError as exc:
+    except _authority_module().MCPAuthError as exc:
         return _auth_error_payload(exc)
 
     if verdict.lower() not in ("pass", "fail"):
@@ -606,11 +682,11 @@ def startup_and_bind_stdio(
     global _READY_SESSION_TOKEN
     identity = (supervisor or require_supervisor_identity()).strip()
     if not identity:
-        raise UnauthenticatedPrincipal(
+        raise _authority_module().UnauthenticatedPrincipal(
             f"local stdio requires an explicit supervisor identity; set "
             f"{SUPERVISOR_ENV} to name the supervising principal"
         )
-    auth = authority if authority is not None else MCPPrincipalAuthority()
+    auth = authority if authority is not None else _authority_module().MCPPrincipalAuthority()
     bind_authority(auth)
     _READY_SESSION_TOKEN = auth.issue_session(
         role="controller", client_id=identity, transport="stdio"
@@ -634,8 +710,7 @@ def main() -> None:
     """
     control.require_mcp()  # raises the explicit diagnostic when absent
     require_supervisor_identity()  # local stdio needs a named supervisor
-    authority = _AUTHORITY
-    if authority is None or not callable(getattr(authority, "serve_live", None)):
+    if _bound_authority() is None:
         # The host process did not bind an authority: perform the production
         # issuance at startup, so a reachable server is authorized rather than
         # trusted for merely being reachable.
@@ -647,11 +722,19 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # A *documented* non-zero exit for either refusal: the server never starts
+    # without its dependency or an explicit, authenticated supervisor identity.
+    # ``EXIT_REFUSED`` is the single code an operator scripts against.
     try:
         main()
-    except MCPAuthError as exc:
-        print(f"skillweave-mcp refused: {exc.message}", file=sys.stderr)
-        raise SystemExit(1)
     except control.McpDependencyUnavailable as exc:
+        # Checked first so the dependency-refusal path never has to import the
+        # optional authority subpackage. One line, token-free, no traceback.
         print(f"skillweave-mcp unavailable: {exc.reason}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(EXIT_REFUSED)
+    except _authority_module().MCPAuthError as exc:
+        # A missing supervisor identity (the stdio seam) or any other auth
+        # refusal: print the actionable one-liner and exit with the documented
+        # code rather than dumping a traceback.
+        print(f"skillweave-mcp refused: {exc.message}", file=sys.stderr)
+        raise SystemExit(EXIT_REFUSED)

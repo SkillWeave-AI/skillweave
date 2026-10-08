@@ -582,6 +582,10 @@ evidence = json.dumps([art])
 server_env = dict(os.environ)
 server_env["PYTHONPATH"] = os.environ["SKILLWEAVE_SRC"] + os.pathsep + os.environ["SDK_SRC"]
 server_env["PYTHONUNBUFFERED"] = "1"
+# SW-1510-MCP-AUTH: a local stdio session must name its explicit supervisor
+# identity, exactly as a real operator's launcher does. Without it the server
+# refuses to start (nil supervisor) and the handshake never completes.
+server_env["SKILLWEAVE_MCP_SUPERVISOR"] = os.environ["MCP_SUPERVISOR"]
 params = StdioServerParameters(
     command=os.environ["MCP_PY"],
     args=["-B", "-m", "skillweave.mcp.server"],
@@ -654,6 +658,9 @@ def test_real_mcp_transport_initialize_call_and_status(tmp_path):
         "MCP_WORK": str(work),
         "SKILLWEAVE_SRC": str(_SRC),
         "SDK_SRC": str(sdk),
+        # The explicit supervisor identity every real local stdio launcher must
+        # now provide (SW-1510-MCP-AUTH criterion 3).
+        "MCP_SUPERVISOR": "supervisor:ops-harness",
     })
     proc = subprocess.run(
         [mcp_py, "-B", str(driver)],
