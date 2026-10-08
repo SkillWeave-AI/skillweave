@@ -79,13 +79,18 @@ class EgressPolicy:
     def allows(self, endpoint: Optional[str]) -> bool:
         """Whether an outbound call to ``endpoint`` is permitted.
 
-        A network call with no declared endpoint fails closed: the facade never
-        invents a destination.
+        A non-empty ``endpoint_allowlist`` is required when egress is
+        permitted.  An empty allowlist denies all destinations, so the
+        admitted endpoint always equals one the caller explicitly listed.
+
+        A network call with no declared endpoint fails closed: the facade
+        never invents a destination.
         """
         if not self.allow_network:
             return False
         if not self.endpoint_allowlist:
-            return bool(endpoint)
+            # An empty allowlist means "no endpoint is approved", not "any".
+            return False
         if not endpoint:
             return False
         return _host_of(endpoint) in self.endpoint_allowlist

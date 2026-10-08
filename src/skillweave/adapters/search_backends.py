@@ -25,6 +25,7 @@ never dressed up as a retrieved source.
 from __future__ import annotations
 
 import asyncio
+import html as html_mod
 import json
 import re
 import urllib.error
@@ -95,6 +96,11 @@ class SearchProviderSpec:
     ``endpoint_host`` is the egress destination the policy allowlist is checked
     against; it is ``None`` for the in-process MCP stdio binding (the child is
     launched locally, and its own network egress is the server's concern).
+
+    ``credential_refs`` are the credential reference ids the adapter's
+    descriptor declares.  The facade checks these against the caller's
+    ``credential_availability`` mapping before the call; a missing credential
+    for a required ref causes a hard refusal.
     """
 
     adapter_id: str
@@ -103,6 +109,7 @@ class SearchProviderSpec:
     capabilities: tuple[str, ...]
     endpoint_host: Optional[str]
     fetcher: Callable[..., Any]
+    credential_refs: tuple[str, ...] = ()
 
 
 # ── provider fetchers (return typed records; raise ProviderCallError) ──────
@@ -153,6 +160,16 @@ async def _in_executor(fn: Callable[[], Any]) -> Any:
     return await loop.run_in_executor(None, fn)
 
 
+def _normalise_tag_quotes(html: str) -> str:
+    """Normalise single quotes to double quotes only inside HTML tags.
+
+    This avoids corrupting apostrophes in title or snippet text content.
+    """
+    def _replace_tag(m: re.Match) -> str:
+        return m.group(0).replace("'", '"')
+    return re.sub(r"<[^>]+>", _replace_tag, html)
+
+
 def _ddg_parse(html: str) -> list[SearchResultRecord]:
     """Parse DuckDuckGo Lite HTML into typed search result records.
 
@@ -166,8 +183,9 @@ def _ddg_parse(html: str) -> list[SearchResultRecord]:
     Returns zero records for empty pages, challenge pages or malformed HTML
     with no parseable results.
     """
-    # Normalise quotes to double so one regex works for both quote styles.
-    normalised = html.replace("'", '"')
+    # Normalise quotes to double *only inside HTML tags* so apostrophes in
+    # free text (titles, snippets) are never corrupted.
+    normalised = _normalise_tag_quotes(html)
 
     # --- 1. Detect challenge/empty pages early -------------------------------
     _challenge_indicators = (
@@ -205,23 +223,39 @@ def _ddg_parse(html: str) -> list[SearchResultRecord]:
             m_uddg = re.search(r"uddg=([^&]+)", url)
             if m_uddg:
                 url = unquote(m_uddg.group(1))
+        # HTML-unescape the href so &amp; and other entities are decoded.
+        url = html_mod.unescape(url)
         if not (url.startswith("http://") or url.startswith("https://")):
             continue
 
         title = re.sub(r"<[^>]+>", "", title_html).strip()
+        # HTML-unescape the title text too.
+        title = html_mod.unescape(title)
         if not title:
             continue
 
-        # --- 3. Find the nearest result-snippet after the link -----------------
+        # --- 3. Find the snippet for *this* result only ------------------------
+        # Scan from just after this link's </a> until the next <a with
+        # class="result-link" (or end of string).  This prevents a row that
+        # has no snippet from leaking into the next result's snippet.
         snippet = ""
         after_link = normalised[link_end:]
+        next_link_match = re.search(
+            r'<a\s(?=[^>]*?class="result-link")',
+            after_link,
+        )
+        if next_link_match:
+            snippet_region = after_link[: next_link_match.start()]
+        else:
+            snippet_region = after_link
         m_snip = re.search(
             r'<td[^>]*?class="result-snippet"[^>]*>(.*?)</td>',
-            after_link,
+            snippet_region,
             re.DOTALL,
         )
         if m_snip:
             snippet = re.sub(r"<[^>]+>", "", m_snip.group(1)).strip()
+            snippet = html_mod.unescape(snippet)
 
         out.append(
             SearchResultRecord(
@@ -529,6 +563,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="lite.duckduckgo.com",
         fetcher=_fetch_duckduckgo,
+        # DuckDuckGo Lite requires no API key; no credential_ref needed.
     ),
     "serper": SearchProviderSpec(
         adapter_id="serper-search",
@@ -537,6 +572,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="google.serper.dev",
         fetcher=_fetch_serper,
+        credential_refs=("serper_api_key",),
     ),
     "serpapi": SearchProviderSpec(
         adapter_id="serpapi-search",
@@ -545,6 +581,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="serpapi.com",
         fetcher=_fetch_serpapi,
+        credential_refs=("serpapi_api_key",),
     ),
     "tavily": SearchProviderSpec(
         adapter_id="tavily-search",
@@ -553,6 +590,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="api.tavily.com",
         fetcher=_fetch_tavily,
+        credential_refs=("tavily_api_key",),
     ),
     "brave": SearchProviderSpec(
         adapter_id="brave-search",
@@ -561,6 +599,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="api.search.brave.com",
         fetcher=_fetch_brave,
+        credential_refs=("brave_api_key",),
     ),
     "perplexity-mcp": SearchProviderSpec(
         adapter_id="perplexity-search-mcp",
@@ -569,6 +608,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES,
         endpoint_host=None,
         fetcher=_fetch_perplexity_mcp,
+        credential_refs=("perplexity_api_key",),
     ),
     "perplexity-http": SearchProviderSpec(
         adapter_id="perplexity-search-http",
@@ -577,6 +617,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="api.perplexity.ai",
         fetcher=_fetch_perplexity_http,
+        credential_refs=("perplexity_api_key",),
     ),
 }
 
@@ -686,6 +727,7 @@ def build_search_registry(
             ),
             transport=spec.transport,
             capabilities=tuple(spec.capabilities),
+            credential_refs=spec.credential_refs,
         )
         registry.register(descriptor, SearchAdapterBackend(spec), source="builtin_search")
     return registry
