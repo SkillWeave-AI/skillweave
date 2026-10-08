@@ -31,12 +31,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -46,6 +48,7 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _PYPROJECT = _REPO_ROOT / "pyproject.toml"
+_WORKFLOW = _REPO_ROOT / ".forgejo" / "workflows" / "contract-ci.yml"
 _SDK_DIR_ENV = "SKILLWEAVE_SDK_DIR"
 
 #: Digest of the frozen Core+execution+adapter schema byte set, computed with
@@ -251,6 +254,95 @@ def _iter_relative_schema_keys(schemas_dir: Path) -> list[str]:
                   for p in schemas_dir.rglob("*.schema.json"))
 
 
+# ── the pin's provenance: the pin must be the SDK head the wheel is built from ──
+
+
+def _workflow_pinned_sha() -> str:
+    """Read ``SDK_QUALIFIED_SHA`` out of the gate workflow (single source)."""
+    return re.search(
+        r'SDK_QUALIFIED_SHA:\s*"([0-9a-f]{40})"',
+        _WORKFLOW.read_text(encoding="utf-8"),
+    ).group(1)
+
+
+def _git(sdk_root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(sdk_root), *args],
+        capture_output=True, text=True,
+    )
+
+
+def _require_git(sdk_root: Path) -> None:
+    """Skip (as a justified skip) when the SDK is not a VCS checkout.
+
+    The pin provenance checks need git history; in the CI wiring the SDK is a
+    ``git clone`` and these run strictly. Against a bare export/sdist (no
+    ``.git``) they are recorded as a skip with a reason — never a silent pass.
+    """
+    if not (sdk_root / ".git").exists():
+        pytest.skip(
+            f"{sdk_root} is not a git checkout; the SDK pin provenance cannot "
+            f"be verified from history (no .git). CI clones the SDK, so this "
+            f"runs strictly there."
+        )
+
+
+def _build_wheel_from_commit(sdk_root: Path, sha: str, staging: Path, outdir: Path) -> Path:
+    """Build the SDK wheel from the *tracked tree at `sha`*, via ``git archive``.
+
+    This reproduces exactly what the workflow does: it checks out the pinned
+    commit and builds the wheel from that tree, not from the working tree (which
+    may carry unpinned edits). ``git archive`` needs no network and does not
+    disturb the checkout.
+    """
+    tree = staging / "tree"
+    tree.mkdir(parents=True, exist_ok=True)
+    archive = subprocess.run(
+        ["git", "-C", str(sdk_root), "archive", "--format=tar", sha],
+        capture_output=True,
+    )
+    if archive.returncode != 0:
+        raise AssertionError(
+            f"git archive {sha} failed: {archive.stderr.decode('utf-8', 'replace')}"
+        )
+    with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
+        tf.extractall(tree)
+    return _build_wheel_from_tree(tree, outdir)
+
+
+def _build_wheel_from_tree(tree: Path, outdir: Path) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    build = subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--no-isolation",
+         "--outdir", str(outdir)],
+        cwd=str(tree), capture_output=True, text=True,
+    )
+    if build.returncode != 0:
+        raise AssertionError(
+            f"wheel build failed at {tree}\nstdout:\n{build.stdout}\nstderr:\n{build.stderr}"
+        )
+    wheels = sorted(outdir.glob("skillweave_sdk-*.whl"))
+    assert len(wheels) == 1, f"expected exactly one SDK wheel, found {wheels}"
+    return wheels[0]
+
+
+def _wheel_authority_names(wheel: Path) -> list[str]:
+    with zipfile.ZipFile(wheel) as zf:
+        return sorted(n for n in zf.namelist() if "_authority" in n)
+
+
+@pytest.fixture(scope="session")
+def pinned_wheel(sdk_root: Path, tmp_path_factory) -> Path:
+    """The wheel built from the SHA the gate workflow pins, read live."""
+    _require_git(sdk_root)
+    sha = _workflow_pinned_sha()
+    return _build_wheel_from_commit(
+        sdk_root, sha,
+        tmp_path_factory.mktemp("sdk-ci-pin-stage"),
+        tmp_path_factory.mktemp("sdk-ci-pin-wheel"),
+    )
+
+
 # ── an external consumer importing the installed wheel, nothing else ────────
 
 
@@ -425,6 +517,40 @@ class TestCriterion1PublishedWheel:
             "misconfigured SDK_DIR for a missing one"
         )
 
+    def test_pin_is_ancestor_or_equal_of_the_sdk_head_the_wheel_is_built_from(
+        self, sdk_root
+    ):
+        # The pin must be a commit the SDK checkout actually contains, and it
+        # must not be *ahead* of the tree the wheel is built from. A pin that is
+        # not an ancestor-or-equal of HEAD would point at a commit the consumer
+        # cannot reach, so the qualified wheel could not be reproduced.
+        _require_git(sdk_root)
+        pin = _workflow_pinned_sha()
+        claimed = _git(sdk_root, "cat-file", "-e", f"{pin}^{{commit}}")
+        assert claimed.returncode == 0, (
+            f"pinned SDK_QUALIFIED_SHA {pin} is not a commit in {sdk_root}"
+        )
+        ance = _git(sdk_root, "merge-base", "--is-ancestor", pin, "HEAD")
+        assert ance.returncode == 0, (
+            f"the workflow pins {pin}, which is not an ancestor-or-equal of the "
+            f"SDK checkout head — the pin is not the tree the wheel is built from"
+        )
+
+    def test_wheel_at_the_pin_ships_the_ownership_authority_payload(self, sdk_root, pinned_wheel):
+        # The decisive provenance check: build the wheel at exactly the pinned
+        # SHA and prove it carries the _authority payload criterion 1 reads. A
+        # pin one commit behind the SDK change that adds that payload (as
+        # a663a947 was) ships no authority files and the gate is red at its own
+        # declared pin.
+        _require_git(sdk_root)
+        names = _wheel_authority_names(pinned_wheel)
+        assert names, (
+            f"the wheel built at the pinned SHA ships no skillweave_sdk/"
+            f"_authority payload; the gate would be red at its own pin. "
+            f"wheel contents: {sorted(name for name in zipfile.ZipFile(pinned_wheel).namelist())[:8]}…"
+        )
+        assert any(n.endswith("execution-catalog.json") for n in names), names
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # Criterion 2 — fresh consumer green; one declared drift → specific red;
@@ -594,6 +720,50 @@ class TestCriterion3ReleaseRecord:
         )
         # Justified skips: the gate reports skips and requires a reason.
         assert "skip" in lowered, "the gate must record skips"
+
+    def test_gate_workflow_collection_error_detection_names_both_shapes(self):
+        workflow = _WORKFLOW.read_text(encoding="utf-8")
+        assert "--continue-on-collection-errors" in workflow
+        # The gate decides on the pytest exit code AND names the collection
+        # shape explicitly, so a future edit cannot quietly narrow detection to
+        # the newer ``ERROR tests/...`` node form only. Both the ERROR/FAILED
+        # node and the ``___ ERROR collecting ...`` banner must be anchored.
+        assert re.search(r"\^\(ERROR\|FAILED\) ", workflow), (
+            "the gate must name the ERROR/FAILED node shape"
+        )
+        assert re.search(r"\^_\+ ERROR collecting", workflow), (
+            "the gate must name the 'ERROR collecting' banner shape"
+        )
+
+    def test_intentionally_broken_collection_is_recorded_and_red(self, tmp_path):
+        # A deliberately broken module must (a) make pytest exit non-zero — the
+        # decisive verdict the gate uses — and (b) emit output the gate's grep
+        # recognizes as a collection error, proving the gate goes red on a
+        # collection error and not only on an assertion failure.
+        broken = tmp_path / "test_sw1510_broken_collection.py"
+        broken.write_text(
+            "import this_module_does_not_exist_sw1510  # collection error\n\n\n"
+            "def test_ok():\n    assert True\n",
+            encoding="utf-8",
+        )
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", str(broken),
+             "-p", "no:cacheprovider", "-q", "--continue-on-collection-errors",
+             "-o", "addopts=", "--basetemp", str(tmp_path / "bt")],
+            cwd=str(tmp_path), capture_output=True, text=True,
+        )
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode != 0, (
+            f"a broken collection did not make pytest fail:\n{combined}"
+        )
+        detected = (
+            re.search(r"^(ERROR|FAILED) ", combined, re.MULTILINE)
+            or re.search(r"^_+ ERROR collecting", combined, re.MULTILINE)
+        )
+        assert detected, (
+            f"the gate's grep would NOT recognize this collection error and "
+            f"would read the run as green:\n{combined}"
+        )
 
     def test_historical_allowlist_is_not_a_clean_certificate(self):
         # The drift counterproof must assert a *specific* red, not lean on a

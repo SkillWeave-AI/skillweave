@@ -30,9 +30,13 @@
 #
 # Publication hold: the published SDK tag ``v0.2.0`` predates the frozen
 # execution/adapter contract set, so the gate pins the *qualified commit*
-# (SDK_QUALIFIED_SHA) rather than the tag. When an authorized publisher cuts a
-# tag that carries the frozen set, SDK_QUALIFIED_SHA may be replaced by that
-# tag. This lane cannot publish; it can only name the qualified combination.
+# (SDK_QUALIFIED_SHA) rather than the tag. The pin MUST be a commit that ships
+# the ownership payload: the wheel at ``a663a947`` (the parent of the SDK
+# candidate) carries no ``skillweave_sdk/_authority`` files, so the gate is RED
+# at that pin. The pin is therefore the SDK candidate head that adds
+# ``tool.setuptools.data-files``. When an authorized publisher cuts a tag that
+# carries the frozen set, SDK_QUALIFIED_SHA may be replaced by that tag. This
+# lane cannot publish; it can only name the qualified combination.
 
 name: Contract CI — Cross-Repo Contract Validation
 
@@ -48,7 +52,9 @@ permissions:
 
 env:
   # The exact SDK commit qualified against the Core frozen canonical digest.
-  SDK_QUALIFIED_SHA: "a663a9478493d694ee9ecaf4c9cd5411bb7a5ea8"
+  # This must be a commit whose wheel ships skillweave_sdk/_authority; the
+  # parent commit a663a947 does not, and the gate would be red at that pin.
+  SDK_QUALIFIED_SHA: "bc86910c5a7c182ede598ebba750ca6cba0bfde6"
   # The frozen canonical digest of the full schema set (flat + execution +
   # adapter), computed with the SDK's own algorithm over the installed wheel.
   QUALIFIED_DIGEST: "3dd247f604017bac4ff37ff4f3e9b46c5d1bc48fc8ef225de88ec4b6d14d2e64"
@@ -198,7 +204,15 @@ jobs:
             grep -E "collected|passed|failed|error|skipped|ERROR|FAILED|SKIPPED" /tmp/contract-gate.log || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          if grep -qE "^(ERROR|FAILED) " /tmp/contract-gate.log; then
+          # The pytest EXIT CODE is the decisive verdict: a collection error, a
+          # failure, and an unexpected skip-with-error all make it non-zero. The
+          # grep below is a belt-and-braces name for the *collection* shape so a
+          # reader of the log sees the specific cause. Newer pytest prints the
+          # collection-error summary as ``ERROR tests/...`` (an ERROR node, which
+          # the first pattern covers) and, on older/unformatted output, as an
+          # ``_____ ERROR collecting <node> _____`` banner, which the second
+          # pattern covers. Either way the run is red on the exit code alone.
+          if grep -qE "^(ERROR|FAILED) |^_+ ERROR collecting" /tmp/contract-gate.log; then
             echo "::error::the contract gate recorded a collection error or failure"
             exit 1
           fi
