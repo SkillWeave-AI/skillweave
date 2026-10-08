@@ -45,6 +45,7 @@ __all__ = [
     "McpToolError",
     "NegotiatedSession",
     "redact_text",
+    "forwarded_secret_values",
     "is_floating_command",
     "McpStdioClient",
 ]
@@ -108,12 +109,56 @@ def redact_text(
     return out
 
 
-class McpClientError(RuntimeError):
-    """An MCP lifecycle or call error, carrying the JSON-RPC/transport code."""
+def forwarded_secret_values(
+    env_allowlist: Iterable[str], extra_env: Mapping[str, str]
+) -> list[str]:
+    """The **actual** secret values forwarded to the owned child environment.
 
-    def __init__(self, message: str, *, code: Optional[int] = None) -> None:
-        super().__init__(message)
+    A credential crosses to the child only through the allowlisted environment
+    (read from ``os.environ``) or an explicit ``extra_env`` value. Those exact
+    values -- ``pplx-...``, ``sk-...`` or any other shape -- are the ones a
+    server can echo back in an error, an ``isError`` body or a tool listing, so
+    they are what must be redacted at the boundary rather than only on stderr.
+    """
+    values: list[str] = []
+    for name in env_allowlist:
+        value = os.environ.get(str(name))
+        if value:
+            values.append(value)
+    for value in (extra_env or {}).values():
+        text = "" if value is None else str(value)
+        if text:
+            values.append(text)
+    # De-duplicate while keeping order; a value equal to the placeholder would
+    # otherwise make redaction idempotently re-mark its own output.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if value not in seen and value != _REDACTED:
+            seen.add(value)
+            unique.append(value)
+    return unique
+
+
+class McpClientError(RuntimeError):
+    """An MCP lifecycle or call error, carrying the JSON-RPC/transport code.
+
+    ``message`` is **redacted at construction**: a server-originated error text
+    (a JSON-RPC ``error`` object) may echo a forwarded credential, so it passes
+    :func:`redact_text` (with the forwarded secret values) before it is ever
+    stored -- ``str(exc)`` can therefore never carry a raw secret.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[int] = None,
+        secrets: Iterable[str] = (),
+    ) -> None:
         self.code = code
+        self.secrets: tuple[str, ...] = tuple(str(s) for s in secrets if s)
+        super().__init__(redact_text(str(message), secrets=self.secrets))
 
 
 class McpTimeoutError(McpClientError):
@@ -123,8 +168,15 @@ class McpTimeoutError(McpClientError):
 class McpToolError(McpClientError):
     """A ``tools/call`` result was flagged ``isError`` (or malformed)."""
 
-    def __init__(self, message: str, *, code: Optional[int] = None, is_error: bool = True) -> None:
-        super().__init__(message, code=code)
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[int] = None,
+        is_error: bool = True,
+        secrets: Iterable[str] = (),
+    ) -> None:
+        super().__init__(message, code=code, secrets=secrets)
         self.is_error = is_error
 
 
@@ -195,7 +247,15 @@ class McpStdioClient:
         self._timeout = timeout
         self._client_name = client_name
         self._client_version = client_version
-        self._secrets = tuple(str(s) for s in secrets if s)
+        # Redaction covers *both* caller-declared secrets and the actual values
+        # forwarded to the child environment (allowlisted + extra_env): a server
+        # that echoes its own credential in an error must not leak it.
+        forwarded = forwarded_secret_values(self._env_allowlist, self._extra_env)
+        merged: list[str] = []
+        for value in (*[str(s) for s in secrets if s], *forwarded):
+            if value and value != _REDACTED and value not in merged:
+                merged.append(value)
+        self._secrets = tuple(merged)
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._next_id = 0
         self._session: Optional[NegotiatedSession] = None
@@ -223,7 +283,19 @@ class McpStdioClient:
 
     def stderr_text(self) -> str:
         """Drained stderr, redacted of any secret sentinel."""
-        return redact_text("\n".join(self._stderr_lines), secrets=self._secrets)
+        return self.redact("\n".join(self._stderr_lines))
+
+    def redact(self, text: str, *, extra_patterns: Iterable[str] = ()) -> str:
+        """Redact secret values/shapes from any text this client surfaces.
+
+        Public so a caller (the Council backend) can redact a text it is about
+        to persist -- an ``isError`` body, a tool listing, a synthesis -- with
+        exactly the same secret set the client redacts its errors and stderr
+        with.
+        """
+        return redact_text(
+            text, secrets=self._secrets, extra_patterns=extra_patterns
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -397,9 +469,12 @@ class McpStdioClient:
                 continue  # response to a different/earlier request; skip
             if "error" in message:
                 err = message["error"]
+                # Server-originated text: redact forwarded secrets before it is
+                # stored on the exception (``str(exc)`` must never leak one).
                 raise McpClientError(
                     str(err.get("message") if isinstance(err, Mapping) else err),
                     code=(err.get("code") if isinstance(err, Mapping) else None),
+                    secrets=self._secrets,
                 )
             return message.get("result", {})
 
@@ -466,8 +541,11 @@ class McpStdioClient:
         )
         result = await self._read_response(rid)
         if isinstance(result, Mapping) and result.get("isError") is True:
+            # The isError body is server-originated; redact before raising.
             detail = _text_of(result) or "tool reported isError"
-            raise McpToolError(f"tool {name!r} returned isError: {detail}")
+            raise McpToolError(
+                f"tool {name!r} returned isError: {detail}", secrets=self._secrets
+            )
         return result if isinstance(result, Mapping) else {"content": result}
 
 

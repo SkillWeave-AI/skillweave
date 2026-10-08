@@ -26,16 +26,32 @@ Modes (argv[1]):
     text-only          tools/call returns a text content block and NO citation
     hang               never answers tools/call (drives the timeout path)
     stderr-secret      writes a secret sentinel to stderr, then behaves normally
+    stderr-leak        echoes the forwarded PERPLEXITY_API_KEY on stderr, then
+                       behaves normally
+    error-leak         tools/call -> JSON-RPC error -32603 whose message echoes
+                       the forwarded PERPLEXITY_API_KEY
+    iserror-leak       tools/call result isError=true with content echoing it
+    tool-leak          tools/list advertises the leaked key as a tool name
 
 Only a local interpreter + this file ever launches it: no floating ``git+`` or
 URL install is constructed anywhere.
 """
 
 import json
+import os
 import sys
 import time
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "normal"
+
+#: The env var a test forwards and that these modes echo back -- the exact
+#: vector of the controller's redaction defect (server-originated text carrying
+#: a live credential).
+_SECRET_ENV = "PERPLEXITY_API_KEY"
+
+
+def _leaked() -> str:
+    return os.environ.get(_SECRET_ENV, "pplx-MISSING")
 
 _TOOL = {
     "name": "perplexity_search",
@@ -76,6 +92,10 @@ def main():
     if MODE == "stderr-secret":
         sys.stderr.write(f"server boot: using token {_SECRET}\n")
         sys.stderr.flush()
+    if MODE == "stderr-leak":
+        # Echo the *forwarded* credential on stderr (not the fixed sentinel).
+        sys.stderr.write(f"server boot: auth {_leaked()}\n")
+        sys.stderr.flush()
     initialized = False
     for line in sys.stdin:
         line = line.strip()
@@ -106,7 +126,16 @@ def main():
                 _error(rid, -32002, "server not initialized")
                 continue
             _interleave()
-            tool = _OTHER_TOOL if MODE == "missing-tool" else _TOOL
+            if MODE == "tool-leak":
+                # The advertised tool name carries the forwarded credential, so
+                # a missing-tool message that lists the tools would leak it.
+                tool = {"name": f"perplexity_search_{_leaked()}",
+                        "description": "leaky tool name",
+                        "inputSchema": {"type": "object", "properties": {}}}
+            elif MODE == "missing-tool":
+                tool = _OTHER_TOOL
+            else:
+                tool = _TOOL
             _result(rid, {"tools": [tool]})
         elif method == "tools/call":
             if MODE == "reject-first-call" and not initialized:
@@ -118,6 +147,9 @@ def main():
             if MODE == "error":
                 _error(rid, -32603, "internal error")
                 continue
+            if MODE == "error-leak":
+                _error(rid, -32603, f"upstream rejected credential {_leaked()}")
+                continue
             if MODE == "malformed":
                 sys.stdout.write("this is not json\n")
                 sys.stdout.flush()
@@ -127,6 +159,14 @@ def main():
                 _result(rid, {
                     "isError": True,
                     "content": [{"type": "text", "text": "tool failed upstream"}],
+                })
+                continue
+            if MODE == "iserror-leak":
+                _interleave()
+                _result(rid, {
+                    "isError": True,
+                    "content": [{"type": "text",
+                                 "text": f"tool failed with key {_leaked()}"}],
                 })
                 continue
             if MODE == "text-only":

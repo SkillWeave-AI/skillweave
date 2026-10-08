@@ -160,6 +160,7 @@ def run_perplexity_mcp(
     tool_name: str = PERPLEXITY_MCP_TOOL,
     timeout: float = 30.0,
     protocol_version: str = "2025-06-18",
+    secrets: Sequence[str] = (),
 ) -> tuple[SearchOutcome, Optional[NegotiatedSession]]:
     """Synchronous driver: call the owned MCP child and return the typed outcome.
 
@@ -168,6 +169,11 @@ def run_perplexity_mcp(
     binding). The ``outcome`` is a fully typed :class:`SearchOutcome`: a
     non-success always carries **no** results and an ``error_code`` naming the
     blocking fact.
+
+    ``secrets`` are extra exact values to redact from any server-originated
+    text; the values actually forwarded to the child (allowlisted env +
+    ``extra_env``) are redacted regardless, so a server that echoes its own
+    credential can never leak it into the outcome.
     """
     sha = query_digest(query)
     if not command:
@@ -182,6 +188,7 @@ def run_perplexity_mcp(
         extra_env=extra_env,
         protocol_version=protocol_version,
         timeout=timeout,
+        secrets=secrets,
     )
     import asyncio
 
@@ -215,11 +222,14 @@ async def _drive(
     try:
         names = await client.tool_names()
         if tool_name not in names:
+            # A server controls its tool list; redact before it lands in
+            # SearchOutcome.synthesis / the persisted evidence.
             return (
                 _failure(
                     sha,
                     "tool_missing",
-                    f"MCP server does not expose tool {tool_name!r}; tools={names}",
+                    f"MCP server does not expose tool {tool_name!r}; "
+                    f"tools={client.redact(str(names))}",
                 ),
                 session,
             )
@@ -234,7 +244,9 @@ async def _drive(
         await client.close()
 
     records = normalize_records(result)
-    synthesis = content_text_blocks(result) or None
+    # A synthesis is server-originated text persisted as a receipt field; the
+    # client-level redactor masks any forwarded credential it may echo.
+    synthesis = client.redact(content_text_blocks(result)) or None
     if not records:
         outcome = _failure(
             sha,
@@ -332,6 +344,7 @@ class PerplexityMcpBackend(AdapterBackend):
             extra_env=argument.get("extra_env", {}),
             protocol_version=str(argument.get("protocol_version", "2025-06-18")),
             timeout=self._timeout,
+            secrets=argument.get("secrets", ()),
         )
         outcome, session = await _drive(client, query, sha, self._tool_name)
         self.last_session = session

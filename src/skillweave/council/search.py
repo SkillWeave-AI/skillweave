@@ -258,6 +258,11 @@ class WebSearch:
         if spec is not None and spec.transport == "mcp-stdio":
             argument["command"] = config.mcp_command
             argument["env_allowlist"] = config.mcp_env_allowlist
+            # The resolved credential value is redacted from any
+            # server-originated text the backend surfaces (defence in depth
+            # alongside the allowlisted env values the client reads itself).
+            if config.api_key:
+                argument["secrets"] = [config.api_key]
             # Resolve the exact launcher (criterion 2). When the caller named an
             # explicit command it wins and no discovery happens; otherwise a
             # registered runtime / verified installed binary is resolved. A
