@@ -1,100 +1,75 @@
+"""SkillWeave command server (the six legacy tools) over MCP.
+
+The durable semantics live in the shared service (``skillweave.runsvc``); this
+module is the *transport* the command tools are bound to. Each tool delegates to
+:mod:`skillweave.mcp.control`, which composes the same
+:class:`~skillweave.runsvc.service.RunApplicationService` the CLI drives, so the
+CLI and MCP cannot disagree about what ran.
+
+Dependency honesty (SW-1510-MCP-CONTROL criterion 2)
+----------------------------------------------------
+A working server needs the real ``mcp`` package. When it is absent this module
+still imports (so the tool functions remain importable/callable for in-process
+callers), but the server cannot advertise itself as working: the placeholder
+``mcp`` object carries an explicit degradation reason, exposes ``can_serve ==
+False``, and its ``run`` raises :class:`McpDependencyUnavailable`. Running this
+module as ``__main__`` with no ``mcp`` package exits non-zero with that
+diagnostic instead of silently no-op'ing.
+"""
+
 import json
-import os
-import shlex
 import sys
 
+from skillweave.mcp import control
+
 try:
-    from mcp.server.fastmcp import FastMCP
-except ImportError:
-    class FastMCP:
-        def __init__(self, name):
-            self.name = name
-            self.tools = []
-        def tool(self):
-            def decorator(func):
-                self.tools.append(func)
-                return func
-            return decorator
+    from mcp.server.fastmcp import FastMCP as _RealFastMCP
+except ImportError:  # pragma: no cover - exercised on a host without `mcp`
+    _RealFastMCP = None
 
-from skillweave.dispatch.application import generate_run_id
 
-mcp = FastMCP("SkillWeave")
+class _DegradedFastMCP:
+    """A tracked stand-in used *only* when the ``mcp`` package is missing.
+
+    It records the decorated tool functions (so the module's tool registry stays
+    inspectable) but is explicitly *not* a server: it reports a degradation
+    reason and refuses to run.
+    """
+
+    can_serve = False
+    degradation_reason = control.DEGRADED_REASON
+
+    def __init__(self, name):
+        self.name = name
+        self.tools = []
+
+    def tool(self):
+        def decorator(func):
+            self.tools.append(func)
+            return func
+
+        return decorator
+
+    def run(self, *args, **kwargs):
+        raise control.McpDependencyUnavailable()
+
+
+if _RealFastMCP is not None:
+    mcp = _RealFastMCP(control.SERVER_NAME)
+else:
+    mcp = _DegradedFastMCP(control.SERVER_NAME)
+
 
 def _get_store(db_path=".skillweave/store.db"):
-    from skillweave.runtime.store import SQLiteRunStore
-    return SQLiteRunStore(db_path)
+    return control._get_store(db_path)
+
 
 def _default_stream_root(db_path):
-    """The durable stream root used when the caller does not name one.
+    return control.default_stream_root(db_path)
 
-    Keep the stream evidence for a disk-backed run store beside it
-    (``<db dir>/streams``); an in-memory store gets a private per-process
-    directory. Either way the MCP entry persists real frames/facts/cursor
-    rather than a memory-only collector.
-    """
-    if db_path in ("", ":memory:"):
-        import tempfile
-        return os.path.join(tempfile.mkdtemp(prefix="skillweave-stream-"), "streams")
-    db_dir = os.path.dirname(os.path.abspath(db_path)) or "."
-    return os.path.join(db_dir, "streams")
 
 def _get_run_svc(db_path=".skillweave/store.db", artifacts_path=".skillweave/artifacts", stream_root=None):
-    from skillweave.runtime.journal import EventJournal
-    from skillweave.runtime.registry import RawArtifactStore
-    from skillweave.runtime.stream import DurableStreamStore
-    from skillweave.runtime.reservation import ReservationStore
-    from skillweave.runsvc.service import RunApplicationService
-    store = _get_store(db_path)
-    journal = EventJournal(db_path)
-    raw_artifacts = RawArtifactStore(artifacts_path)
-    # The MCP surface drives the same durable streaming collector as the CLI, so
-    # the two native entries persist identical per-attempt stream evidence. A
-    # read-only surface (status/replay) that names no stream root gets the
-    # memory-only store and therefore creates no files as a side effect.
-    stream_store = DurableStreamStore(root=stream_root) if stream_root else None
-    # SW-1510-BUDGET: wire the atomic reservation store explicitly so the MCP
-    # entry is bound to the budget guard.  Every MCP create_run acquires a
-    # reservation slot; cumulative usage is tracked.
-    reservation_store = ReservationStore(db_path)
-    return RunApplicationService(
-        store, journal, raw_artifacts, stream_store,
-        reservation_store=reservation_store,
-    )
-
-def _artifact_evidence_list(artifact_evidence: str):
-    """Parse the MCP-supplied artifact proof graph(s); ``None`` when absent."""
-    if not artifact_evidence:
-        return None
-    payload = json.loads(artifact_evidence)
-    if isinstance(payload, dict):
-        return [payload]
-    if isinstance(payload, list):
-        return payload
-    raise ValueError("artifact_evidence must be a JSON object or a list of objects")
-
-
-def _source_binding(source_root: str, subject_commit: str):
-    """A read-only source resolver over ``source_root`` (``None`` when absent)."""
-    if not source_root:
-        return None
-    from skillweave.runtime.verify import FilesystemSourceResolver
-    return FilesystemSourceResolver(source_root, commit=subject_commit)
-
-
-def _analysis_binding(analysis_root: str):
-    """Read coverage-path analysis bytes from ``analysis_root`` (``None``)."""
-    if not analysis_root:
-        return None
-    root = os.path.abspath(analysis_root)
-
-    def _reader(path):
-        try:
-            with open(os.path.join(root, path), "rb") as fh:
-                return fh.read()
-        except OSError:
-            return None
-
-    return _reader
+    return control.get_run_service(db_path, artifacts_path, stream_root)
 
 
 @mcp.tool()
@@ -115,60 +90,26 @@ def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, co
     them on an assay run is itself a refusal -- the native PASS is withheld,
     never bypassed by omission.
     """
-    svc = _get_run_svc(
-        db_path, artifacts_path, stream_root or _default_stream_root(db_path)
-    )
-    run_id = generate_run_id()
-    # SW-1510-BUDGET: Check for an existing owner envelope for this task scope
-    # across ALL runs first.  If the host has pre-configured a finite envelope,
-    # honour it — never overwrite with unlimited.  Only create the explicit
-    # owner-authorized unlimited envelope when no owner envelope exists.
-    from skillweave.runtime.reservation import ReservationEnvelope as _ReservationEnvelope
-    effective_task_id = task_id or run_id
-    scope_id = f"{effective_task_id}/attempt-{attempt}"
-    existing = svc.reservation_store.get_envelope_for_task_scope(effective_task_id)
-    if existing is not None:
-        owner_env = existing
-    else:
-        owner_env = _ReservationEnvelope()
-        svc.reservation_store.set_envelope(run_id, scope_id, owner_env)
-
-    cmd_list = shlex.split(command)
-    execution = svc.execute_streaming_native(
-        command=cmd_list,
-        run_id=run_id,
+    payload = control.create_run_payload(
         tool=tool,
         model=model,
         subject_repo=subject_repo,
         subject_commit=subject_commit,
+        command=command,
+        db_path=db_path,
+        artifacts_path=artifacts_path,
         methodology=methodology,
         autonomy_policy=autonomy_policy,
-        task_id=effective_task_id,
+        task_id=task_id,
         attempt=attempt,
-        output_root=output_root or None,
-        reservation_envelope=owner_env,
-        artifact_evidence=_artifact_evidence_list(artifact_evidence),
-        source_resolver=_source_binding(source_root, subject_commit),
-        analysis_reader=_analysis_binding(analysis_root),
+        output_root=output_root,
+        stream_root=stream_root,
+        artifact_evidence=artifact_evidence,
+        source_root=source_root,
+        analysis_root=analysis_root,
     )
-
-    result_obj = execution["result"]
-    payload = {
-        "run_id": execution["run_id"],
-        "state": svc.store.get_run(run_id).state,
-        "gate_state": execution["gate_state"],
-        "raw_digest": execution["raw_digest"],
-        "methodology": execution["methodology"],
-        "stream": {
-            "durable": execution.get("durable", True),
-            "cursor": svc.stream_store.cursor,
-            "stdout_digest": result_obj.stdout_digest,
-            "stderr_digest": result_obj.stderr_digest,
-        },
-    }
-    if "assay" in execution:
-        payload["assay"] = execution["assay"]
     return json.dumps(payload)
+
 
 @mcp.tool()
 def status_run(run_id: str, db_path: str = ".skillweave/store.db") -> str:
@@ -177,11 +118,11 @@ def status_run(run_id: str, db_path: str = ".skillweave/store.db") -> str:
     Includes the methodology/attempt and (for Assay) the ordered phases and
     terminal outcome, read from the same snapshot the CLI and replay use.
     """
-    svc = _get_run_svc(db_path)
-    snapshot = svc.run_snapshot(run_id)
-    if snapshot is None:
+    result = control.control_status(run_id, db_path=db_path)
+    if result.get("error") == "Run not found":
         return json.dumps({"error": "Run not found"})
-    return json.dumps(snapshot)
+    return json.dumps(result)
+
 
 @mcp.tool()
 def cancel_run(run_id: str, reason: str = "operator_halt", db_path: str = ".skillweave/store.db") -> str:
@@ -194,23 +135,11 @@ def cancel_run(run_id: str, reason: str = "operator_halt", db_path: str = ".skil
     an unobservable process is reported as ``unknown_inflight`` — the tool
     never claims a termination it did not perform.
     """
-    from skillweave.runtime.errors import ProcessIdentityError, StoreError
-
-    svc = _get_run_svc(db_path)
-    if svc.store.get_run(run_id) is None:
+    result = control.control_cancel(run_id, reason=reason, db_path=db_path)
+    if result.get("error") == "Run not found":
         return json.dumps({"error": "Run not found"})
-    try:
-        result = svc.cancel_process(run_id, reason=reason)
-    except ProcessIdentityError as exc:
-        return json.dumps({
-            "error": "process identity not verified; cancellation refused",
-            "run_id": run_id,
-            "reason": exc.reason,
-            "verification": exc.verification,
-        })
-    except StoreError as exc:
-        return json.dumps({"error": str(exc), "run_id": run_id})
-    return json.dumps({"status": "cancel_requested", **result})
+    return json.dumps(result)
+
 
 @mcp.tool()
 def resume_run(run_id: str, db_path: str = ".skillweave/store.db", command: str = "") -> str:
@@ -222,43 +151,18 @@ def resume_run(run_id: str, db_path: str = ".skillweave/store.db", command: str 
     reconciles stored intents and returns the run's *actual* state with
     ``restarted: false``.
     """
-    from skillweave.runtime.errors import StoreError
+    result = control.control_resume(run_id, command=command, db_path=db_path)
+    if result.get("error") == "Run not found":
+        return json.dumps({"error": "Run not found"})
+    return json.dumps(result)
 
-    svc = _get_run_svc(db_path)
-    if not command:
-        snapshot = svc.resume_run(run_id)
-        if snapshot is None:
-            return json.dumps({"error": "Run not found"})
-        return json.dumps({
-            "status": "reconciled",
-            "restarted": False,
-            "note": "no command supplied; no new attempt launched",
-            **snapshot,
-        })
-
-    cmd_list = shlex.split(command)
-    try:
-        result = svc.restart_attempt(run_id, cmd_list)
-    except StoreError as exc:
-        return json.dumps({"error": str(exc), "run_id": run_id})
-    return json.dumps({
-        "status": "restarted",
-        "restart_kind": "new_identified_attempt",
-        **result,
-    })
 
 @mcp.tool()
 def get_evidence(run_id: str, db_path: str = ".skillweave/store.db") -> str:
     """Get evidence/journal for a run."""
-    from skillweave.runtime.journal import EventJournal
-    journal = EventJournal(db_path)
-    events = journal.get_events(run_id)
-    # Ensure events are dicts if they are dataclasses
-    try:
-        events = [e.to_dict() if hasattr(e, "to_dict") else e for e in events]
-    except Exception:
-        pass
-    return json.dumps({"events": events})
+    result = control.control_evidence(run_id, db_path=db_path)
+    return json.dumps({"events": result["events"]})
+
 
 @mcp.tool()
 def review_run(run_id: str, verdict: str, comment: str, db_path: str = ".skillweave/store.db") -> str:
@@ -267,7 +171,7 @@ def review_run(run_id: str, verdict: str, comment: str, db_path: str = ".skillwe
     record = store.get_run(run_id)
     if not record:
         return json.dumps({"error": "Run not found"})
-    
+
     target_state = "advance_or_stop"
     stop_reason = None
     if verdict.lower() != "pass":
@@ -280,10 +184,28 @@ def review_run(run_id: str, verdict: str, comment: str, db_path: str = ".skillwe
         expected_version=record.version,
         reason=f"Review verdict {verdict}: {comment}",
         role="reviewer",
-        stop_reason=stop_reason
+        stop_reason=stop_reason,
     )
     return json.dumps({"status": "reviewed", "verdict": verdict, "run_id": run_id})
 
+
+def main() -> None:
+    """Serve the command server, or refuse with an explicit unavailable state.
+
+    This is the only entry the module exposes as a *server*. With no ``mcp``
+    package it raises :class:`~skillweave.mcp.control.McpDependencyUnavailable`
+    (surfaced as a non-zero exit by ``__main__``) rather than silently no-op'ing.
+    """
+    control.require_mcp()  # raises the explicit diagnostic when absent
+    runner = getattr(mcp, "run", None)
+    if not callable(runner):
+        raise control.McpDependencyUnavailable(control.DEGRADED_REASON)
+    runner()
+
+
 if __name__ == "__main__":
-    if hasattr(mcp, "run"):
-        mcp.run()
+    try:
+        main()
+    except control.McpDependencyUnavailable as exc:
+        print(f"skillweave-mcp unavailable: {exc.reason}", file=sys.stderr)
+        raise SystemExit(1)
