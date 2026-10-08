@@ -111,6 +111,66 @@ CLI, MCP and a journal replay all read the single `run_snapshot(run_id)` view �
 ordered `phases`, terminal `outcome`, and the verifier `verification` /
 `gate_state`. They cannot disagree about what ran.
 
+## MCP control surface (`SW-1510-MCP-CONTROL`)
+
+MCP is *transport*, not the source of durable truth. The six legacy command
+tools (`create_run`, `status_run`, `cancel_run`, `resume_run`, `get_evidence`,
+`review_run`) keep their names, signatures and flat JSON shapes and delegate to
+`skillweave.mcp.control`, which composes the same `RunApplicationService` the
+CLI drives. Alongside them the control surface (`src/skillweave/mcp/control.py`)
+exposes:
+
+* **A namespaced, opt-in read shape.** `snapshot_v1(run_id)` emits the frozen
+  `run-snapshot-v1` record; an unknown version name is *refused*
+  (`SnapshotVersionRefused`), never coerced to a supported one.
+* **Structured refusals, never raised exceptions.** A control tool *returns* a
+  contract or storage refusal as a durable record —
+  `{"error", "code", "run_id", "version", "supported": [...]}` — and never
+  leaks an exception across the tool boundary. `code` is one of
+  `unsupported_version` (an unknown version name), `snapshot_unavailable` (a run
+  whose trusted fields cannot be expressed in the frozen enum — e.g. the
+  default `collaborative` policy has no `run-snapshot-v1` slot;
+  `SUPPORTED_SNAPSHOT_VERSIONS` is deliberately **not** widened), `not_found`,
+  or `storage_unavailable`. `control_cancel` additionally reports an unverified
+  process identity as `code == "identity_unverified"` with the verification
+  reason.
+* **First-run store creation.** The control surface creates the run store's
+  parent directory on first use, as the CLI ingress does, so a control call from
+  a fresh project cwd *creates* `.skillweave` rather than failing with `unable to
+  open database file`. The directory-backed stores do not need pre-creation -- a
+  durable stream store creates its own root and the raw artifact store is
+  memory-backed -- so an inspect-only call has no artifacts-directory side
+  effect on disk.
+* **An honest dependency diagnostic.** Serving needs the real `mcp` package.
+  When it is absent the placeholder server reports `can_serve == False` with an
+  explicit reason and refuses to run; `python -m skillweave.mcp.server` exits
+  non-zero with the diagnostic instead of silently no-op'ing.
+* **Transport/capability negotiation.** `stdio` and the scoped Streamable HTTP
+  transport are described and negotiated. Experimental MCP *Tasks* are
+  negotiated only where the transport supports them **and** the client asks;
+  otherwise the negotiated execution shape is the ordinary asynchronous tool
+  plus a poll cursor (`control_poll`).
+* **A validated scoped bind.** `serve(transport="http")` runs the real
+  `streamable-http` transport only after `require_scoped_bind` validates the
+  bind *before* any server is built: the default host is loopback
+  (`127.0.0.1`), a non-loopback host is refused (`ScopedHttpRefused`) unless
+  `allow_remote=True` is passed, and a scope token (`auth_token` or
+  `SKILLWEAVE_MCP_HTTP_TOKEN`) is required. A bind that is not scoped refuses;
+  nothing is served open.
+
+### Stub vs live transport proof
+
+`tests/unit/test_1510_mcp_control.py::TestScopedHttpServingPath` executes the
+real `control.serve` code path against an injected fake FastMCP module (the
+module's `fastmcp_factory` seam). Those assertions **pin the serving contract** —
+the exact `run(transport="streamable-http")` call, the host/port settings, the
+loopback default and the pre-serve refusals — and are **not** a live transport
+proof. The live proofs (`*_transport_initialize_and_list`) speak the MCP
+protocol to a real server over stdio and over scoped Streamable HTTP; they
+**skip, naming the missing package**, when the real `mcp` package is not
+importable. On a host without `mcp` the live paths are therefore *unproven*, not
+silently passed.
+
 ## Limitations
 
 * The legacy/default path (`methodology="ralph"`, the historical default)

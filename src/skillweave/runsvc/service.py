@@ -240,6 +240,40 @@ class RunExecutionError(Exception):
     """The worker process itself failed (non-zero exit, signal, or timeout)."""
 
 
+#: The frozen artifact version this service composes for the shared control
+#: surface. ``run-snapshot-v1`` is exactly the ``build_run_snapshot`` record set;
+#: the name is the public, opt-in selector -- a *named* version, not a flag.
+RUN_SNAPSHOT_VERSION = "run-snapshot-v1"
+
+#: The artifact versions :meth:`RunApplicationService.run_snapshot_v1` can emit.
+#: A caller that names an unknown version is *refused* (mirrors
+#: ``runtime.verify.SUPPORTED_ARTIFACT_VERSIONS``): an unsupported version is
+#: never silently coerced to a supported one.
+SUPPORTED_RUN_SNAPSHOT_VERSIONS = frozenset({RUN_SNAPSHOT_VERSION})
+
+
+class RunSnapshotContractError(RunIntegrationError):
+    """A ``run-snapshot-v1`` could not be composed without fabricating a field.
+
+    Raised instead of returning a partial/best-effort record: the frozen schema
+    is *validated rather than defaulted*, so a run whose trusted fields cannot
+    be expressed in the declared version (an unsupported version name, a mode
+    field outside the frozen enum, a missing digest or native handle) is refused
+    by name. Stage is ``"snapshot"``.
+    """
+
+    def __init__(self, version: str, reason: str, run_id: Optional[str] = None):
+        self.version = version
+        self.reason = reason
+        self.run_id = run_id
+        super().__init__(
+            "snapshot",
+            f"run snapshot {version!r} refused"
+            + (f" for run {run_id!r}" if run_id else "")
+            + f": {reason}",
+        )
+
+
 @dataclass
 class RunExecution:
     """The complete, gap-free record set of one authoritative run.
@@ -783,6 +817,24 @@ class RunApplicationService:
                     "reservation",
                     f"reservation completion failed: {exc}",
                 ) from exc
+
+        # SW-1510-ROUTE-LOCK (criterion 1): emit a follow-up route_decision
+        # event with the answering identity now that the child has completed.
+        # The subprocess-based execute path captures raw stdout, not the
+        # structured provider response envelope, so the answering model is not
+        # observable from the parent.  Record a null answering model with a
+        # reason so the identity chain is honest rather than silently absent.
+        if reservation_rec is not None:
+            self._update_route_decision_answering(
+                run_id,
+                task_id=task_id or run_id,
+                correlation_id=f"{task_id or run_id}/attempt-{attempt}",
+                requested_alias=model or "",
+                answering_model="",
+                reservation_id=reservation_rec.reservation_id,
+                attempt=int(attempt),
+                attempt_order=1,
+            )
 
         # Stage 3: raw artifact (content-addressed bytes).
         raw_bytes = result.stdout or b""
@@ -1669,6 +1721,142 @@ class RunApplicationService:
             "envelope_digest": envelope_digest,
             "authority_decision_digest": authority_decision_digest,
         }
+
+    # ------------------------------------------------------------------
+    # Frozen run-snapshot-v1 (SW-1510-MCP-CONTROL)
+    #
+    # The versioned, opt-in read shape the shared control surface exposes by
+    # name. It is composed from exactly the trusted values the shared
+    # ``run_snapshot`` view already carries (plus the run's own identity
+    # digests) and adds nothing: a field that cannot be expressed in the frozen
+    # version is a *refusal*, never a fabricated value.
+    # ------------------------------------------------------------------
+
+    def run_snapshot_v1(
+        self,
+        run_id: str,
+        *,
+        version: str = RUN_SNAPSHOT_VERSION,
+    ) -> Optional[dict[str, Any]]:
+        """Compose the frozen ``run-snapshot-v1`` record for *run_id*.
+
+        ``version`` is a namespaced selector. An unknown version name is
+        *refused* (:class:`RunSnapshotContractError`), never silently coerced to
+        a supported one -- the same discipline the artifact verifier applies to
+        its own versioned surface. ``None`` is returned only when the run itself
+        is unknown.
+
+        The three mode fields (``methodology``, ``autonomy_policy``,
+        ``session_schedule``) are carried as three *distinct* values. A mode
+        field that has no declared mapping into the frozen enum (for example an
+        autonomy policy outside it) is refused by name rather than mapped to a
+        default, so the record never claims a mode that did not run. The
+        ``process_identity`` handle is the native handle the trusted service
+        issues for this run -- never a model-authored string.
+        """
+        if version not in SUPPORTED_RUN_SNAPSHOT_VERSIONS:
+            raise RunSnapshotContractError(
+                version,
+                f"unsupported version; this service emits one of "
+                f"{sorted(SUPPORTED_RUN_SNAPSHOT_VERSIONS)}",
+                run_id=run_id,
+            )
+
+        snapshot = self.run_snapshot(run_id)
+        if snapshot is None:
+            return None
+        # ``state`` / ``version`` / ``attempt`` / ``task_id`` are read from the
+        # persisted run record itself (the shared view, which reads receipts and
+        # journal, is authoritative for the derived fields).
+        record = self.store.get_run(run_id)
+        if record is None:
+            return None
+
+        # Three distinct mode fields. The methodology is passed through as the
+        # shared view reports it; the autonomy policy must resolve by name into
+        # the frozen enum (never an invented default); the schedule is carried
+        # verbatim.
+        AS_enum = _runtime_attr("snapshot", "ASSAY_TO_AUTONOMY")
+        methodology = snapshot.get("methodology") or "ralph"
+        autonomy_name = snapshot.get("autonomy_policy") or ""
+        autonomy = AS_enum.get(autonomy_name)
+        if autonomy is None and autonomy_name in ("conservative", "medium", "unicorn"):
+            # Already expressed in the frozen enum by name.
+            autonomy = autonomy_name
+        if autonomy is None:
+            raise RunSnapshotContractError(
+                version,
+                f"autonomy_policy {autonomy_name!r} has no declared mapping "
+                f"into the frozen enum "
+                f"['conservative', 'medium', 'unicorn']",
+                run_id=run_id,
+            )
+        session_schedule = snapshot.get("session_schedule") or "batch"
+
+        # The gate state is the value the completion contract derived; a run
+        # that has not reached a verified gate yet reports the neutral,
+        # non-verdict marker ``pending`` rather than a fabricated pass.
+        gate_state = snapshot.get("gate_state") or "pending"
+
+        # The subject/brief/envelope/authority digests are the run's own
+        # trusted identity digests, read from its persisted receipts and
+        # re-expressed by name -- never re-derived from an exit code. Each is
+        # *distinct*: subject = the exact source the receipt recorded,
+        # brief = the declared producer command, envelope = the bound receipt
+        # and authority = the independent verifier's verdict. A missing receipt
+        # leaves the field empty, which the frozen builder refuses rather than
+        # accepts as a placeholder.
+        producer = self.store.get_evidence(f"runsvc-{run_id}")
+        verifier = self.store.get_evidence(f"verify-runsvc-{run_id}")
+        subject_digest = ""
+        brief_digest = ""
+        envelope_digest = ""
+        authority_decision_digest = ""
+        if producer is not None:
+            if producer.subject_repo and producer.subject_commit:
+                subject_digest = _sha256_hex(
+                    f"{producer.subject_repo}@{producer.subject_commit}".encode("utf-8")
+                )
+            if producer.producer_command:
+                brief_digest = _sha256_hex(
+                    producer.producer_command.encode("utf-8")
+                )
+            if producer.sha256:
+                envelope_digest = _sha256_hex(
+                    f"envelope:{producer.sha256}".encode("utf-8")
+                )
+        if verifier is not None and verifier.sha256:
+            authority_decision_digest = _sha256_hex(
+                f"verdict:{verifier.sha256}".encode("utf-8")
+            )
+
+        build_run_snapshot, snapshot_inputs_from_run = _runtime_attr(
+            "snapshot", "build_run_snapshot", "snapshot_inputs_from_run"
+        )
+        SnapshotError = _runtime_attr("snapshot", "SnapshotError")
+        try:
+            inputs = snapshot_inputs_from_run(
+                run_id=run_id,
+                task_id=str(snapshot.get("task_id") or run_id),
+                state=str(record.state or ""),
+                gate_state=str(gate_state),
+                methodology=str(methodology),
+                autonomy_policy=str(autonomy),
+                session_schedule=str(session_schedule),
+                subject_digest=subject_digest,
+                brief_digest=brief_digest,
+                envelope_digest=envelope_digest,
+                process_identity=snapshot.get("process_identity") or {},
+                authority_decision_digest=authority_decision_digest,
+                attempt=int(snapshot.get("attempt") or 1),
+                version=int(record.version or 1),
+                event_cursor=int(snapshot.get("event_cursor") or 0),
+            )
+            return build_run_snapshot(inputs)
+        except SnapshotError as exc:
+            raise RunSnapshotContractError(
+                version, str(exc), run_id=run_id
+            ) from exc
 
     # ------------------------------------------------------------------
     # Declared methodology binding (SW-1510-ASSAY)
@@ -3753,6 +3941,24 @@ class RunApplicationService:
                     "reservation",
                     f"reservation completion failed: {exc}",
                 ) from exc
+
+        # SW-1510-ROUTE-LOCK (criterion 1): emit a follow-up route_decision
+        # event with the answering identity now that the streaming child has
+        # completed.  The subprocess-based streaming path captures raw stdout,
+        # not the structured provider response envelope, so the answering model
+        # is not observable from the parent.  Record a null answering model with
+        # a reason so the identity chain is honest rather than silently absent.
+        if reservation_rec is not None:
+            self._update_route_decision_answering(
+                run_id,
+                task_id=task_id or run_id,
+                correlation_id=f"{task_id or run_id}/attempt-{attempt}",
+                requested_alias=model or "",
+                answering_model="",
+                reservation_id=reservation_rec.reservation_id,
+                attempt=int(attempt),
+                attempt_order=1,
+            )
 
         fact = result.fact
         out_summary = self.stream_store.summary(
