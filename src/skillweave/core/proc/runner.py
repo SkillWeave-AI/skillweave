@@ -261,15 +261,27 @@ class ScopeEnforcement:
 
     # -- command wrapping / window lifetime ---------------------------------
 
-    def wrap_command(self, command: Sequence[str]) -> List[str]:
-        """Return the argv actually spawned (the adapter may wrap it)."""
+    def wrap_command(self, command: Sequence[str], *,
+                     allowed_egress_host: str = "",
+                     allowed_egress_port: int = 0) -> List[str]:
+        """Return the argv actually spawned (the adapter may wrap it).
+
+        When *allowed_egress_host*/*allowed_egress_port* are set, the
+        isolation adapter's wrap (e.g. Seatbelt profile) also allows
+        outbound TCP to only that address (SW-1510-ROUTE-LOCK criterion 2,
+        composed WITH the store protection).
+        """
         if self.isolation is None or not hasattr(self.isolation, "wrap_command"):
             return [str(c) for c in command]
         import pathlib
 
         scope = pathlib.Path(self.checkout_root) if self.checkout_root else None
         try:
-            return self.isolation.wrap_command(command, writable_scope=scope)
+            return self.isolation.wrap_command(
+                command, writable_scope=scope,
+                allowed_egress_host=allowed_egress_host,
+                allowed_egress_port=allowed_egress_port,
+            )
         except TypeError:
             return [str(c) for c in command]
 

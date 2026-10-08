@@ -261,6 +261,8 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
         *,
         writable_scope: Path,
         protected: ProtectedStores,
+        allowed_egress_host: str = "",
+        allowed_egress_port: int = 0,
     ) -> list[str]:
         sandbox_exec = shutil.which("sandbox-exec")
         if not sandbox_exec:
@@ -268,7 +270,11 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
         return [
             sandbox_exec,
             "-p",
-            self.build_profile(Path(writable_scope), protected),
+            self.build_profile(
+                Path(writable_scope), protected,
+                allowed_egress_host=allowed_egress_host,
+                allowed_egress_port=allowed_egress_port,
+            ),
             *[str(c) for c in command],
         ]
 
@@ -475,11 +481,21 @@ class StoreProtection:
             self.sealed = False
         return False
 
-    def wrap_command(self, command: Sequence[str], *, writable_scope: Path) -> list[str]:
-        """Return the argv to actually spawn (adapter may wrap it)."""
+    def wrap_command(self, command: Sequence[str], *,
+                     writable_scope: Path,
+                     allowed_egress_host: str = "",
+                     allowed_egress_port: int = 0) -> list[str]:
+        """Return the argv to actually spawn (adapter may wrap it).
+
+        When *allowed_egress_host*/*allowed_egress_port* are set, the
+        Seatbelt profile also allows outbound TCP to only that address
+        (SW-1510-ROUTE-LOCK criterion 2, composed WITH the store protection).
+        """
         if isinstance(self.adapter, SandboxExecAdapter):
             return self.adapter.wrap_command(
-                command, writable_scope=writable_scope, protected=self.protected
+                command, writable_scope=writable_scope, protected=self.protected,
+                allowed_egress_host=allowed_egress_host,
+                allowed_egress_port=allowed_egress_port,
             )
         return [str(c) for c in command]
 
