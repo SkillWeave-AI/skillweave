@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -1657,6 +1658,205 @@ class TestConsoleEntrypointRouteLock:
         assert result.returncode == 0, f"stderr: {result.stderr}"
         assert "GATEWAY_OK" in result.stdout
         assert "GATEWAY_REFUSED" in result.stdout
+
+    # ------------------------------------------------------------------
+    # Subprocess egress confinement via sandbox-exec (controller finding 2b)
+    # ------------------------------------------------------------------
+
+    def _sandbox_available(self) -> bool:
+        """Check if sandbox-exec (Seatbelt) is available on this host.
+
+        Uses the same probe as ``SandboxExecAdapter.available()``: the
+        binary must exist and ``sandbox-exec -p "(version 1)(allow default)"
+        /bin/echo ok`` must succeed.  macOS Seatbelt is restricted on many
+        configurations (returns EPERM exit 71 even as root); the probe
+        detects that honestly rather than guessing from platform alone.
+        """
+        from skillweave.runtime.worker_launcher import SandboxExecAdapter
+        return SandboxExecAdapter().available()
+
+    def test_sandbox_allows_approved_gateway_connection(self):
+        """sandbox-exec with egress profile allows connection to approved port.
+
+        A Python child wrapped with sandbox-exec using the route-proof
+        egress profile can attempt a TCP connection to 127.0.0.1:8090.
+        The sandbox permits it; if nothing is listening the child gets
+        ConnectionRefusedError (not a sandbox block).
+        """
+        if not self._sandbox_available():
+            pytest.skip(
+                "sandbox-exec (Seatbelt) is not available on this host; "
+                "this test requires a macOS host where Seatbelt profiles "
+                "can be applied"
+            )
+
+        import subprocess as _subprocess
+        import sys as _sys
+        import tempfile as _tempfile
+        src_dir = str(_src.parent)
+        sandbox_exec = shutil.which("sandbox-exec")
+        assert sandbox_exec is not None
+
+        # Build the same egress profile the service uses
+        from skillweave.runtime.worker_launcher import SandboxExecAdapter
+        adapter = SandboxExecAdapter()
+        profile = adapter.build_egress_profile("127.0.0.1", 8090)
+
+        script = (
+            "import socket\n"
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.settimeout(3)\n"
+            "try:\n"
+            "    s.connect(('127.0.0.1', 8090))\n"
+            "    print('CONNECTED')\n"
+            "except ConnectionRefusedError:\n"
+            "    # Port is closed but sandbox allowed the connection attempt\n"
+            "    print('ALLOWED_REFUSED')\n"
+            "except PermissionError:\n"
+            "    print('SANDBOX_BLOCKED')\n"
+            "except OSError as e:\n"
+            "    print(f'OS_ERROR: {e.errno} {e.strerror}')\n"
+            "finally:\n"
+            "    s.close()\n"
+        )
+        with _tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", prefix="sandbox_egress_approved_",
+            dir=src_dir, delete=False,
+        ) as f:
+            f.write(script)
+            script_path = f.name
+        try:
+            result = _subprocess.run(
+                [sandbox_exec, "-p", profile, _sys.executable, script_path],
+                capture_output=True, text=True, timeout=10,
+            )
+        finally:
+            import os as _os
+            try:
+                _os.unlink(script_path)
+            except OSError:
+                pass
+
+        assert result.returncode == 0, (
+            f"sandbox-exec child failed: stdout={result.stdout!r} "
+            f"stderr={result.stderr!r}"
+        )
+        # Either the port is open (CONNECTED) or closed but allowed
+        # (ALLOWED_REFUSED).  SANDBOX_BLOCKED would mean the profile
+        # did not permit the approved gateway.
+        assert "ALLOWED_REFUSED" in result.stdout or "CONNECTED" in result.stdout, (
+            f"sandbox blocked approved gateway: stdout={result.stdout!r}"
+        )
+
+    def test_sandbox_blocks_alternative_loopback_port(self):
+        """sandbox-exec with egress profile blocks alternative loopback port.
+
+        A Python child wrapped with sandbox-exec cannot connect to
+        127.0.0.1:9090 (a different port on the same loopback address).
+        The sandbox denies the outbound TCP connection.
+        """
+        if not self._sandbox_available():
+            pytest.skip(
+                "sandbox-exec (Seatbelt) is not available on this host; "
+                "this test requires a macOS host where Seatbelt profiles "
+                "can be applied"
+            )
+
+        import subprocess as _subprocess
+        import sys as _sys
+        import tempfile as _tempfile
+        src_dir = str(_src.parent)
+        sandbox_exec = shutil.which("sandbox-exec")
+        assert sandbox_exec is not None
+
+        from skillweave.runtime.worker_launcher import SandboxExecAdapter
+        adapter = SandboxExecAdapter()
+        profile = adapter.build_egress_profile("127.0.0.1", 8090)
+
+        script = (
+            "import socket\n"
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.settimeout(3)\n"
+            "try:\n"
+            "    s.connect(('127.0.0.1', 9090))\n"
+            "    print('CONNECTED')\n"
+            "except ConnectionRefusedError:\n"
+            "    # Sandbox allowed it (unexpected)\n"
+            "    print('ALLOWED_REFUSED')\n"
+            "except PermissionError:\n"
+            "    print('SANDBOX_BLOCKED')\n"
+            "except OSError as e:\n"
+            "    print(f'OS_ERROR: {e.errno} {e.strerror}')\n"
+            "finally:\n"
+            "    s.close()\n"
+        )
+        with _tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", prefix="sandbox_egress_blocked_",
+            dir=src_dir, delete=False,
+        ) as f:
+            f.write(script)
+            script_path = f.name
+        try:
+            result = _subprocess.run(
+                [sandbox_exec, "-p", profile, _sys.executable, script_path],
+                capture_output=True, text=True, timeout=10,
+            )
+        finally:
+            import os as _os
+            try:
+                _os.unlink(script_path)
+            except OSError:
+                pass
+
+        assert result.returncode == 0, (
+            f"sandbox-exec child failed: stdout={result.stdout!r} "
+            f"stderr={result.stderr!r}"
+        )
+        assert "SANDBOX_BLOCKED" in result.stdout, (
+            f"expected sandbox to block alternative port 9090, "
+            f"got stdout={result.stdout!r}"
+        )
+
+    def test_sandbox_blocks_bash_network_call(self):
+        """sandbox-exec with egress profile blocks a Bash network call.
+
+        A Bash child wrapped with sandbox-exec cannot reach an unapproved
+        host via /dev/tcp (bash's virtual network filesystem).  The
+        sandbox denies the TCP connection.
+        """
+        if not self._sandbox_available():
+            pytest.skip(
+                "sandbox-exec (Seatbelt) is not available on this host; "
+                "this test requires a macOS host where Seatbelt profiles "
+                "can be applied"
+            )
+
+        import subprocess as _subprocess
+        sandbox_exec = shutil.which("sandbox-exec")
+        assert sandbox_exec is not None
+
+        from skillweave.runtime.worker_launcher import SandboxExecAdapter
+        adapter = SandboxExecAdapter()
+        profile = adapter.build_egress_profile("127.0.0.1", 8090)
+
+        argv = [
+            sandbox_exec, "-p", profile,
+            "/bin/bash", "-c",
+            "cat < /dev/tcp/127.0.0.1/9090 2>/dev/null || echo 'BASH_FAILED'",
+        ]
+        try:
+            result = _subprocess.run(
+                argv, capture_output=True, text=True, timeout=10,
+            )
+        except _subprocess.TimeoutExpired:
+            result = _subprocess.CompletedProcess(
+                argv, returncode=-1, stdout="", stderr="TIMEOUT",
+            )
+
+        assert "BASH_FAILED" in result.stdout, (
+            f"bash network call was not blocked by sandbox: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

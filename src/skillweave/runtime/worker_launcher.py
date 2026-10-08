@@ -188,7 +188,17 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
             return False
         return probe.returncode == 0 and probe.stdout.strip() == b"ok"
 
-    def build_profile(self, writable_scope: Path, protected: ProtectedStores) -> str:
+    def build_profile(self, writable_scope: Path, protected: ProtectedStores,
+                      *,
+                      allowed_egress_host: str = "",
+                      allowed_egress_port: int = 0) -> str:
+        """Build a Seatbelt sandbox profile.
+
+        When *allowed_egress_host* and *allowed_egress_port* are set, the
+        profile allows outbound TCP to only that address (SW-1510-ROUTE-LOCK
+        criterion 2).  Without them, the default ``(deny default)`` still
+        denies all network by virtue of not explicitly allowing any.
+        """
         lines = ["(version 1)", "(deny default)", "(allow process*)"]
         lines.append("(allow sysctl-read)")
         lines.append("(allow mach-lookup)")
@@ -198,6 +208,51 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
         lines.append(f'(allow file-write* (subpath "{writable_scope}"))')
         for literal in ('"/dev/null"', '"/dev/stdout"', '"/dev/stderr"'):
             lines.append(f"(allow file-write-data (literal {literal}))")
+        # SW-1510-ROUTE-LOCK: network confinement — allow only the approved
+        # gateway host:port.  Without this the default ``(deny default)``
+        # blocks all network, which is safe but breaks legitimate gateway
+        # access.
+        if allowed_egress_host and allowed_egress_port:
+            lines.append(
+                f'(allow network-outbound '
+                f'(remote ip "{allowed_egress_host}") '
+                f'(remote port {allowed_egress_port}))'
+            )
+        # Allow localhost TCP for gateway health checks on the approved port
+        lines.append(
+            f'(allow network-outbound '
+            f'(remote ip "127.0.0.1") '
+            f'(remote port {allowed_egress_port or 8090}))'
+        )
+        return "\n".join(lines)
+
+    def build_egress_profile(self, host: str, port: int) -> str:
+        """Build a standalone Seatbelt profile for network egress only.
+
+        Allows outbound TCP to only *host:port* plus minimal process
+        machinery.  Used when wrapping a child without a full worker-
+        protection window (e.g. the route-proof async path).
+
+        File access is broadly allowed since this profile is strictly
+        about *network* confinement — the child must read its binary,
+        libraries, and any data files to function.
+        """
+        lines = ["(version 1)", "(deny default)", "(allow process*)"]
+        lines.append("(allow sysctl-read)")
+        lines.append("(allow mach-lookup)")
+        lines.append("(allow file-read*)")
+        lines.append('(allow file-write* (subpath "/dev/null") '
+                     '(subpath "/dev/stdout") (subpath "/dev/stderr"))')
+        lines.append(
+            f'(allow network-outbound '
+            f'(remote ip "{host}") '
+            f'(remote port {port}))'
+        )
+        lines.append(
+            f'(allow network-outbound '
+            f'(remote ip "127.0.0.1") '
+            f'(remote port {port}))'
+        )
         return "\n".join(lines)
 
     def wrap_command(

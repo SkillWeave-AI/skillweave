@@ -333,6 +333,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             artifact_evidence=artifact_evidence,
             source_resolver=source_resolver,
             analysis_reader=analysis_reader,
+            route_proof=route_proof,
         )
 
         result_obj = execution["result"]
