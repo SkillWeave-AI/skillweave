@@ -131,6 +131,9 @@ REPAIR_ALLOWED_ACTION: dict[str, str] = {
     "malformed_artifact": "remediate",
     "source_drift": "reschedule",
     "repeated_semantic_failure": "hold",
+    # A failure that matched no typed signal fails closed to a HOLD rather than
+    # defaulting to a permissive remediation.
+    "unclassified": "hold",
 }
 
 #: Action name -> the Assay :class:`ActionType` it is gated as.

@@ -65,8 +65,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 #: The frozen execution-contract id the correction records are emitted under.
 ATTEMPT_EVENT_SCHEMA_ID = "https://skillweave.dev/schemas/execution/attempt-event/v1"
 
-#: class -> the single permitted action, as the contract requires.
-_EXPECTED_ALLOWED = [
+#: class -> the single permitted action, as the contract requires (the six
+#: distinguishable classes of criterion 1).
+_CONTRACT_ALLOWED = [
     (sr.ErrorClass.AUTH_QUOTA.value, sr.RepairAction.HOLD.value),
     (sr.ErrorClass.CAPABILITY_MISMATCH.value, sr.RepairAction.HOLD.value),
     (sr.ErrorClass.CONTEXT_PRESSURE.value, sr.RepairAction.SPLIT.value),
@@ -74,6 +75,13 @@ _EXPECTED_ALLOWED = [
     (sr.ErrorClass.SOURCE_DRIFT.value, sr.RepairAction.RESCHEDULE.value),
     (sr.ErrorClass.REPEATED_SEMANTIC_FAILURE.value, sr.RepairAction.HOLD.value),
 ]
+
+#: The fail-closed class: a failure that matches no typed signal. It is a HOLD
+#: so an unnamed failure can never default to a permissive remediation.
+_FAIL_CLOSED_ALLOWED = (sr.ErrorClass.UNCLASSIFIED.value, sr.RepairAction.HOLD.value)
+
+#: Every class in the vocabulary and its single permitted action.
+_EXPECTED_ALLOWED = [*_CONTRACT_ALLOWED, _FAIL_CLOSED_ALLOWED]
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +132,10 @@ def test_module_and_controller_agree_on_six_class_action_table():
     }
     assert module_table == dict(_EXPECTED_ALLOWED)
     assert REPAIR_ALLOWED_ACTION == module_table
-    assert len(sr.ErrorClass) == 6
+    # The six distinguishable classes of criterion 1, plus the fail-closed
+    # class that keeps an unclassifiable failure out of a permissive action.
+    assert len(_CONTRACT_ALLOWED) == 6
+    assert len(sr.ErrorClass) == 7
 
 
 @pytest.mark.parametrize("error_class,action", _EXPECTED_ALLOWED)
@@ -136,6 +147,114 @@ def test_allowed_action_is_the_single_permitted_action(error_class, action):
 def test_unknown_error_class_is_refused_not_defaulted():
     with pytest.raises(sr.UnsupportedErrorClass):
         sr.allowed_action("totally_made_up")
+
+
+#: Real provider rate-limit / usage-limit / auth phrasings. Each is an
+#: auth/quota condition and must NEVER be classified as a malformed artifact
+#: (which would permit an automated ``remediate`` of a quota failure).
+_QUOTA_PHRASINGS = [
+    "HTTP 429 rate_limit: you exceeded the 5-hour usage limit",
+    "429 Too Many Requests",
+    "rate limit exceeded, retry later",
+    "you have reached your usage limit",
+    "insufficient_quota: you exceeded your current quota",
+    "insufficient credit balance",
+    "402 Payment Required",
+    "401 Unauthorized",
+    "403 Forbidden",
+    "you are out of credits",
+]
+
+
+@pytest.mark.parametrize("message", _QUOTA_PHRASINGS)
+def test_provider_quota_phrasings_are_auth_quota_never_remediated(message):
+    error_class = sr.classify_error(message=message)
+    assert error_class == sr.ErrorClass.AUTH_QUOTA.value
+    assert error_class != sr.ErrorClass.MALFORMED_ARTIFACT.value
+    # A quota failure is never automated: its only permitted action is HOLD.
+    assert sr.allowed_action(error_class) == sr.RepairAction.HOLD.value
+
+    # ...and the Assay controller holds it (no automation) rather than
+    # approving a remediation on the strength of the wrong class.
+    engine, controller = _controller("unicorn")
+    decision = controller.act(
+        RepairActionRequest(error_class=error_class, action="remediate")
+    )
+    assert decision.approved is False
+    assert decision.requires_human is True
+
+
+def test_mixed_signal_message_resolves_to_the_most_specific_class():
+    # "capability ... route": both signals present; the specific capability
+    # signal wins deterministically, so the class is not the incidental route.
+    message = (
+        "model does not support tool use; the requested capability is "
+        "unavailable on this route"
+    )
+    assert sr.classify_error(message=message) == sr.ErrorClass.CAPABILITY_MISMATCH.value
+    # A message that is *only* a quota signal still classifies as quota.
+    assert sr.classify_error(message="quota exhausted on the route") == (
+        sr.ErrorClass.AUTH_QUOTA.value
+    )
+    # Repeated application is deterministic (no ordering flakiness).
+    assert sr.classify_error(message=message) == sr.classify_error(message=message)
+
+
+def test_unclassifiable_failure_fails_closed_to_a_hold(tmp_path):
+    # A message carrying no typed signal is *not* silently a malformed artifact.
+    assert sr.classify_error(message="zzz nothing recognisable here") == (
+        sr.ErrorClass.UNCLASSIFIED.value
+    )
+
+    # Through the real seam: an absence of any grounded failure, error or
+    # signal is a HOLD, never a PASS.
+    repo = _repo(tmp_path)
+    plan = {"id": "T-u", "lane": {"modifies": ["src/real_module.py"]}}
+    outcome = sr.repair_plan_from_grounding(
+        plan, repo, role="ops", current_target_digest=digest_target(plan),
+        authorize=lambda r, c, f: True,
+    )
+    assert outcome.held is True
+    assert outcome.error_class == sr.ErrorClass.UNCLASSIFIED.value
+    assert outcome.action_taken == sr.RepairAction.HOLD.value
+
+    # The controller holds the unclassified class as a human decision.
+    engine, controller = _controller("unicorn")
+    decision = controller.act(
+        RepairActionRequest(error_class="unclassified", action="hold")
+    )
+    assert decision.approved is False
+    assert decision.requires_human is True
+
+
+def test_correction_count_must_be_a_positive_integer(tmp_path):
+    from skillweave.runtime.preflight import failure_for_missing_path
+    failure = failure_for_missing_path(
+        path="src/x.py", task_id="T", lane_field="modifies", target_digest="a" * 64,
+    )
+    attempt = sr.RepairAttempt(
+        attempt=1, failure_fingerprint=failure.fingerprint,
+        failure_class=failure.failure_class, implicated_fields=["modifies"],
+        before_digest="x", after_digest="y", command="promptchain-validate",
+        exit_code=0, outcome="repaired", error_class="malformed_artifact",
+        correction_count=1,
+    )
+    good = attempt.to_attempt_event(run_id="r", task_id="T")
+    sr.validate_attempt_event(good)  # a 1-based count is accepted
+
+    # The bounded correction count is 1-based: zero, negatives, non-integers
+    # and booleans are refused rather than guessed into a supported shape.
+    for bad in (-1, 0, "3", 1.5, True):
+        event = dict(
+            good, payload=dict(good["payload"], correction_count=bad)
+        )
+        with pytest.raises(ValueError):
+            sr.validate_attempt_event(event)
+
+    # A correction event carrying an unknown class is refused too.
+    unknown = dict(good, payload=dict(good["payload"], error_class="not_a_class"))
+    with pytest.raises(ValueError):
+        sr.validate_attempt_event(unknown)
 
 
 @pytest.mark.parametrize("error_class,action", _EXPECTED_ALLOWED)
@@ -175,6 +294,11 @@ def test_classify_error_produces_each_of_the_six_classes(error_class, action):
         assert sr.classify_error(
             failure=failure, prior_fingerprints=[failure.fingerprint]
         ) == error_class
+    elif error_class == sr.ErrorClass.UNCLASSIFIED.value:
+        # Nothing typed matched: the classification fails closed, it does not
+        # default to a permissive "malformed artifact -> remediate".
+        assert sr.classify_error(message="zzz unrecognised gibberish") == error_class
+        assert sr.classify_error() == error_class
     assert sr.allowed_action(error_class) == action
 
 

@@ -45,6 +45,7 @@ count — appended to, never overwriting, the prior attempts.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -105,6 +106,11 @@ class ErrorClass(str, Enum):
     #: Repeated semantic failure: the same fingerprint recurred, so the repair
     #: did not stick. The action is HOLD (escalate/split), never another retry.
     REPEATED_SEMANTIC_FAILURE = "repeated_semantic_failure"
+    #: Unclassified: no typed signal matched, so the failure cannot be shown to
+    #: be a *malformed artifact*. The classification fails closed to a HOLD
+    #: rather than defaulting to a permissive ``remediate`` (the malformed-
+    #: artifact class is reserved for genuinely malformed-artifact evidence).
+    UNCLASSIFIED = "unclassified"
 
 
 class RepairAction(str, Enum):
@@ -125,6 +131,7 @@ ALLOWED_ACTION: dict[ErrorClass, RepairAction] = {
     ErrorClass.MALFORMED_ARTIFACT: RepairAction.REMEDIATE,
     ErrorClass.SOURCE_DRIFT: RepairAction.RESCHEDULE,
     ErrorClass.REPEATED_SEMANTIC_FAILURE: RepairAction.HOLD,
+    ErrorClass.UNCLASSIFIED: RepairAction.HOLD,
 }
 
 #: Alias kept for callers that read the mapping by string key.
@@ -164,36 +171,133 @@ _IDENTITY_FIELDS = frozenset(
     {"product", "remote_repo", "branch", "worktree", "sha", "role"}
 )
 
-#: Hold conditions the classifier maps onto an error class.
+#: Structured axis names the seam attaches to a refusal, mapped to the class
+#: they imply. A named axis is authoritative: it is the *observed* check, not a
+#: keyword guess. Budget/admission axes are auth/quota conditions with no
+#: authorized fallback; capability/scope/authority axes are capability
+#: mismatches; a drift axis is source drift; and so on.
+_AXIS_SIGNALS: dict[str, ErrorClass] = {
+    # auth/quota: the acting authority refused or the authorized budget is spent.
+    "actor": ErrorClass.AUTH_QUOTA,
+    "admission": ErrorClass.AUTH_QUOTA,
+    "auth": ErrorClass.AUTH_QUOTA,
+    "budget": ErrorClass.AUTH_QUOTA,
+    "deadline": ErrorClass.AUTH_QUOTA,
+    "envelope": ErrorClass.AUTH_QUOTA,
+    "pin": ErrorClass.AUTH_QUOTA,
+    "quota": ErrorClass.AUTH_QUOTA,
+    "rate_limit": ErrorClass.AUTH_QUOTA,
+    "route": ErrorClass.AUTH_QUOTA,
+    "turn_limit": ErrorClass.AUTH_QUOTA,
+    # capability mismatch: the role/route lacks a capability the action needs.
+    "authority": ErrorClass.CAPABILITY_MISMATCH,
+    "capability": ErrorClass.CAPABILITY_MISMATCH,
+    "scope": ErrorClass.CAPABILITY_MISMATCH,
+    # context pressure: the probe exhausted its working context.
+    "context": ErrorClass.CONTEXT_PRESSURE,
+    "context_pressure": ErrorClass.CONTEXT_PRESSURE,
+    # source drift: the ground moved under the diagnosis.
+    "drift": ErrorClass.SOURCE_DRIFT,
+    "target_drift": ErrorClass.SOURCE_DRIFT,
+    # repeated semantic failure: the same fingerprint recurred.
+    "fingerprint": ErrorClass.REPEATED_SEMANTIC_FAILURE,
+    "repeated": ErrorClass.REPEATED_SEMANTIC_FAILURE,
+    # malformed artifact: a genuinely ungrounded/unsupported declared surface.
+    "malformed": ErrorClass.MALFORMED_ARTIFACT,
+    "schema": ErrorClass.MALFORMED_ARTIFACT,
+}
+
+#: Hold conditions the classifier maps onto the auth/quota class when they
+#: arrive as an unlisted axis (kept explicit and broad so an unknown budget-ish
+#: axis still fails closed to a HOLD rather than a permissive action).
 _BUDGET_AXES = frozenset(
     {"actor", "deadline", "budget", "envelope", "pin", "admission", "turn_limit", "quota", "route"}
 )
+
+#: Ordered typed signals for free-text diagnosis — most specific first. Each
+#: entry maps a compiled word-boundary pattern to the *single* class it implies;
+#: the FIRST matching entry wins, so a specific signal always outranks a broader
+#: one. This is what makes ambiguity deterministic:
+#:
+#: * a 429 / rate/usage limit / insufficient balance / 401-403 / unauthorized is
+#:   a quota condition, never a malformed artifact;
+#: * "the requested capability is unavailable on this route" is a capability
+#:   mismatch (``capab`` is tested before the merely-incidental ``route``);
+#: * a message that matches nothing is left *unclassified* so the caller fails
+#:   closed to a HOLD — there is no permissive default.
+_SIGNAL_PATTERNS: tuple[tuple[ErrorClass, "re.Pattern[str]"], ...] = (
+    (
+        ErrorClass.AUTH_QUOTA,
+        re.compile(
+            r"\b(?:quota|rate[ _-]?limit|too many requests|usage limit|"
+            r"insufficient[ _a-z]*(?:quota|credit|balance|funds|token)|payments? required|"
+            r"out of credits?|no credits?|"
+            r"(?:un)?authori[sz]ed|unauthenticated|no authorized fallback|"
+            r"auth(?:entication|orization)?|401|402|403|429)\b"
+        ),
+    ),
+    (
+        ErrorClass.CONTEXT_PRESSURE,
+        re.compile(
+            r"\b(?:context (?:length|window|limit|overflow)|context[_ -]?length|"
+            r"token limit|maximum tokens|ran out of context|"
+            r"prompt is too long)\b"
+        ),
+    ),
+    (
+        ErrorClass.CAPABILITY_MISMATCH,
+        re.compile(
+            r"\b(?:capab\w*|permission\w*|forbidden|not support\w*|"
+            r"unsupported (?:capabilit\w*|tool\w*|feature\w*)|"
+            r"not available on this route|authority expansion)\b"
+        ),
+    ),
+    (
+        ErrorClass.SOURCE_DRIFT,
+        re.compile(r"\b(?:drift\w*|stale|moved|mismatch\w*)\b"),
+    ),
+    (
+        ErrorClass.REPEATED_SEMANTIC_FAILURE,
+        re.compile(r"\b(?:fingerprint\w*|repeated\w*|recurred|recurring|recurr\w*)\b"),
+    ),
+    (
+        ErrorClass.MALFORMED_ARTIFACT,
+        re.compile(
+            r"\b(?:malformed|schema|unsupported version|ungrounded|"
+            r"missing field|syntax error)\b"
+        ),
+    ),
+)
+
+
+def _match_signal(text: str) -> Optional[ErrorClass]:
+    """Return the class of the most specific typed signal in *text*, or ``None``.
+
+    ``None`` means *unclassifiable* — deliberately not a malformed artifact, so
+    the caller fails closed to a HOLD rather than remediating a failure it could
+    not name.
+    """
+    lowered = text.lower()
+    for error_class, pattern in _SIGNAL_PATTERNS:
+        if pattern.search(lowered):
+            return error_class
+    return None
 
 
 def _classify_exception(error: BaseException) -> Optional[ErrorClass]:
     """Best-effort structured classification of an exception from the seam.
 
-    Structured attributes (an ``axis`` naming the refusal) are consulted before
-    free text; the name/text scan is a fallback, not the authority.
+    A named ``axis`` (the *observed* refusal) is authoritative and is consulted
+    before free text; the ordered :data:`_SIGNAL_PATTERNS` scan over the
+    exception name and text is the deterministic fallback.
     """
-    name = type(error).__name__
-    axis = str(getattr(error, "axis", "") or "").lower()
-    lowered_name = name.lower()
-    text = f"{name} {axis} {error}".lower()
-
-    if "quota" in lowered_name or axis in _BUDGET_AXES:
+    axis = str(getattr(error, "axis", "") or "").strip().lower()
+    if axis in _AXIS_SIGNALS:
+        return _AXIS_SIGNALS[axis]
+    if axis in _BUDGET_AXES:
         return ErrorClass.AUTH_QUOTA
-    if "context" in text or "token limit" in text or "contextlength" in text or "context window" in text:
-        return ErrorClass.CONTEXT_PRESSURE
-    if axis in {"capability", "scope"} or "capab" in text or "permission" in text or "forbidden" in text:
-        return ErrorClass.CAPABILITY_MISMATCH
-    if "drift" in text or axis == "target_drift" or "stale" in text:
-        return ErrorClass.SOURCE_DRIFT
-    if "fingerprint" in text or "repeated" in text:
-        return ErrorClass.REPEATED_SEMANTIC_FAILURE
-    if "schema" in text or "malformed" in text or "unsupported version" in text:
-        return ErrorClass.MALFORMED_ARTIFACT
-    return None
+    text = f"{type(error).__name__} {axis} {error}"
+    return _match_signal(text)
 
 
 def _classify_failure(
@@ -205,7 +309,8 @@ def _classify_failure(
     same diagnosis recurring means the previous correction did not stick. An
     identity-field mismatch is source drift (the ground moved); the two
     grounding-repairable classes are a malformed artifact (the declared surface
-    is ungrounded).
+    is ungrounded). Any grounded failure this vocabulary cannot name is
+    *unclassified* — it is never defaulted into a permissive ``remediate``.
     """
     if prior_fingerprints and failure.fingerprint in set(prior_fingerprints):
         return ErrorClass.REPEATED_SEMANTIC_FAILURE
@@ -218,7 +323,7 @@ def _classify_failure(
         f in _IDENTITY_FIELDS for f in failure.implicated_fields
     ):
         return ErrorClass.SOURCE_DRIFT
-    return ErrorClass.MALFORMED_ARTIFACT
+    return ErrorClass.UNCLASSIFIED
 
 
 def classify_error(
@@ -226,6 +331,7 @@ def classify_error(
     failure: Optional[PreflightFailure] = None,
     error: Optional[BaseException] = None,
     message: str = "",
+    classified: Optional[PreflightFailure] = None,
     prior_fingerprints: Optional[Sequence[str]] = None,
     budget_exhausted: bool = False,
 ) -> str:
@@ -235,33 +341,35 @@ def classify_error(
     controller seam (``error``) and the run's prior correction fingerprints. An
     exhausted budget is classified before anything else: it is an
     auth/quota condition with no authorized fallback.
+
+    A diagnosis that matches no typed signal is returned as
+    :data:`ErrorClass.UNCLASSIFIED` — the classification fails closed, because a
+    failure that cannot be *named* must never default to a permissive
+    ``remediate``. ``classified`` is an accepted alias for ``failure``.
     """
+    if classified is not None and failure is None:
+        failure = classified
     if budget_exhausted:
         return ErrorClass.AUTH_QUOTA.value
     prior = list(prior_fingerprints or [])
+    failure_class: Optional[ErrorClass] = None
     if failure is not None:
-        cls = _classify_failure(failure, prior)
-        if cls is not ErrorClass.MALFORMED_ARTIFACT:
-            return cls.value
+        failure_class = _classify_failure(failure, prior)
+        if failure_class is not ErrorClass.MALFORMED_ARTIFACT:
+            return failure_class.value
     if error is not None:
         cls = _classify_exception(error)
         if cls is not None:
             return cls.value
     if message:
-        lowered = message.lower()
-        if "quota" in lowered or "auth" in lowered or "budget" in lowered or "route" in lowered:
-            return ErrorClass.AUTH_QUOTA.value
-        if "context" in lowered or "window" in lowered:
-            return ErrorClass.CONTEXT_PRESSURE.value
-        if "capab" in lowered or "permission" in lowered or "forbidden" in lowered:
-            return ErrorClass.CAPABILITY_MISMATCH.value
-        if "drift" in lowered or "stale" in lowered or "moved" in lowered:
-            return ErrorClass.SOURCE_DRIFT.value
-        if "fingerprint" in lowered or "repeated" in lowered:
-            return ErrorClass.REPEATED_SEMANTIC_FAILURE.value
-    if failure is not None:
-        return _classify_failure(failure, prior).value
-    return ErrorClass.MALFORMED_ARTIFACT.value
+        cls = _match_signal(message)
+        if cls is not None:
+            return cls.value
+    if failure_class is not None:
+        # A malformed-artifact failure with no competing signal, or an
+        # unclassifiable one (which fails closed to a HOLD).
+        return failure_class.value
+    return ErrorClass.UNCLASSIFIED.value
 
 
 class HoldReason(str, Enum):
@@ -402,7 +510,9 @@ def validate_attempt_event(event: dict[str, Any]) -> None:
 
     Raises :class:`UnsupportedAttemptEventVersion` for an unknown version (or an
     unknown schema id); raises :class:`ValueError` for a record missing the
-    required correction facts. Never repairs the record into a supported shape.
+    required correction facts, for a ``correction_count`` that is not a positive
+    integer, and for an ``error_class`` outside the recognised vocabulary. Never
+    repairs the record into a supported shape.
     """
     version = event.get("schema_version")
     if version not in SUPPORTED_ATTEMPT_EVENT_VERSIONS:
@@ -412,6 +522,7 @@ def validate_attempt_event(event: dict[str, Any]) -> None:
             f"attempt-event schema_id {event.get('schema_id')!r} is not "
             f"{ATTEMPT_EVENT_SCHEMA_ID!r}"
         )
+    payload = event.get("payload", {})
     for key in (
         "failure_fingerprint",
         "error_class",
@@ -420,8 +531,29 @@ def validate_attempt_event(event: dict[str, Any]) -> None:
         "verifier_result",
         "correction_count",
     ):
-        if key not in event.get("payload", {}):
+        if key not in payload:
             raise ValueError(f"attempt-event payload is missing {key!r}")
+
+    # The bounded correction count is 1-based: it is the number of corrections
+    # attempted for this fingerprint, so zero is not a correction and a negative
+    # count is meaningless. A bool is rejected even though it is an ``int`` in
+    # Python, because ``True`` is not a count.
+    count = payload["correction_count"]
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError(
+            f"attempt-event correction_count {count!r} must be a positive "
+            f"integer (the bounded correction count is 1-based)"
+        )
+
+    # An unrecognised class cannot be routed to a permitted action, so it is
+    # refused here rather than defaulted to a permissive one.
+    try:
+        ErrorClass(payload["error_class"])
+    except ValueError as exc:
+        raise ValueError(
+            f"attempt-event error_class {payload['error_class']!r} is not one "
+            f"of {sorted(c.value for c in ErrorClass)}"
+        ) from exc
 
 
 @dataclass
@@ -1270,6 +1402,21 @@ def repair_plan_from_grounding(
         )
 
     if failure is None:
+        # No grounded surface failure was detected. A call with a presented
+        # refusal or an exhausted budget was already held above; a call with
+        # *nothing* to classify (no surface failure, no error, no recognisable
+        # signal) must also fail closed to a HOLD rather than be treated as a
+        # successful repair — an unclassifiable failure is never a PASS.
+        error_class = classify_error(prior_fingerprints=prior_fingerprints)
+        if error_class != ErrorClass.MALFORMED_ARTIFACT.value:
+            return RepairOutcome(
+                repaired=False,
+                hold_reason=_hold_reason_for_class(error_class),
+                attempts=list(repairer.attempts),
+                target_digest=current_target_digest,
+                error_class=error_class,
+                action_taken=ALLOWED_ACTION[ErrorClass(error_class)].value,
+            )
         return RepairOutcome(
             repaired=True,
             repaired_plan=plan,
@@ -1299,4 +1446,6 @@ def _hold_reason_for_class(error_class: str) -> str:
         return HoldReason.REPEATED_FINGERPRINT.value
     if error_class == ErrorClass.CONTEXT_PRESSURE.value:
         return HoldReason.CONTROLLER_HELD.value
+    # malformed_artifact is only reached here when its permitted remediation was
+    # not applied; unclassified fails closed to the same non-repairable hold.
     return HoldReason.NON_REPAIRABLE_CLASS.value
