@@ -256,7 +256,6 @@ class WebSearch:
         }
         spec = _SPEC_BY_ADAPTER.get(adapter_id)
         if spec is not None and spec.transport == "mcp-stdio":
-            argument["command"] = config.mcp_command
             argument["env_allowlist"] = config.mcp_env_allowlist
             # The resolved credential value is redacted from any
             # server-originated text the backend surfaces (defence in depth
@@ -268,6 +267,13 @@ class WebSearch:
             # registered runtime / verified installed binary is resolved. A
             # failure here yields *no* adapter-owned launcher, so the backend
             # reports a typed ``no_binding`` rather than launching anything.
+            #
+            # ``command`` is deliberately left unset until the resolver has
+            # *accepted* the binding: it is only ever populated by
+            # ``mcp_argument_from_resolution`` below. That way a *refused*
+            # explicit command (a floating ``git+``/URL install or an unpinned
+            # ``uvx`` spec) leaves no command behind, and the backend spawns
+            # nothing instead of executing a refused launcher.
             try:
                 resolution = resolve_launcher(
                     explicit_command=config.mcp_command,
@@ -277,6 +283,7 @@ class WebSearch:
                     verify_installed=config.verify_launcher_installed,
                 )
             except LauncherResolutionError as exc:
+                argument.pop("command", None)
                 argument["launcher_provenance"] = {
                     "kind": "unresolved",
                     "source": "launcher_resolver",

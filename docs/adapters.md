@@ -147,6 +147,27 @@ Council-owned modules:
   A floating `git+`/URL command or an unpinned `uvx` spec is refused before any
   process is spawned.
 
+**Criterion 2 at the consumer boundary.** The resolver is not the only place a
+refused launcher could slip through. `WebSearch._backend_argument` populates
+`command` **only** from an accepted resolution — a refused explicit command
+leaves no `command` behind — and `PerplexityMcpBackend.invoke` /
+`run_perplexity_mcp` re-check a *raw* command, so a floating `git+`/URL install
+or an unpinned `uvx` spec becomes a typed `no_binding` that spawns **nothing**,
+whatever path supplied it. The check skips a *resolver-produced* command (one
+carrying a `launcher_kind`), because its resolved `uvx --from name==version name`
+shape is already validated and must not be misread as unpinned.
+
+**Cross-owner hold (Discovered, not fixed here).** Discovery's
+`resolve_search_outcome` **defaults** to the SW-ADAPT-001 substrate registry,
+whose Perplexity MCP binding (`skillweave.adapters.search_backends.
+_fetch_perplexity_mcp`, plus `skillweave.adapters.mcp_client`) lives outside
+Council's write scope. On that default path a floating `git+` command is refused
+before spawn (as a raised client error rather than Council's typed `no_binding`),
+but an **unpinned `uvx` spec is NOT refused** — the substrate spawns it. Closing
+that requires SW-ADAPT-001 scope; the criterion-2 regressions drive the function
+with Council's owned registry and record the substrate default's behaviour
+explicitly (see `tests/contract/test_council_launcher_refusal_consumers.py`).
+
 The Council caller (`WebSearch.search`) stays a **formatted-string** API; the
 Discovery research invocation is proven to consume Council's typed outcome (a
 real cited source on success, an explicit failure state otherwise). Both are

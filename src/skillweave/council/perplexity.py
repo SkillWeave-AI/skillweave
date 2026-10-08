@@ -44,6 +44,7 @@ from skillweave.adapters import (
 )
 from skillweave.adapters.outcomes import query_digest
 
+from .launcher import LauncherResolutionError, resolve_launcher
 from .mcp_client import (
     McpClientError,
     McpStdioClient,
@@ -65,6 +66,30 @@ __all__ = [
 COUNCIL_MCP_ADAPTER_ID = "perplexity-search-mcp"
 PERPLEXITY_PROVIDER = "perplexity"
 PERPLEXITY_MCP_TOOL = "perplexity_search"
+
+def _refused_launcher_detail(
+    command: Sequence[str], *, resolved: bool = False
+) -> Optional[str]:
+    """A refusal reason when a *raw* command would install floating code.
+
+    A command that carries a floating ``git+``/URL marker or an unpinned ``uvx``
+    spec is refused by the same resolver the Council/Discovery entry points use.
+    Returns ``None`` when the command is admissible.
+
+    ``resolved`` marks a command the *launcher resolver itself produced* (its
+    argument carries a ``launcher_kind``): that command was already validated at
+    resolution time, so it is not re-judged here. Re-validating a resolved
+    ``uvx --from name==version name`` command would misread its bare trailing
+    distribution name as an unpinned spec and wrongly refuse a legitimate launch.
+    """
+    if resolved:
+        return None
+    try:
+        resolve_launcher(explicit_command=list(command))
+    except LauncherResolutionError as exc:
+        asset = getattr(exc, "asset", None) or "explicit_command"
+        return f"launcher refused ({asset}): {exc}"
+    return None
 
 _URL_KEYS = ("url", "link", "uri", "source_url")
 _TITLE_KEYS = ("title", "name", "heading")
@@ -181,6 +206,14 @@ def run_perplexity_mcp(
             _failure(sha, "no_binding", "no MCP launcher binding supplied for perplexity"),
             None,
         )
+    # Defence in depth (criterion 2): a *raw* command that would install floating
+    # code (a ``git+``/URL marker or an unpinned ``uvx`` spec) is refused here as
+    # a typed ``no_binding`` before any process is spawned, rather than letting
+    # the client raise on a floating launch. A resolved command (one the
+    # launcher resolver produced) is supplied by the caller and is not re-judged.
+    refusal = _refused_launcher_detail(command)
+    if refusal is not None:
+        return _failure(sha, "no_binding", refusal), None
 
     client = McpStdioClient(
         command,
@@ -209,11 +242,21 @@ def run_perplexity_mcp(
 async def _drive(
     client: McpStdioClient, query: str, sha: str, tool_name: str
 ) -> tuple[SearchOutcome, Optional[NegotiatedSession]]:
+    """Drive one call and map every outcome to a typed, redacted ``SearchOutcome``.
+
+    Status note: a child that never becomes usable -- an unspawnable command, a
+    *cancelled* call, or a stream that closes during the handshake -- is reported
+    with ``error_code="launch_failed"`` and, because that is an availability fact
+    rather than a malformed payload, surfaces as ``status="unavailable"`` (see
+    :func:`_failure`). ``_code`` names the exact blocking fact where one exists.
+    """
     import asyncio
 
     try:
         await client.start()
     except McpClientError as exc:
+        # A stream closed / handshake cancelled before the server was usable:
+        # the launch never completed, so ``launch_failed`` (=> ``unavailable``).
         return _failure(sha, _code(exc, "launch_failed"), str(exc)), None
     except OSError as exc:  # a child that cannot be spawned
         return _failure(sha, "launch_failed", f"could not launch MCP child: {exc}"), None
@@ -337,6 +380,19 @@ class PerplexityMcpBackend(AdapterBackend):
                 "no_binding",
                 "no MCP launcher binding supplied for perplexity",
             )
+        # Defence in depth (criterion 2): whatever path supplied this command --
+        # Council's own backend, or a Discovery adapter driving it directly --
+        # a floating ``git+``/URL install or an unpinned ``uvx`` spec is refused
+        # here, before any process is spawned, as a typed ``no_binding``. The
+        # command the *resolver* produced (registered/installed/pinned-uvx) was
+        # already validated at resolution time and is admissible, so a
+        # legitimate launch is unaffected.
+        refusal = _refused_launcher_detail(
+            command, resolved=("launcher_kind" in argument)
+        )
+        if refusal is not None:
+            self.last_session = None
+            return _failure(sha, "no_binding", refusal)
 
         client = McpStdioClient(
             command,

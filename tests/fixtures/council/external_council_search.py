@@ -14,11 +14,17 @@ to consume the Council repair, not a stub.
   cited http(s) source;
 * :func:`council_mcp_failure_factory` -- drives the ``text-only`` fake server: a
   synthesis with no cited URL, so a typed ``no_results`` non-success with zero
-  sources (an explicit failure state, never a fabricated source).
+  sources (an explicit failure state, never a fabricated source);
+* :func:`council_mcp_refusal_factory` -- hands Council's backend a *floating*
+  command (criterion 2). The backend must return a typed ``no_binding`` and
+  spawn **nothing**; the command names a harmless fake launcher that would append
+  its argv to ``COUNCIL_REFUSAL_ARGV_LOG`` if it were ever executed, so a
+  non-empty log is the observable proof a process was launched.
 
 No live provider is ever called.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -35,6 +41,7 @@ FAKE_SERVER = Path(__file__).resolve().parent / "fake_mcp_server.py"
 
 _SUCCESS_ID = "external-council-mcp-search"
 _FAILURE_ID = "external-council-mcp-fail"
+_REFUSAL_ID = "external-council-mcp-refusal"
 
 
 def _descriptor(adapter_id: str) -> AdapterDescriptor:
@@ -78,3 +85,28 @@ def council_mcp_success_factory():
 
 def council_mcp_failure_factory():
     return _descriptor(_FAILURE_ID), _CouncilMcpBackend("text-only")
+
+
+class _CouncilMcpRefusalBackend(AdapterBackend):
+    """Hands Council's backend a *floating* command, recording any spawn.
+
+    This is the criterion-2 refusal at the Discovery consumer boundary. The
+    backend must return a typed ``no_binding`` and spawn **nothing**: the
+    command points at a harmless fake launcher that would append its argv to
+    ``COUNCIL_REFUSAL_ARGV_LOG`` if it were ever executed, so a non-empty log is
+    the observable proof a process was launched.
+    """
+
+    async def invoke(self, operation, argument, context):
+        command = [os.environ["COUNCIL_REFUSAL_FAKE_LAUNCHER"],
+                   "git+https://example.invalid/unpinned-mcp"]
+        backend = PerplexityMcpBackend(timeout=5.0)
+        return await backend.invoke(
+            operation,
+            {"query": argument.get("query", ""), "command": command},
+            context,
+        )
+
+
+def council_mcp_refusal_factory():
+    return _descriptor(_REFUSAL_ID), _CouncilMcpRefusalBackend()
