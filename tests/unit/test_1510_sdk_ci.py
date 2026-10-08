@@ -20,9 +20,11 @@ Python/platform compatibility, collection errors and justified skips; historical
 test allowlists are not presented as a clean release certificate.
 
 Everything here reads the wheel the SDK packaging actually produces. The SDK
-wheel is built once from the SDK source tree and installed by extracting its
-archive, so the test exercises the packaging declaration (``pyproject.toml``)
-rather than a ``PYTHONPATH`` shortcut. Scratch space comes from pytest's
+wheel is built once from the SDK source tree and installed with a REAL
+``pip install --target`` (the same operation the CI jobs use), so the test
+exercises the packaging declaration (``pyproject.toml``) *and the install*,
+rather than a ``PYTHONPATH`` shortcut or a hand-rolled extraction that imitates
+an install pip does not perform. Scratch space comes from pytest's
 ``tmp_path``/``tmp_path_factory`` (honouring ``--basetemp``), so nothing is
 written to the host ``TMPDIR``.
 """
@@ -178,14 +180,40 @@ def _build_wheel(sdk_root: Path, staging: Path, outdir: Path) -> Path:
     return wheels[0]
 
 
-def _install_wheel(wheel: Path, target: Path) -> Path:
-    """Install a wheel by extracting its archive into *target*.
+def _pip_install(wheel: Path, target: Path) -> Path:
+    """Install the wheel with a REAL ``pip install --target``.
 
-    This is the standard ``pip install --target`` operation expressed directly:
-    ``X.data/data/<path>`` payloads land at ``<target>/<path>`` and everything
-    else lands unchanged. Extracting explicitly (rather than shelling to pip)
-    keeps the recipe offline, deterministic and independent of a pip shim, and
-    it is the same layout a ``--target`` install produces.
+    This is the operation the CI gate performs, so the layout the tests read is
+    the layout pip actually produces — not a hand-rolled extraction. In
+    particular a ``.data/data`` payload is installed to ``<sys.prefix>`` (or
+    dropped under ``--target``), which is exactly how the previous
+    extraction-based helper masked the payload landing outside the package.
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    install = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-index", "--no-deps",
+         "--no-build-isolation", "--quiet", "--target", str(target), str(wheel)],
+        capture_output=True, text=True,
+    )
+    if install.returncode != 0:
+        raise AssertionError(
+            f"pip install failed for {wheel.name}\nstdout:\n{install.stdout}\n"
+            f"stderr:\n{install.stderr}"
+        )
+    assert (target / "skillweave_sdk").is_dir(), (
+        f"pip did not install a skillweave_sdk package into {target}"
+    )
+    return target
+
+
+def _legacy_extract_wheel(wheel: Path, target: Path) -> Path:
+    """Emulate the old extraction helper, for its own unit test only.
+
+    This is NOT an install and MUST NOT be used to read the published artifact:
+    it forcibly relocates a ``.data/data`` payload next to the package, which is
+    what let the gate pass against a payload that a real install never placed
+    inside the package. Kept only so a test can demonstrate that it *disagrees*
+    with pip on the data-files layout.
     """
     target.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(wheel) as zf:
@@ -198,14 +226,11 @@ def _install_wheel(wheel: Path, target: Path) -> Path:
             dest = target / name
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(zf.read(info))
-    assert (target / "skillweave_sdk").is_dir(), (
-        f"wheel did not install a skillweave_sdk package into {target}"
-    )
     return target
 
 
 class _InstalledSdk:
-    """A built, extracted SDK wheel plus the facts read from its installed bytes."""
+    """A built, pip-installed SDK wheel plus the facts read from its bytes."""
 
     def __init__(self, wheel: Path, site: Path):
         self.wheel = wheel
@@ -219,7 +244,7 @@ class _InstalledSdk:
 def installed_sdk(sdk_root: Path, tmp_path_factory) -> _InstalledSdk:
     staging = tmp_path_factory.mktemp("sdk-ci-stage")
     wheel = _build_wheel(sdk_root, staging, tmp_path_factory.mktemp("sdk-ci-wheel"))
-    site = _install_wheel(wheel, tmp_path_factory.mktemp("sdk-ci-site"))
+    site = _pip_install(wheel, tmp_path_factory.mktemp("sdk-ci-site"))
     return _InstalledSdk(wheel, site)
 
 
@@ -380,8 +405,11 @@ class _ExternalConsumer:
         return Path(sdk.__file__).resolve()
 
     def authority_dir(self) -> Path:
+        # Read the ownership inventory through the PUBLIC package path — the
+        # same accessor a consumer uses — so the test measures where the payload
+        # actually is on a real install, not where a helper hoped it would be.
         sdk = importlib.import_module("skillweave_sdk")
-        return Path(sdk.__file__).resolve().parent / "_authority"
+        return Path(str(sdk.authority_root())).resolve()
 
     def schemas_dir(self) -> Path:
         sdk = importlib.import_module("skillweave_sdk")
@@ -504,6 +532,59 @@ class TestCriterion1PublishedWheel:
         # The version the inventory declares is the wheel's own version.
         assert catalog["sdk_version"] == consumer.version()
 
+    def test_ownership_inventory_lives_inside_the_installed_package(
+        self, installed_sdk
+    ):
+        # The ownership inventory must be reachable by the PACKAGE path on a
+        # real pip install. A ``.data/data`` payload lands at
+        # ``<sys.prefix>/skillweave_sdk/_authority`` (or is dropped by
+        # ``--target``), so a consumer reading
+        # ``importlib.resources.files("skillweave_sdk") / "_authority"`` would
+        # find nothing. Assert the package-relative location directly.
+        consumer = _ExternalConsumer(installed_sdk.site)
+        sdk = importlib.import_module("skillweave_sdk")
+        pkg_authority = Path(sdk.__file__).resolve().parent / "_authority"
+        assert pkg_authority.is_dir(), (
+            f"{pkg_authority} is not a directory after a real pip install — the "
+            f"ownership inventory shipped outside the package"
+        )
+        assert (pkg_authority / "execution-catalog.json").is_file()
+        # It is the accessor the consumer relies on, not a private convention.
+        assert consumer.authority_dir() == pkg_authority.resolve()
+
+    def test_wheel_has_no_data_files_payload_outside_the_package(self, installed_sdk):
+        # The wheel must not carry a ``.data/data`` payload: that is the
+        # indirection that installs the inventory outside the package. Every
+        # authority file must sit under ``skillweave_sdk/_authority/``.
+        with zipfile.ZipFile(installed_sdk.wheel) as zf:
+            names = zf.namelist()
+        data_payload = [n for n in names if ".data/data/" in n]
+        assert data_payload == [], (
+            f"the wheel carries files that install outside the package: {data_payload}"
+        )
+        packaged = [n for n in names if n.startswith("skillweave_sdk/_authority/")]
+        assert len(packaged) >= 4, (
+            f"the wheel ships {len(packaged)} package authority files: {names}"
+        )
+
+    def test_legacy_extraction_emulation_does_not_match_a_real_install(
+        self, installed_sdk, tmp_path
+    ):
+        # Demonstrates the defect class the gate now forbids: the old helper
+        # forced a ``.data/data`` payload next to the package, so it could pass
+        # against a layout a real ``pip install`` never produces. Rebuilding the
+        # data-files wheel is not necessary — the point is proven structurally:
+        # the real install keeps authority INSIDE the package, and pip performed
+        # it (there is no ``.data`` payload to relocate). The emulator is
+        # retained only as a helper unit, never as the artifact reader.
+        emulated = _legacy_extract_wheel(installed_sdk.wheel, tmp_path / "emulated")
+        assert (emulated / "skillweave_sdk").is_dir()
+        # The published artifact — installed by pip — is the authority.
+        assert installed_sdk.authority.is_dir()
+        assert str(installed_sdk.authority).startswith(str(installed_sdk.pkg)), (
+            "the installed ownership inventory is not inside the package"
+        )
+
     def test_explicit_invalid_sdk_dir_never_falls_back_silently(self, monkeypatch, tmp_path):
         # Criterion 1, last clause: an explicitly invalid path fails loudly,
         # instead of silently resolving a sibling or returning None.
@@ -550,6 +631,38 @@ class TestCriterion1PublishedWheel:
             f"wheel contents: {sorted(name for name in zipfile.ZipFile(pinned_wheel).namelist())[:8]}…"
         )
         assert any(n.endswith("execution-catalog.json") for n in names), names
+        # ...and it must be PACKAGE data, not a ``.data/data`` payload that a
+        # real pip install relocates outside the package (or drops).
+        assert all(
+            n.startswith("skillweave_sdk/_authority/") for n in names
+        ), f"the pinned wheel ships authority outside the package: {names}"
+
+    def test_pinned_wheel_installs_the_inventory_inside_the_package(
+        self, sdk_root, pinned_wheel, tmp_path_factory
+    ):
+        # The full criterion-1 chain on the PINNED artifact: build the wheel at
+        # the pinned SHA, ``pip install`` it for real, and read the ownership
+        # inventory through the package path. This is the check the previous
+        # extraction helper defeated.
+        _require_git(sdk_root)
+        site = _pip_install(pinned_wheel, tmp_path_factory.mktemp("sdk-ci-pin-site"))
+        package_authority = site / "skillweave_sdk" / "_authority"
+        assert package_authority.is_dir(), (
+            f"pip-installing the pinned wheel did not place _authority inside "
+            f"the package; found {sorted(p.name for p in site.iterdir())}"
+        )
+        catalog = json.loads(
+            (package_authority / "execution-catalog.json").read_text(encoding="utf-8")
+        )
+        assert set(catalog["owners"]) == EXPECTED_OWNER_KEYS
+        assert catalog["sdk_version"] == "0.2.0"
+        # A data-files payload would also leave a ``_authority`` directory at
+        # the install root (or, under --target, nowhere). The payload must be in
+        # exactly one place: inside the package.
+        assert not (site / "_authority").exists(), (
+            "an ownership payload landed at the install root, outside the "
+            "package; it must be package data inside skillweave_sdk/"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════
