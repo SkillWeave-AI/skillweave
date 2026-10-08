@@ -582,10 +582,21 @@ def create_run_payload(
     from skillweave.runtime.reservation import ReservationEnvelope as _ReservationEnvelope
 
     # SW-1510-ROUTE-LOCK: load the route-proof document when supplied.
+    # A malformed route proof produces a structured route_lock error
+    # (exit nonzero, no traceback).
     route_proof_obj = None
     if route_proof:
-        from skillweave.routing.route_proof import RouteProof as _RouteProof
-        route_proof_obj = _RouteProof.load(route_proof)
+        from skillweave.routing.route_proof import RouteProof as _RouteProof, RouteProofError
+        try:
+            route_proof_obj = _RouteProof.load(route_proof)
+        except RouteProofError as exc:
+            return _contract_guard(
+                "",
+                exc=RunIntegrationError(
+                    "route_lock",
+                    f"malformed route proof: {exc}",
+                ),
+            )
 
     try:
         effective_task_id = task_id or run_id

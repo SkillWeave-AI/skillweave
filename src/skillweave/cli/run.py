@@ -281,10 +281,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # When a route-proof is loaded, the approved routes become the exclusive
     # set of permitted egress routes (default-deny).  When no route-proof is
     # supplied, the legacy unlimited path is unchanged.
+    # A malformed route proof produces a structured route_lock error
+    # (exit nonzero, no traceback).
     route_proof = None
     if args.route_proof:
-        from skillweave.routing.route_proof import RouteProof
-        route_proof = RouteProof.load(args.route_proof)
+        from skillweave.routing.route_proof import RouteProof, RouteProofError
+        try:
+            route_proof = RouteProof.load(args.route_proof)
+        except RouteProofError as exc:
+            error_dict = {
+                "error": f"route_lock: malformed route proof: {exc}",
+                "run_id": run_id,
+            }
+            sys.stderr.write(json.dumps(error_dict, sort_keys=True) + "\n")
+            return 1
 
     # SW-1510-BUDGET: Check for an existing owner envelope for this task scope
     # across ALL runs first.  If the host has pre-configured a finite envelope

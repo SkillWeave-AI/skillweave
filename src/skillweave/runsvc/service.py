@@ -123,22 +123,13 @@ _LOCKED_CHILD_ENV_ALLOWLIST: tuple[str, ...] = (
     "TERM",
 )
 
-#: SW-1510-ROUTE-LOCK (criterion 3): The pinned route set that every route
-#: proof must declare a subset of.  A route proof that declares routes
-#: outside this pin is refused (HOLD) at ingestion — the pin is the
-#: owner-controlled policy, not the document's own declaration.
-_APPROVED_ROUTE_PIN: frozenset[str] = frozenset({
-    "byteplus/deepseek-v4-flash",
-    "byteplus/deepseek-v4.1-flash",
-    "byteplus/deepseek-v4-pro",
-    "byteplus/deepseek-v4.1-pro",
-})
-
-#: SW-1510-ROUTE-LOCK (criterion 3): The required policy revision that every
-#: route proof must carry.  A proof whose revision does not match this value
-#: is refused (HOLD) at ingestion — the pin is the current policy version,
-#: not whatever version the document declares.
-_REQUIRED_ROUTE_PROOF_REVISION: str = "1.3.11"
+#: SW-1510-ROUTE-LOCK (criterion 3): The owner-controlled route policy is
+#: loaded from configuration (``SKILLWEAVE_ROUTE_POLICY`` env var) and is the
+#: single source of truth for the approved route set, required policy revision,
+#: and approved egress gateway.  No provider literals, no port constant and no
+#: revision literal live in generic Core source — the policy document supplies
+#: them all.  When a route proof is supplied but no policy is configured, the
+#: launch is HELD with a named reason.
 
 
 def _work_contract_bound_base(work_contract: Any) -> Optional[str]:
@@ -571,8 +562,12 @@ class RunApplicationService:
         # produce named HOLDs before any OS confinement check.  Only then
         # check egress gateway and OS confinement availability.
         if route_proof is not None:
+            from skillweave.routing.route_policy import resolve_route_policy
+            route_policy = resolve_route_policy()
             # Criterion 3: pin validation (host-independent, pure logic).
-            self._verify_route_proof_against_pin(route_proof)
+            self._verify_route_proof_against_pin(
+                route_proof, route_policy=route_policy
+            )
             if model is not None:
                 from skillweave.routing.faigate_adapter import verify_approved_route
 
@@ -589,7 +584,9 @@ class RunApplicationService:
             # checks so that on a host without sandbox-exec the named HOLD
             # reasons above still discriminate wrong-version from
             # enforcement-unavailable.
-            self._enforce_route_proof_egress(route_proof)
+            self._enforce_route_proof_egress(
+                route_proof, route_policy=route_policy
+            )
 
         # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the worker
         # is launched.  This is the admission gate: no provider or tool
@@ -1465,14 +1462,20 @@ class RunApplicationService:
     # refused (HOLD) with a clear reason.
     # ------------------------------------------------------------------
 
-    def _enforce_route_proof_egress(self, route_proof: Any) -> None:
+    def _enforce_route_proof_egress(
+        self,
+        route_proof: Any,
+        *,
+        route_policy: Optional[Any] = None,
+    ) -> None:
         """Verify egress gateway and OS confinement before paid admission.
 
         Called BEFORE reservation (``reserve()``) when a route proof is
         supplied.  Checks:
 
         1. The approved gateway URL routes through the enforcing Faigate
-           gateway (``check_egress_gateway``).
+           gateway (``check_egress_gateway``), using the policy gateway
+           host:port (not a module constant).
         2. ``sandbox-exec`` (Seatbelt) is available to confine the child's
            network egress to only the approved host:port.
 
@@ -1481,18 +1484,36 @@ class RunApplicationService:
         consumed.
         """
         from skillweave.runtime.worker_launcher import SandboxExecAdapter
-        from skillweave.routing.faigate_adapter import check_egress_gateway
+        from skillweave.routing.faigate_adapter import check_egress_gateway, EgressGatewayError
+
+        # Use the policy gateway for the egress check (not a module constant).
+        # Fall back to the proof's gateway when no policy is configured
+        # (should not happen in practice since _verify_route_proof_against_pin
+        # already refused a proof without a policy, but guard defensively).
+        policy_host = (
+            route_policy.approved_gateway_host if route_policy is not None
+            else route_proof.approved_gateway_host
+        )
+        policy_port = (
+            route_policy.approved_gateway_port if route_policy is not None
+            else route_proof.approved_gateway_port
+        )
 
         approved_url = (
             f"http://{route_proof.approved_gateway_host}:"
             f"{route_proof.approved_gateway_port}"
         )
         try:
-            check_egress_gateway(approved_url)
+            check_egress_gateway(
+                approved_url,
+                approved_host=policy_host,
+                approved_port=policy_port,
+            )
         except Exception as exc:
             raise RunIntegrationError(
                 "route_lock",
-                f"egress gateway check failed for {approved_url!r}: {exc}; "
+                f"egress_gateway check failed for {approved_url!r}: "
+                f"{exc}; "
                 f"refusing to launch with an unapproved gateway (HOLD)",
             ) from exc
 
@@ -1505,15 +1526,22 @@ class RunApplicationService:
                 f"refusing to launch an unconfined worker (HOLD)",
             )
 
-    def _verify_route_proof_against_pin(self, route_proof: Any) -> None:
+    def _verify_route_proof_against_pin(
+        self,
+        route_proof: Any,
+        *,
+        route_policy: Optional[Any] = None,
+    ) -> None:
         """Validate *route_proof* against the owner-controlled policy pin (criterion 3).
 
         Checks:
-        1. The proof's revision matches the required policy revision.
-        2. Every route in the proof's ``approved_routes`` is within the
-           pinned approved set (``_APPROVED_ROUTE_PIN``).  A route outside
-           the pin (wrong version, wrong provider, direct-provider bypass)
-           is refused at ingestion regardless of what the document declares.
+        1. A route policy is configured (absent policy while a route proof is
+           supplied => HOLD with a named reason).
+        2. The proof's revision matches the policy's required revision.
+        3. Every route in the proof's ``approved_routes`` is within the
+           policy-approved set.  A route outside the pin (wrong version, wrong
+           provider, direct-provider bypass) is refused at ingestion regardless
+        4. The proof's approved gateway host:port matches the policy.
 
         Raises ``RunIntegrationError`` with stage ``"route_lock"`` when
         the proof does not match the pin — the launch is held before any
@@ -1521,24 +1549,46 @@ class RunApplicationService:
         """
         from skillweave.routing.faigate_adapter import verify_approved_route
 
-        # Check revision pin
+        if route_policy is None:
+            raise RunIntegrationError(
+                "route_lock",
+                "a route proof was supplied but no route policy is configured "
+                "(set SKILLWEAVE_ROUTE_POLICY); "
+                "refusing to enforce an unpinned route set (HOLD)",
+            )
+
+        # Check revision pin against the policy, not a module constant
         proof_revision = getattr(route_proof, "policy_revision", "")
-        if proof_revision != _REQUIRED_ROUTE_PROOF_REVISION:
+        if proof_revision != route_policy.required_revision:
             raise RunIntegrationError(
                 "route_lock",
                 f"route proof revision {proof_revision!r} does not match "
-                f"required revision {_REQUIRED_ROUTE_PROOF_REVISION!r}; "
+                f"policy required revision {route_policy.required_revision!r}; "
                 f"refusing out-of-date policy (HOLD)",
             )
 
-        # Check every approved route is within the pinned set
+        # Check every approved route is within the policy-approved set
         for r in route_proof.approved_routes:
-            if r not in _APPROVED_ROUTE_PIN:
+            if r not in route_policy.approved_routes:
                 raise RunIntegrationError(
                     "route_lock",
                     f"route proof declares route {r!r} which is not in the "
-                    f"pinned approved set; refusing unapproved route (HOLD)",
+                    f"policy-approved set; refusing unapproved route (HOLD)",
                 )
+
+        # Check the proof's approved gateway matches the policy gateway
+        if (
+            route_proof.approved_gateway_host != route_policy.approved_gateway_host
+            or route_proof.approved_gateway_port != route_policy.approved_gateway_port
+        ):
+            raise RunIntegrationError(
+                "route_lock",
+                f"route proof approved gateway "
+                f"{route_proof.approved_gateway_host}:{route_proof.approved_gateway_port} "
+                f"does not match policy gateway "
+                f"{route_policy.approved_gateway_host}:{route_policy.approved_gateway_port}; "
+                f"refusing mismatched gateway (HOLD)",
+            )
 
     def _sandbox_wrap_egress(
         self,
@@ -2554,8 +2604,12 @@ class RunApplicationService:
         # produce named HOLDs before any OS confinement check.  Only then
         # check egress gateway and OS confinement availability.
         if route_proof is not None:
+            from skillweave.routing.route_policy import resolve_route_policy
+            route_policy = resolve_route_policy()
             # Criterion 3: pin validation (host-independent, pure logic).
-            self._verify_route_proof_against_pin(route_proof)
+            self._verify_route_proof_against_pin(
+                route_proof, route_policy=route_policy
+            )
             if route is not None:
                 from skillweave.routing.faigate_adapter import verify_approved_route
                 try:
@@ -2571,7 +2625,9 @@ class RunApplicationService:
             # checks so that on a host without sandbox-exec the named HOLD
             # reasons above still discriminate wrong-version from
             # enforcement-unavailable.
-            self._enforce_route_proof_egress(route_proof)
+            self._enforce_route_proof_egress(
+                route_proof, route_policy=route_policy
+            )
 
         # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the detached
         # child is launched.  The async/restart path must be admitted through
@@ -3132,7 +3188,11 @@ class RunApplicationService:
         # SW-1510-ROUTE-LOCK (criterion 3): validate the resolved route proof
         # against the owner-controlled policy pin on restart too.
         if resolved_route_proof is not None:
-            self._verify_route_proof_against_pin(resolved_route_proof)
+            from skillweave.routing.route_policy import resolve_route_policy
+            route_policy = resolve_route_policy()
+            self._verify_route_proof_against_pin(
+                resolved_route_proof, route_policy=route_policy
+            )
         # Emit a route_decision event for the new attempt on restart with
         # a route proof, so resume/restart records the identity chain.
         #
@@ -3661,8 +3721,12 @@ class RunApplicationService:
         # produce named HOLDs before any OS confinement check.  Only then
         # check egress gateway and OS confinement availability.
         if route_proof is not None:
+            from skillweave.routing.route_policy import resolve_route_policy
+            route_policy = resolve_route_policy()
             # Criterion 3: pin validation (host-independent, pure logic).
-            self._verify_route_proof_against_pin(route_proof)
+            self._verify_route_proof_against_pin(
+                route_proof, route_policy=route_policy
+            )
             if model is not None:
                 from skillweave.routing.faigate_adapter import verify_approved_route
                 try:
@@ -3678,7 +3742,9 @@ class RunApplicationService:
             # checks so that on a host without sandbox-exec the named HOLD
             # reasons above still discriminate wrong-version from
             # enforcement-unavailable.
-            self._enforce_route_proof_egress(route_proof)
+            self._enforce_route_proof_egress(
+                route_proof, route_policy=route_policy
+            )
 
         # Stage 1: Run — walk the lane to ``verify`` under CAS, as ``execute`` does.
         self.store.create_run(run_id)

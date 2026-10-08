@@ -49,6 +49,7 @@ from skillweave.routing.faigate_adapter import (  # noqa: E402
     check_egress_gateway,
     check_retry_attribution,
     ModelNamespaceError,
+    EgressGatewayError,
     FAIGATE_MAP,
     OPENROUTER_MAP,
     ROUTER_PROFILES,
@@ -57,6 +58,13 @@ from skillweave.routing.faigate_adapter import (  # noqa: E402
 from skillweave.routing.route_proof import (  # noqa: E402
     RouteProof,
     RouteProofError,
+)
+
+from skillweave.routing.route_policy import (  # noqa: E402
+    RoutePolicy,
+    RoutePolicyError,
+    resolve_route_policy,
+    _ENV_ROUTE_POLICY,
 )
 
 from skillweave.runtime.reservation import (  # noqa: E402
@@ -86,6 +94,64 @@ from skillweave.dispatch.model_policy import (  # noqa: E402
     AttemptAttribution,
     check_attempt_route,
 )
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _clean_env() -> dict:
+    """A subprocess environment with ``PYTHONPATH`` removed."""
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    return env
+
+
+def _venv_site(venv_dir: Path) -> Path:
+    matches = sorted(venv_dir.glob("lib/python*/site-packages"))
+    assert matches, f"no venv site-packages under {venv_dir}"
+    return matches[0]
+
+
+def _build_wheel(work: Path) -> Path:
+    """Copy source to *work* and build a wheel offline."""
+    import subprocess as _subprocess
+    import sys as _sys
+    (work / "src").parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(REPO_ROOT / "src", work / "src")
+    shutil.copy2(REPO_ROOT / "pyproject.toml", work / "pyproject.toml")
+    shutil.copy2(REPO_ROOT / "README.md", work / "README.md")
+    shutil.copy2(REPO_ROOT / "LICENSE", work / "LICENSE")
+    _subprocess.run(
+        [_sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-index",
+         "--no-build-isolation", "-w", str(work / "dist"), str(work)],
+        cwd=str(work), capture_output=True, text=True, env=_clean_env(),
+    ).check_returncode()
+    wheels = sorted((work / "dist").glob("skillweave-*.whl"))
+    assert wheels, f"no wheel built in {work / 'dist'}"
+    return wheels[-1]
+
+
+def _install_into_fresh_venv(work: Path, wheel: Path) -> Path:
+    """Install *wheel* into a fresh venv under *work*."""
+    import subprocess as _subprocess
+    import sys as _sys
+    venv_dir = work / "venv"
+    env = _clean_env()
+    _subprocess.run([_sys.executable, "-m", "venv", str(venv_dir)], check=True,
+                   capture_output=True, text=True, env=env)
+    site = _venv_site(venv_dir)
+    _subprocess.run(
+        [str(venv_dir / "bin" / "pip"), "install", "--no-deps", "--no-index",
+         str(wheel)],
+        check=True, capture_output=True, text=True, env=env,
+    )
+    # The offline install cannot fetch PyYAML (a declared runtime dependency).
+    import yaml  # noqa: PLC0415 - intentional late import
+    ambient_yaml = Path(yaml.__file__).resolve().parent
+    shutil.copytree(ambient_yaml, site / "yaml")
+    extra = ambient_yaml.parent / "_yaml"
+    if extra.exists():
+        shutil.copytree(extra, site / "_yaml")
+    return venv_dir
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -338,37 +404,37 @@ class TestEgressGateway:
 
     def test_alternative_loopback_port_is_refused(self):
         """A Faigate-like router on a different port is refused."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("http://127.0.0.1:9090/v1")
         assert "port" in str(exc.value).lower()
 
     def test_different_host_is_refused(self):
         """A different loopback host is refused."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("http://127.0.0.2:8090/v1")
         assert "host" in str(exc.value).lower()
 
     def test_localhost_by_name_is_refused(self):
         """'localhost' by name is refused (only 127.0.0.1 is approved)."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("http://localhost:8090/v1")
         assert "host" in str(exc.value).lower()
 
     def test_direct_upstream_is_refused(self):
         """A direct upstream URL (e.g. api.openai.com) is refused."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("https://api.openai.com/v1")
         assert "scheme" in str(exc.value).lower()
 
     def test_different_loopback_router_is_refused(self):
         """OmniRoute on localhost:20128 is refused."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("http://localhost:20128/v1")
         assert "host" in str(exc.value).lower()
 
     def test_empty_url_is_refused(self):
         """An empty or malformed URL is refused."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("")
         assert "empty" in str(exc.value).lower()
 
@@ -382,13 +448,13 @@ class TestEgressGateway:
         # The check_egress_gateway function is called with the URL that
         # a Bash call would resolve to; if it raises, the call is blocked
         # before any network activity.
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("http://alternative-router.local/v1")
         assert "host" in str(exc.value).lower()
 
     def test_https_to_gateway_port_is_refused(self):
         """HTTPS to the gateway address is refused (only HTTP is approved)."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("https://127.0.0.1:8090/v1")
         assert "scheme" in str(exc.value).lower()
 
@@ -401,7 +467,7 @@ class TestEgressGateway:
         """
         # The check is called at decision time, not after the call.
         # If it raises, the run is HOLD before any provider is contacted.
-        with pytest.raises(ModelNamespaceError):
+        with pytest.raises(EgressGatewayError):
             check_egress_gateway("http://192.168.1.100:8090/v1")
 
     # --- Adversarial URL parsing tests (controller finding 2 on f36a3ea) ---
@@ -415,50 +481,50 @@ class TestEgressGateway:
         ``127.0.0.1`` so the check fails on the port (``8090.evil.com``),
         not the hostname.
         """
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("http://127.0.0.1:8090.evil.com/v1")
         msg = str(exc.value).lower()
         assert "port" in msg
 
     def test_userinfo_is_refused(self):
         """A URL with userinfo (http://user:pass@127.0.0.1:8090) is refused."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("http://user:pass@127.0.0.1:8090/v1")
         assert "userinfo" in str(exc.value).lower() or "credential" in str(exc.value).lower()
 
     def test_trailing_dot_host_is_refused(self):
         """A trailing-dot host (127.0.0.1.:8090) is refused."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("http://127.0.0.1.:8090/v1")
         assert "host" in str(exc.value).lower()
 
     def test_ipv6_loopback_is_refused(self):
         """IPv6 ::1 as host is refused (only 127.0.0.1 is approved)."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("http://[::1]:8090/v1")
         assert "host" in str(exc.value).lower()
 
     def test_ipv4_alias_192_168_is_refused(self):
         """A private IPv4 address as host is refused."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("http://192.168.1.1:8090/v1")
         assert "host" in str(exc.value).lower()
 
     def test_http_scheme_is_required(self):
         """Only http scheme is allowed; https/ftp are refused."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("ftp://127.0.0.1:8090/v1")
         assert "scheme" in str(exc.value).lower()
 
     def test_empty_url_is_refused_with_exact_parse(self):
         """Empty URL is refused before URL parsing."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("")
         assert "empty" in str(exc.value).lower()
 
     def test_userinfo_no_password_is_refused(self):
         """A URL with only a username (http://user@127.0.0.1:8090) is refused."""
-        with pytest.raises(ModelNamespaceError) as exc:
+        with pytest.raises(EgressGatewayError) as exc:
             check_egress_gateway("http://user@127.0.0.1:8090/v1")
         assert "userinfo" in str(exc.value).lower() or "credential" in str(exc.value).lower()
 
@@ -790,6 +856,15 @@ class TestRouteLockIntegrity:
 _ROUTE_PROOF_FIXTURE = (
     Path(__file__).resolve().parent.parent / "fixtures" / "route-proof-byteplus-v1.json"
 )
+_ROUTE_POLICY_FIXTURE = (
+    Path(__file__).resolve().parent.parent / "fixtures" / "route-policy-byteplus-v1.json"
+)
+_ROUTE_PROOF_WRONG_REVISION = (
+    Path(__file__).resolve().parent.parent / "fixtures" / "route-proof-wrong-revision.json"
+)
+_ROUTE_PROOF_FOREIGN_GATEWAY = (
+    Path(__file__).resolve().parent.parent / "fixtures" / "route-proof-foreign-gateway.json"
+)
 
 
 class TestRouteProofDocument:
@@ -855,6 +930,290 @@ class TestRouteProofDocument:
         assert restored.tier_routes == proof.tier_routes
         assert restored.approved_gateway_host == proof.approved_gateway_host
         assert restored.approved_gateway_port == proof.approved_gateway_port
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RoutePolicy document: owner-controlled policy pin loading and validation.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestRoutePolicyDocument:
+    """Route-policy document loading, validation, and round-trip (controller finding d)."""
+
+    def test_load_route_policy_fixture(self):
+        """The fixture route-policy document loads without error."""
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        assert policy.schema_version == "route-policy-v1"
+        assert policy.required_revision == "1.3.11"
+        assert "byteplus/deepseek-v4-flash" in policy.approved_routes
+        assert "byteplus/deepseek-v4.1-flash" in policy.approved_routes
+        assert "byteplus/deepseek-v4-pro" in policy.approved_routes
+        assert "byteplus/deepseek-v4.1-pro" in policy.approved_routes
+        assert policy.approved_gateway_host == "127.0.0.1"
+        assert policy.approved_gateway_port == 8090
+
+    def test_route_policy_from_dict_validates_schema(self):
+        """from_dict refuses a non-route-policy-v1 schema."""
+        with pytest.raises(RoutePolicyError) as exc:
+            RoutePolicy.from_dict({"schema": "route-proof-v1", "required_revision": "1.0"})
+        assert "unsupported schema" in str(exc.value)
+
+    def test_route_policy_empty_approved_routes_refused(self):
+        """from_dict refuses an empty approved_routes list."""
+        data = {
+            "schema": "route-policy-v1",
+            "required_revision": "1.3.11",
+            "approved_gateway": {"host": "127.0.0.1", "port": 8090},
+            "approved_routes": [],
+        }
+        with pytest.raises(RoutePolicyError) as exc:
+            RoutePolicy.from_dict(data)
+        assert "must not be empty" in str(exc.value)
+
+    def test_route_policy_bare_model_route_refused(self):
+        """A route without a provider/ prefix is refused as direct bypass."""
+        data = {
+            "schema": "route-policy-v1",
+            "required_revision": "1.3.11",
+            "approved_gateway": {"host": "127.0.0.1", "port": 8090},
+            "approved_routes": ["deepseek-v4-flash"],
+        }
+        with pytest.raises(RoutePolicyError) as exc:
+            RoutePolicy.from_dict(data)
+        assert "provider prefix" in str(exc.value) or "bypass" in str(exc.value)
+
+    def test_route_policy_missing_required_revision_refused(self):
+        """from_dict refuses a missing required_revision."""
+        data = {
+            "schema": "route-policy-v1",
+            "approved_gateway": {"host": "127.0.0.1", "port": 8090},
+            "approved_routes": ["byteplus/deepseek-v4-flash"],
+        }
+        with pytest.raises(RoutePolicyError) as exc:
+            RoutePolicy.from_dict(data)
+        assert "required_revision" in str(exc.value)
+
+    def test_route_policy_invalid_gateway_port_refused(self):
+        """from_dict refuses an out-of-range port."""
+        data = {
+            "schema": "route-policy-v1",
+            "required_revision": "1.3.11",
+            "approved_gateway": {"host": "127.0.0.1", "port": 99999},
+            "approved_routes": ["byteplus/deepseek-v4-flash"],
+        }
+        with pytest.raises(RoutePolicyError) as exc:
+            RoutePolicy.from_dict(data)
+        assert "port" in str(exc.value)
+
+    def test_route_policy_to_dict_round_trip(self):
+        """RoutePolicy serializes and deserializes faithfully."""
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        data = policy.to_dict()
+        restored = RoutePolicy.from_dict(data)
+        assert restored.approved_routes == policy.approved_routes
+        assert restored.required_revision == policy.required_revision
+        assert restored.approved_gateway_host == policy.approved_gateway_host
+        assert restored.approved_gateway_port == policy.approved_gateway_port
+
+    def test_route_policy_resolve_none_when_not_configured(self):
+        """resolve_route_policy returns None when no env var or path."""
+        old = os.environ.pop(_ENV_ROUTE_POLICY, None)
+        try:
+            result = resolve_route_policy()
+            assert result is None
+        finally:
+            if old is not None:
+                os.environ[_ENV_ROUTE_POLICY] = old
+
+    def test_route_policy_resolve_from_env(self):
+        """resolve_route_policy resolves from SKILLWEAVE_ROUTE_POLICY env var."""
+        old = os.environ.pop(_ENV_ROUTE_POLICY, None)
+        try:
+            os.environ[_ENV_ROUTE_POLICY] = str(_ROUTE_POLICY_FIXTURE)
+            policy = resolve_route_policy()
+            assert policy is not None
+            assert policy.required_revision == "1.3.11"
+        finally:
+            if old is not None:
+                os.environ[_ENV_ROUTE_POLICY] = old
+            else:
+                os.environ.pop(_ENV_ROUTE_POLICY, None)
+
+    def test_route_policy_check_route_allowed_passes(self):
+        """check_route_allowed does not raise for a policy-approved route."""
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        policy.check_route_allowed("byteplus/deepseek-v4-flash")
+        policy.check_route_allowed("byteplus/deepseek-v4-pro")
+
+    def test_route_policy_check_route_allowed_refuses_unapproved(self):
+        """check_route_allowed raises for a route not in the policy."""
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        with pytest.raises(RoutePolicyError) as exc:
+            policy.check_route_allowed("byteplus/deepseek-v3")
+        assert "not in the policy-approved set" in str(exc.value)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Route-proof vs policy pin verification (controller finding d).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestRouteProofAgainstPolicy:
+    """Route-proof verification against the owner-controlled policy pin."""
+
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        p = tmp_path / "test_pin_verify.db"
+        yield str(p)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @pytest.fixture
+    def scratch(self, tmp_path):
+        a = tmp_path / "artifacts"
+        a.mkdir()
+        return str(a)
+
+    @pytest.fixture
+    def svc(self, db_path, scratch):
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationStore
+        store = SQLiteRunStore(db_path)
+        journal = EventJournal(db_path)
+        raw = RawArtifactStore(scratch)
+        stream = DurableStreamStore(root=scratch)
+        rs = ReservationStore(db_path)
+        return RunApplicationService(store, journal, raw, stream, reservation_store=rs)
+
+    def test_policy_absent_hold(self, svc, db_path, scratch):
+        """A route proof without a policy results in HOLD (no route policy is configured).
+
+        The controller requires: policy-absent => RunIntegrationError("route_lock", ...)
+        with "no route policy is configured" in the message.
+        """
+        import sys as _sys
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        cmd = [_sys.executable, "-c", "print('should-not-run')"]
+        old = os.environ.pop(_ENV_ROUTE_POLICY, None)
+        try:
+            with pytest.raises(RunIntegrationError) as exc:
+                svc.execute_streaming_native(
+                    command=cmd,
+                    run_id="run-policy-absent",
+                    tool="bash",
+                    model="byteplus/deepseek-v4-flash",
+                    subject_repo="test-repo",
+                    subject_commit="a724d32a724d32a724d32a724d32a724d32a724d",
+                    task_id="task-policy-absent",
+                    attempt=1,
+                    route_proof=proof,
+                )
+            assert exc.value.stage == "route_lock"
+            assert "no route policy is configured" in str(exc.value).lower()
+        finally:
+            if old is not None:
+                os.environ[_ENV_ROUTE_POLICY] = old
+            else:
+                os.environ.pop(_ENV_ROUTE_POLICY, None)
+
+    def test_wrong_revision_hold(self, svc, db_path, scratch):
+        """A route proof with the wrong revision is held when a policy is configured."""
+        import sys as _sys
+        proof = RouteProof.load(str(_ROUTE_PROOF_WRONG_REVISION))
+        cmd = [_sys.executable, "-c", "print('should-not-run')"]
+        old = os.environ.pop(_ENV_ROUTE_POLICY, None)
+        try:
+            os.environ[_ENV_ROUTE_POLICY] = str(_ROUTE_POLICY_FIXTURE)
+            with pytest.raises(RunIntegrationError) as exc:
+                svc.execute_streaming_native(
+                    command=cmd,
+                    run_id="run-wrong-revision",
+                    tool="bash",
+                    model="byteplus/deepseek-v4-flash",
+                    subject_repo="test-repo",
+                    subject_commit="a724d32a724d32a724d32a724d32a724d32a724d",
+                    task_id="task-wrong-revision",
+                    attempt=1,
+                    route_proof=proof,
+                )
+            assert exc.value.stage == "route_lock"
+            assert "revision" in str(exc.value).lower()
+        finally:
+            if old is not None:
+                os.environ[_ENV_ROUTE_POLICY] = old
+            else:
+                os.environ.pop(_ENV_ROUTE_POLICY, None)
+
+    def test_foreign_gateway_hold(self, svc, db_path, scratch):
+        """A route proof with a foreign gateway is held when a policy is configured."""
+        import sys as _sys
+        proof = RouteProof.load(str(_ROUTE_PROOF_FOREIGN_GATEWAY))
+        cmd = [_sys.executable, "-c", "print('should-not-run')"]
+        old = os.environ.pop(_ENV_ROUTE_POLICY, None)
+        try:
+            os.environ[_ENV_ROUTE_POLICY] = str(_ROUTE_POLICY_FIXTURE)
+            with pytest.raises(RunIntegrationError) as exc:
+                svc.execute_streaming_native(
+                    command=cmd,
+                    run_id="run-foreign-gateway",
+                    tool="bash",
+                    model="byteplus/deepseek-v4-flash",
+                    subject_repo="test-repo",
+                    subject_commit="a724d32a724d32a724d32a724d32a724d32a724d",
+                    task_id="task-foreign-gateway",
+                    attempt=1,
+                    route_proof=proof,
+                )
+            assert exc.value.stage == "route_lock"
+            assert "gateway" in str(exc.value).lower()
+        finally:
+            if old is not None:
+                os.environ[_ENV_ROUTE_POLICY] = old
+            else:
+                os.environ.pop(_ENV_ROUTE_POLICY, None)
+
+    def test_matching_policy_and_proof_admitted(self, svc, db_path, scratch):
+        """A route proof matching the policy exactly is admitted (gate_state == pass).
+
+        On hosts without sandbox-exec, the run is held with
+        enforcement_unavailable instead (also a named route_lock HOLD).
+        """
+        import sys as _sys
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        cmd = [_sys.executable, "-c", "print('matching-policy-probe')"]
+        old = os.environ.pop(_ENV_ROUTE_POLICY, None)
+        try:
+            os.environ[_ENV_ROUTE_POLICY] = str(_ROUTE_POLICY_FIXTURE)
+            try:
+                result = svc.execute_streaming_native(
+                    command=cmd,
+                    run_id="run-matching-policy",
+                    tool="bash",
+                    model="byteplus/deepseek-v4-flash",
+                    subject_repo="test-repo",
+                    subject_commit="a724d32a724d32a724d32a724d32a724d32a724d",
+                    task_id="task-matching-policy",
+                    attempt=1,
+                    route_proof=proof,
+                )
+                # The run is admitted (sandbox-exec available)
+                assert result["run_id"] == "run-matching-policy"
+            except RunIntegrationError as exc:
+                # Without sandbox-exec the run is held (still a named
+                # route_lock HOLD, not an unpinned failure).
+                assert exc.stage == "route_lock"
+                msg = str(exc).lower()
+                assert "sandbox-exec" in msg or "os confinement" in msg
+        finally:
+            if old is not None:
+                os.environ[_ENV_ROUTE_POLICY] = old
+            else:
+                os.environ.pop(_ENV_ROUTE_POLICY, None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1374,11 +1733,11 @@ class TestChildEnvironmentConfinement:
 
     def test_egress_gateway_enforced_before_admission(self):
         """check_egress_gateway refuses non-approved URLs before any call."""
-        with pytest.raises(ModelNamespaceError):
+        with pytest.raises(EgressGatewayError):
             check_egress_gateway("http://127.0.0.1:9090")
-        with pytest.raises(ModelNamespaceError):
+        with pytest.raises(EgressGatewayError):
             check_egress_gateway("http://localhost:8090")
-        with pytest.raises(ModelNamespaceError):
+        with pytest.raises(EgressGatewayError):
             check_egress_gateway("https://api.openai.com/v1")
         # Approved gateway passes
         check_egress_gateway(APPROVED_GATEWAY_URL)
@@ -1815,18 +2174,160 @@ class TestConsoleEntrypointRouteLock:
         result = self._run_subprocess_script([
             "import sys",
             "sys.path.insert(0, 'src')",
-            "from skillweave.routing.faigate_adapter import check_egress_gateway, ModelNamespaceError",
+            "from skillweave.routing.faigate_adapter import check_egress_gateway, EgressGatewayError",
             "check_egress_gateway('http://127.0.0.1:8090/v1')",
             "print('GATEWAY_OK')",
             "try:",
             "    check_egress_gateway('http://localhost:8090/v1')",
             "    print('UNEXPECTED')",
-            "except ModelNamespaceError:",
+            "except EgressGatewayError:",
             "    print('GATEWAY_REFUSED')",
         ])
         assert result.returncode == 0, f"stderr: {result.stderr}"
         assert "GATEWAY_OK" in result.stdout
         assert "GATEWAY_REFUSED" in result.stdout
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Installed-wheel console script test (controller finding d).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestInstalledWheelRouteLock:
+    """The installed wheel's ``skillweave run`` console script enforces route lock.
+
+    Builds a wheel, installs into a fresh venv, and runs the console script
+    with a route-proof and policy configured, verifying the lock holds at the
+    outermost boundary.
+    """
+
+    def test_installed_wheel_route_lock_holds_at_console_script(self, tmp_path):
+        """skillweave run with route-proof and SKILLWEAVE_ROUTE_POLICY enforces lock."""
+        pytest.importorskip("yaml")
+        import subprocess as _subprocess
+        import sys as _sys
+
+        work = tmp_path / "build"
+        work.mkdir()
+
+        # Build wheel
+        _build_wheel(work)
+        wheels = sorted((work / "dist").glob("skillweave-*.whl"))
+        assert wheels, "no wheel built"
+        wheel = wheels[-1]
+
+        # Install into fresh venv
+        venv_dir = _install_into_fresh_venv(work, wheel)
+        script = venv_dir / "bin" / "skillweave"
+        assert script.exists(), f"console script not found at {script}"
+
+        db = tmp_path / "installed-route-lock.db"
+        art = tmp_path / "installed-route-lock-art"
+        art.mkdir(exist_ok=True)
+
+        proof_path = str(_ROUTE_PROOF_FIXTURE)
+        policy_path = str(_ROUTE_POLICY_FIXTURE)
+
+        env = _clean_env()
+        env["TMPDIR"] = str(tmp_path / "tmp")
+        (tmp_path / "tmp").mkdir(exist_ok=True)
+        env[_ENV_ROUTE_POLICY] = policy_path
+
+        proc = _subprocess.run(
+            [
+                str(script), "run",
+                "--tool", "opencode",
+                "--model", "byteplus/deepseek-v4-flash",
+                "--subject-repo", "skillweave",
+                "--subject-commit", "a724d32a724d32a724d32a724d32a724d32a724d",
+                "--methodology", "ralph",
+                "--task-id", "task-installed-route-lock",
+                "--attempt", "1",
+                "--db-path", str(db),
+                "--artifacts-path", str(art),
+                "--route-proof", proof_path,
+                "--",
+                _sys.executable, "-c", "print('installed-route-lock-probe')",
+            ],
+            cwd=str(tmp_path), env=env, capture_output=True, text=True,
+        )
+        # On a host without sandbox-exec the run is held (enforcement
+        # unavailable).  Verify the error is structured and names route_lock.
+        if proc.returncode != 0:
+            assert "route_lock" in proc.stderr or "route_lock" in proc.stdout, (
+                f"expected route_lock error, got rc={proc.returncode} "
+                f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+            )
+            # No traceback should appear
+            assert "Traceback" not in proc.stderr, (
+                f"no traceback expected, got stderr={proc.stderr!r}"
+            )
+        else:
+            payload = json.loads(proc.stdout)
+            assert payload["run_id"] is not None
+            # On sandbox-exec-capable hosts, the run passes
+            # the route lock pin checks and the gate passes
+
+    def test_installed_wheel_route_lock_refuses_no_policy(self, tmp_path):
+        """skillweave run with route-proof but no policy is held with route_lock error."""
+        pytest.importorskip("yaml")
+        import subprocess as _subprocess
+        import sys as _sys
+
+        work = tmp_path / "build"
+        work.mkdir()
+
+        _build_wheel(work)
+        wheels = sorted((work / "dist").glob("skillweave-*.whl"))
+        assert wheels, "no wheel built"
+        wheel = wheels[-1]
+
+        venv_dir = _install_into_fresh_venv(work, wheel)
+        script = venv_dir / "bin" / "skillweave"
+        assert script.exists()
+
+        db = tmp_path / "installed-no-policy.db"
+        art = tmp_path / "installed-no-policy-art"
+        art.mkdir(exist_ok=True)
+
+        proof_path = str(_ROUTE_PROOF_FIXTURE)
+
+        env = _clean_env()
+        env["TMPDIR"] = str(tmp_path / "tmp")
+        (tmp_path / "tmp").mkdir(exist_ok=True)
+        # Deliberately do NOT set SKILLWEAVE_ROUTE_POLICY
+
+        proc = _subprocess.run(
+            [
+                str(script), "run",
+                "--tool", "opencode",
+                "--model", "byteplus/deepseek-v4-flash",
+                "--subject-repo", "skillweave",
+                "--subject-commit", "a724d32a724d32a724d32a724d32a724d32a724d",
+                "--methodology", "ralph",
+                "--task-id", "task-installed-no-policy",
+                "--attempt", "1",
+                "--db-path", str(db),
+                "--artifacts-path", str(art),
+                "--route-proof", proof_path,
+                "--",
+                _sys.executable, "-c", "print('should-not-run')",
+            ],
+            cwd=str(tmp_path), env=env, capture_output=True, text=True,
+        )
+        assert proc.returncode != 0, (
+            f"expected non-zero exit when no policy is configured, "
+            f"got rc=0 stdout={proc.stdout!r}"
+        )
+        # The error must be a structured route_lock error, not a raw traceback
+        assert "route_lock" in (proc.stderr + proc.stdout), (
+            f"expected route_lock in error output, "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+        # No traceback should appear
+        assert "Traceback" not in proc.stderr, (
+            f"no traceback expected, got stderr={proc.stderr!r}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

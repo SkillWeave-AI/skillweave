@@ -50,6 +50,20 @@ class ModelNamespaceError(ValueError):
         self.reason = reason
 
 
+class EgressGatewayError(ValueError):
+    """An egress gateway check failed (criterion 2).
+
+    Raised when a URL does not route through the approved enforcing gateway.
+    This is distinct from a model namespace error: the check names the failing
+    check (``egress_gateway``) so a caller can produce a clear HOLD reason.
+    """
+
+    def __init__(self, url: str, reason: str):
+        super().__init__(f"egress_gateway check failed for {url!r}: {reason}")
+        self.url = url
+        self.reason = reason
+
+
 class UnavailableModelError(RuntimeError):
     """The provider confirmed it cannot serve the requested model id."""
 
@@ -802,7 +816,11 @@ class FaigateProvider(CouncilProvider):
         # alternative loopback routers and direct upstream URLs before any
         # network call — even when the env-var config points elsewhere.
         if enforce_egress:
-            check_egress_gateway(self.base_url)
+            check_egress_gateway(
+                self.base_url,
+                approved_host=os.environ.get("FAIGATE_HOST", FAIGATE_DEFAULT_HOST),
+                approved_port=int(os.environ.get("FAIGATE_PORT", FAIGATE_DEFAULT_PORT)),
+            )
         # If no explicit key, try reading from ~/.config/faigate/tokens.json
         if not self.api_key:
             token_file = os.path.expanduser("~/.config/faigate/tokens.json")
@@ -1713,56 +1731,66 @@ def verify_approved_route(resolved_model: str, provider: str = "faigate") -> Non
         )
 
 
-def check_egress_gateway(url: str) -> None:
+def check_egress_gateway(
+    url: str,
+    *,
+    approved_host: str = "127.0.0.1",
+    approved_port: int = 8090,
+) -> None:
     """Verify that ``url`` routes through the approved Faigate gateway.
 
     Criterion 2: worker and child egress is restricted to the approved
-    enforcing gateway at ``http://127.0.0.1:8090``.  Alternative loopback
-    routers (different ports, different hosts), suffix/subdomain attacks
+    enforcing gateway.  Alternative loopback routers (different ports,
+    different hosts), suffix/subdomain attacks
     (``127.0.0.1:8090.evil.com``), userinfo tricks, trailing-dot hosts,
     IPv6/IPv4 aliases that are not the approved host:port, and direct
     upstream URLs are detected and refused using exact URL parsing
     (scheme, hostname, port).  When enforcement is absent the check
     raises before any paid admission.
 
-    Raises ``ModelNamespaceError`` with a description of the disallowed
-    egress path.
+    ``approved_host`` and ``approved_port`` default to the fixture policy
+    values but are overridable from a loaded :class:`RoutePolicy` so no
+    provider literals live in generic Core source.
+
+    Raises ``EgressGatewayError`` with a description of the disallowed
+    egress path (not ``ModelNamespaceError``, so the error message names
+    ``egress_gateway`` instead of ``invalid model namespace``).
     """
     from urllib.parse import urlparse
 
     if not url:
-        raise ModelNamespaceError(
+        raise EgressGatewayError(
             url,
             f"egress URL is empty; approved gateway is "
-            f"{APPROVED_GATEWAY_URL}",
+            f"http://{approved_host}:{approved_port}",
         )
 
     parsed = urlparse(url)
 
     # Reject non-HTTP schemes (e.g. https, ftp, file)
     if parsed.scheme != "http":
-        raise ModelNamespaceError(
+        raise EgressGatewayError(
             url,
-            f"egress URL {url!r} uses scheme {parsed.scheme!r}; "
+            f"egress URL uses scheme {parsed.scheme!r}; "
             f"only http is allowed through the approved gateway "
-            f"at {APPROVED_GATEWAY_URL}",
+            f"at http://{approved_host}:{approved_port}",
         )
 
     # Reject userinfo (e.g. http://user:pass@127.0.0.1:8090)
     if parsed.username is not None or parsed.password is not None:
-        raise ModelNamespaceError(
+        raise EgressGatewayError(
             url,
-            f"egress URL {url!r} contains userinfo; "
-            f"approved gateway {APPROVED_GATEWAY_URL} "
+            f"egress URL contains userinfo; "
+            f"approved gateway http://{approved_host}:{approved_port} "
             f"must not have credentials",
         )
 
     # Exact hostname and port comparison
-    if parsed.hostname != APPROVED_GATEWAY_HOST:
-        raise ModelNamespaceError(
+    if parsed.hostname != approved_host:
+        raise EgressGatewayError(
             url,
-            f"egress URL {url!r} resolves to host {parsed.hostname!r}; "
-            f"only {APPROVED_GATEWAY_HOST!r} is the approved gateway host; "
+            f"egress URL resolves to host {parsed.hostname!r}; "
+            f"only {approved_host!r} is the approved gateway host; "
             "alternative loopback routers and direct upstream URLs are "
             "not allowed",
         )
@@ -1774,11 +1802,11 @@ def check_egress_gateway(url: str) -> None:
         actual_port = parsed.port
     except ValueError:
         actual_port = None
-    if actual_port is None or actual_port != APPROVED_GATEWAY_PORT:
-        raise ModelNamespaceError(
+    if actual_port is None or actual_port != approved_port:
+        raise EgressGatewayError(
             url,
-            f"egress URL {url!r} uses port {actual_port!r}; "
-            f"only port {APPROVED_GATEWAY_PORT} is the approved "
+            f"egress URL uses port {actual_port!r}; "
+            f"only port {approved_port} is the approved "
             f"gateway port; alternative loopback routers on different "
             f"ports are not allowed",
         )

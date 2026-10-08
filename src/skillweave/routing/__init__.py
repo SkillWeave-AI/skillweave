@@ -41,11 +41,23 @@ from .route_proof import (  # noqa: F401
     RouteProofError,
 )
 
+# The owner-controlled route policy document (SW-1510-ROUTE-LOCK criterion 3):
+# the policy is the owner pin that every observed route proof must be a subset
+# of.  No provider literals, no port constant and no revision literal live in
+# generic Core source.
+from .route_policy import (  # noqa: F401
+    RoutePolicy,
+    RoutePolicyError,
+    resolve_route_policy,
+    _ENV_ROUTE_POLICY,
+)
+
 from .faigate_adapter import (  # noqa: F401
     CouncilProvider,
     FaigateProvider,
     ModelInfo,
     ModelResolution,
+    EgressGatewayError,
     ROUTER_PROFILES,
     detect_providers,
     get_best_provider,
@@ -167,6 +179,11 @@ __all__ = [
     "ResolutionRecord",
     "RouteProof",
     "RouteProofError",
+    "EgressGatewayError",
+    "RoutePolicy",
+    "RoutePolicyError",
+    "resolve_route_policy",
+    "_ENV_ROUTE_POLICY",
     "HarnessSource",
     "HarnessError",
     "HarnessDetermination",
