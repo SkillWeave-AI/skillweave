@@ -45,6 +45,18 @@ from skillweave.adapters import (
     build_search_registry,
 )
 
+from .launcher import (
+    LauncherResolutionError,
+    UvxFallback,
+    mcp_argument_from_resolution,
+    resolve_launcher,
+)
+from .perplexity import (
+    COUNCIL_MCP_ADAPTER_ID,
+    PerplexityMcpBackend,
+    council_mcp_descriptor,
+)
+
 
 @dataclass
 class SearchResult:
@@ -65,9 +77,17 @@ class SearchConfig:
     hybrid_search: bool = True
     api_key: str | None = None
     #: Explicit MCP stdio launch command for the Perplexity MCP binding. When
-    #: unset, the Perplexity MCP transport is not attempted (never a floating
-    #: install).
+    #: unset, the MCP launcher resolver still tries a registered compatible
+    #: runtime and then a verified installed binary (never a floating install).
     mcp_command: list[str] | None = None
+    #: Pin the launcher resolver to a specific registered runtime id.
+    launcher_registration_id: str | None = None
+    #: An explicit, pinned uvx fallback (exact distribution/version + network).
+    uvx_fallback: "UvxFallback | None" = None
+    #: Whether the resolver must verify an installed binary (off in unit use).
+    verify_launcher_installed: bool = True
+    #: Attribution for an explicit ``mcp_command`` (a free-form provenance map).
+    launcher_provenance: dict | None = None
     #: Environment variable names forwarded to the owned MCP child.
     mcp_env_allowlist: tuple[str, ...] = ()
 
@@ -86,8 +106,32 @@ for _key, _spec in SEARCH_PROVIDER_SPECS.items():
 
 
 def search_registry() -> AdapterRegistry:
-    """Build the shared search registry (all providers, one extension point)."""
-    return build_search_registry()
+    """Build the shared search registry (all providers, one extension point).
+
+    The one Council-owned difference from the bare substrate is the Perplexity
+    ``mcp-stdio`` binding: Council replaces its backend with its own
+    (``PerplexityMcpBackend``), which performs the lifecycle handshake, records
+    the negotiated version/capabilities, normalizes every supported Perplexity
+    result shape, and turns malformed/``isError``/missing-tool/JSON-RPC-error
+    payloads into typed non-success outcomes. The adapter *id* and descriptor
+    *axes* are unchanged, so provider resolution, the Discovery provider map and
+    the facade are unaffected.
+    """
+    registry = build_search_registry()
+    from skillweave.adapters import AdapterRegistry as _Registry  # local: type only
+
+    # Rebuild the mcp binding only: a fresh registry, same descriptors, with the
+    # Perplexity MCP backend swapped for Council's. Everything else is the
+    # substrate's own backend, untouched.
+    council = _Registry()
+    for entry in registry.entries():
+        if entry.descriptor.id == COUNCIL_MCP_ADAPTER_ID:
+            continue
+        council.register(entry.descriptor, entry.backend, source=entry.source)
+    council.register(
+        council_mcp_descriptor(), PerplexityMcpBackend(), source="council:perplexity_mcp"
+    )
+    return council
 
 
 class WebSearch:
@@ -214,6 +258,29 @@ class WebSearch:
         if spec is not None and spec.transport == "mcp-stdio":
             argument["command"] = config.mcp_command
             argument["env_allowlist"] = config.mcp_env_allowlist
+            # Resolve the exact launcher (criterion 2). When the caller named an
+            # explicit command it wins and no discovery happens; otherwise a
+            # registered runtime / verified installed binary is resolved. A
+            # failure here yields *no* adapter-owned launcher, so the backend
+            # reports a typed ``no_binding`` rather than launching anything.
+            try:
+                resolution = resolve_launcher(
+                    explicit_command=config.mcp_command,
+                    explicit_provenance=config.launcher_provenance,
+                    registration_id=config.launcher_registration_id,
+                    uvx_fallback=config.uvx_fallback,
+                    verify_installed=config.verify_launcher_installed,
+                )
+            except LauncherResolutionError as exc:
+                argument["launcher_provenance"] = {
+                    "kind": "unresolved",
+                    "source": "launcher_resolver",
+                    "detail": str(exc),
+                    "asset": getattr(exc, "asset", None),
+                }
+                argument["launcher_resolution_error"] = getattr(exc, "asset", None) or "launcher"
+                return argument
+            argument = mcp_argument_from_resolution(resolution, argument)
         return argument
 
     # ── Helpers ───────────────────────────────────────────────────────
