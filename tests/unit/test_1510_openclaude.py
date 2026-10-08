@@ -23,6 +23,7 @@ launch here is either an injected counter or a local ``sys.executable``.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -39,7 +40,9 @@ from skillweave.routing.harness_adapter import (  # noqa: E402
     HEADLESS_EVENT_INPUT_REQUIRED,
     HEADLESS_EVENT_PERMISSION_DENIED,
     HEADLESS_EVENT_RAW,
+    HEADLESS_EVENT_RESULT_ERROR,
     HEADLESS_EVENT_WORKER_EXIT,
+    OBSERVER_OWNED_FILENAMES,
     PERMISSION_MODE_DEFAULT,
     PERMISSION_MODE_DONT_ASK,
     AdapterRequest,
@@ -846,3 +849,215 @@ def test_execute_drives_a_real_clean_child_and_types_its_stream():
     seen = probe_outcome.result.stream.events[0].data["payload"]
     assert set(seen) == set(AMBIENT_PROVIDER_ENV_KEYS)
     assert not any(seen.values())
+
+
+# ══ Round 2 · AC2: a failed result is a typed failed terminal, not a success ══
+#
+# The controller probe: OpenClaude can emit a ``result`` event that reports an
+# error (a failure subtype, an ``is_error`` flag, a non-zero embedded exit code)
+# and *still exit 0*. Each of these must be a typed ``result_error`` terminal and
+# must fall closed through the real execute path, regardless of the exit code.
+# A benign result (subtype success / ``is_error`` false / code 0) must still
+# succeed, and a message that merely *mentions* the markers stays untyped.
+
+_FAILED_RESULT_LINES = [
+    json.dumps({"type": "result", "subtype": "success", "is_error": True,
+                "result": "API Error: 429"}),
+    json.dumps({"type": "result", "subtype": "error_max_turns"}),
+    json.dumps({"type": "result", "subtype": "error_during_execution",
+                "is_error": True}),
+    json.dumps({"type": "result", "subtype": "exit", "code": 3}),
+    json.dumps({"type": "result", "code": 1}),
+    json.dumps({"type": "result", "error": "provider refused"}),
+]
+
+
+@pytest.mark.parametrize("line", _FAILED_RESULT_LINES)
+def test_failed_result_is_typed_as_result_error(line):
+    event = classify_headless_event(json.loads(line))
+    assert event["kind"] == HEADLESS_EVENT_RESULT_ERROR
+    # It is never mistaken for a clean worker exit.
+    assert event["kind"] != HEADLESS_EVENT_WORKER_EXIT
+
+
+@pytest.mark.parametrize("line", _FAILED_RESULT_LINES)
+def test_failed_result_is_a_failed_terminal_not_a_worker_exit(line):
+    from skillweave.trace.contracts import JobStatus
+
+    status = headless_terminal_status(parse_headless_events([line]))
+    assert status["terminal"] == HEADLESS_EVENT_RESULT_ERROR
+    # The typed lifecycle reads as failed / not succeeded.
+    lifecycle = status["lifecycle"]
+    assert lifecycle.job_status is JobStatus.NOT_STARTED
+
+
+@pytest.mark.parametrize("line", _FAILED_RESULT_LINES)
+def test_failed_result_falls_closed_through_execute(line):
+    # The launcher's process exits 0 (the real child runs the emitting script to
+    # completion), yet the reported failure must not be a success.
+    adapter, plan = _headless_plan("openclaude")
+    launch, lines = _streaming_launch(adapter, stream=[line])
+    outcome = adapter.execute(
+        plan, launch=launch, stream_output=lines, run_id="oc-1510-failed"
+    )
+    result = outcome.result
+    assert result.failed is True
+    assert result.blocked is False
+    assert outcome.succeeded is False
+    assert result.termination == HEADLESS_EVENT_RESULT_ERROR
+    assert result.exit_code == 0  # the process exited 0 - and still failed closed
+
+
+def test_a_benign_result_still_succeeds_through_execute():
+    adapter, plan = _headless_plan("openclaude")
+    benign = json.dumps(
+        {"type": "result", "subtype": "success", "is_error": False, "code": 0}
+    )
+    launch, lines = _streaming_launch(adapter, stream=[benign])
+    outcome = adapter.execute(
+        plan, launch=launch, stream_output=lines, run_id="oc-1510-benign"
+    )
+    assert outcome.result.failed is False
+    assert outcome.result.stream.terminal["terminal"] == HEADLESS_EVENT_WORKER_EXIT
+    assert outcome.succeeded is True
+
+
+def test_prose_that_merely_mentions_an_error_is_not_a_failed_terminal():
+    # A message body is not a structured failure field: the words are data.
+    line = json.dumps(
+        {"type": "result", "subtype": "success",
+         "result": "no error occurred; the run completed"}
+    )
+    event = classify_headless_event(json.loads(line))
+    assert event["kind"] == HEADLESS_EVENT_WORKER_EXIT
+    assert event["kind"] != HEADLESS_EVENT_RESULT_ERROR
+
+
+def test_input_required_still_maps_to_blocked_input_with_result_error_present():
+    # A failed result and an input request in one stream: the failure is the
+    # strongest terminal, and a blocked child is still never a success.
+    from skillweave.trace.contracts import JobStatus
+
+    status = headless_terminal_status(
+        [{"kind": HEADLESS_EVENT_INPUT_REQUIRED},
+         {"kind": HEADLESS_EVENT_RESULT_ERROR}]
+    )
+    assert status["terminal"] == HEADLESS_EVENT_RESULT_ERROR
+    blocked = headless_terminal_status([{"kind": HEADLESS_EVENT_INPUT_REQUIRED}])
+    assert blocked["lifecycle"].job_status is JobStatus.BLOCKED_INPUT
+
+
+# ══ Round 2 · AC3: the observer guard is filesystem identity, not spelling ════
+
+_CASE_VARIANT_NAMES = [
+    "META.JSON",
+    "Frames.Jsonl",
+    "CURSOR.json",
+    "Observer.JSON",
+    "FACTS.JSONL",
+]
+
+
+@pytest.mark.parametrize("name", _CASE_VARIANT_NAMES)
+def test_execute_refuses_a_case_variant_of_an_observer_owned_name(name, tmp_path):
+    # On a case-insensitive volume a case variant is the *same file*: it must be
+    # refused before any byte is written and before launch.
+    adapter, plan = _headless_plan("openclaude")
+    counter = _Counter()
+    target = tmp_path / name
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(
+            plan, launch=counter, scratch_target=str(target), scratch_data=b"forged"
+        )
+    assert counter.calls == []
+    assert exc.value.asset == "observer_state"
+    assert not target.exists()
+
+
+def test_execute_refuses_a_hard_link_to_an_observer_owned_file(tmp_path):
+    # A hard link shares the inode: its name and path are neutral, only its
+    # filesystem identity betrays it. The adapter's *own* configured root is
+    # used, so the guard is tied to a live store, not to a per-call argument.
+    root = tmp_path / "observer-store"
+    root.mkdir()
+    owned = root / "meta.json"
+    owned.write_text("real evidence")
+    link = tmp_path / "innocent-name.bin"
+    os.link(owned, link)
+    assert os.stat(link).st_nlink == 2
+    assert os.stat(link).st_ino == os.stat(owned).st_ino
+
+    adapter = OpenClaudeAdapter(executable="openclaude", observer_roots=[str(root)])
+    assert adapter.observer_roots == (str(root),)
+    plan = adapter.plan(
+        AdapterRequest(
+            run_id="oc-1510",
+            role="ops",
+            requirement=CapabilityRequirement(complexity=0),
+            work=b"do the thing",
+        )
+    )
+    counter = _Counter()
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(plan, launch=counter, scratch_target=str(link), scratch_data=b"x")
+    assert counter.calls == []
+    assert exc.value.asset == "observer_state"
+    assert owned.read_text() == "real evidence", "the observer-owned file was not touched"
+
+
+def test_adapter_configured_observer_root_guards_without_a_per_call_argument(tmp_path):
+    # The structural root: execute takes no observer_roots, only the adapter's
+    # own configuration carries the store root.
+    root = tmp_path / "observer-store"
+    root.mkdir()
+    adapter = OpenClaudeAdapter(executable="openclaude", observer_roots=[str(root)])
+    plan = adapter.plan(
+        AdapterRequest(
+            run_id="oc-1510",
+            role="ops",
+            requirement=CapabilityRequirement(complexity=0),
+            work=b"do the thing",
+        )
+    )
+    counter = _Counter()
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(
+            plan, launch=counter, scratch_target=str(root / "scratch.txt"), scratch_data=b"x"
+        )
+    assert counter.calls == []
+    assert exc.value.asset == "observer_state"
+
+
+def test_unresolvable_destination_fails_closed():
+    # A destination that cannot be resolved is refused rather than written.
+    with pytest.raises(HarnessAdapterError) as exc:
+        assert_not_observer_owned("bad\x00name")
+    assert exc.value.asset == "observer_state"
+
+
+def test_an_ordinary_scratch_target_under_a_configured_root_elsewhere(tmp_path):
+    # A configured observer root does not make unrelated writes fail.
+    root = tmp_path / "observer-store"
+    root.mkdir()
+    adapter = OpenClaudeAdapter(executable="openclaude", observer_roots=[str(root)])
+    plan = adapter.plan(
+        AdapterRequest(
+            run_id="oc-1510",
+            role="ops",
+            requirement=CapabilityRequirement(complexity=0),
+            work=b"do the thing",
+        )
+    )
+    target = tmp_path / "worktree" / "notes.txt"
+    target.parent.mkdir()
+    outcome = adapter.execute(plan, launch=_Counter(), scratch_target=str(target),
+                              scratch_data=b"ok")
+    assert target.read_bytes() == b"ok"
+    assert outcome.succeeded is True
+
+
+def test_observer_owned_filenames_vocabulary_is_unchanged():
+    # The literal original criterion names the observer-owned files.
+    assert set(OBSERVER_OWNED_FILENAMES) == {
+        "frames.jsonl", "facts.jsonl", "cursor.json", "observer.json", "meta.json",
+    }

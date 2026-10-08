@@ -1640,6 +1640,10 @@ HEADLESS_EVENT_INPUT_REQUIRED = "input_required"
 HEADLESS_EVENT_WORKER_EXIT = "worker_exit"
 HEADLESS_EVENT_RAW = "raw"
 HEADLESS_EVENT_OTHER = "event"
+#: A ``result`` event that reports a failure (a failure subtype or an error
+#: flag). Typed separately from ``worker_exit`` so a failed run cannot be read
+#: as a successful exit — OpenClaude may exit 0 while ``is_error`` is true.
+HEADLESS_EVENT_RESULT_ERROR = "result_error"
 
 _PERMISSION_DENIED_MARKERS = (
     "permission_denied",
@@ -1655,6 +1659,17 @@ _INPUT_REQUIRED_MARKERS = (
     "needs_input",
 )
 _WORKER_EXIT_MARKERS = ("result", "exit", "done", "complete")
+
+#: A ``result`` event whose *subtype* names a failure is a typed failed terminal,
+#: not a worker exit-and-succeed. OpenClaude can emit one of these and still exit
+#: 0, so a failure result must never be reported as success regardless of the
+#: process exit code.
+_RESULT_ERROR_SUBTYPE_MARKERS = ("error", "fail")
+#: A ``result`` event that reports an error via a flag rather than a subtype.
+_RESULT_ERROR_FLAG_KEYS = ("is_error", "error")
+#: A ``result`` event that reports a non-zero exit code carries its failure in
+#: the code itself, regardless of the subtype spelling.
+_RESULT_EXIT_CODE_KEYS = ("code", "exit_code")
 
 #: The default cap on prompt bytes handed to a headless child on stdin. An
 #: oversized prompt is refused before launch rather than truncated: a silently
@@ -1739,10 +1754,44 @@ def classify_headless_event(payload: Any) -> dict[str, Any]:
     elif _matches(joined, _INPUT_REQUIRED_MARKERS):
         kind = HEADLESS_EVENT_INPUT_REQUIRED
     elif _matches(joined, _WORKER_EXIT_MARKERS):
-        kind = HEADLESS_EVENT_WORKER_EXIT
+        # A ``result`` event is a worker exit — but one that *reports a failure*
+        # (a failure subtype or an error flag) is a typed failed terminal, not a
+        # clean exit. The child may have exited 0 while reporting the error.
+        kind = (
+            HEADLESS_EVENT_RESULT_ERROR
+            if _result_event_reports_failure(payload, joined)
+            else HEADLESS_EVENT_WORKER_EXIT
+        )
     else:
         kind = HEADLESS_EVENT_OTHER
     return {"kind": kind, "payload": dict(payload)}
+
+
+def _result_event_reports_failure(payload: Mapping[str, Any], joined: str) -> bool:
+    """Whether a ``result`` event reports a failure.
+
+    A failure is named by the ``subtype`` (``error``/``fail`` substring, e.g.
+    ``error_max_turns``, ``error_during_execution``), by an error flag
+    (``is_error`` true, or a non-empty ``error``), or by a non-zero exit
+    ``code``. These are read from the structured fields only, never from prose
+    in ``result`` (a message that merely *mentions* an error is not itself an
+    error).
+    """
+    if _matches(joined, _RESULT_ERROR_SUBTYPE_MARKERS):
+        return True
+    for key in _RESULT_ERROR_FLAG_KEYS:
+        value = payload.get(key)
+        if value is True:
+            return True
+        if isinstance(value, str) and value.strip():
+            return True
+    for key in _RESULT_EXIT_CODE_KEYS:
+        value = payload.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value != 0:
+            return True
+    return False
 
 
 def parse_headless_events(lines: Iterable[str]) -> list[dict[str, Any]]:
@@ -1771,13 +1820,23 @@ def headless_terminal_status(
 ) -> Optional[dict[str, Any]]:
     """The typed terminal outcome of a headless event stream, or ``None``.
 
-    A worker *exit* is terminal and wins. Failing that, an ``input_required``
+    A *failed* result (``result_error``) is terminal first: a run that reports an
+    error must never be read as a successful worker exit, regardless of the
+    process exit code — it becomes a typed ``failed`` lifecycle result. Then a
+    worker *exit* is terminal and wins. Failing that, an ``input_required``
     request is terminal as a typed ``blocked_input`` lifecycle result (from the
     shared lifecycle contract) — the child is waiting, and a headless adapter
     must never wait on it. Failing that, a permission denial is reported as its
     own typed terminal. A stream with none of those is ``None`` (not terminal).
     """
     kinds = [event.get("kind") for event in events]
+    if HEADLESS_EVENT_RESULT_ERROR in kinds:
+        from skillweave.trace.contracts import JobResult
+
+        return {
+            "terminal": HEADLESS_EVENT_RESULT_ERROR,
+            "lifecycle": JobResult(),
+        }
     if HEADLESS_EVENT_WORKER_EXIT in kinds:
         return {"terminal": HEADLESS_EVENT_WORKER_EXIT}
     if HEADLESS_EVENT_INPUT_REQUIRED in kinds:
@@ -1837,6 +1896,61 @@ def check_surface(
     return {"tools": sorted(avail_tools), "plugins": sorted(avail_plugins)}
 
 
+def _realpath_fail_closed(path: str, *, asset: str) -> str:
+    """Resolve ``path`` to an absolute real path, or refuse (fail closed).
+
+    A destination whose path cannot be resolved is refused rather than written:
+    an unresolved path is exactly the case where a spelling check could be
+    fooled. ``ValueError`` covers an embedded NUL byte; ``OSError`` covers a
+    platform path-resolution failure.
+    """
+    try:
+        return os.path.realpath(os.path.abspath(path))
+    except (OSError, ValueError) as exc:
+        raise HarnessAdapterError(
+            f"cannot resolve {asset} path {path!r}: {exc}",
+            asset="observer_state",
+        )
+
+
+def _path_chain(resolved: str) -> list[str]:
+    """The resolved path and each of its ancestors, nearest first."""
+    chain: list[str] = []
+    current = resolved
+    while True:
+        chain.append(current)
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            break
+        current = parent
+    return chain
+
+
+def _observer_identities(observer_roots: Sequence[str]) -> set[tuple[int, int]]:
+    """The filesystem identities of every observer-owned entry that exists.
+
+    Each observer root directory *and* each observer-owned file inside it is
+    identified by ``(st_dev, st_ino)``. A hard link shares its inode with its
+    target, so a hard link to ``meta.json`` under a neutral name is caught by
+    identity even though neither its spelling nor its path is suspicious.
+    """
+    identities: set[tuple[int, int]] = set()
+    for root in observer_roots:
+        rr = _realpath_fail_closed(str(root), asset="observer root")
+        try:
+            root_stat = os.stat(rr)
+        except OSError:
+            continue
+        identities.add((root_stat.st_dev, root_stat.st_ino))
+        for name in OBSERVER_OWNED_FILENAMES:
+            try:
+                st = os.stat(os.path.join(rr, name))
+            except OSError:
+                continue
+            identities.add((st.st_dev, st.st_ino))
+    return identities
+
+
 def assert_not_observer_owned(
     target: str, *, observer_roots: Sequence[str] = ()
 ) -> str:
@@ -1845,26 +1959,51 @@ def assert_not_observer_owned(
     The adapter may not write observer-owned state: the durable stream store's
     files (``frames.jsonl``/``facts.jsonl``/``cursor.json``/``meta.json``), the
     observer's own record, or anything under an explicit observer root. The
-    target is realpath-resolved first, so a symlink cannot smuggle a write in.
+    guard is **structural**, not a spelling check:
+
+    - The target is realpath-resolved first, so a symlink cannot smuggle a write
+      in; a destination that cannot be resolved is refused fail-closed.
+    - The basename is compared **case-folded** against
+      :data:`OBSERVER_OWNED_FILENAMES`, so on a case-insensitive volume (macOS
+      APFS) ``META.JSON`` cannot clobber ``meta.json``.
+    - The target and its ancestor chain are compared **by filesystem identity**
+      (``st_dev``/``st_ino``) against the observer-owned entries, so a hard link
+      to an observer-owned file under a neutral name (same inode) is refused.
+
+    The name and identity checks apply even when no observer root is configured.
     """
     if not isinstance(target, str) or not target.strip():
         raise HarnessAdapterError(
             "write target must be a non-empty path",
             asset="target",
         )
-    resolved = os.path.realpath(os.path.abspath(target))
-    if os.path.basename(resolved) in OBSERVER_OWNED_FILENAMES:
+    resolved = _realpath_fail_closed(target, asset="write target")
+    folded = {name.lower() for name in OBSERVER_OWNED_FILENAMES}
+    if os.path.basename(resolved).lower() in folded:
         raise HarnessAdapterError(
             f"refusing to write observer-owned file {resolved!r}",
             asset="observer_state",
         )
     for root in observer_roots:
-        rr = os.path.realpath(os.path.abspath(root))
+        rr = _realpath_fail_closed(str(root), asset="observer root")
         if resolved == rr or resolved.startswith(rr + os.sep):
             raise HarnessAdapterError(
                 f"refusing to write inside observer root {rr!r}",
                 asset="observer_state",
             )
+    identities = _observer_identities(observer_roots)
+    if identities:
+        for node in _path_chain(resolved):
+            try:
+                st = os.stat(node)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) in identities:
+                raise HarnessAdapterError(
+                    f"refusing to write {resolved!r}: its filesystem identity "
+                    "matches observer-owned state",
+                    asset="observer_state",
+                )
     return target
 
 
@@ -1947,14 +2086,17 @@ class HeadlessStreamIngest:
     ``events`` are the classified events in order; ``terminal`` is the typed
     terminal outcome (:func:`headless_terminal_status`) or ``None``. ``blocked``
     is ``True`` exactly when the child requested input — the adapter's signal
-    that it must not wait. ``lifecycle`` is the shared ``blocked_input`` result
-    in that case, else ``None``.
+    that it must not wait. ``failed`` is ``True`` exactly when a ``result``
+    event reported a failure. ``lifecycle`` is the shared terminal lifecycle
+    result (``blocked_input`` or the default ``failed`` result) in those cases,
+    else ``None``.
     """
 
     events: tuple[HeadlessEventRecord, ...]
     terminal: Optional[dict[str, Any]] = None
     blocked: bool = False
     lifecycle: Any = None
+    failed: bool = False
 
     def to_attempt_events(self, *, subject_repo: str = "", subject_commit: str = "") -> list[dict[str, Any]]:
         return [
@@ -1973,10 +2115,12 @@ def ingest_headless_stream(
     The adapter's real ingestion path (criterion 2): the child's stdout is
     parsed line by line (:func:`parse_headless_events`), each event is numbered
     with a ``{run_id}:{index}`` cursor, and the typed terminal outcome is
-    computed (:func:`headless_terminal_status`). A worker *exit* is terminal; an
-    ``input_required`` request is terminal as the shared ``blocked_input``
-    lifecycle result, so the adapter never silently waits on a child that wants
-    input. A stream with no terminal marker yields ``terminal=None``.
+    computed (:func:`headless_terminal_status`). An ``input_required`` request
+    is terminal as the shared ``blocked_input`` lifecycle result, so the adapter
+    never silently waits on a child that wants input; a worker *exit* is
+    terminal too, and a *failed* result is terminal as a failed result so it is
+    never read as success. A stream with no terminal marker yields
+    ``terminal=None``.
     """
     parsed = parse_headless_events(lines)
     records = tuple(
@@ -1990,12 +2134,15 @@ def ingest_headless_stream(
         for index, event in enumerate(parsed)
     )
     status = headless_terminal_status(parsed)
-    blocked = bool(status) and status.get("terminal") == HEADLESS_EVENT_INPUT_REQUIRED
+    terminal_kind = status.get("terminal") if status else None
+    blocked = terminal_kind == HEADLESS_EVENT_INPUT_REQUIRED
+    failed = terminal_kind == HEADLESS_EVENT_RESULT_ERROR
     return HeadlessStreamIngest(
         events=records,
         terminal=status,
         blocked=blocked,
-        lifecycle=(status.get("lifecycle") if blocked and status else None),
+        lifecycle=(status.get("lifecycle") if (blocked or failed) and status else None),
+        failed=failed,
     )
 
 
@@ -2006,9 +2153,11 @@ class HeadlessResult:
     """The adapter's own result: the launcher's verdict *plus* typed events.
 
     ``succeeded`` reflects the launcher's verdict and then falls closed: a child
-    that requested input (``blocked``) or a child whose stderr burst exceeded
-    the backpressure cap (``backpressure_exceeded``) is **never** a success, even
-    if the launcher happened to report one. ``stream`` is the typed ingest of
+    that requested input (``blocked``), a child whose ``result`` event reported
+    a failure (``failed``), or a child whose stderr burst exceeded the
+    backpressure cap (``backpressure_exceeded``) is **never** a success, even if
+    the launcher happened to report one (for example a process that exits 0
+    while its stream reports ``is_error``). ``stream`` is the typed ingest of
     the child's stream-json output (or ``None`` when none was produced).
     """
 
@@ -2024,6 +2173,10 @@ class HeadlessResult:
         return bool(self.stream) and self.stream.blocked
 
     @property
+    def failed(self) -> bool:
+        return bool(self.stream) and self.stream.failed
+
+    @property
     def lifecycle(self) -> Any:
         return self.stream.lifecycle if self.stream else None
 
@@ -2035,6 +2188,7 @@ class HeadlessResult:
             "stderr_bytes": self.stderr_bytes,
             "backpressure_exceeded": self.backpressure_exceeded,
             "blocked": self.blocked,
+            "failed": self.failed,
             "terminal": self.stream.terminal if self.stream else None,
             "events": [event.to_dict() for event in self.stream.events]
             if self.stream
@@ -2093,6 +2247,7 @@ class OpenClaudeAdapter(HarnessAdapter):
         *,
         permission_mode: str = PERMISSION_MODE_DEFAULT,
         gateway_env: Optional[Mapping[str, str]] = None,
+        observer_roots: Sequence[str] = (),
     ) -> None:
         if not isinstance(executable, str) or not executable.strip():
             raise HarnessAdapterError(
@@ -2132,6 +2287,15 @@ class OpenClaudeAdapter(HarnessAdapter):
                     asset=cap,
                 )
         self._capabilities = frozenset(declared)
+        # Observer-owned durable-stream/evidence roots this adapter instance is
+        # bound to. The write funnel is therefore tied to a *live* store root on
+        # the production path (not only to a per-call argument): a worker can
+        # never write the observer's evidence trail of the store this adapter
+        # serves. Roots are resolved here so a malformed one fails at construction.
+        self._observer_roots: tuple[str, ...] = tuple(
+            _realpath_fail_closed(str(root), asset="observer root")
+            for root in observer_roots
+        )
 
     @property
     def name(self) -> str:
@@ -2148,6 +2312,11 @@ class OpenClaudeAdapter(HarnessAdapter):
     @property
     def gateway_env(self) -> dict[str, str]:
         return dict(self._gateway_env)
+
+    @property
+    def observer_roots(self) -> tuple[str, ...]:
+        """The observer-owned store roots this adapter is bound to (SW-1510-OPENCLAUDE)."""
+        return self._observer_roots
 
     def capabilities(self) -> frozenset[str]:
         return self._capabilities
@@ -2263,8 +2432,13 @@ class OpenClaudeAdapter(HarnessAdapter):
                 asset="launch",
             )
         if scratch_target is not None:
+            # The guard is structural: the adapter's *own* configured observer
+            # roots are always in scope, unioned with any per-call roots, so the
+            # production path is tied to a live store root rather than relying
+            # on a caller to pass one (finding 3).
+            effective_roots = tuple(self._observer_roots) + tuple(observer_roots)
             write_worker_scratch(
-                scratch_target, scratch_data, observer_roots=observer_roots
+                scratch_target, scratch_data, observer_roots=effective_roots
             )
         if missing_plugins:
             check_surface(required_plugins=missing_plugins)
@@ -2313,10 +2487,11 @@ class OpenClaudeAdapter(HarnessAdapter):
 
         The launcher's raw result is replaced by a :class:`HeadlessResult` that
         carries the typed ingest of the child's stream-json output. ``succeeded``
-        falls closed: a blocked-input child or a backpressure-exceeded child is
-        never a success. With no ``stream_output`` the launcher's own result is
-        preserved untouched, so the ordinary injected-seam contract (a caller's
-        own result object) is unchanged.
+        falls closed: a blocked-input child, a child whose stream reports a
+        failed ``result`` (OpenClaude can ``is_error`` while exiting 0) or a
+        backpressure-exceeded child is never a success. With no ``stream_output``
+        the launcher's own result is preserved untouched, so the ordinary
+        injected-seam contract (a caller's own result object) is unchanged.
         """
         if stream_output is None:
             return outcome
@@ -2328,9 +2503,12 @@ class OpenClaudeAdapter(HarnessAdapter):
         termination = getattr(raw, "termination", "exited")
         if stream.blocked:
             termination = HEADLESS_EVENT_INPUT_REQUIRED
+        elif stream.failed:
+            termination = HEADLESS_EVENT_RESULT_ERROR
         succeeded = (
             bool(getattr(raw, "succeeded", False))
             and not stream.blocked
+            and not stream.failed
             and not backpressure
         )
         return HarnessOutcome(
@@ -2389,6 +2567,7 @@ __all__ = [
     "HEADLESS_EVENT_PERMISSION_DENIED",
     "HEADLESS_EVENT_INPUT_REQUIRED",
     "HEADLESS_EVENT_WORKER_EXIT",
+    "HEADLESS_EVENT_RESULT_ERROR",
     "HEADLESS_EVENT_RAW",
     "HEADLESS_INPUT_REQUIRED_MARKER",
     "HEADLESS_PERMISSION_DENIED_MARKER",

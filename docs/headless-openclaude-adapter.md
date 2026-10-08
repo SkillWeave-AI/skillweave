@@ -59,16 +59,26 @@ from the router's decision (`plan.strategy.model_mix[0]`), never from the plugin
 The child's stream-json lifecycle is read as typed events:
 
 - `classify_headless_event(payload)` — an **initial permission denial**
-  (`permission_denied`), an **input request** (`input_required`) or a **worker
-  exit**. Anything else is a benign `event` (surfaced, never dropped). A payload
-  that is not a JSON object is refused (fail closed).
+  (`permission_denied`), an **input request** (`input_required`), a **failed
+  result** (`result_error`) or a **worker exit**. A `result` event that reports
+  a failure — a failure `subtype` (`error_*`), an `is_error`/`error` flag, or a
+  non-zero embedded exit `code` — is typed `result_error`, **not** a clean
+  worker exit. These are read from structured fields only, never from prose: a
+  message that merely *mentions* an error is still an ordinary event. Anything
+  else is a benign `event` (surfaced, never dropped). A payload that is not a
+  JSON object is refused (fail closed).
 - `parse_headless_events(lines)` — one event per line; a non-JSON line is a
   visible `raw` event.
-- `headless_terminal_status(events)` — worker exit wins; otherwise an
-  `input_required` request is terminal and returns the shared lifecycle
-  `blocked_input` result (`skillweave.trace.contracts.blocked_input_result`), so
-  a headless adapter **never waits** on a child that wants input; otherwise a
-  permission denial is its own typed terminal.
+- `headless_terminal_status(events)` — a **failed result** (`result_error`) is
+  terminal first and returns a typed `failed` lifecycle `JobResult` (the shared
+  contract's fail-closed default), so an error result is never read as a
+  successful exit **regardless of the process exit code** (OpenClaude can emit
+  `is_error` and still exit 0). Failing that a worker exit is terminal and wins;
+  otherwise an `input_required` request is terminal and returns the shared
+  lifecycle `blocked_input` result
+  (`skillweave.trace.contracts.blocked_input_result`), so a headless adapter
+  **never waits** on a child that wants input; otherwise a permission denial is
+  its own typed terminal.
 
 ### The typed vocabulary is composed into `execute`, not just exported
 
@@ -85,10 +95,13 @@ uses them on its real path.
   typed terminal status. An `input_required` request maps to the shared
   `blocked_input` lifecycle result, and the returned `HeadlessResult.succeeded`
   **falls closed** — the adapter never reports a child waiting for input as a
-  success, and never waits (repair finding B).
-- `HeadlessResult` carries the typed stream, `exit_code`, `stderr_bytes` and
-  `backpressure_exceeded`; `to_dict()`/`HeadlessStreamIngest.to_attempt_events()`
-  render the events for an `attempt-event-v1` consumer.
+  success, and never waits (repair finding B). A **failed result**
+  (`result_error`) likewise maps to a typed `failed` lifecycle result and falls
+  closed, so a child that reports an error while exiting 0 is never a success.
+- `HeadlessResult` carries the typed stream, `exit_code`, `stderr_bytes`,
+  `blocked`, `failed` and `backpressure_exceeded`;
+  `to_dict()`/`HeadlessStreamIngest.to_attempt_events()` render the events for
+  an `attempt-event-v1` consumer.
 - With no `stream_output` the launcher's own result is preserved untouched, so a
   caller that supplies its own result object keeps the legacy contract.
 
@@ -120,7 +133,18 @@ performs zero work:
 - `assert_not_observer_owned(target, *, observer_roots=())` — the adapter may
   not write observer-owned state: `frames.jsonl`, `facts.jsonl`, `cursor.json`,
   `observer.json`, `meta.json`, or anything under an explicit observer root. The
-  target is realpath-resolved first, so a symlink cannot smuggle a write in.
+  guard is **structural, not a spelling check**. The target is realpath-resolved
+  first, so a symlink cannot smuggle a write in, and an unresolvable destination
+  is refused fail-closed. The basename is compared **case-folded**, so on a
+  case-insensitive volume (macOS APFS) `META.JSON` cannot clobber `meta.json`.
+  The target and each ancestor are compared **by filesystem identity**
+  (`st_dev`/`st_ino`) against the observer-owned entries, so a hard link to an
+  observer-owned file under a neutral name (same inode) is refused. The name and
+  identity checks apply even when no observer root is configured.
+- `OpenClaudeAdapter(observer_roots=...)` — the durable stream/evidence roots the
+  adapter instance is bound to. `execute` always unions these with any per-call
+  `observer_roots`, so on the production path the guard is tied to a **live**
+  store root rather than relying on a caller to pass one.
 - **stderr backpressure** — `run_command(..., stderr_retain_limit=N)` caps the
   retained stderr; bytes beyond the cap are counted
   (`stderr_backpressure_events`, `stderr_observed_bytes`, `stderr_exceeded_cap`)
@@ -143,9 +167,18 @@ performs zero work:
   - the typed permission-denial / `input_required` / worker-exit events,
     including `input_required` → `blocked_input`, driven by a **real emitting
     child through `execute`** (not by calling the helpers directly);
+  - a **failed result** (`is_error` true, `error_max_turns`,
+    `error_during_execution`, a non-zero embedded exit code, an `error` field)
+    is a typed `result_error` terminal that **falls closed through `execute`**
+    even though the real child exits 0, while a benign result still succeeds and
+    prose that merely mentions an error stays untyped;
   - a missing / `None` / non-callable `launch` seam is a named refusal;
   - the observer-write funnel and the stderr backpressure cap driven through
     `execute` (a blocked-input or backpressure child falls closed);
+  - a **case variant** of an observer-owned name, a **hard link** to one (refused
+    by inode identity against the adapter's *configured* root, with no per-call
+    root), an unresolvable destination, and an ordinary path under a configured
+    root elsewhere — all driven through `execute`;
   - the adapter is selected **by name through the production
     `HarnessAdapterRegistry`** and executes through that registry path;
   - missing plugin/tool and oversized-prompt fixtures with an injected launch
