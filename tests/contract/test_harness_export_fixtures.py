@@ -222,6 +222,22 @@ class TestFixtureShape:
         with pytest.raises(ValueError, match="Unknown harness"):
             generate_harness_config("nonexistent-framework", "perplexity")
 
+    @pytest.mark.parametrize("bad_harness", ["gemini-cli", "openclaude", "windsurf"])
+    def test_write_unknown_harness_raises_and_creates_no_file(self, bad_harness, tmp_path):
+        """write_harness_config raises ValueError for unknown harnesses
+        and creates no file on disk."""
+        with pytest.raises(ValueError, match="Unknown harness"):
+            write_harness_config(bad_harness, output_dir=str(tmp_path))
+        # Verify no file was created for this harness
+        possible = [
+            tmp_path / f"{bad_harness}.json",
+            tmp_path / f"{bad_harness}.toml",
+        ]
+        for p in possible:
+            assert not p.exists(), (
+                f"write_harness_config({bad_harness!r}) should not create {p}"
+            )
+
 
 class TestCredentialParity:
     """Every harness fixture carries the same credential reference.

@@ -339,6 +339,14 @@ def write_harness_config(
     Returns:
         The path to the written config file.
     """
+    # Validate harness BEFORE computing section key/entry or writing anything.
+    # Unknown harnesses must raise ValueError and leave no file behind.
+    if harness not in CONFIG_BUILDERS:
+        raise ValueError(
+            f"Unknown harness: {harness!r}; "
+            f"known: {sorted(CONFIG_BUILDERS)}"
+        )
+
     output_dir = Path(output_dir)
     section_key = _section_key_for_harness(harness)
     entry = _build_entry_for_harness(harness, name, command)
