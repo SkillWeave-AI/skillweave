@@ -34,8 +34,18 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Sequence
+
+# The service's contract-refusal exceptions. The run service never imports this
+# module, so a module-level import here is safe (no cycle). These are the
+# refusals the control surface *returns* as structured errors rather than
+# letting leak across the tool boundary.
+from skillweave.runsvc.service import (
+    RunIntegrationError,
+    RunSnapshotContractError,
+)
 
 #: The MCP protocol version this surface speaks (kept in step with the accepted
 #: in-tree stdio client, ``skillweave.council.mcp_client.MCP_PROTOCOL_VERSION``).
@@ -118,6 +128,19 @@ class ScopedHttpRefused(RuntimeError):
     The refusal is *structural*: a non-loopback bind without explicit remote
     opt-in, or a missing scope token. ``reason`` names the refused bind so a
     caller can act on it without inspecting a stack trace.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+class ControlStorageError(RuntimeError):
+    """A control operation could not reach its durable store.
+
+    Carries a *string* ``reason`` (never the raw sqlite exception object, whose
+    ``str`` may embed host filesystem details) so a caller can return a
+    structured diagnostic rather than leaking ``sqlite3.OperationalError``.
     """
 
     def __init__(self, reason: str):
@@ -310,10 +333,37 @@ def serve_scoped_http(
 # Service composition (the single service both CLI and MCP drive)
 # ---------------------------------------------------------------------------
 
+def _ensure_parent_dir(path: str) -> None:
+    """Create the parent directory of a file-backed path (no-op for ``:memory:``).
+
+    The CLI creates this directory at ingress; the control surface must too, or
+    a first control call in a fresh project fails to open the run store. A
+    directory-creating failure is surfaced as :class:`ControlStorageError` (a
+    durable string reason), never a raw ``OSError``.
+    """
+    if not path or path == ":memory:":
+        return
+    parent = os.path.dirname(os.path.abspath(path))
+    if not parent:
+        return
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as exc:
+        raise ControlStorageError(
+            f"cannot create storage directory {parent!r}: {type(exc).__name__}"
+        ) from exc
+
+
 def _get_store(db_path: str = ".skillweave/store.db"):
     from skillweave.runtime.store import SQLiteRunStore
 
-    return SQLiteRunStore(db_path)
+    _ensure_parent_dir(db_path)
+    try:
+        return SQLiteRunStore(db_path)
+    except sqlite3.OperationalError as exc:
+        raise ControlStorageError(
+            f"cannot open run store {db_path!r}: {type(exc).__name__}"
+        ) from exc
 
 
 def default_stream_root(db_path: str) -> str:
@@ -331,12 +381,23 @@ def get_run_service(
     artifacts_path: str = ".skillweave/artifacts",
     stream_root: Optional[str] = None,
 ):
-    """Build the same :class:`RunApplicationService` the CLI ingress builds."""
+    """Build the same :class:`RunApplicationService` the CLI ingress builds.
+
+    The run store's parent directory is created up front, mirroring the CLI
+    ingress, so a first control call in a fresh project succeeds instead of
+    failing to open the database. The directory-backed stores do not need this:
+    :class:`DurableStreamStore` creates its own root, and the raw artifact store
+    is memory-backed, so neither is pre-created here (a read must not have the
+    side effect of creating an artifacts directory on disk). A store that still
+    cannot be opened is surfaced as :class:`ControlStorageError`.
+    """
     from skillweave.runtime.journal import EventJournal
     from skillweave.runtime.registry import RawArtifactStore
     from skillweave.runtime.reservation import ReservationStore
     from skillweave.runtime.stream import DurableStreamStore
     from skillweave.runsvc.service import RunApplicationService
+
+    _ensure_parent_dir(db_path)
 
     store = _get_store(db_path)
     journal = EventJournal(db_path)
@@ -387,6 +448,95 @@ def analysis_binding(analysis_root: str):
     return _reader
 
 
+# ---------------------------------------------------------------------------
+# Structured results: contract refusals are returned, not raised
+# ---------------------------------------------------------------------------
+
+def structured_error(
+    code: str,
+    message: str,
+    *,
+    run_id: str = "",
+    version: str = "",
+    supported: Optional[Sequence[str]] = None,
+) -> dict[str, Any]:
+    """A durable, structured error record a control tool can *return*.
+
+    Every control operation returns either a result or one of these: an
+    exception is never leaked across the tool boundary. ``code`` is a stable
+    machine-readable token; ``supported`` names the versions a refusal would
+    accept.
+    """
+    payload: dict[str, Any] = {
+        "error": message,
+        "code": code,
+        "run_id": run_id,
+        "version": version,
+        "supported": list(supported) if supported is not None else [],
+    }
+    return payload
+
+
+def _snapshot_error_payload(
+    run_id: str,
+    *,
+    version: str = "",
+    exc: Optional[Exception] = None,
+) -> dict[str, Any]:
+    """Map a snapshot contract refusal onto the structured error record."""
+    if isinstance(exc, SnapshotVersionRefused):
+        return structured_error(
+            "unsupported_version",
+            f"unsupported run-snapshot version {version!r}",
+            run_id=run_id,
+            version=version,
+            supported=sorted(SUPPORTED_SNAPSHOT_VERSIONS),
+        )
+    reason = getattr(exc, "reason", None) or "refused"
+    return structured_error(
+        "snapshot_unavailable",
+        str(reason),
+        run_id=run_id,
+        version=version or RUN_SNAPSHOT_VERSION,
+        supported=sorted(SUPPORTED_SNAPSHOT_VERSIONS),
+    )
+
+
+def _storage_error_payload(exc: Exception, **extra: Any) -> dict[str, Any]:
+    reason = getattr(exc, "reason", None) or "storage unavailable"
+    return structured_error("storage_unavailable", str(reason), **extra)
+
+
+def _contract_guard(
+    run_id: str, *, version: str = "", exc: Exception
+) -> dict[str, Any]:
+    """Route a service-refusal exception to the right structured payload."""
+    if isinstance(exc, ControlStorageError):
+        return _storage_error_payload(exc, run_id=run_id)
+    return _snapshot_error_payload(run_id, version=version, exc=exc)
+
+
+def _not_found(run_id: str, *, version: str = "") -> dict[str, Any]:
+    """The durable not-found record (message preserved for legacy callers)."""
+    return structured_error("not_found", "Run not found", run_id=run_id, version=version)
+
+
+def _open_service(
+    db_path: str,
+    artifacts_path: str,
+    stream_root: Optional[str] = None,
+):
+    """Build the shared service, mapping storage failures to a typed error."""
+    try:
+        return get_run_service(db_path, artifacts_path, stream_root)
+    except ControlStorageError:
+        raise
+    except sqlite3.OperationalError as exc:
+        raise ControlStorageError(
+            f"cannot open run service for {db_path!r}: {type(exc).__name__}"
+        ) from exc
+
+
 def create_run_payload(
     *,
     tool: str,
@@ -412,42 +562,54 @@ def create_run_payload(
     delegates to. It mints the run id, honours/creates the owner budget
     envelope, drives ``execute_streaming_native`` and returns the durable
     structured payload (run/state/gate/digest/stream[/assay]).
+
+    First-run behaviour: the run store's parent directory is created here (the
+    durable stream store creates its own root), so a run started from a fresh
+    project cwd *creates* its store rather than failing with
+    ``unable to open database file``. A store/contract failure is *returned* as
+    a structured error dict, never raised across the tool boundary.
     """
     from skillweave.dispatch.application import generate_run_id
 
-    svc = get_run_service(
-        db_path, artifacts_path, stream_root or default_stream_root(db_path)
-    )
+    try:
+        svc = _open_service(
+            db_path, artifacts_path, stream_root or default_stream_root(db_path)
+        )
+    except (ControlStorageError, RunSnapshotContractError, RunIntegrationError) as exc:
+        return _contract_guard("", exc=exc)
     run_id = generate_run_id()
     from skillweave.runtime.reservation import ReservationEnvelope as _ReservationEnvelope
 
-    effective_task_id = task_id or run_id
-    scope_id = f"{effective_task_id}/attempt-{attempt}"
-    existing = svc.reservation_store.get_envelope_for_task_scope(effective_task_id)
-    if existing is not None:
-        owner_env = existing
-    else:
-        owner_env = _ReservationEnvelope()
-        svc.reservation_store.set_envelope(run_id, scope_id, owner_env)
+    try:
+        effective_task_id = task_id or run_id
+        scope_id = f"{effective_task_id}/attempt-{attempt}"
+        existing = svc.reservation_store.get_envelope_for_task_scope(effective_task_id)
+        if existing is not None:
+            owner_env = existing
+        else:
+            owner_env = _ReservationEnvelope()
+            svc.reservation_store.set_envelope(run_id, scope_id, owner_env)
 
-    cmd_list = shlex.split(command)
-    execution = svc.execute_streaming_native(
-        command=cmd_list,
-        run_id=run_id,
-        tool=tool,
-        model=model,
-        subject_repo=subject_repo,
-        subject_commit=subject_commit,
-        methodology=methodology,
-        autonomy_policy=autonomy_policy,
-        task_id=effective_task_id,
-        attempt=attempt,
-        output_root=output_root or None,
-        reservation_envelope=owner_env,
-        artifact_evidence=artifact_evidence_list(artifact_evidence),
-        source_resolver=source_binding(source_root, subject_commit),
-        analysis_reader=analysis_binding(analysis_root),
-    )
+        cmd_list = shlex.split(command)
+        execution = svc.execute_streaming_native(
+            command=cmd_list,
+            run_id=run_id,
+            tool=tool,
+            model=model,
+            subject_repo=subject_repo,
+            subject_commit=subject_commit,
+            methodology=methodology,
+            autonomy_policy=autonomy_policy,
+            task_id=effective_task_id,
+            attempt=attempt,
+            output_root=output_root or None,
+            reservation_envelope=owner_env,
+            artifact_evidence=artifact_evidence_list(artifact_evidence),
+            source_resolver=source_binding(source_root, subject_commit),
+            analysis_reader=analysis_binding(analysis_root),
+        )
+    except (ControlStorageError, RunSnapshotContractError, RunIntegrationError) as exc:
+        return _contract_guard("", exc=exc)
 
     result_obj = execution["result"]
     payload = {
@@ -497,16 +659,22 @@ def snapshot_v1(
 ) -> dict[str, Any]:
     """Compose the frozen ``run-snapshot-v1`` for ``run_id``.
 
-    An unsupported ``version`` name is refused by :class:`SnapshotVersionRefused`
-    (never coerced). A run whose trusted fields cannot be expressed in the
-    frozen version is refused by the service itself
-    (``RunSnapshotContractError``).
+    A contract refusal -- an unsupported ``version`` name, or a run whose
+    trusted fields cannot be expressed in the frozen version -- is *returned* as
+    a structured error dict, never raised across the tool boundary.
     """
-    _require_snapshot_version(version)
-    svc = get_run_service(db_path, artifacts_path)
-    snapshot = svc.run_snapshot_v1(run_id)
+    try:
+        _require_snapshot_version(version)
+        svc = _open_service(db_path, artifacts_path)
+        snapshot = svc.run_snapshot_v1(run_id, version=version)
+    except (
+        SnapshotVersionRefused,
+        ControlStorageError,
+        RunSnapshotContractError,
+    ) as exc:
+        return _contract_guard(run_id, version=version, exc=exc)
     if snapshot is None:
-        return {"error": "Run not found", "run_id": run_id, "version": version}
+        return _not_found(run_id, version=version)
     return snapshot
 
 
@@ -521,18 +689,26 @@ def control_status(
 
     With no ``version`` the durable shared snapshot (``run_snapshot``) is
     returned unchanged (legacy shape). With an explicit ``version`` the frozen
-    versioned record ``run-snapshot-v1`` is returned, refusing an unknown name.
+    versioned record ``run-snapshot-v1`` is returned; an unknown name or an
+    unrepresentable run is *returned* as a structured error dict, not raised.
     """
-    svc = get_run_service(db_path, artifacts_path)
-    if not version:
-        snapshot = svc.run_snapshot(run_id)
-        if snapshot is None:
-            return {"error": "Run not found", "run_id": run_id}
-        return snapshot
-    _require_snapshot_version(version)
-    snapshot = svc.run_snapshot_v1(run_id, version=version)
+    try:
+        svc = _open_service(db_path, artifacts_path)
+        if not version:
+            snapshot = svc.run_snapshot(run_id)
+            if snapshot is None:
+                return _not_found(run_id)
+            return snapshot
+        _require_snapshot_version(version)
+        snapshot = svc.run_snapshot_v1(run_id, version=version)
+    except (
+        SnapshotVersionRefused,
+        ControlStorageError,
+        RunSnapshotContractError,
+    ) as exc:
+        return _contract_guard(run_id, version=version, exc=exc)
     if snapshot is None:
-        return {"error": "Run not found", "run_id": run_id, "version": version}
+        return _not_found(run_id, version=version)
     return snapshot
 
 
@@ -544,8 +720,19 @@ def control_evidence(
     """Return a run's ordered journal evidence (the durable record)."""
     from skillweave.runtime.journal import EventJournal
 
-    journal = EventJournal(db_path)
-    events = journal.get_events(run_id)
+    try:
+        _ensure_parent_dir(db_path)
+        journal = EventJournal(db_path)
+        events = journal.get_events(run_id)
+    except (ControlStorageError, sqlite3.OperationalError) as exc:
+        if isinstance(exc, ControlStorageError):
+            return _storage_error_payload(exc, run_id=run_id)
+        return _storage_error_payload(
+            ControlStorageError(
+                f"cannot open run journal {db_path!r}: {type(exc).__name__}"
+            ),
+            run_id=run_id,
+        )
     try:
         events = [e.to_dict() if hasattr(e, "to_dict") else e for e in events]
     except Exception:  # noqa: BLE001
@@ -564,23 +751,29 @@ def control_cancel(
 
     A refusal (recycled PID / stale command / foreign worker) is returned as a
     structured refusal carrying the verification reason; nothing is signalled.
+    A storage/service contract refusal is likewise returned, not raised.
     """
     from skillweave.runtime.errors import ProcessIdentityError, StoreError
 
-    svc = get_run_service(db_path, artifacts_path)
-    if svc.store.get_run(run_id) is None:
-        return {"error": "Run not found", "run_id": run_id}
     try:
+        svc = _open_service(db_path, artifacts_path)
+        if svc.store.get_run(run_id) is None:
+            return _not_found(run_id)
         result = svc.cancel_process(run_id, reason=reason)
     except ProcessIdentityError as exc:
         return {
             "error": "process identity not verified; cancellation refused",
+            "code": "identity_unverified",
             "run_id": run_id,
+            "version": "",
+            "supported": [],
             "reason": exc.reason,
             "verification": exc.verification,
         }
+    except (ControlStorageError, RunSnapshotContractError, RunIntegrationError) as exc:
+        return _contract_guard(run_id, exc=exc)
     except StoreError as exc:
-        return {"error": str(exc), "run_id": run_id}
+        return structured_error("store_error", str(exc), run_id=run_id)
     return {"status": "cancel_requested", **result}
 
 
@@ -598,29 +791,32 @@ def control_resume(
     actual state with ``restarted: false`` (a transition alone never claims a
     restart). With a *command* it launches a real NEW identified attempt through
     the native service, preserving *idempotency_key* so a replay returns the
-    already-launched attempt.
+    already-launched attempt. Contract/storage refusals are returned, not
+    raised.
     """
     from skillweave.runtime.errors import StoreError
 
-    svc = get_run_service(db_path, artifacts_path)
-    if not command:
-        snapshot = svc.resume_run(run_id)
-        if snapshot is None:
-            return {"error": "Run not found", "run_id": run_id}
-        return {
-            "status": "reconciled",
-            "restarted": False,
-            "note": "no command supplied; no new attempt launched",
-            **snapshot,
-        }
     try:
+        svc = _open_service(db_path, artifacts_path)
+        if not command:
+            snapshot = svc.resume_run(run_id)
+            if snapshot is None:
+                return _not_found(run_id)
+            return {
+                "status": "reconciled",
+                "restarted": False,
+                "note": "no command supplied; no new attempt launched",
+                **snapshot,
+            }
         result = svc.restart_attempt(
             run_id,
             shlex.split(command),
             idempotency_key=idempotency_key or None,
         )
+    except (ControlStorageError, RunSnapshotContractError, RunIntegrationError) as exc:
+        return _contract_guard(run_id, exc=exc)
     except StoreError as exc:
-        return {"error": str(exc), "run_id": run_id}
+        return structured_error("store_error", str(exc), run_id=run_id)
     return {
         "status": "restarted",
         "restart_kind": "new_identified_attempt",
@@ -640,14 +836,18 @@ def control_poll(
     """Poll a run's ordered progress frames from ``after_cursor``.
 
     This is the *fallback* async shape -- a cursor a client advances -- used
-    when experimental MCP Tasks are not negotiated for the transport.
+    when experimental MCP Tasks are not negotiated for the transport. A storage
+    refusal is returned as a structured error, not raised.
     """
-    svc = get_run_service(
-        db_path, artifacts_path, stream_root or default_stream_root(db_path)
-    )
-    frames = svc.stream_frames(
-        run_id, after_cursor=after_cursor, limit=limit or None
-    )
+    try:
+        svc = _open_service(
+            db_path, artifacts_path, stream_root or default_stream_root(db_path)
+        )
+        frames = svc.stream_frames(
+            run_id, after_cursor=after_cursor, limit=limit or None
+        )
+    except (ControlStorageError, RunSnapshotContractError, RunIntegrationError) as exc:
+        return _contract_guard(run_id, exc=exc)
     latest = frames[-1]["cursor"] if frames else after_cursor
     return {
         "run_id": run_id,
@@ -844,6 +1044,7 @@ __all__ = [
     "CONTROL_NAMESPACE",
     "CONTROL_SURFACE",
     "CONTROL_VERSION",
+    "ControlStorageError",
     "DEFAULT_HTTP_HOST",
     "DEFAULT_HTTP_PORT",
     "DEGRADED_REASON",
@@ -882,6 +1083,7 @@ __all__ = [
     "server_capabilities",
     "snapshot_v1",
     "source_binding",
+    "structured_error",
     "tool_schema",
     "transport_profile",
     "unavailable_payload",

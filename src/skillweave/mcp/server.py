@@ -161,6 +161,9 @@ def resume_run(run_id: str, db_path: str = ".skillweave/store.db", command: str 
 def get_evidence(run_id: str, db_path: str = ".skillweave/store.db") -> str:
     """Get evidence/journal for a run."""
     result = control.control_evidence(run_id, db_path=db_path)
+    if "error" in result:
+        # A storage refusal is a structured record, not a key error.
+        return json.dumps(result)
     return json.dumps({"events": result["events"]})
 
 
