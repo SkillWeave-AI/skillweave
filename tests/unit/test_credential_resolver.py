@@ -162,7 +162,6 @@ class TestCredentialResolverChildEnv:
     def test_child_env_contains_only_allowlisted_vars(self):
         resolver = CredentialResolver()
         child = resolver.child_env(
-            "PERPLEXITY_COOKIES",
             env_allowlist=("PATH", "HOME"),
         )
         # Only allowlisted vars are in the child env
@@ -174,7 +173,6 @@ class TestCredentialResolverChildEnv:
     def test_child_env_does_not_contain_the_reference_var_by_default(self):
         resolver = CredentialResolver()
         child = resolver.child_env(
-            "PERPLEXITY_COOKIES",
             env_allowlist=(),
         )
         assert "PERPLEXITY_COOKIES" not in child

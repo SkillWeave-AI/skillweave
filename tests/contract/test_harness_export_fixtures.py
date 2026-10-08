@@ -56,6 +56,34 @@ def _has_floating(cmd: str, args: list[str]) -> bool:
     return bool(FLOATING_RE.search(combined))
 
 
+def _get_servers(config: dict[str, Any], harness: str) -> dict[str, Any]:
+    """Extract the server map from a config for the given harness."""
+    if harness == "codex":
+        return config.get("mcp_servers", {})
+    if harness == "opencode":
+        return config.get("mcp", {})
+    return config.get("mcpServers", {})
+
+
+def _get_command_and_args(srv: dict[str, Any], harness: str) -> tuple[str, list[str]]:
+    """Extract command string and args list from a server entry."""
+    cmd = srv.get("command", "")
+    args = srv.get("args", [])
+    if harness == "opencode":
+        cmd_list = srv.get("command", [])
+        if isinstance(cmd_list, list):
+            cmd = cmd_list[0] if cmd_list else ""
+            args = list(cmd_list[1:]) if len(cmd_list) > 1 else []
+        else:
+            cmd = cmd_list if isinstance(cmd_list, str) else str(cmd_list)
+            args = []
+    if isinstance(cmd, list):
+        cmd = " ".join(str(x) for x in cmd) if cmd else ""
+    if not isinstance(args, list):
+        args = list(args) if isinstance(args, (tuple, set)) else [str(args)]
+    return str(cmd), [str(a) for a in args]
+
+
 # ── Fixture config factories for each harness ──────────────────────────────
 
 def _fixture_claude_desktop(name: str, *, ref_only: bool = True) -> dict[str, Any]:
@@ -136,13 +164,14 @@ def _fixture_antigravity(name: str, *, ref_only: bool = True) -> dict[str, Any]:
 
 def _fixture_codex(name: str, *, ref_only: bool = True) -> dict[str, Any]:
     """Codex: ~/.codex/config.toml
-    TOML format (tested via the Python dict representation).
+    TOML format with ``mcp_servers`` section key (NOT ``mcpServers``).
+    This matches the real CodexAdapter which uses TOML ``config.setdefault("mcp_servers", {})``.
     """
     env = {"PERPLEXITY_COOKIES": "${PERPLEXITY_COOKIES}"} if ref_only else {}
     return {
         "harness": "codex",
         "config": {
-            "mcpServers": {
+            "mcp_servers": {
                 name: {
                     "command": "/fixture/perplexity-mcp",
                     "args": [],
@@ -155,7 +184,10 @@ def _fixture_codex(name: str, *, ref_only: bool = True) -> dict[str, Any]:
 
 def _fixture_opencode(name: str, *, ref_only: bool = True) -> dict[str, Any]:
     """OpenCode: ~/.config/opencode/opencode.json
-    Format: { mcp: { <name>: { command, args, env } } } (uses "mcp" not "mcpServers")
+    OpenCode stores MCP servers under ``mcp`` map. Local stdio servers use
+    ``{"type": "local", "command": ["cmd", "...args"], "enabled": true}``,
+    not the Claude-style ``mcpServers`` shape.
+    This matches ``McpConfigPatcher.build_opencode_mcp_entry()``.
     """
     env = {"PERPLEXITY_COOKIES": "${PERPLEXITY_COOKIES}"} if ref_only else {}
     return {
@@ -163,8 +195,9 @@ def _fixture_opencode(name: str, *, ref_only: bool = True) -> dict[str, Any]:
         "config": {
             "mcp": {
                 name: {
-                    "command": "/fixture/perplexity-mcp",
-                    "args": [],
+                    "type": "local",
+                    "command": ["/fixture/perplexity-mcp"],
+                    "enabled": True,
                     "env": env,
                 }
             }
@@ -201,10 +234,7 @@ class TestFixtureShape:
         factory = FIXTURE_FACTORIES[harness]
         fixture = factory("perplexity")
         config = fixture["config"]
-        if harness == "opencode":
-            servers = config.get("mcp", {})
-        else:
-            servers = config.get("mcpServers", {})
+        servers = _get_servers(config, harness)
         for srv in servers.values():
             env = srv.get("env", {})
             for val in env.values():
@@ -217,10 +247,7 @@ class TestFixtureShape:
         factory = FIXTURE_FACTORIES[harness]
         fixture = factory("perplexity")
         config = fixture["config"]
-        if harness == "opencode":
-            servers = config.get("mcp", {})
-        else:
-            servers = config.get("mcpServers", {})
+        servers = _get_servers(config, harness)
         for srv in servers.values():
             env = srv.get("env", {})
             for val in env.values():
@@ -233,13 +260,9 @@ class TestFixtureShape:
         factory = FIXTURE_FACTORIES[harness]
         fixture = factory("perplexity")
         config = fixture["config"]
-        if harness == "opencode":
-            servers = config.get("mcp", {})
-        else:
-            servers = config.get("mcpServers", {})
+        servers = _get_servers(config, harness)
         for srv in servers.values():
-            cmd = srv.get("command", "")
-            args = srv.get("args", [])
+            cmd, args = _get_command_and_args(srv, harness)
             assert not _has_floating(cmd, args), (
                 f"{harness}: floating install marker in command"
             )
@@ -260,10 +283,7 @@ class TestCredentialParity:
             factory = FIXTURE_FACTORIES[harness]
             fixture = factory("perplexity")
             config = fixture["config"]
-            if harness == "opencode":
-                servers = config.get("mcp", {})
-            else:
-                servers = config.get("mcpServers", {})
+            servers = _get_servers(config, harness)
             has_ref = any(
                 "PERPLEXITY_COOKIES" in srv.get("env", {})
                 for srv in servers.values()
@@ -306,10 +326,7 @@ class TestBaselineParity:
             factory = FIXTURE_FACTORIES[harness]
             fixture = factory("perplexity", ref_only=True)
             config = fixture["config"]
-            if harness == "opencode":
-                servers = config.get("mcp", {})
-            else:
-                servers = config.get("mcpServers", {})
+            servers = _get_servers(config, harness)
             has_ref = any(
                 "PERPLEXITY_COOKIES" in srv.get("env", {})
                 for srv in servers.values()
@@ -320,7 +337,7 @@ class TestBaselineParity:
                 for val in srv.get("env", {}).values()
             )
             no_floating = all(
-                not _has_floating(srv.get("command", ""), srv.get("args", []))
+                not _has_floating(*_get_command_and_args(srv, harness))
                 for srv in servers.values()
             )
             assert has_ref and no_literal and no_floating, (
@@ -347,12 +364,22 @@ class TestBaselineParity:
 
 
 class TestOpenCodeConfigShape:
-    """OpenCode uses "mcp" section key, not "mcpServers"."""
+    """OpenCode uses "mcp" section key with native entry shape."""
 
     def test_opencode_uses_mcp_key(self):
         fixture = _fixture_opencode("perplexity")
         assert "mcp" in fixture["config"]
         assert "mcpServers" not in fixture["config"]
+
+    def test_opencode_entry_has_native_shape(self):
+        """OpenCode entry must match build_opencode_mcp_entry() output."""
+        fixture = _fixture_opencode("perplexity")
+        mcp = fixture["config"]["mcp"]
+        for name, srv in mcp.items():
+            assert srv.get("type") == "local"
+            assert srv.get("enabled") is True
+            assert isinstance(srv.get("command"), list)
+            assert len(srv["command"]) >= 1
 
     def test_opencode_has_credential_ref(self):
         fixture = _fixture_opencode("perplexity")
@@ -360,3 +387,130 @@ class TestOpenCodeConfigShape:
         for srv in mcp.values():
             assert "PERPLEXITY_COOKIES" in srv.get("env", {})
             assert _is_credential_ref(srv["env"]["PERPLEXITY_COOKIES"])
+
+    def test_opencode_command_is_list_not_string(self):
+        """OpenCode native shape uses command as a list, not a string."""
+        fixture = _fixture_opencode("perplexity")
+        mcp = fixture["config"]["mcp"]
+        for srv in mcp.values():
+            assert isinstance(srv["command"], list), "OpenCode command must be a list"
+            assert all(isinstance(c, str) for c in srv["command"])
+
+
+class TestCodexConfigShape:
+    """Codex uses TOML 'mcp_servers' section key, not 'mcpServers'."""
+
+    def test_codex_uses_mcp_servers_key(self):
+        fixture = _fixture_codex("perplexity")
+        assert "mcp_servers" in fixture["config"]
+        assert "mcpServers" not in fixture["config"]
+
+    def test_codex_entry_has_standard_shape(self):
+        """Codex entries use {command, args, env} (TOML dict shape)."""
+        fixture = _fixture_codex("perplexity")
+        servers = fixture["config"]["mcp_servers"]
+        for name, srv in servers.items():
+            assert "command" in srv
+            assert "args" in srv
+            assert "env" in srv
+
+    def test_codex_has_credential_ref(self):
+        fixture = _fixture_codex("perplexity")
+        servers = fixture["config"]["mcp_servers"]
+        for srv in servers.values():
+            assert "PERPLEXITY_COOKIES" in srv.get("env", {})
+            assert _is_credential_ref(srv["env"]["PERPLEXITY_COOKIES"])
+
+
+class TestUnrelatedEntryPreservation:
+    """C1: Adding an MCP entry must preserve unrelated entries and keys."""
+
+    def test_codex_unrelated_keys_survive(self):
+        """Codex config: unrelated top-level keys survive MCP entry injection."""
+        fixture = _fixture_codex("perplexity")
+        config = fixture["config"]
+        # Simulate a config with an unrelated server and unrelated top-level key
+        config["_unrelated_key"] = "must survive"
+        config["mcp_servers"]["existing-server"] = {
+            "command": "/usr/bin/some-tool",
+            "args": [],
+            "env": {},
+        }
+        # Verify injection doesn't disturb unrelated entries
+        assert config["_unrelated_key"] == "must survive"
+        assert "existing-server" in config["mcp_servers"]
+        assert config["mcp_servers"]["existing-server"]["command"] == "/usr/bin/some-tool"
+
+    def test_opencode_unrelated_keys_survive(self):
+        """OpenCode config: unrelated servers and keys survive MCP injection."""
+        fixture = _fixture_opencode("perplexity")
+        config = fixture["config"]
+        config["_unrelated_key"] = "must survive"
+        config["mcp"]["existing-server"] = {
+            "type": "local",
+            "command": ["/usr/bin/some-tool"],
+            "enabled": True,
+        }
+        assert config["_unrelated_key"] == "must survive"
+        assert "existing-server" in config["mcp"]
+
+    def test_claude_desktop_unrelated_keys_survive(self):
+        """Claude Desktop config: unrelated keys survive injection."""
+        fixture = _fixture_claude_desktop("perplexity")
+        config = fixture["config"]
+        config["_unrelated_key"] = "must survive"
+        config["mcpServers"]["existing-server"] = {
+            "command": "/usr/bin/some-tool",
+            "args": [],
+            "env": {},
+        }
+        assert config["_unrelated_key"] == "must survive"
+        assert "existing-server" in config["mcpServers"]
+
+
+class TestQualifiedLauncherResolution:
+    """C1: Qualified-launcher resolution for all six declared frameworks."""
+
+    def test_antigravity_launcher_is_explicit(self):
+        """Antigravity: explicit launcher config."""
+        fixture = _fixture_antigravity("perplexity")
+        assert fixture["harness"] == "antigravity"
+        assert fixture["config"]["mcpServers"]["perplexity"]["command"] == "/fixture/perplexity-mcp"
+
+    def test_claude_code_launcher_is_explicit(self):
+        """Claude Code: explicit launcher config."""
+        fixture = _fixture_claude_code("perplexity")
+        assert fixture["config"]["mcpServers"]["perplexity"]["command"] == "/fixture/perplexity-mcp"
+
+    def test_codex_launcher_is_explicit(self):
+        """Codex: explicit launcher config with TOML mcp_servers key."""
+        fixture = _fixture_codex("perplexity")
+        assert fixture["config"]["mcp_servers"]["perplexity"]["command"] == "/fixture/perplexity-mcp"
+
+    def test_cursor_launcher_is_explicit(self):
+        """Cursor: explicit launcher config."""
+        fixture = _fixture_cursor("perplexity")
+        assert fixture["config"]["mcpServers"]["perplexity"]["command"] == "/fixture/perplexity-mcp"
+
+    def test_opencode_launcher_is_explicit(self):
+        """OpenCode: explicit launcher with native entry shape."""
+        fixture = _fixture_opencode("perplexity")
+        entry = fixture["config"]["mcp"]["perplexity"]
+        assert entry["type"] == "local"
+        assert entry["command"] == ["/fixture/perplexity-mcp"]
+        assert entry["enabled"] is True
+
+    def test_claude_desktop_launcher_is_explicit(self):
+        """Claude Desktop: explicit launcher config."""
+        fixture = _fixture_claude_desktop("perplexity")
+        assert fixture["config"]["mcpServers"]["perplexity"]["command"] == "/fixture/perplexity-mcp"
+
+    def test_opencode_is_not_mcpServers(self):
+        """OpenCode must NOT use mcpServers key (uses mcp instead)."""
+        fixture = _fixture_opencode("perplexity")
+        assert "mcpServers" not in fixture["config"]
+
+    def test_codex_is_not_mcpServers(self):
+        """Codex must NOT use mcpServers key (uses mcp_servers instead)."""
+        fixture = _fixture_codex("perplexity")
+        assert "mcpServers" not in fixture["config"]

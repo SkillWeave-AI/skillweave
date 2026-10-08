@@ -168,9 +168,8 @@ class CredentialResolver:
         }
         return mapping.get(reference_id, (reference_id,))
 
-    @staticmethod
     def child_env(
-        reference_id: str,
+        self,
         env_allowlist: tuple[str, ...] = (),
     ) -> dict[str, str]:
         """Build an owned child environment, injecting only allowlisted vars.
@@ -178,10 +177,50 @@ class CredentialResolver:
         This is the ONLY place secret values enter the child process. The
         returned dict contains only environment variables that are on the
         allowlist. The value is never logged or persisted.
+
+        Uses the resolver's configured env source (``env_overrides`` or
+        ``os.environ``) so that tests can inject values without setting real
+        environment variables.
         """
+        source = (
+            self._env_overrides
+            if self._env_overrides is not None
+            else os.environ
+        )
         child: dict[str, str] = {}
         for var in env_allowlist:
-            value = os.environ.get(var)
+            value = source.get(var)
             if value is not None:
                 child[var] = value
         return child
+
+
+def check_credential_availability(
+    reference_id: str,
+    resolver: Optional[CredentialResolver] = None,
+) -> str:
+    """Check credential availability, returning 'available' or 'missing'.
+
+    This is the single production entry point that bridges CredentialResolver
+    to the policy gate and the launcher. Returns the availability string used
+    by EffectivePolicy and AdmissionDecision.
+    """
+    r = resolver if resolver is not None else CredentialResolver()
+    resolution = r.resolve(reference_id)
+    return "available" if resolution.available else "missing"
+
+
+def build_allowlisted_child_env(
+    reference_id: str,
+    resolver: Optional[CredentialResolver] = None,
+) -> dict[str, str]:
+    """Build the child environment for a credential reference.
+
+    Only the allowlisted variable(s) for the given reference are injected.
+    The values are never logged or persisted.
+    """
+    r = resolver if resolver is not None else CredentialResolver()
+    resolution = r.resolve(reference_id)
+    if not resolution.available:
+        return {}
+    return r.child_env(env_allowlist=resolution.variable_names)
