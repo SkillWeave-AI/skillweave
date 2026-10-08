@@ -1471,3 +1471,183 @@ def _profile_pin(profile: "RoutingProfile") -> Optional[str]:
     if len(pins) == 1:
         return next(iter(pins))
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SW-1510-ROUTE-LOCK: Route decision records, gateway enforcement, and
+# BytePlus V4 Flash / V4.1 Flash / Pro route enforcement.
+# ═══════════════════════════════════════════════════════════════════════════
+
+#: The approved Faigate gateway endpoint.  Worker and child egress is
+#: restricted to this address (criterion 2); alternative loopback routers
+#: on different ports/hosts and direct upstream URLs are refused.
+APPROVED_GATEWAY_HOST = "127.0.0.1"
+APPROVED_GATEWAY_PORT = 8090
+APPROVED_GATEWAY_URL = f"http://{APPROVED_GATEWAY_HOST}:{APPROVED_GATEWAY_PORT}"
+
+#: The approved BytePlus V4 Flash / V4.1 Flash / Pro route set (criterion 3).
+#: Every model resolved through the gateway must match one of these routes.
+#: A wrong version (e.g. ``deepseek-v3``) or a direct-provider bypass (no
+#: ``byteplus/`` prefix) is refused and causes HOLD.
+APPROVED_BYTEPLUS_ROUTES: frozenset[str] = frozenset({
+    "byteplus/deepseek-v4-flash",
+    "byteplus/deepseek-v4.1-flash",
+    "byteplus/deepseek-v4-pro",
+    "byteplus/deepseek-v4.1-pro",
+})
+
+#: The policy revision recorded per seat and per decision (criterion 1).
+#: Carried as ``policy_revision`` on every ``RouteDecision`` so a run record
+#: can tell which policy version produced a given route binding.
+COUNCIL_POLICY_REVISION = "1.3.11"
+
+
+@dataclass
+class RouteDecision:
+    """Full record of a route decision (SW-1510-ROUTE-LOCK criterion 1).
+
+    Every request — parent or nested — retains its full identity chain so a
+    later reader can reconstruct the request → resolution → answer path
+    without guessing.  When answering envelope identity is not observable it
+    is left as ``None``, never fabricated.
+
+    ``correlation_id`` links parent and nested requests into a single trace.
+    ``requested_alias`` is the model alias the caller asked for (provider-native).
+    ``resolved_provider`` names the gateway/provider that resolved the alias.
+    ``resolved_model`` is the concrete model id the gateway produced.
+    ``answering_envelope_identity`` is the ``model`` field from the response
+    envelope, when available.
+    ``catalog_revision`` and ``policy_revision`` name the profile/policy data
+    versions that produced this decision.
+    """
+
+    correlation_id: str
+    requested_alias: str
+    resolved_provider: str
+    resolved_model: str
+    answering_envelope_identity: Optional[str] = None
+    catalog_revision: str = ""
+    policy_revision: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "correlation_id": self.correlation_id,
+            "requested_alias": self.requested_alias,
+            "resolved_provider": self.resolved_provider,
+            "resolved_model": self.resolved_model,
+            "answering_envelope_identity": self.answering_envelope_identity,
+            "catalog_revision": self.catalog_revision,
+            "policy_revision": self.policy_revision,
+        }
+
+
+def make_route_decision(
+    correlation_id: str,
+    requested_alias: str,
+    resolved_provider: str,
+    resolved_model: str,
+    answering_envelope_identity: Optional[str] = None,
+    catalog_revision: str = "",
+    policy_revision: str = "",
+) -> RouteDecision:
+    """Build a ``RouteDecision`` with the given identity chain.
+
+    ``catalog_revision`` and ``policy_revision`` default to the current
+    ``COUNCIL_POLICY_REVISION`` when not provided, so a caller that does not
+    explicitly track revisions still gets a recorded value.
+    """
+    return RouteDecision(
+        correlation_id=correlation_id,
+        requested_alias=requested_alias,
+        resolved_provider=resolved_provider,
+        resolved_model=resolved_model,
+        answering_envelope_identity=answering_envelope_identity,
+        catalog_revision=catalog_revision or COUNCIL_POLICY_REVISION,
+        policy_revision=policy_revision or COUNCIL_POLICY_REVISION,
+    )
+
+
+def is_byteplus_route(resolved_model: str) -> bool:
+    """Whether ``resolved_model`` is an approved BytePlus route (criterion 3).
+
+    An approved route is one whose provider prefix and model name match
+    the known BytePlus V4 Flash / V4.1 Flash / Pro set.  Unknown routes,
+    wrong versions, or direct-provider bypasses (no ``byteplus/`` prefix)
+    return ``False``, causing the caller to HOLD.
+    """
+    return resolved_model in APPROVED_BYTEPLUS_ROUTES
+
+
+def verify_approved_route(resolved_model: str, provider: str = "faigate") -> None:
+    """Verify that ``resolved_model`` is an approved BytePlus route.
+
+    Raises ``ModelNamespaceError`` (HOLD) when the route is not approved.
+    This is the fail-closed check: a model that does not match the known
+    BytePlus V4 Flash / V4.1 Flash / Pro set is refused before any provider
+    call, not silently routed to an unapproved provider.
+
+    The provider itself must be the approved gateway (``faigate``).  A
+    direct-provider bypass (e.g. ``openrouter``, ``single_model``) or an
+    alternative router is also refused here — before any paid admission.
+    """
+    if provider not in ("faigate",):
+        raise ModelNamespaceError(
+            resolved_model,
+            f"provider {provider!r} is not the approved gateway; "
+            "direct-provider bypass is not allowed",
+        )
+    if not is_byteplus_route(resolved_model):
+        raise ModelNamespaceError(
+            resolved_model,
+            f"model {resolved_model!r} is not an approved BytePlus route; "
+            f"approved routes: {sorted(APPROVED_BYTEPLUS_ROUTES)}",
+        )
+
+
+def check_egress_gateway(url: str) -> None:
+    """Verify that ``url`` routes through the approved Faigate gateway.
+
+    Criterion 2: worker and child egress is restricted to the approved
+    enforcing gateway at ``http://127.0.0.1:8090``.  Alternative loopback
+    routers (different ports, different hosts) and direct upstream URLs
+    are detected and refused.  When enforcement is absent — the URL does
+    not start with the approved gateway address — the check raises before
+    any paid admission.
+
+    Raises ``ModelNamespaceError`` with a description of the disallowed
+    egress path.
+    """
+    normalized = url.rstrip("/")
+    if not normalized.startswith(APPROVED_GATEWAY_URL):
+        raise ModelNamespaceError(
+            url,
+            f"egress URL {url!r} does not route through the approved gateway "
+            f"at {APPROVED_GATEWAY_URL}; alternative loopback or direct "
+            "upstream is not allowed",
+        )
+
+
+def check_retry_attribution(
+    attempt: int,
+    requested_route: str,
+    allowed_routes: Optional[set[str]] = None,
+) -> None:
+    """Verify a retry/escalation has proper attempt attribution (criterion 4).
+
+    Each retry must carry its own new attempt attribution (``attempt >= 1``)
+    and the requested route must be within the approved route set.  When
+    ``allowed_routes`` is set and the requested route is not in it, the
+    retry is refused — raw upstream names or global environment keys cannot
+    override the approved route set.
+
+    Raises ``ValueError`` when the retry attribution is invalid.
+    """
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise ValueError(
+            f"retry attempt must be a positive integer, got {attempt!r}"
+        )
+    if allowed_routes is not None and requested_route not in allowed_routes:
+        raise ValueError(
+            f"retry route {requested_route!r} is not in allowed routes "
+            f"{sorted(allowed_routes)}"
+        )

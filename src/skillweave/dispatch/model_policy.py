@@ -536,6 +536,100 @@ def apply_transfer_observation(
     return declaration
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SW-1510-ROUTE-LOCK: Tier-to-route binding and retry attribution.
+# ═══════════════════════════════════════════════════════════════════════════
+
+#: The approved BytePlus routes per capability tier (criterion 3).
+#: ``flash`` tiers map to the cheaper Flash class; ``pro`` tiers map to
+#: the stronger Pro class.  This is the single binding between capability
+#: tiers and concrete provider routes — raw upstream names or global
+#: environment keys cannot override this mapping.
+TIER_ROUTE_MAP: dict[str, frozenset[str]] = {
+    ModelTier.FLASH.value: frozenset({
+        "byteplus/deepseek-v4-flash",
+        "byteplus/deepseek-v4.1-flash",
+    }),
+    ModelTier.PRO.value: frozenset({
+        "byteplus/deepseek-v4-pro",
+        "byteplus/deepseek-v4.1-pro",
+        # Pro escalation may also use Flash routes when budget permits.
+        "byteplus/deepseek-v4-flash",
+        "byteplus/deepseek-v4.1-flash",
+    }),
+}
+
+
+def resolve_route_for_tier(tier: str) -> frozenset[str]:
+    """Return the approved route set for a capability tier (criterion 3).
+
+    The mapping is the single authoritative binding between the provider-
+    neutral ``flash``/``pro`` tier vocabulary and the concrete BytePlus
+    route names.  An unknown tier raises ``AllocationError``, so a caller
+    can never silently route through an unapproved provider.
+    """
+    routes = TIER_ROUTE_MAP.get(tier)
+    if routes is None:
+        raise AllocationError(
+            f"unknown tier {tier!r} for route resolution "
+            f"(expected one of {sorted(TIER_ROUTE_MAP)})"
+        )
+    return routes
+
+
+@dataclass(frozen=True)
+class AttemptAttribution:
+    """Retry/escalation attempt attribution (criterion 4).
+
+    Each retry or escalation carries its own new ``attempt`` number
+    (strictly increasing from the parent), the ``requested_route`` the
+    attempt is bound to, and the ``reserved_budget`` (in abstract cost
+    units) allocated for this attempt.  An attempt with ``attempt < 1``
+    or without an explicit route is invalid and must be refused before
+    any launch.
+
+    When ``allowed_routes`` is set, the requested route must be within
+    that set — raw upstream names or global environment keys cannot
+    override the approved route set.
+    """
+
+    attempt: int = 1
+    requested_route: str = ""
+    reserved_budget: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.attempt, int) or isinstance(self.attempt, bool):
+            raise AllocationError(
+                f"attempt must be a positive integer, got {self.attempt!r}"
+            )
+        if self.attempt < 1:
+            raise AllocationError(
+                f"attempt must be >= 1, got {self.attempt}"
+            )
+        if not self.requested_route:
+            raise AllocationError(
+                "an attempt attribution requires a non-empty requested_route"
+            )
+
+
+def check_attempt_route(
+    attribution: AttemptAttribution,
+    allowed_routes: Optional[frozenset[str]] = None,
+) -> None:
+    """Verify that an attempt's route is within the allowed set (criterion 4).
+
+    Raises ``AllocationError`` when the route is not permitted.  When
+    ``allowed_routes`` is ``None``, the check is skipped (caller has not
+    declared a route restriction).
+    """
+    if allowed_routes is not None and attribution.requested_route not in allowed_routes:
+        raise AllocationError(
+            f"attempt {attribution.attempt} requests route "
+            f"{attribution.requested_route!r} which is not in allowed routes "
+            f"{sorted(allowed_routes)}"
+        )
+
+
 __all__ = [
     "ModelTier",
     "AllocationError",
@@ -558,4 +652,8 @@ __all__ = [
     "ModelReceipt",
     "TransferObservation",
     "apply_transfer_observation",
+    "TIER_ROUTE_MAP",
+    "resolve_route_for_tier",
+    "AttemptAttribution",
+    "check_attempt_route",
 ]
