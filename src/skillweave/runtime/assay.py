@@ -116,6 +116,195 @@ class PolicyDecision:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+# ── Classified repair binding (SW-1510-REPAIR) ──────────────────────────────
+
+#: The six error classes a bounded repair distinguishes, and the single
+#: permitted action for each. This is the controller-side mirror of
+#: ``semantic_repair.ErrorClass`` / ``ALLOWED_ACTION``; it is kept as data (not
+#: an import) so ``runtime.assay`` carries no dependency on the repair module
+#: and can still be exercised offline. The two must agree — a mirrored pair is
+#: asserted by ``tests/unit/test_1510_repair.py``.
+REPAIR_ALLOWED_ACTION: dict[str, str] = {
+    "auth_quota": "hold",
+    "capability_mismatch": "hold",
+    "context_pressure": "split",
+    "malformed_artifact": "remediate",
+    "source_drift": "reschedule",
+    "repeated_semantic_failure": "hold",
+    # A failure that matched no typed signal fails closed to a HOLD rather than
+    # defaulting to a permissive remediation.
+    "unclassified": "hold",
+}
+
+#: Action name -> the Assay :class:`ActionType` it is gated as.
+_REPAIR_ACTION_TYPE: dict[str, ActionType] = {
+    "remediate": ActionType.REMEDIATE,
+    "reschedule": ActionType.RESCHEDULE,
+    "split": ActionType.SPLIT,
+}
+
+
+@dataclass(frozen=True)
+class RepairActionRequest:
+    """A classified repair decision offered to the Assay controller.
+
+    ``error_class`` is one of the six classes; ``action`` is the single allowed
+    action for that class. The controller refuses an action that is not the
+    allowed one for the class (an unsupported route), rather than executing it.
+    """
+
+    error_class: str
+    action: str
+    description: str = ""
+    scope: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RepairActionDecision:
+    """The controller's decision over a classified repair action."""
+
+    approved: bool
+    error_class: str
+    action: str
+    reason: str = ""
+    requires_human: bool = False
+    policy: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class AssayRepairController:
+    """Bind classified bounded repairs to the Assay policy + admission seam.
+
+    The controller is the single place a *classification* becomes a *permitted
+    action*. It:
+
+    * refuses an ``error_class`` outside the vocabulary and an ``action`` that
+      is not the allowed action for its class (an unsupported route is refused,
+      never executed);
+    * gates the action through the Assay autonomy policy — Unicorn approves
+      permitted reversible decisions (remediate/reschedule/split), while a class
+      whose allowed action is HOLD always escalates to a human;
+    * when an :class:`AssayEngine` is bound, enforces the engine's admission
+      contract (actor, pinned subject/brief, deadline, remaining budget) so a
+      HOLD on refused admission never becomes a mutation.
+    """
+
+    def __init__(
+        self,
+        *,
+        policy: Optional[AssayPolicy] = None,
+        policy_name: str = "unicorn",
+        engine: Optional["AssayEngine"] = None,
+        admission: Optional["AssayAdmission"] = None,
+    ) -> None:
+        if engine is not None:
+            self.engine = engine
+            self.policy = engine.policy
+        else:
+            self.engine = None
+            self.policy = policy if policy is not None else create_policy(policy_name)
+        self.admission = admission
+        #: The ordered, append-only corrections this controller accepted.
+        self.corrections: list[dict[str, Any]] = []
+
+    def act(self, request: RepairActionRequest) -> RepairActionDecision:
+        """Decide whether a classified repair *action* may run.
+
+        Never raises for a refused action: a refusal is returned as a decision
+        with ``approved=False`` so the caller records a HOLD, not a crash.
+        """
+        error_class = request.error_class
+        allowed = REPAIR_ALLOWED_ACTION.get(error_class)
+        if allowed is None:
+            return RepairActionDecision(
+                approved=False,
+                error_class=error_class,
+                action=request.action,
+                reason=f"unsupported error class {error_class!r}",
+                requires_human=True,
+                policy=getattr(self.policy, "name", ""),
+            )
+        if request.action != allowed:
+            return RepairActionDecision(
+                approved=False,
+                error_class=error_class,
+                action=request.action,
+                reason=(
+                    f"unsupported route: action {request.action!r} is not the "
+                    f"allowed action {allowed!r} for class {error_class!r}"
+                ),
+                requires_human=True,
+                policy=getattr(self.policy, "name", ""),
+            )
+
+        # A class whose allowed action is HOLD is a human decision by design.
+        if allowed == "hold":
+            return RepairActionDecision(
+                approved=False,
+                error_class=error_class,
+                action=request.action,
+                reason=f"{error_class} holds: no automated action is permitted",
+                requires_human=True,
+                policy=getattr(self.policy, "name", ""),
+            )
+
+        action_type = _REPAIR_ACTION_TYPE[allowed]
+        action = ActionRequest(
+            action_type=action_type,
+            description=request.description
+            or f"{error_class} -> {allowed}",
+            state=AssayState.CLASSIFY,
+            target_state=(
+                AssayState.REMEDIATE
+                if action_type == ActionType.REMEDIATE
+                else None
+            ),
+            scope=request.scope,
+            metadata={"error_class": error_class, **dict(request.metadata)},
+        )
+
+        # Admission first: a refused admission is a HOLD, and the policy is
+        # never even consulted for a mutation the run is not admitted for.
+        if self.engine is not None:
+            try:
+                self.engine.admit(self.admission)
+            except AdmissionRefused as exc:
+                return RepairActionDecision(
+                    approved=False,
+                    error_class=error_class,
+                    action=request.action,
+                    reason=f"admission refused ({exc.axis}): {exc.reason}",
+                    requires_human=True,
+                    policy=getattr(self.policy, "name", ""),
+                )
+
+        decision = self.policy.check(action)
+        return RepairActionDecision(
+            approved=decision.approved,
+            error_class=error_class,
+            action=request.action,
+            reason=decision.reason,
+            requires_human=decision.requires_human,
+            policy=getattr(self.policy, "name", ""),
+            metadata=dict(decision.metadata),
+        )
+
+    def record_correction(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Validate and record a frozen ``attempt-event-v1`` correction.
+
+        A consumer of the correction stream refuses a version it does not
+        support rather than guessing at the shape; the validation is delegated
+        to ``semantic_repair.validate_attempt_event`` (imported lazily so this
+        module keeps no dependency on the repair module).
+        """
+        from .semantic_repair import validate_attempt_event
+
+        validate_attempt_event(event)
+        self.corrections.append(event)
+        return event
+
+
 # ── AssayPolicy (abstract base) ─────────────────────────────────────────────
 
 class AssayPolicy:
@@ -802,6 +991,21 @@ class AssayEngine:
             self._enforce_budget(env["remaining_budget"], axis="budget")
         return actor
 
+    def admit(
+        self,
+        admission: Optional["AssayAdmission"] = None,
+        *,
+        check_budget: bool = True,
+    ) -> str:
+        """Verify the admission contract *without* mutating, and return the actor.
+
+        A public seam for a controller that must decide whether a mutation is
+        admitted before it acts. Raises :class:`AdmissionRefused` on any failed
+        axis (actor, subject, brief, deadline, budget) exactly as a mutating
+        call would — the decision is the same gate the mutation uses.
+        """
+        return self._check_admission(admission, check_budget=check_budget)
+
     def _merged_envelope(self, proposed: Optional["AssayEnvelope"]) -> dict[str, Any]:
         """Combine the authority envelope with a caller's, tightening only.
 
@@ -1155,6 +1359,10 @@ __all__ = [
     "ActionType",
     "ActionRequest",
     "PolicyDecision",
+    "REPAIR_ALLOWED_ACTION",
+    "RepairActionRequest",
+    "RepairActionDecision",
+    "AssayRepairController",
     "AssayPolicy",
     "ConservativePolicy",
     "ModeratePolicy",
