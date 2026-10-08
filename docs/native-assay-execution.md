@@ -111,6 +111,28 @@ CLI, MCP and a journal replay all read the single `run_snapshot(run_id)` view â€
 ordered `phases`, terminal `outcome`, and the verifier `verification` /
 `gate_state`. They cannot disagree about what ran.
 
+## MCP control surface (`SW-1510-MCP-CONTROL`)
+
+MCP is *transport*, not the source of durable truth. The six legacy command
+tools (`create_run`, `status_run`, `cancel_run`, `resume_run`, `get_evidence`,
+`review_run`) keep their names, signatures and flat JSON shapes and delegate to
+`skillweave.mcp.control`, which composes the same `RunApplicationService` the
+CLI drives. Alongside them the control surface (`src/skillweave/mcp/control.py`)
+exposes:
+
+* **A namespaced, opt-in read shape.** `snapshot_v1(run_id)` emits the frozen
+  `run-snapshot-v1` record; an unknown version name is *refused*
+  (`SnapshotVersionRefused`), never coerced to a supported one.
+* **An honest dependency diagnostic.** Serving needs the real `mcp` package.
+  When it is absent the placeholder server reports `can_serve == False` with an
+  explicit reason and refuses to run; `python -m skillweave.mcp.server` exits
+  non-zero with the diagnostic instead of silently no-op'ing.
+* **Transport/capability negotiation.** `stdio` and the scoped Streamable HTTP
+  transport are described and negotiated. Experimental MCP *Tasks* are
+  negotiated only where the transport supports them **and** the client asks;
+  otherwise the negotiated execution shape is the ordinary asynchronous tool
+  plus a poll cursor (`control_poll`).
+
 ## Limitations
 
 * The legacy/default path (`methodology="ralph"`, the historical default)
