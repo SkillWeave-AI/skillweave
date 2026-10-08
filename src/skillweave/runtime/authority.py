@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 import secrets
 from dataclasses import dataclass, field
@@ -308,32 +309,37 @@ class AuthorityGuard:
 # mint a principal, cannot widen its own role, and cannot replay a consumed
 # decision.
 
-#: The frozen authorization-envelope version the MCP middleware consumes. An
-#: unknown version is refused by name; there is no silent default.
-EXECUTION_ENVELOPE_VERSION = "execution-envelope-v1"
+#: The SDK-owned, frozen ``execution-envelope-v1`` contract this middleware
+#: consumes. Core does **not** copy the schema bytes: the wire shape is the one
+#: authority (``skillweave_sdk.validator``, installed from
+#: ``integrations/skillweave-sdk``) and the middleware validates against its
+#: schema ``$id`` -- never a private, competing contract. See controller
+#: finding 3.
+EXECUTION_ENVELOPE_SCHEMA_ID = (
+    "https://skillweave.dev/schemas/execution/execution-envelope/v1"
+)
 
-#: The frozen schema digest of the ``execution-envelope-v1`` shape. It is
-#: pinned here so a consumer refuses an envelope whose shape does not match
-#: the reviewed contract -- the digest is over the ordered ``(field, type)``
-#: declarations below. Freeze before implementation, per the boundary.
+#: The SDK schema's frozen ``schema_version`` const (``$id`` above). An unknown
+#: version is refused by name; there is no silent default.
+EXECUTION_ENVELOPE_VERSION = "1.0.0"
+
+#: The canonical digest of the SDK contract *set* the middleware was frozen
+#: against. It is pinned (rather than read from the ambient package) so a
+#: consumer refuses a drifted schema tree by name; when the SDK is present the
+#: value is cross-checked against ``skillweave_sdk.validator``.
 EXECUTION_ENVELOPE_SCHEMA_DIGEST = (
-    "8e37019a8adfc0e7d1aaeb29d3ee2d214edf39caad9ad9b0ec72dd67bf80b2c9"
+    "3dd247f604017bac4ff37ff4f3e9b46c5d1bc48fc8ef225de88ec4b6d14d2e64"
 )
 
-#: The ordered ``(field, type)`` declarations the schema digest commits to.
-EXECUTION_ENVELOPE_FIELDS: tuple[tuple[str, str], ...] = (
-    ("version", "string"),
-    ("schema_digest", "string"),
-    ("principal", "string"),
-    ("role", "string"),
-    ("client_id", "string"),
-    ("scopes", "array<string>"),
-    ("allowed_run_ids", "array<string>"),
-    ("session_id", "string"),
-    ("issued_at", "string"),
-    ("expires_at", "string|null"),
-    ("transport", "string"),
-)
+#: The namespaced extension key under which the MCP-principal facts ride. The
+#: SDK envelope forbids additional top-level properties, so the middleware's
+#: extra fields live inside the open ``scope`` object under a namespaced key --
+#: an extension of the one contract, never a second competing one.
+EXECUTION_ENVELOPE_MCP_EXTENSION = "skillweave:mcp"
+
+#: The provider routes a client credential may never be forwarded to (kept in
+#: sync with the middleware's ``NON_FORWARDABLE_ROUTES``).
+_NON_FORWARDABLE_ROUTES = frozenset({"passthrough", "echo", "reflect"})
 
 #: The four MCP session roles that must carry *distinct scoped authority*.
 #: ``worker`` is the most constrained (execute one bound attempt, never
@@ -369,7 +375,7 @@ MCP_ROLE_SCOPES: dict[str, dict[str, Any]] = {
     "controller": {
         "operations": frozenset(
             {"read_run", "write_run_state", "start_run", "cancel_run",
-             "resume_run", "admit_gate"}
+             "resume_run", "admit_gate", "forward"}
         ),
         "can_review": False,
         "can_approve": False,
@@ -454,6 +460,20 @@ class UnsupportedEnvelopeVersion(MCPAuthError):
         super().__init__("unsupported_envelope_version", message, **kw)
 
 
+class EnvelopeSchemaInvalid(MCPAuthError):
+    """An envelope whose shape violates the frozen SDK contract.
+
+    Distinct from :class:`UnsupportedEnvelopeVersion`: the version is one this
+    surface speaks, but the record does not satisfy the SDK
+    ``execution-envelope-v1`` schema (a forbidden property, a missing required
+    field, or an SDK-reported validation error). Refused by name, never
+    partially accepted.
+    """
+
+    def __init__(self, message: str, **kw: Any):
+        super().__init__("envelope_schema_invalid", message, **kw)
+
+
 @dataclass(frozen=True)
 class MCPPrincipal:
     """An *authenticated* MCP session principal.
@@ -502,6 +522,7 @@ class _MCPSessionRecord:
     expires_at: Optional[str]
     allowed_roots: tuple[str, ...] = ()
     allowed_argv0: frozenset[str] = frozenset()
+    allowed_routes: tuple[str, ...] = ()
     revoked: bool = False
 
     def is_live(self, at: str) -> bool:
@@ -523,16 +544,76 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _envelope_for(principal: MCPPrincipal) -> dict[str, Any]:
-    """Serialise a verified principal as an ``execution-envelope-v1`` record.
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
-    The envelope is a *derived view* of host-verified facts; it is what the MCP
-    authorization middleware passes downstream. It carries the frozen version
-    and schema digest so a consumer can refuse a mismatched shape by name.
+
+def _digest(obj: Any) -> str:
+    return hashlib.sha256(_canonical_json(obj).encode("utf-8")).hexdigest()
+
+
+#: The eleven required top-level properties of the frozen SDK
+#: ``execution-envelope-v1`` contract. ``additionalProperties: false`` means a
+#: record carrying anything else is refused.
+_EXECUTION_ENVELOPE_REQUIRED: tuple[str, ...] = (
+    "schema_version",
+    "envelope_id",
+    "authorized_principal",
+    "subject_digest",
+    "brief_digest",
+    "scope",
+    "deadline_utc",
+    "limit_policy",
+    "allowed_routes",
+    "irreversible_actions",
+    "authority_evidence_digest",
+)
+
+#: The route a session that admits *no* provider route still carries -- the SDK
+#: schema requires at least one entry. It names no provider, so forwarding to a
+#: real provider is refused by ``allowed_routes``.
+_LOCAL_ONLY_ROUTE = "skillweave-local"
+
+
+def _sdk_validator_module():
+    """The installed ``skillweave_sdk.validator`` module, or ``None``.
+
+    The SDK is the contract authority (``integrations/skillweave-sdk``). It is
+    used only when it is importable *and* its registry actually carries the
+    frozen execution-envelope schema; a host whose ambient SDK predates the
+    execution contract set yields ``None`` and the verifier falls back to the
+    strict structural check below -- a *documented hold*, never a silent accept.
     """
-    return {
-        "version": EXECUTION_ENVELOPE_VERSION,
-        "schema_digest": EXECUTION_ENVELOPE_SCHEMA_DIGEST,
+    try:
+        import skillweave_sdk.validator as validator
+    except Exception:  # noqa: BLE001 - any import failure is a hold, not a crash
+        return None
+    try:
+        registry = validator.load_registry()
+    except Exception:  # noqa: BLE001
+        return None
+    if EXECUTION_ENVELOPE_SCHEMA_ID not in registry:
+        return None
+    return validator
+
+
+def sdk_validator_available() -> bool:
+    """Whether the SDK contract authority is usable in this process."""
+    return _sdk_validator_module() is not None
+
+
+def _envelope_for(principal: MCPPrincipal) -> dict[str, Any]:
+    """Serialise a verified principal as an SDK ``execution-envelope-v1``.
+
+    The producer is the authority service; the consumer is the MCP
+    authorization middleware. The record is the *frozen SDK shape* (validated
+    against ``skillweave_sdk.validator``), not a private contract: the MCP
+    principal facts ride inside the open ``scope`` object under the namespaced
+    :data:`EXECUTION_ENVELOPE_MCP_EXTENSION` key, never as competing top-level
+    fields. Digests are host-computed from verified facts, so they are real
+    ``^[a-f0-9]{64}$`` values rather than placeholders.
+    """
+    mcp_facts = {
         "principal": principal.principal,
         "role": principal.role,
         "client_id": principal.client_id,
@@ -543,31 +624,102 @@ def _envelope_for(principal: MCPPrincipal) -> dict[str, Any]:
         "expires_at": principal.expires_at,
         "transport": principal.transport,
     }
+    return {
+        "schema_version": EXECUTION_ENVELOPE_VERSION,
+        "envelope_id": f"mcp-{principal.session_id}",
+        "authorized_principal": principal.principal,
+        "subject_digest": _digest({"session_id": principal.session_id}),
+        "brief_digest": _digest(
+            {"role": principal.role, "scopes": sorted(principal.scopes)}
+        ),
+        "scope": {EXECUTION_ENVELOPE_MCP_EXTENSION: mcp_facts},
+        "deadline_utc": None,
+        "limit_policy": {
+            "policy": "observe_adapt",
+            "max_request_bytes": 1,
+            "max_output_tokens": 1,
+            "max_inflight_requests": 1,
+            "max_parallel_lanes": 1,
+        },
+        "allowed_routes": [_LOCAL_ONLY_ROUTE],
+        "irreversible_actions": [],
+        "authority_evidence_digest": _digest(mcp_facts),
+    }
+
+
+def mcp_principal_facts(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Read the namespaced MCP-principal facts back off a verified envelope.
+
+    Returns ``{}`` when the extension is absent: the SDK envelope is valid
+    without the middleware's extension, and the middleware never invents facts
+    that were not serialised from a verified principal.
+    """
+    if not isinstance(envelope, Mapping):
+        return {}
+    scope = envelope.get("scope")
+    if not isinstance(scope, Mapping):
+        return {}
+    facts = scope.get(EXECUTION_ENVELOPE_MCP_EXTENSION)
+    return dict(facts) if isinstance(facts, Mapping) else {}
 
 
 def verify_execution_envelope(envelope: Mapping[str, Any]) -> str:
-    """Refuse an envelope whose version or schema digest is not the frozen one.
+    """Validate an envelope against the frozen SDK ``execution-envelope-v1``.
 
     Producer is the authority service; consumer is the MCP authorization
-    middleware. An unknown version or a drifted schema digest is a *refusal by
-    name*, never a silent accept. Returns the version on success.
+    middleware. The record is validated against the SDK schema
+    ``skillweave_sdk.validator`` (schema ``$id`` :data:`EXECUTION_ENVELOPE_SCHEMA_ID`)
+    -- it is the one contract, and any other shape is a *refusal by name*.
+
+    An unknown ``schema_version``, a top-level property the SDK schema forbids,
+    or any SDK validation error is refused rather than silently accepted. When
+    the SDK contract authority is genuinely unavailable in this process (an
+    ambient SDK predating the execution set) the verifier applies the strict
+    structural half of the same schema -- required fields and no extras -- and
+    records that hold; it never accepts without *some* contract check.
+    Returns the version on success.
     """
     if not isinstance(envelope, Mapping):
         raise UnsupportedEnvelopeVersion("execution envelope must be a mapping")
-    version = envelope.get("version")
+    version = envelope.get("schema_version")
     if version != EXECUTION_ENVELOPE_VERSION:
         raise UnsupportedEnvelopeVersion(
-            f"unsupported execution-envelope version {version!r}; this surface "
-            f"speaks {EXECUTION_ENVELOPE_VERSION!r}",
-            extra={"version": version, "supported": [EXECUTION_ENVELOPE_VERSION]},
+            f"unsupported execution-envelope schema_version {version!r}; this "
+            f"surface speaks {EXECUTION_ENVELOPE_VERSION!r}",
+            extra={"schema_version": version, "supported": [EXECUTION_ENVELOPE_VERSION]},
         )
-    digest = envelope.get("schema_digest")
-    if digest != EXECUTION_ENVELOPE_SCHEMA_DIGEST:
-        raise UnsupportedEnvelopeVersion(
-            "execution-envelope schema digest does not match the frozen "
-            "contract",
-            extra={"schema_digest": digest,
-                   "expected": EXECUTION_ENVELOPE_SCHEMA_DIGEST},
+
+    validator = _sdk_validator_module()
+    if validator is not None:
+        try:
+            validator.verify_canonical_digest()
+        except Exception as exc:  # noqa: BLE001
+            raise UnsupportedEnvelopeVersion(
+                "execution-envelope schema set has drifted from the frozen "
+                "canonical digest",
+                extra={"expected": EXECUTION_ENVELOPE_SCHEMA_DIGEST,
+                       "reason": str(exc)},
+            ) from exc
+        errors = validator.validate(dict(envelope), EXECUTION_ENVELOPE_SCHEMA_ID)
+        if errors:
+            raise EnvelopeSchemaInvalid(
+                "execution envelope does not satisfy the SDK "
+                "execution-envelope-v1 contract",
+                extra={"errors": list(errors)},
+            )
+        return EXECUTION_ENVELOPE_VERSION
+
+    # Documented hold: the installed SDK cannot validate the execution contract
+    # set (ambient SDK predates SW-1510-CONTRACT). Apply the frozen structural
+    # half -- required fields present, no properties the schema forbids.
+    missing = [f for f in _EXECUTION_ENVELOPE_REQUIRED if f not in envelope]
+    extra = sorted(set(envelope) - set(_EXECUTION_ENVELOPE_REQUIRED))
+    if missing or extra:
+        raise EnvelopeSchemaInvalid(
+            "execution envelope does not satisfy the frozen "
+            "execution-envelope-v1 shape (SDK validator unavailable)",
+            extra={"missing": missing, "unexpected": extra,
+                   "sdk_validator_available": False},
         )
     return EXECUTION_ENVELOPE_VERSION
 
@@ -606,6 +758,7 @@ class MCPPrincipalAuthority:
         run_ids: Iterable[str] = (),
         allowed_roots: Iterable[str] = (),
         allowed_argv0: Iterable[str] = (),
+        allowed_routes: Iterable[str] = (),
         ttl_seconds: Optional[float] = None,
     ) -> str:
         """Mint an opaque session token for *role* bound to *client_id*.
@@ -648,6 +801,7 @@ class MCPPrincipalAuthority:
             expires_at=expires,
             allowed_roots=tuple(allowed_roots),
             allowed_argv0=frozenset(allowed_argv0),
+            allowed_routes=tuple(allowed_routes),
         )
         return token
 
@@ -722,6 +876,7 @@ class MCPPrincipalAuthority:
         command: str = "",
         approval_token: str = "",
         start_scope: str = "",
+        provider_route: str = "",
         default_paths: Iterable[str] = (),
     ) -> MCPPrincipal:
         """Authorize *operation* for the principal behind *token*.
@@ -759,6 +914,7 @@ class MCPPrincipalAuthority:
             principal, operation, db_path, artifacts_path, default_paths
         )
         self._guard_command(principal, operation, command)
+        self._guard_provider_route(principal, operation, provider_route)
         if start_scope:
             if start_scope in self._started_scopes:
                 raise DuplicateStartRefused(
@@ -846,6 +1002,41 @@ class MCPPrincipalAuthority:
                 role=principal.role,
                 action=operation,
                 extra={"argv0": argv[0], "allowed": sorted(record.allowed_argv0)},
+            )
+
+    def _guard_provider_route(
+        self, principal: MCPPrincipal, operation: str, provider_route: str
+    ) -> None:
+        """Refuse forwarding a client credential to an unapproved provider.
+
+        The client's MCP session token is authority over *this server*, never a
+        provider bearer token. A route that only exists to echo/reflect a
+        credential is always refused; any other route must be one the
+        principal's session was explicitly bound to
+        (:meth:`issue_session` ``allowed_routes``). An unbound session may
+        forward nowhere -- there is no wildcard.
+        """
+        if not provider_route:
+            return
+        if provider_route in _NON_FORWARDABLE_ROUTES:
+            raise MCPAuthError(
+                "token_passthrough_refused",
+                f"refusing to forward a client credential to route "
+                f"{provider_route!r}",
+                role=principal.role,
+                action=operation,
+                extra={"route": provider_route},
+            )
+        record = self._record_for_principal(principal)
+        if provider_route not in record.allowed_routes:
+            raise MCPAuthError(
+                "unapproved_provider_route",
+                f"route {provider_route!r} is not in the principal's approved "
+                f"provider routes",
+                role=principal.role,
+                action=operation,
+                extra={"route": provider_route,
+                       "allowed_routes": list(record.allowed_routes)},
             )
 
     def _record_for_principal(self, principal: MCPPrincipal) -> _MCPSessionRecord:
@@ -942,5 +1133,6 @@ def _record_fields(record: _MCPSessionRecord) -> dict[str, Any]:
         "expires_at": record.expires_at,
         "allowed_roots": record.allowed_roots,
         "allowed_argv0": record.allowed_argv0,
+        "allowed_routes": record.allowed_routes,
         "revoked": record.revoked,
     }

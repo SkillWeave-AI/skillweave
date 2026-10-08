@@ -38,6 +38,7 @@ import sys
 
 from skillweave.mcp import control
 from skillweave.runtime.authority import (
+    EXECUTION_ENVELOPE_MCP_EXTENSION,
     MCPAuthError,
     MCPPrincipal,
     MCPPrincipalAuthority,
@@ -67,6 +68,12 @@ NON_FORWARDABLE_ROUTES = frozenset({"passthrough", "echo", "reflect"})
 #: The process-wide authority. Bound exactly once by the host process
 #: (:func:`bind_authority`); a client cannot bind or replace it.
 _AUTHORITY: "MCPPrincipalAuthority | None" = None
+
+#: The session token the *production* stdio startup minted for this process
+#: (:func:`startup_and_bind_stdio`). It is host memory, never the wire: a
+#: stdio client's protected calls resolve to this principal when it presents
+#: no explicit credential. An HTTP client still presents its own token.
+_READY_SESSION_TOKEN: "str | None" = None
 
 
 class _DegradedFastMCP:
@@ -168,6 +175,80 @@ def server_default_paths() -> tuple:
     return (".skillweave/store.db", ".skillweave/artifacts")
 
 
+def start_scope_for(*, task_id: str, attempt: int, run_id: str = "") -> str:
+    """The start scope a create/start operation is bound to.
+
+    Mirrors the shared service's own scope id
+    (``control.create_run_payload``: ``f"{task_id or run_id}/attempt-{attempt}"``)
+    so the authorization seam refuses a *duplicate start of the same attempt*
+    at the real tool even though this surface mints its own run id.
+    """
+    effective = task_id or run_id
+    return f"{effective}/attempt-{attempt}"
+
+
+def resolve_session_token(presented: str = "") -> str:
+    """The session credential a protected call runs under.
+
+    A client may present a token in the call or in
+    :data:`SESSION_TOKEN_ENV`. When it presents neither, the token the
+    *production* stdio startup minted (:data:`_READY_SESSION_TOKEN`) resolves
+    the host-owned supervisor principal -- a local stdio client cannot mint it,
+    only the host binding did. An HTTP client has no such fallback and must
+    present its own credential.
+    """
+    return presented or session_token_from_env() or (_READY_SESSION_TOKEN or "")
+
+
+def gate_operation(
+    operation: str,
+    presented_token: str = "",
+    *,
+    requested_role: str = "",
+    run_id: str = "",
+    db_path: str = "",
+    artifacts_path: str = "",
+    command: str = "",
+    approval_token: str = "",
+    start_scope: str = "",
+    provider_route: str = "",
+):
+    """Authorize *operation* at the tool boundary (the controller's gate seam).
+
+    Returns ``(principal, None)`` when the call is admitted -- the caller's
+    ``db_path``/``artifacts_path``/``command`` have been proven either to be the
+    server default or inside the authenticated principal's bound scope -- and
+    ``(None, refusal_json)`` when it is refused, with the auditable typed error
+    serialised for the tool to return.
+
+    When the host has bound **no** authority the seam returns ``(None, None)``:
+    that is the accepted in-process/direct-caller path used by the CLI parity
+    tests, and it is why a reachable server is only *gated* once the host binds
+    an authority. Once an authority *is* bound, a caller that presents no
+    resolvable credential is refused for **every** tool, not only review.
+    """
+    authority = _AUTHORITY
+    if authority is None or not callable(getattr(authority, "serve_live", None)):
+        return None, None
+    token = resolve_session_token(presented_token)
+    try:
+        principal = authenticate_operation(
+            token,
+            operation,
+            requested_role=requested_role,
+            run_id=run_id,
+            db_path=db_path,
+            artifacts_path=artifacts_path,
+            command=command,
+            approval_token=approval_token,
+            start_scope=start_scope,
+            provider_route=provider_route,
+        )
+    except MCPAuthError as exc:
+        return None, _auth_error_payload(exc)
+    return principal, None
+
+
 def authenticate_operation(
     session_token: str,
     operation: str,
@@ -179,6 +260,7 @@ def authenticate_operation(
     command: str = "",
     approval_token: str = "",
     start_scope: str = "",
+    provider_route: str = "",
 ) -> MCPPrincipal:
     """Resolve and authorize the principal for *operation* (the middleware).
 
@@ -203,30 +285,64 @@ def authenticate_operation(
         command=command,
         approval_token=approval_token,
         start_scope=start_scope,
+        provider_route=provider_route,
         default_paths=server_default_paths(),
     )
 
 
-def authorize_provider_forwarding(envelope, route: str) -> None:
+def authorize_provider_forwarding(
+    envelope, route: str, *, session_token: str = ""
+) -> None:
     """Refuse forwarding a client credential to an unapproved provider route.
 
     An ``execution-envelope-v1`` may name ``allowed_routes``; a route outside
     that set -- or a route that only exists to echo/reflect a credential -- is
-    a refusal. The client's MCP session token is authority over this server,
-    never a provider bearer token, so it is not passed through.
-    """
-    from skillweave.runtime.authority import MCPAuthError as _MCPAuthError
+    a refusal. The client's MCP session token is authority over *this server*,
+    never a provider bearer token, so it is never passed through.
 
+    When the caller presents a session token **and** the host has bound an
+    authority, the decision is delegated to that authority
+    (:meth:`MCPPrincipalAuthority.authorize` with ``provider_route``), so the
+    route set is the authenticated principal's bound routes rather than an
+    envelope field a caller could write. The envelope's own ``allowed_routes``
+    remain the fallback for an unbound, direct in-process caller.
+    """
+    authority = _AUTHORITY
+    token = resolve_session_token(session_token)
+    if token and authority is not None and callable(
+        getattr(authority, "serve_live", None)
+    ):
+        principal = authority.verify_session(token)
+        authority.authorize(
+            token, "forward",
+            provider_route=route,
+            default_paths=server_default_paths(),
+        )
+        facts = principal.to_envelope().get("scope", {}).get(
+            EXECUTION_ENVELOPE_MCP_EXTENSION, {}
+        )
+        if facts.get("allowed_routes") and route not in facts["allowed_routes"]:
+            raise MCPAuthError(
+                "unapproved_provider_route",
+                f"route {route!r} is not in the principal's approved routes",
+                role=principal.role,
+                action="forward",
+                extra={"route": route,
+                       "allowed_routes": list(facts["allowed_routes"])},
+            )
+        return
+
+    # Direct in-process caller (no bound session): the envelope is the policy.
     allowed = (envelope or {}).get("allowed_routes") or []
     if route in NON_FORWARDABLE_ROUTES:
-        raise _MCPAuthError(
+        raise MCPAuthError(
             "token_passthrough_refused",
             f"refusing to forward a client credential to route {route!r}",
             action="forward",
             extra={"route": route},
         )
     if allowed and route not in allowed:
-        raise _MCPAuthError(
+        raise MCPAuthError(
             "unapproved_provider_route",
             f"route {route!r} is not in the envelope's allowed_routes",
             action="forward",
@@ -253,7 +369,7 @@ def _auth_error_payload(exc: MCPAuthError) -> str:
 
 
 @mcp.tool()
-def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, command: str, db_path: str = ".skillweave/store.db", artifacts_path: str = ".skillweave/artifacts", methodology: str = "ralph", autonomy_policy: str = "", task_id: str = "", attempt: int = 1, output_root: str = "", stream_root: str = "", artifact_evidence: str = "", source_root: str = "", analysis_root: str = "") -> str:
+def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, command: str, db_path: str = ".skillweave/store.db", artifacts_path: str = ".skillweave/artifacts", methodology: str = "ralph", autonomy_policy: str = "", task_id: str = "", attempt: int = 1, output_root: str = "", stream_root: str = "", artifact_evidence: str = "", source_root: str = "", analysis_root: str = "", session_token: str = "") -> str:
     """Create and execute a new SkillWeave run.
 
     ``methodology`` is the declared methodology binding (default ``ralph``).
@@ -269,7 +385,26 @@ def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, co
     bound to and ``analysis_root`` the per-path analysis artifacts. Omitting
     them on an assay run is itself a refusal -- the native PASS is withheld,
     never bypassed by omission.
+
+    SW-1510-MCP-AUTH: the caller-supplied ``db_path``/``artifacts_path``/
+    ``command`` are authorized at this boundary, never trusted; and the start
+    scope (``task_id``/``attempt``) is refused as a duplicate at the authority
+    seam, so a second start of the same attempt cannot launch.
     """
+    start_scope = (
+        start_scope_for(task_id=task_id, attempt=attempt) if task_id else ""
+    )
+    principal, refusal = gate_operation(
+        "start_run",
+        session_token,
+        run_id="",
+        db_path=db_path,
+        artifacts_path=artifacts_path,
+        command=command,
+        start_scope=start_scope,
+    )
+    if refusal is not None:
+        return refusal
     payload = control.create_run_payload(
         tool=tool,
         model=model,
@@ -292,12 +427,20 @@ def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, co
 
 
 @mcp.tool()
-def status_run(run_id: str, db_path: str = ".skillweave/store.db") -> str:
+def status_run(run_id: str, db_path: str = ".skillweave/store.db", session_token: str = "") -> str:
     """Get the status of a specific run.
 
     Includes the methodology/attempt and (for Assay) the ordered phases and
     terminal outcome, read from the same snapshot the CLI and replay use.
+
+    SW-1510-MCP-AUTH: the read is authorized at this boundary; a cross-client
+    run id is refused with an auditable typed error.
     """
+    _principal, refusal = gate_operation(
+        "read_run", session_token, run_id=run_id, db_path=db_path,
+    )
+    if refusal is not None:
+        return refusal
     result = control.control_status(run_id, db_path=db_path)
     if result.get("error") == "Run not found":
         return json.dumps({"error": "Run not found"})
@@ -305,7 +448,7 @@ def status_run(run_id: str, db_path: str = ".skillweave/store.db") -> str:
 
 
 @mcp.tool()
-def cancel_run(run_id: str, reason: str = "operator_halt", db_path: str = ".skillweave/store.db") -> str:
+def cancel_run(run_id: str, reason: str = "operator_halt", db_path: str = ".skillweave/store.db", session_token: str = "") -> str:
     """Cancel a run through the native lifecycle entry.
 
     Never a bare database transition: the service re-verifies the recorded
@@ -314,7 +457,15 @@ def cancel_run(run_id: str, reason: str = "operator_halt", db_path: str = ".skil
     stale command or a foreign worker is refused (nothing is signalled) and
     an unobservable process is reported as ``unknown_inflight`` — the tool
     never claims a termination it did not perform.
+
+    SW-1510-MCP-AUTH: the cancel is authorized at this boundary; a
+    cross-client run id is refused with an auditable typed error.
     """
+    _principal, refusal = gate_operation(
+        "cancel_run", session_token, run_id=run_id, db_path=db_path,
+    )
+    if refusal is not None:
+        return refusal
     result = control.control_cancel(run_id, reason=reason, db_path=db_path)
     if result.get("error") == "Run not found":
         return json.dumps({"error": "Run not found"})
@@ -322,7 +473,7 @@ def cancel_run(run_id: str, reason: str = "operator_halt", db_path: str = ".skil
 
 
 @mcp.tool()
-def resume_run(run_id: str, db_path: str = ".skillweave/store.db", command: str = "") -> str:
+def resume_run(run_id: str, db_path: str = ".skillweave/store.db", command: str = "", session_token: str = "") -> str:
     """Resume a run by launching a NEW identified attempt.
 
     With a *command*, this launches a real new attempt (new process, new
@@ -330,7 +481,17 @@ def resume_run(run_id: str, db_path: str = ".skillweave/store.db", command: str 
     "restarted" from a database transition alone. Without a command it
     reconciles stored intents and returns the run's *actual* state with
     ``restarted: false``.
+
+    SW-1510-MCP-AUTH: the resume (and any caller-supplied command) is
+    authorized at this boundary; a cross-client run id or an arbitrary command
+    is refused with an auditable typed error.
     """
+    _principal, refusal = gate_operation(
+        "resume_run", session_token, run_id=run_id, db_path=db_path,
+        command=command,
+    )
+    if refusal is not None:
+        return refusal
     result = control.control_resume(run_id, command=command, db_path=db_path)
     if result.get("error") == "Run not found":
         return json.dumps({"error": "Run not found"})
@@ -338,8 +499,17 @@ def resume_run(run_id: str, db_path: str = ".skillweave/store.db", command: str 
 
 
 @mcp.tool()
-def get_evidence(run_id: str, db_path: str = ".skillweave/store.db") -> str:
-    """Get evidence/journal for a run."""
+def get_evidence(run_id: str, db_path: str = ".skillweave/store.db", session_token: str = "") -> str:
+    """Get evidence/journal for a run.
+
+    SW-1510-MCP-AUTH: the read is authorized at this boundary; a cross-client
+    run id is refused with an auditable typed error.
+    """
+    _principal, refusal = gate_operation(
+        "read_run", session_token, run_id=run_id, db_path=db_path,
+    )
+    if refusal is not None:
+        return refusal
     result = control.control_evidence(run_id, db_path=db_path)
     if "error" in result:
         # A storage refusal is a structured record, not a key error.
@@ -414,6 +584,40 @@ def review_run(run_id: str, verdict: str, comment: str, db_path: str = ".skillwe
     })
 
 
+def startup_and_bind_stdio(
+    *,
+    authority: "MCPPrincipalAuthority | None" = None,
+    supervisor: str = "",
+) -> str:
+    """Production issuance point: bind the authority and mint the stdio session.
+
+    This is the only *production* caller of
+    :meth:`MCPPrincipalAuthority.issue_session`. A local stdio start names its
+    supervisor (:data:`SUPERVISOR_ENV`); this binds one process authority
+    (:func:`bind_authority`) and mints exactly one ``controller``-role stdio
+    session for that local operator. The minted token is held only in host
+    memory (:data:`_READY_SESSION_TOKEN`) so the protected tools resolve the
+    local operator without a wire credential -- it is never written to the
+    environment or logged, and no client can mint it.
+
+    An HTTP deployment does not use this path: the host binds its own authority
+    and each HTTP client presents its own issued token.
+    """
+    global _READY_SESSION_TOKEN
+    identity = (supervisor or require_supervisor_identity()).strip()
+    if not identity:
+        raise UnauthenticatedPrincipal(
+            f"local stdio requires an explicit supervisor identity; set "
+            f"{SUPERVISOR_ENV} to name the supervising principal"
+        )
+    auth = authority if authority is not None else MCPPrincipalAuthority()
+    bind_authority(auth)
+    _READY_SESSION_TOKEN = auth.issue_session(
+        role="controller", client_id=identity, transport="stdio"
+    )
+    return _READY_SESSION_TOKEN
+
+
 def main() -> None:
     """Serve the command server, or refuse with an explicit unavailable state.
 
@@ -424,11 +628,18 @@ def main() -> None:
     A local stdio session must run under an *explicit supervisor identity*
     (:data:`SUPERVISOR_ENV`) and the host must have bound an MCP authority: a
     local stdio client is not implicitly trusted and a reachable server is not
-    proof of authorization. Both are enforced before the runner is invoked.
+    proof of authorization. Both are enforced before the runner is invoked;
+    when the host has not already bound an authority, startup performs the
+    production issuance itself (:func:`startup_and_bind_stdio`).
     """
     control.require_mcp()  # raises the explicit diagnostic when absent
     require_supervisor_identity()  # local stdio needs a named supervisor
-    _require_authority()  # a reachable server is not proof of authorization
+    authority = _AUTHORITY
+    if authority is None or not callable(getattr(authority, "serve_live", None)):
+        # The host process did not bind an authority: perform the production
+        # issuance at startup, so a reachable server is authorized rather than
+        # trusted for merely being reachable.
+        startup_and_bind_stdio()
     runner = getattr(mcp, "run", None)
     if not callable(runner):
         raise control.McpDependencyUnavailable(control.DEGRADED_REASON)

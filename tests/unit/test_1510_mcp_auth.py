@@ -19,8 +19,15 @@ verifies principals -- never against a re-implementation:
    applicable authorization controls and **no token passthrough** to unapproved
    providers.
 
+Every one of the six protected tools is gated at the real server entrypoint,
+not only ``review_run``; a duplicate start is refused at the real ``create_run``;
+and the production issuance point binds the authority and mints the stdio
+session the server startup serves under.
+
 The frozen ``execution-envelope-v1`` boundary the middleware consumes is proven
-too: a drifted version or schema digest is refused by name.
+too: the producer emits the SDK contract (``skillweave_sdk.validator``) and a
+record that violates it -- an unknown version, a forbidden property or a
+missing required field -- is refused by name.
 """
 
 from __future__ import annotations
@@ -39,11 +46,13 @@ import pytest  # noqa: E402
 
 from skillweave.mcp import server as mcp_server  # noqa: E402
 from skillweave.runtime.authority import (  # noqa: E402
+    EXECUTION_ENVELOPE_MCP_EXTENSION,
     EXECUTION_ENVELOPE_SCHEMA_DIGEST,
     EXECUTION_ENVELOPE_VERSION,
     CommandInjectionRefused,
     CrossClientAccessRefused,
     DuplicateStartRefused,
+    EnvelopeSchemaInvalid,
     MCPAuthError,
     MCPPrincipalAuthority,
     PathInjectionRefused,
@@ -51,6 +60,8 @@ from skillweave.runtime.authority import (  # noqa: E402
     RoleEscalationRefused,
     UnauthenticatedPrincipal,
     UnsupportedEnvelopeVersion,
+    _EXECUTION_ENVELOPE_REQUIRED,
+    _sdk_validator_module,
     verify_execution_envelope,
 )
 from skillweave.runtime.store import SQLiteRunStore  # noqa: E402
@@ -79,9 +90,12 @@ def authority():
     """
     auth = MCPPrincipalAuthority()
     previous = mcp_server.get_authority()
+    previous_ready = mcp_server._READY_SESSION_TOKEN
     mcp_server.bind_authority(auth)
+    mcp_server._READY_SESSION_TOKEN = None
     yield auth
     mcp_server._AUTHORITY = previous
+    mcp_server._READY_SESSION_TOKEN = previous_ready
 
 
 def _child_env() -> dict:
@@ -356,6 +370,150 @@ class TestTypedRefusals:
 
 
 # ===========================================================================
+# Every protected tool is gated (controller finding 1); duplicate start and
+# injected paths are refused at the real tool (finding 2)
+# ===========================================================================
+
+
+class TestEveryToolIsGated:
+    """No tool bypasses the authorization seam: with an authority bound and no
+    resolvable credential, *every* protected tool refuses -- not only review."""
+
+    def test_bound_authority_refuses_each_tool_without_a_credential(
+        self, authority, tmp_path
+    ):
+        db, _root = _make_run(tmp_path, "run-1")
+        calls = {
+            "create_run": lambda: mcp_server.create_run(
+                "cli", "m", "repo", "commit", command="true", db_path=db,
+            ),
+            "status_run": lambda: mcp_server.status_run("run-1", db_path=db),
+            "cancel_run": lambda: mcp_server.cancel_run("run-1", db_path=db),
+            "resume_run": lambda: mcp_server.resume_run("run-1", db_path=db),
+            "get_evidence": lambda: mcp_server.get_evidence("run-1", db_path=db),
+            "review_run": lambda: mcp_server.review_run(
+                "run-1", "pass", "ok", db_path=db
+            ),
+        }
+        for name, call in calls.items():
+            record = _assert_typed_refusal(call(), "unauthenticated")
+            assert record["status"] == "refused", name
+
+    def test_cross_client_status_and_evidence_are_refused(self, authority, tmp_path):
+        db, root = _make_run(tmp_path, "run-mine")
+        token = authority.issue_session(
+            role="observer", client_id="A", transport="stdio",
+            run_ids=["run-mine"], allowed_roots=[root],
+        )
+        _assert_typed_refusal(
+            mcp_server.status_run("run-not-mine", db_path=db, session_token=token),
+            "cross_client_access_refused",
+        )
+        _assert_typed_refusal(
+            mcp_server.get_evidence("run-not-mine", db_path=db, session_token=token),
+            "cross_client_access_refused",
+        )
+
+    def test_an_authenticated_read_is_admitted(self, authority, tmp_path):
+        db, root = _make_run(tmp_path, "run-1")
+        token = authority.issue_session(
+            role="observer", client_id="A", transport="stdio",
+            run_ids=["run-1"], allowed_roots=[root],
+        )
+        out = json.loads(
+            mcp_server.status_run("run-1", db_path=db, session_token=token)
+        )
+        assert out.get("status") != "refused", out
+
+    def test_injected_db_path_is_refused_at_the_real_tool(self, authority, tmp_path):
+        db, root = _make_run(tmp_path, "run-1")
+        token = authority.issue_session(
+            role="observer", client_id="A", transport="stdio",
+            run_ids=["run-1"], allowed_roots=[root],
+        )
+        _assert_typed_refusal(
+            mcp_server.status_run(
+                "run-1", db_path="/etc/other/store.db", session_token=token
+            ),
+            "path_injection_refused",
+        )
+
+    def test_duplicate_start_is_refused_at_the_real_create_run(self, authority, tmp_path):
+        db, root = _make_run(tmp_path, "run-1")
+        artifacts = os.path.join(root, "artifacts")
+        token = authority.issue_session(
+            role="controller", client_id="A", transport="stdio",
+            allowed_roots=[root], allowed_argv0=["/usr/bin/true"],
+        )
+        first = mcp_server.create_run(
+            "cli", "m", "repo", "commit", command="/usr/bin/true",
+            db_path=db, artifacts_path=artifacts,
+            task_id="task-1", attempt=1, session_token=token,
+        )
+        # The first start may legitimately execute or fail a storage contract;
+        # either way it is not a refusal of the *start authority*.
+        assert json.loads(first).get("code") != "duplicate_start_refused"
+        second = mcp_server.create_run(
+            "cli", "m", "repo", "commit", command="/usr/bin/true",
+            db_path=db, artifacts_path=artifacts,
+            task_id="task-1", attempt=1, session_token=token,
+        )
+        _assert_typed_refusal(second, "duplicate_start_refused")
+
+
+# ===========================================================================
+# Production issuance point (controller finding 4)
+# ===========================================================================
+
+
+class TestProductionIssuance:
+    def test_startup_binds_authority_and_mints_a_stdio_session(self, monkeypatch):
+        monkeypatch.delenv(mcp_server.SUPERVISOR_ENV, raising=False)
+        monkeypatch.setattr(mcp_server, "_AUTHORITY", None)
+        monkeypatch.setattr(mcp_server, "_READY_SESSION_TOKEN", None)
+
+        with pytest.raises(UnauthenticatedPrincipal):
+            mcp_server.startup_and_bind_stdio()  # no supervisor named
+
+        token = mcp_server.startup_and_bind_stdio(supervisor="supervisor:ops-1")
+        assert isinstance(token, str) and token
+        auth = mcp_server.get_authority()
+        principal = auth.verify_session(token)
+        assert principal.role == "controller"
+        assert principal.transport == "stdio"
+        # The minted token is host memory, never the environment.
+        assert mcp_server.session_token_from_env() == ""
+        # ...and a protected call resolves to it with no wire credential.
+        resolved = mcp_server.resolve_session_token("")
+        assert resolved == token
+        admitted, refusal = mcp_server.gate_operation(
+            "read_run", "", db_path=".skillweave/store.db"
+        )
+        assert refusal is None and admitted.role == "controller"
+
+    def test_main_performs_production_issuance_before_serving(self, monkeypatch):
+        monkeypatch.setenv(mcp_server.SUPERVISOR_ENV, "supervisor:ops-3")
+        monkeypatch.setattr(mcp_server, "_AUTHORITY", None)
+        monkeypatch.setattr(mcp_server, "_READY_SESSION_TOKEN", None)
+        monkeypatch.setattr(mcp_server.control, "require_mcp", lambda: None)
+
+        served = {}
+
+        class _Runner:
+            def run(self):
+                served["ran"] = True
+
+        monkeypatch.setattr(mcp_server, "mcp", _Runner())
+        mcp_server.main()
+
+        assert served.get("ran") is True
+        assert mcp_server.get_authority() is not None
+        ready = mcp_server._READY_SESSION_TOKEN
+        assert ready
+        assert mcp_server.get_authority().verify_session(ready).role == "controller"
+
+
+# ===========================================================================
 # Criterion 3: stdio supervisor identity, HTTP controls, no token passthrough
 # ===========================================================================
 
@@ -377,6 +535,7 @@ class TestStdioSupervisorIdentity:
         package), then the stdio supervisor identity -- a local stdio client is
         never implicitly trusted."""
         monkeypatch.delenv(mcp_server.SUPERVISOR_ENV, raising=False)
+        monkeypatch.setattr(mcp_server, "_AUTHORITY", None)
         from skillweave.mcp import control as _control
 
         if not _control.mcp_available():
@@ -390,29 +549,63 @@ class TestStdioSupervisorIdentity:
 
 
 class TestHttpAuthorizationControls:
-    def test_execution_envelope_freezes_version_and_schema_digest(self, authority):
+    def test_execution_envelope_is_the_frozen_sdk_contract(self, authority):
+        """The producer emits the SDK ``execution-envelope-v1`` -- not a
+        private contract -- and the consumer validates it against the SDK."""
         token = authority.issue_session(
             role="reviewer", client_id="c", transport="http", run_ids=["r1"],
         )
         envelope = authority.verify_session(token).to_envelope()
-        assert envelope["version"] == EXECUTION_ENVELOPE_VERSION
-        assert envelope["schema_digest"] == EXECUTION_ENVELOPE_SCHEMA_DIGEST
+        # Exactly the eleven SDK-required properties: no private top-level
+        # contract, no ``version``/``schema_digest`` keys of its own.
+        assert set(envelope) == set(_EXECUTION_ENVELOPE_REQUIRED)
+        assert envelope["schema_version"] == EXECUTION_ENVELOPE_VERSION
         assert verify_execution_envelope(envelope) == EXECUTION_ENVELOPE_VERSION
+        # The MCP-principal facts ride a namespaced extension inside ``scope``,
+        # never as competing top-level fields.
+        facts = envelope["scope"][EXECUTION_ENVELOPE_MCP_EXTENSION]
+        assert facts["role"] == "reviewer"
+        assert facts["transport"] == "http"
+
+    def test_envelope_is_validated_against_the_sdk_when_available(self, authority):
+        """Against the *real* SDK validator, the produced envelope validates."""
+        validator = _sdk_validator_module()
+        if validator is None:
+            pytest.skip("the SDK execution contract set is unavailable here")
+        from skillweave.runtime.authority import EXECUTION_ENVELOPE_SCHEMA_ID
+
+        envelope = authority.verify_session(
+            authority.issue_session(role="controller", client_id="c", transport="http")
+        ).to_envelope()
+        assert validator.validate(dict(envelope), EXECUTION_ENVELOPE_SCHEMA_ID) == []
+        # The pinned digest is the SDK's own canonical digest of the set.
+        assert validator.canonical_digest() == EXECUTION_ENVELOPE_SCHEMA_DIGEST
 
     def test_unsupported_envelope_version_is_refused_by_name(self):
+        record = {f: None for f in _EXECUTION_ENVELOPE_REQUIRED}
+        record["schema_version"] = "2.0.0"
         with pytest.raises(UnsupportedEnvelopeVersion) as exc:
-            verify_execution_envelope(
-                {"version": "execution-envelope-v2",
-                 "schema_digest": EXECUTION_ENVELOPE_SCHEMA_DIGEST}
-            )
+            verify_execution_envelope(record)
         assert exc.value.code == "unsupported_envelope_version"
-        assert "execution-envelope-v2" in exc.value.message
+        assert "2.0.0" in exc.value.message
 
-    def test_drifted_schema_digest_is_refused(self):
-        with pytest.raises(UnsupportedEnvelopeVersion):
-            verify_execution_envelope(
-                {"version": EXECUTION_ENVELOPE_VERSION, "schema_digest": "deadbeef"}
-            )
+    def test_envelope_with_a_forbidden_top_level_field_is_refused(self, authority):
+        envelope = authority.verify_session(
+            authority.issue_session(role="observer", client_id="c", transport="http")
+        ).to_envelope()
+        envelope["version"] = EXECUTION_ENVELOPE_VERSION  # a private, extra key
+        with pytest.raises(EnvelopeSchemaInvalid) as exc:
+            verify_execution_envelope(envelope)
+        assert exc.value.code == "envelope_schema_invalid"
+
+    def test_envelope_missing_a_required_field_is_refused(self, authority):
+        envelope = authority.verify_session(
+            authority.issue_session(role="observer", client_id="c", transport="http")
+        ).to_envelope()
+        del envelope["allowed_routes"]
+        with pytest.raises(EnvelopeSchemaInvalid) as exc:
+            verify_execution_envelope(envelope)
+        assert exc.value.code == "envelope_schema_invalid"
 
     def test_unapproved_provider_route_is_refused(self):
         with pytest.raises(MCPAuthError) as exc:
@@ -436,6 +629,38 @@ class TestHttpAuthorizationControls:
         mcp_server.authorize_provider_forwarding(
             {"allowed_routes": ["provider-a"]}, "provider-a",
         )
+
+    def test_provider_forwarding_is_delegated_to_the_authenticated_principal(
+        self, authority
+    ):
+        """With a session token, the route decision is the principal's bound
+        routes -- never the envelope field a caller could write."""
+        unbound = authority.issue_session(
+            role="controller", client_id="c", transport="http",
+        )
+        # The envelope claims "provider-a", but the authenticated principal is
+        # bound to no provider route: refused.
+        with pytest.raises(MCPAuthError) as exc:
+            mcp_server.authorize_provider_forwarding(
+                {"allowed_routes": ["provider-a"]}, "provider-a",
+                session_token=unbound,
+            )
+        assert exc.value.code == "unapproved_provider_route"
+
+        bound = authority.issue_session(
+            role="controller", client_id="c2", transport="http",
+            allowed_routes=["provider-a"],
+        )
+        # The bound principal may forward to its approved provider...
+        mcp_server.authorize_provider_forwarding(
+            {"allowed_routes": ["provider-a"]}, "provider-a", session_token=bound,
+        )
+        # ...but never to a reflecting route, even one the envelope would allow.
+        with pytest.raises(MCPAuthError) as exc:
+            mcp_server.authorize_provider_forwarding(
+                {"allowed_routes": ["echo"]}, "echo", session_token=bound,
+            )
+        assert exc.value.code == "token_passthrough_refused"
 
     def test_scoped_http_bind_still_requires_a_scope_token(self, monkeypatch):
         """The scoped HTTP controls remain in force (loopback default + token)."""
