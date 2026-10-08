@@ -1672,6 +1672,10 @@ OBSERVER_OWNED_FILENAMES: tuple[str, ...] = (
     "meta.json",
 )
 
+#: A sentinel marking an omitted ``launch`` seam, so the adapter can refuse it
+#: with a named ``HarnessAdapterError`` rather than leaking a bare ``TypeError``.
+_NO_LAUNCH: Any = object()
+
 
 def _matches(haystack: str, needles: Sequence[str]) -> bool:
     return any(needle in haystack for needle in needles)
@@ -1864,6 +1868,180 @@ def assert_not_observer_owned(
     return target
 
 
+def write_worker_scratch(
+    target: str,
+    data: bytes,
+    *,
+    observer_roots: Sequence[str] = (),
+) -> str:
+    """Write a worker's scratch output, refusing any observer-owned target.
+
+    This is the write funnel the adapter uses on its real execution path: the
+    write target is passed through :func:`assert_not_observer_owned` **before**
+    any byte is written, so a worker cannot rewrite the durable stream store's
+    files or the observer's record to forge its own evidence trail (criterion 3).
+    The refusal is raised with zero bytes written; an ordinary worker path is
+    written and returned.
+    """
+    assert_not_observer_owned(target, observer_roots=observer_roots)
+    if not isinstance(data, (bytes, bytearray)):
+        raise HarnessAdapterError(
+            "worker scratch output must be bytes",
+            asset="scratch",
+        )
+    with open(target, "wb") as handle:
+        handle.write(bytes(data))
+    return target
+
+
+# ── Headless event ingestion: a child's stream-json, as typed data ─────────
+
+@dataclass(frozen=True)
+class HeadlessEventRecord:
+    """One typed headless event, ready for an ``attempt-event-v1`` consumer.
+
+    ``event_id`` is a stable ``{run_id}:{index}`` cursor and ``data`` is the
+    event payload, so the record crosses the process boundary as pure data. The
+    record names no provider and no model — it is the outcome of *reading* the
+    child's stream, not a decision about it.
+    """
+
+    event_id: str
+    run_id: str
+    index: int
+    kind: str
+    data: dict[str, Any]
+
+    def to_attempt_event(self, *, subject_repo: str = "", subject_commit: str = "") -> dict[str, Any]:
+        """Render this record as an ``attempt-event-v1`` mapping.
+
+        Schema version ``"1.0.0"`` matches the frozen contract
+        (``skillweave_sdk``); a consumer that does not support it must refuse
+        the event rather than best-effort parse it.
+        """
+        return {
+            "schema_version": "1.0.0",
+            "event_id": self.event_id,
+            "run_id": self.run_id,
+            "sequence": self.index,
+            "event_type": self.kind,
+            "subject_repo": subject_repo,
+            "subject_commit": subject_commit,
+            "data": dict(self.data),
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "run_id": self.run_id,
+            "index": self.index,
+            "kind": self.kind,
+            "data": dict(self.data),
+        }
+
+
+@dataclass(frozen=True)
+class HeadlessStreamIngest:
+    """The typed result of ingesting a headless child's stream-json output.
+
+    ``events`` are the classified events in order; ``terminal`` is the typed
+    terminal outcome (:func:`headless_terminal_status`) or ``None``. ``blocked``
+    is ``True`` exactly when the child requested input — the adapter's signal
+    that it must not wait. ``lifecycle`` is the shared ``blocked_input`` result
+    in that case, else ``None``.
+    """
+
+    events: tuple[HeadlessEventRecord, ...]
+    terminal: Optional[dict[str, Any]] = None
+    blocked: bool = False
+    lifecycle: Any = None
+
+    def to_attempt_events(self, *, subject_repo: str = "", subject_commit: str = "") -> list[dict[str, Any]]:
+        return [
+            event.to_attempt_event(
+                subject_repo=subject_repo, subject_commit=subject_commit
+            )
+            for event in self.events
+        ]
+
+
+def ingest_headless_stream(
+    lines: Iterable[str], *, run_id: str
+) -> HeadlessStreamIngest:
+    """Classify a headless child's stream-json output into typed events.
+
+    The adapter's real ingestion path (criterion 2): the child's stdout is
+    parsed line by line (:func:`parse_headless_events`), each event is numbered
+    with a ``{run_id}:{index}`` cursor, and the typed terminal outcome is
+    computed (:func:`headless_terminal_status`). A worker *exit* is terminal; an
+    ``input_required`` request is terminal as the shared ``blocked_input``
+    lifecycle result, so the adapter never silently waits on a child that wants
+    input. A stream with no terminal marker yields ``terminal=None``.
+    """
+    parsed = parse_headless_events(lines)
+    records = tuple(
+        HeadlessEventRecord(
+            event_id=f"{run_id}:{index}",
+            run_id=run_id,
+            index=index,
+            kind=event.get("kind", HEADLESS_EVENT_OTHER),
+            data=dict(event),
+        )
+        for index, event in enumerate(parsed)
+    )
+    status = headless_terminal_status(parsed)
+    blocked = bool(status) and status.get("terminal") == HEADLESS_EVENT_INPUT_REQUIRED
+    return HeadlessStreamIngest(
+        events=records,
+        terminal=status,
+        blocked=blocked,
+        lifecycle=(status.get("lifecycle") if blocked and status else None),
+    )
+
+
+# ── Headless result: the launcher's stream, as typed adapter output ────────
+
+@dataclass
+class HeadlessResult:
+    """The adapter's own result: the launcher's verdict *plus* typed events.
+
+    ``succeeded`` reflects the launcher's verdict and then falls closed: a child
+    that requested input (``blocked``) or a child whose stderr burst exceeded
+    the backpressure cap (``backpressure_exceeded``) is **never** a success, even
+    if the launcher happened to report one. ``stream`` is the typed ingest of
+    the child's stream-json output (or ``None`` when none was produced).
+    """
+
+    succeeded: bool
+    termination: str
+    stream: Optional[HeadlessStreamIngest] = None
+    exit_code: Optional[int] = None
+    stderr_bytes: int = 0
+    backpressure_exceeded: bool = False
+
+    @property
+    def blocked(self) -> bool:
+        return bool(self.stream) and self.stream.blocked
+
+    @property
+    def lifecycle(self) -> Any:
+        return self.stream.lifecycle if self.stream else None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "succeeded": self.succeeded,
+            "termination": self.termination,
+            "exit_code": self.exit_code,
+            "stderr_bytes": self.stderr_bytes,
+            "backpressure_exceeded": self.backpressure_exceeded,
+            "blocked": self.blocked,
+            "terminal": self.stream.terminal if self.stream else None,
+            "events": [event.to_dict() for event in self.stream.events]
+            if self.stream
+            else [],
+        }
+
+
 # ── A plugin: the OpenClaude harness ───────────────────────────────────────
 
 class OpenClaudeAdapter(HarnessAdapter):
@@ -2036,7 +2214,7 @@ class OpenClaudeAdapter(HarnessAdapter):
         self,
         plan: HarnessPlan,
         *,
-        launch: Any,
+        launch: Any = _NO_LAUNCH,
         capability_snapshot: Any = None,
         native_requirements: Any = None,
         host_binding: Any = None,
@@ -2048,24 +2226,46 @@ class OpenClaudeAdapter(HarnessAdapter):
         max_prompt_bytes: int = DEFAULT_MAX_PROMPT_BYTES,
         allow_prompt_overflow: bool = False,
         missing_plugins: Iterable[str] = (),
+        stream_output: Optional[Iterable[str]] = None,
+        scratch_target: Optional[str] = None,
+        scratch_data: bytes = b"",
+        observer_roots: Sequence[str] = (),
+        run_id: str = "",
     ) -> HarnessOutcome:
         """Launch a headless plan through the injected ``launch`` seam.
 
         Wraps the generic :meth:`HarnessAdapter.execute` with the headless,
         fail-closed admission steps, all *before* any launch:
 
-        1. The generic native-tool admission runs first (if the plan requires
-           it) — a refusal performs zero work.
-        2. The declared tool/plugin surface is checked; a missing plugin or tool
+        1. A missing or non-callable ``launch`` seam is refused first, by name —
+           never a bare ``TypeError``.
+        2. If a ``scratch_target`` is given, the worker's write funnel refuses an
+           observer-owned target **before** any byte is written (criterion 3).
+        3. The declared tool/plugin surface is checked; a missing plugin or tool
            is a controlled refusal naming the asset.
-        3. The prompt is size-checked; an oversized prompt is refused rather
+        4. The prompt is size-checked; an oversized prompt is refused rather
            than truncated.
-        4. ``dontAsk`` is refused unless the plan was admitted as native — it
+        5. The generic native-tool admission runs; a refusal performs zero work.
+        6. ``dontAsk`` is refused unless the plan was admitted as native — it
            is not blanket tool authorization.
 
-        Only then is the child launched. ``missing_plugins``/``allow_prompt_overflow``
-        drive the controlled failure fixtures.
+        Only then is the child launched. When ``stream_output`` is supplied the
+        child's stream-json is ingested into typed events (:func:`ingest_headless_stream`);
+        an ``input_required`` request maps to the shared ``blocked_input``
+        lifecycle result and the outcome's ``succeeded`` falls closed. When the
+        launcher reports stderr backpressure, the outcome also falls closed
+        (criterion 3). ``missing_plugins``/``allow_prompt_overflow`` drive the
+        controlled failure fixtures.
         """
+        if launch is _NO_LAUNCH or not callable(launch):
+            raise HarnessAdapterError(
+                "execute() requires a callable launch seam",
+                asset="launch",
+            )
+        if scratch_target is not None:
+            write_worker_scratch(
+                scratch_target, scratch_data, observer_roots=observer_roots
+            )
         if missing_plugins:
             check_surface(required_plugins=missing_plugins)
         if required_tools:
@@ -2093,12 +2293,58 @@ class OpenClaudeAdapter(HarnessAdapter):
         self.validate_permission_mode(
             native_admitted=NATIVE_TOOL_CAPABILITY in plan.required_capabilities
         )
-        return super().execute(
+        outcome = super().execute(
             plan,
             launch=launch,
             capability_snapshot=capability_snapshot,
             native_requirements=native_requirements,
             host_binding=host_binding,
+        )
+        return self._headless_outcome(outcome, stream_output, run_id=run_id)
+
+    def _headless_outcome(
+        self,
+        outcome: HarnessOutcome,
+        stream_output: Optional[Iterable[str]],
+        *,
+        run_id: str,
+    ) -> HarnessOutcome:
+        """Wrap the launcher's verdict with typed headless events (AC2/AC3).
+
+        The launcher's raw result is replaced by a :class:`HeadlessResult` that
+        carries the typed ingest of the child's stream-json output. ``succeeded``
+        falls closed: a blocked-input child or a backpressure-exceeded child is
+        never a success. With no ``stream_output`` the launcher's own result is
+        preserved untouched, so the ordinary injected-seam contract (a caller's
+        own result object) is unchanged.
+        """
+        if stream_output is None:
+            return outcome
+        raw = outcome.result
+        exit_code = getattr(raw, "exit_code", None)
+        stderr_bytes = getattr(raw, "stderr_observed_bytes", 0)
+        backpressure = bool(getattr(raw, "stderr_exceeded_cap", False))
+        stream = ingest_headless_stream(stream_output, run_id=run_id)
+        termination = getattr(raw, "termination", "exited")
+        if stream.blocked:
+            termination = HEADLESS_EVENT_INPUT_REQUIRED
+        succeeded = (
+            bool(getattr(raw, "succeeded", False))
+            and not stream.blocked
+            and not backpressure
+        )
+        return HarnessOutcome(
+            adapter=outcome.adapter,
+            plan=outcome.plan,
+            command=outcome.command,
+            result=HeadlessResult(
+                succeeded=succeeded,
+                termination=termination,
+                stream=stream,
+                exit_code=exit_code,
+                stderr_bytes=stderr_bytes,
+                backpressure_exceeded=backpressure,
+            ),
         )
 
 
@@ -2155,4 +2401,10 @@ __all__ = [
     "check_prompt_size",
     "check_surface",
     "assert_not_observer_owned",
+    # Real execution-path wiring: write funnel + typed event ingestion (SW-1510-OPENCLAUDE)
+    "write_worker_scratch",
+    "HeadlessEventRecord",
+    "HeadlessStreamIngest",
+    "ingest_headless_stream",
+    "HeadlessResult",
 ]

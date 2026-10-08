@@ -70,6 +70,36 @@ The child's stream-json lifecycle is read as typed events:
   a headless adapter **never waits** on a child that wants input; otherwise a
   permission denial is its own typed terminal.
 
+### The typed vocabulary is composed into `execute`, not just exported
+
+The helpers above are not a library beside the adapter: `OpenClaudeAdapter.execute`
+uses them on its real path.
+
+- A missing or non-callable `launch` seam is refused **first**, as a named
+  `HarnessAdapterError(asset="launch")` — the adapter never leaks a bare
+  `TypeError` (repair finding A). The refusal precedes `build_command`, so no
+  argv is built and no process is spawned.
+- When `stream_output` (the child's stdout lines) is supplied,
+  `execute` ingests them with `ingest_headless_stream(lines, run_id=...)`, which
+  parses, numbers each event with a `{run_id}:{index}` cursor and computes the
+  typed terminal status. An `input_required` request maps to the shared
+  `blocked_input` lifecycle result, and the returned `HeadlessResult.succeeded`
+  **falls closed** — the adapter never reports a child waiting for input as a
+  success, and never waits (repair finding B).
+- `HeadlessResult` carries the typed stream, `exit_code`, `stderr_bytes` and
+  `backpressure_exceeded`; `to_dict()`/`HeadlessStreamIngest.to_attempt_events()`
+  render the events for an `attempt-event-v1` consumer.
+- With no `stream_output` the launcher's own result is preserved untouched, so a
+  caller that supplies its own result object keeps the legacy contract.
+
+### The observer-write and backpressure guards are on the execute path
+
+- A `scratch_target` passed to `execute` goes through the write funnel
+  `write_worker_scratch(target, data, observer_roots=...)`, which calls
+  `assert_not_observer_owned` **before** any byte is written (repair finding C).
+- A launcher result reporting `stderr_exceeded_cap` makes the outcome fall
+  closed (`succeeded is False`) as well as carrying `backpressure_exceeded`.
+
 ### `dontAsk` is scoped, not blanket authorization
 
 `PERMISSION_MODE_DEFAULT` (`"default"`) is the fail-closed default. `dontAsk`
@@ -111,7 +141,13 @@ performs zero work:
     the environment the routing adapter produced, and the child's own
     `os.environ` is read back to prove no ambient provider key reached it;
   - the typed permission-denial / `input_required` / worker-exit events,
-    including `input_required` → `blocked_input`;
+    including `input_required` → `blocked_input`, driven by a **real emitting
+    child through `execute`** (not by calling the helpers directly);
+  - a missing / `None` / non-callable `launch` seam is a named refusal;
+  - the observer-write funnel and the stderr backpressure cap driven through
+    `execute` (a blocked-input or backpressure child falls closed);
+  - the adapter is selected **by name through the production
+    `HarnessAdapterRegistry`** and executes through that registry path;
   - missing plugin/tool and oversized-prompt fixtures with an injected launch
     counter that stays at `0`;
   - stderr backpressure on a real capped run;

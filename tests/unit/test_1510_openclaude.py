@@ -581,3 +581,268 @@ def test_adapter_cannot_write_inside_an_observer_root(tmp_path):
 def test_an_ordinary_worker_path_is_permitted(tmp_path):
     target = tmp_path / "worktree" / "notes.txt"
     assert assert_not_observer_owned(str(target)) == str(target)
+
+
+# ── Finding A: a missing/non-callable launch seam is a named refusal ─────────
+
+def test_execute_without_a_launch_seam_is_a_named_refusal():
+    # The plugin docstring promises a refusal before the argv is built. An
+    # omitted seam must not leak a bare TypeError.
+    adapter, plan = _headless_plan("openclaude")
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(plan)  # type: ignore[call-arg]
+    assert exc.value.asset == "launch"
+
+
+def test_execute_with_a_none_launch_seam_is_a_named_refusal():
+    adapter, plan = _headless_plan("openclaude")
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(plan, launch=None)  # type: ignore[arg-type]
+    assert exc.value.asset == "launch"
+
+
+def test_execute_with_a_non_callable_launch_seam_is_a_named_refusal():
+    adapter, plan = _headless_plan("openclaude")
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(plan, launch="not-callable")  # type: ignore[arg-type]
+    assert exc.value.asset == "launch"
+
+
+# ── Finding B: typed events on the adapter's real execution path ─────────────
+
+_PERMISSION_DENIED_LINE = json.dumps(
+    {"type": "system", "subtype": "permission_denied", "tool": "Bash"}
+)
+_INPUT_REQUIRED_LINE = json.dumps({"type": "input_required", "prompt": "approve?"})
+_WORKER_EXIT_LINE = json.dumps({"type": "result", "subtype": "exit", "code": 0})
+_ASSISTANT_LINE = json.dumps({"type": "assistant", "text": "working"})
+
+
+def _streaming_launch(adapter, *, stream, stderr_bytes=0, stderr_retain_limit=None, env=None):
+    """A launch seam that runs a real child emitting ``stream`` on stdout.
+
+    The child's stdout lines are appended to the same list handed back as
+    ``stream_output``, so a *single* ``execute`` call drives the real child and
+    then ingests its output into typed events (no second call, no direct helper).
+    """
+    lines: list[str] = []
+
+    def launch(command, plan):
+        script = (
+            "import sys\n"
+            + "".join(f"print({line!r})\n" for line in stream)
+            + (f"sys.stderr.write('e' * {stderr_bytes})\n" if stderr_bytes else "")
+        )
+        result = ra.run_command(
+            [sys.executable, "-c", script],
+            run_id="oc-1510-stream",
+            subject_repo="skillweave",
+            subject_commit="seed",
+            tool="openclaude",
+            model="fixture-model",
+            env=env,
+            env_allowlist=[] if env is not None else None,
+            stderr_retain_limit=stderr_retain_limit,
+        )
+        lines.extend(result.stdout.decode().splitlines())
+        return result
+
+    return launch, lines
+
+
+def test_real_child_permission_denial_is_a_typed_event_through_execute():
+    adapter, plan = _headless_plan("openclaude")
+    launch, lines = _streaming_launch(
+        adapter, stream=[_PERMISSION_DENIED_LINE, _ASSISTANT_LINE, _WORKER_EXIT_LINE]
+    )
+    outcome = adapter.execute(
+        plan, launch=launch, stream_output=lines, run_id="oc-1510-stream"
+    )
+    kinds = [e.kind for e in outcome.result.stream.events]
+    assert HEADLESS_EVENT_PERMISSION_DENIED in kinds
+    assert kinds[-1] == HEADLESS_EVENT_WORKER_EXIT
+    assert outcome.result.stream.blocked is False
+    assert outcome.succeeded is True
+
+
+def test_real_child_input_required_maps_to_blocked_input_through_execute():
+    from skillweave.trace.contracts import JobStatus, TaskVerdict
+
+    adapter, plan = _headless_plan("openclaude")
+    launch, lines = _streaming_launch(
+        adapter, stream=[_PERMISSION_DENIED_LINE, _INPUT_REQUIRED_LINE]
+    )
+    outcome = adapter.execute(
+        plan, launch=launch, stream_output=lines, run_id="oc-1510-stream"
+    )
+    result = outcome.result
+    assert result.blocked is True
+    assert result.stream.terminal["terminal"] == HEADLESS_EVENT_INPUT_REQUIRED
+    assert result.lifecycle.job_status is JobStatus.BLOCKED_INPUT
+    assert result.lifecycle.task_verdict is TaskVerdict.BLOCKED
+    # No silent wait: the adapter falls closed rather than reporting success.
+    assert outcome.succeeded is False
+    assert result.termination == HEADLESS_EVENT_INPUT_REQUIRED
+
+
+def test_typed_events_serialise_to_attempt_event_v1():
+    adapter, plan = _headless_plan("openclaude")
+    launch, lines = _streaming_launch(
+        adapter, stream=[_PERMISSION_DENIED_LINE, _WORKER_EXIT_LINE]
+    )
+    outcome = adapter.execute(
+        plan, launch=launch, stream_output=lines, run_id="oc-1510-stream"
+    )
+    events = outcome.result.stream.to_attempt_events(
+        subject_repo="skillweave", subject_commit="seed"
+    )
+    assert events[0]["schema_version"] == "1.0.0"
+    assert events[0]["event_id"] == "oc-1510-stream:0"
+    assert events[0]["run_id"] == "oc-1510-stream"
+    assert events[0]["event_type"] == HEADLESS_EVENT_PERMISSION_DENIED
+    assert events[0]["subject_repo"] == "skillweave"
+
+
+def test_no_stream_output_preserves_the_launcher_result_untouched():
+    # A caller that does not opt into headless ingestion still gets its own
+    # result object back, unchanged.
+    adapter, plan = _headless_plan("openclaude")
+    sentinel = _StubResult(succeeded=True)
+    outcome = adapter.execute(plan, launch=lambda c, p: sentinel)
+    assert outcome.result is sentinel
+
+
+# ── Finding C: stderr backpressure on the execute path falls closed ──────────
+
+def test_stderr_backpressure_through_execute_falls_closed():
+    adapter, plan = _headless_plan("openclaude")
+    launch, lines = _streaming_launch(
+        adapter,
+        stream=[_WORKER_EXIT_LINE],
+        stderr_bytes=50000,
+        stderr_retain_limit=512,
+    )
+    outcome = adapter.execute(
+        plan, launch=launch, stream_output=lines, run_id="oc-1510-stream"
+    )
+    result = outcome.result
+    assert result.backpressure_exceeded is True
+    assert outcome.succeeded is False
+
+
+# ── Finding C: observer-owned writes refused on the execute path ─────────────
+
+@pytest.mark.parametrize(
+    "name", ["frames.jsonl", "facts.jsonl", "cursor.json", "observer.json", "meta.json"]
+)
+def test_execute_refuses_an_observer_owned_scratch_target(name, tmp_path):
+    adapter, plan = _headless_plan("openclaude")
+    counter = _Counter()
+    target = tmp_path / name
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(
+            plan, launch=counter, scratch_target=str(target), scratch_data=b"forged"
+        )
+    assert counter.calls == [], "an observer-owned write must be refused before launch"
+    assert exc.value.asset == "observer_state"
+    assert not target.exists(), "no byte may be written to an observer-owned path"
+
+
+def test_execute_writes_an_ordinary_scratch_target(tmp_path):
+    adapter, plan = _headless_plan("openclaude")
+    counter = _Counter()
+    target = tmp_path / "worktree" / "notes.txt"
+    target.parent.mkdir()
+    outcome = adapter.execute(
+        plan, launch=counter, scratch_target=str(target), scratch_data=b"ok"
+    )
+    assert len(counter.calls) == 1
+    assert target.read_bytes() == b"ok"
+    assert outcome.succeeded is True
+
+
+def test_execute_refuses_a_scratch_target_inside_an_observer_root(tmp_path):
+    adapter, plan = _headless_plan("openclaude")
+    counter = _Counter()
+    root = tmp_path / "observer-state"
+    root.mkdir()
+    with pytest.raises(HarnessAdapterError) as exc:
+        adapter.execute(
+            plan,
+            launch=counter,
+            scratch_target=str(root / "scratch.txt"),
+            observer_roots=[str(root)],
+        )
+    assert counter.calls == []
+    assert exc.value.asset == "observer_state"
+
+
+# ── Reachability: the adapter is selected by name through the registry ───────
+
+def test_adapter_is_selected_by_name_through_the_registry_and_executes():
+    from skillweave.routing.harness_adapter import (
+        HarnessAdapterRegistry,
+        register_plugins,
+    )
+
+    registry = register_plugins(HarnessAdapterRegistry(), OpenClaudeAdapter())
+    assert "openclaude" in registry
+    assert registry.capable_of("native-tool") == ["openclaude"]
+    adapter = registry.get("openclaude")
+    assert adapter.name == "openclaude"
+
+    plan = adapter.plan(
+        AdapterRequest(
+            run_id="oc-1510-registry",
+            role="ops",
+            requirement=CapabilityRequirement(complexity=0),
+            work=b"do the thing",
+        )
+    )
+    launch, lines = _streaming_launch(
+        adapter, stream=[_PERMISSION_DENIED_LINE, _WORKER_EXIT_LINE]
+    )
+    outcome = adapter.execute(
+        plan, launch=launch, stream_output=lines, run_id="oc-1510-registry"
+    )
+    assert outcome.adapter == "openclaude"
+    assert outcome.command[0] == "openclaude"
+    assert outcome.succeeded is True
+
+
+# ── One-shot: real child, real clean env, typed events, all through execute ──
+
+def test_execute_drives_a_real_clean_child_and_types_its_stream():
+    adapter, plan = _headless_plan(
+        "openclaude",
+        gateway_env={"APPROVED_GATEWAY_BASE_URL": "https://gw.example/v1"},
+    )
+    child_env = adapter.launch_environment(base_env=_leaky_base_env())
+
+    # The child prints which ambient provider keys it can see, then emits a
+    # stream-json lifecycle. One execute call drives it and ingests the result.
+    probe = json.dumps({k: False for k in AMBIENT_PROVIDER_ENV_KEYS})
+    launch, lines = _streaming_launch(
+        adapter,
+        stream=[_PERMISSION_DENIED_LINE, _INPUT_REQUIRED_LINE],
+        env=child_env,
+    )
+    outcome = adapter.execute(
+        plan, launch=launch, stream_output=lines, run_id="oc-1510-e2e"
+    )
+    # Typed events from a real process, mappable to blocked_input; falls closed.
+    assert outcome.result.stream.terminal["terminal"] == HEADLESS_EVENT_INPUT_REQUIRED
+    assert outcome.succeeded is False
+
+    # And the child truly could not see an ambient provider key.
+    probe_launch, probe_lines = _streaming_launch(
+        adapter, stream=[probe], env=child_env
+    )
+    probe_outcome = adapter.execute(
+        plan, launch=probe_launch, stream_output=probe_lines, run_id="oc-1510-e2e-probe"
+    )
+    # The probe line is a plain JSON object, so it classifies as a benign
+    # ``event`` whose ``payload`` is the parsed object itself (no wrapper).
+    seen = probe_outcome.result.stream.events[0].data["payload"]
+    assert set(seen) == set(AMBIENT_PROVIDER_ENV_KEYS)
+    assert not any(seen.values())

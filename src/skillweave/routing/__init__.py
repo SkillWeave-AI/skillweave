@@ -131,6 +131,11 @@ from .harness_adapter import (  # noqa: F401
     check_prompt_size,
     check_surface,
     assert_not_observer_owned,
+    write_worker_scratch,
+    HeadlessEventRecord,
+    HeadlessStreamIngest,
+    ingest_headless_stream,
+    HeadlessResult,
 )
 
 __all__ = [
@@ -229,4 +234,9 @@ __all__ = [
     "check_prompt_size",
     "check_surface",
     "assert_not_observer_owned",
+    "write_worker_scratch",
+    "HeadlessEventRecord",
+    "HeadlessStreamIngest",
+    "ingest_headless_stream",
+    "HeadlessResult",
 ]
