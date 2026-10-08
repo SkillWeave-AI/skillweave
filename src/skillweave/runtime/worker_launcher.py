@@ -215,15 +215,8 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
         if allowed_egress_host and allowed_egress_port:
             lines.append(
                 f'(allow network-outbound '
-                f'(remote ip "{allowed_egress_host}") '
-                f'(remote port {allowed_egress_port}))'
+                f'(remote ip "localhost:{allowed_egress_port}"))'
             )
-        # Allow localhost TCP for gateway health checks on the approved port
-        lines.append(
-            f'(allow network-outbound '
-            f'(remote ip "127.0.0.1") '
-            f'(remote port {allowed_egress_port or 8090}))'
-        )
         return "\n".join(lines)
 
     def build_egress_profile(self, host: str, port: int) -> str:
@@ -245,13 +238,7 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
                      '(subpath "/dev/stdout") (subpath "/dev/stderr"))')
         lines.append(
             f'(allow network-outbound '
-            f'(remote ip "{host}") '
-            f'(remote port {port}))'
-        )
-        lines.append(
-            f'(allow network-outbound '
-            f'(remote ip "127.0.0.1") '
-            f'(remote port {port}))'
+            f'(remote ip "localhost:{port}"))'
         )
         return "\n".join(lines)
 

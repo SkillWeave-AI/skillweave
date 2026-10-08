@@ -752,6 +752,14 @@ class RunApplicationService:
             # still applied.
             if route_proof is not None and enforcement is None and protection is None:
                 argv = self._sandbox_wrap_egress(list(argv), route_proof)
+            # SW-1510-ROUTE-LOCK: confine the child launch environment to the
+            # locked allowlist only when a route proof is supplied.  Without a
+            # route proof the lock is inert and the child inherits the ambient
+            # environment unchanged, preserving existing behaviour for non-lock
+            # paths (controller finding B).
+            lock_env_allowlist = (
+                list(_LOCKED_CHILD_ENV_ALLOWLIST) if route_proof is not None else None
+            )
             result = run_command(
                 argv,
                 run_id=run_id,
@@ -762,7 +770,7 @@ class RunApplicationService:
                 created_at=created_at,
                 cwd=child_cwd,
                 env=child_env,
-                env_allowlist=list(_LOCKED_CHILD_ENV_ALLOWLIST),
+                env_allowlist=lock_env_allowlist,
             )
         except scope_refusals:
             # A write-scope refusal (traversal/symlink/protected-store escape)
@@ -2761,17 +2769,22 @@ class RunApplicationService:
             if _sp not in _pp:
                 _env["PYTHONPATH"] = _pp + ":" + _sp if _pp else _sp
 
-        # SW-1510-ROUTE-LOCK: confine the child launch environment to the
-        # locked allowlist so ambient provider credentials are stripped.
-        locked_env = self._build_locked_child_env(base_env=_env)
-
-        # SW-1510-ROUTE-LOCK: when a route proof is supplied, wrap the
-        # detached wrapper process with sandbox-exec to confine network
-        # egress to only the approved gateway host:port.
-        child_argv = [sys.executable, "-c", wrapper_src, rid, db_path,
-                      reservation_id_arg] + list(command)
+        # SW-1510-ROUTE-LOCK: when a route proof is supplied, confine the
+        # child launch environment to the locked allowlist so ambient provider
+        # credentials are stripped, and wrap the detached wrapper process with
+        # sandbox-exec to confine network egress to only the approved gateway
+        # host:port.  Without a route proof the lock is inert — the child
+        # inherits the ambient environment unchanged, preserving existing
+        # behaviour for non-lock paths (controller finding B).
         if route_proof is not None:
+            locked_env = self._build_locked_child_env(base_env=_env)
+            child_argv = [sys.executable, "-c", wrapper_src, rid, db_path,
+                          reservation_id_arg] + list(command)
             child_argv = self._sandbox_wrap_egress(child_argv, route_proof)
+        else:
+            locked_env = _env or os.environ
+            child_argv = [sys.executable, "-c", wrapper_src, rid, db_path,
+                          reservation_id_arg] + list(command)
 
         try:
             proc = subprocess.Popen(
@@ -3956,6 +3969,14 @@ class RunApplicationService:
             if route_proof is not None and wrap is None:
                 def wrap(argv, _rp=route_proof, _self=self):
                     return _self._sandbox_wrap_egress(list(argv), _rp)
+            # SW-1510-ROUTE-LOCK: confine the child launch environment to the
+            # locked allowlist only when a route proof is supplied.  Without a
+            # route proof the lock is inert and the child inherits the ambient
+            # environment unchanged, preserving existing behaviour for non-lock
+            # paths (controller finding B).
+            stream_lock_env_allowlist = (
+                list(_LOCKED_CHILD_ENV_ALLOWLIST) if route_proof is not None else None
+            )
             result = run_process_streaming(
                 list(command),
                 run_id=run_id,
@@ -3967,7 +3988,7 @@ class RunApplicationService:
                 stdout_retain_limit=stdout_retain_limit,
                 stderr_retain_limit=stderr_retain_limit,
                 cwd=child_cwd,
-                env_allowlist=list(_LOCKED_CHILD_ENV_ALLOWLIST),
+                env_allowlist=stream_lock_env_allowlist,
                 extra_env=child_env,
                 wrap_command=wrap,
             )

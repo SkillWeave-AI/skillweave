@@ -89,8 +89,6 @@ from skillweave.runtime.registry import RawArtifactStore  # noqa: E402
 from skillweave.dispatch.model_policy import (  # noqa: E402
     ModelTier,
     AllocationError,
-    TIER_ROUTE_MAP,
-    resolve_route_for_tier,
     AttemptAttribution,
     check_attempt_route,
 )
@@ -625,13 +623,14 @@ class TestBytePlusRouteEnforcement:
                         f"{mapped!r} which is not in approved routes"
                     )
 
-    def test_tier_route_map_contains_only_approved_routes(self):
-        """Every route in TIER_ROUTE_MAP is in the approved BytePlus set."""
-        for tier, routes in TIER_ROUTE_MAP.items():
-            for route in routes:
-                assert route in APPROVED_BYTEPLUS_ROUTES, (
-                    f"tier {tier!r} declares route {route!r} "
-                    f"which is not in APPROVED_BYTEPLUS_ROUTES"
+    def test_tier_routes_are_approved_routes(self):
+        """Every tier route in the route-proof fixture is in the approved set."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        for tier_name, tier_routes in proof.tier_routes.items():
+            for route in tier_routes:
+                assert route in proof.approved_routes, (
+                    f"tier {tier_name!r} declares route {route!r} "
+                    f"which is not in the fixture's approved_routes"
                 )
 
 
@@ -641,34 +640,45 @@ class TestBytePlusRouteEnforcement:
 
 
 class TestTierRouteBinding:
-    """The tier-to-route mapping in model_policy binds capability to route (criterion 3)."""
+    """The tier-to-route mapping from the route-proof document binds capability to route (criterion 3)."""
+
+    _proof = None
+
+    @classmethod
+    def _get_proof(cls):
+        if cls._proof is None:
+            cls._proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        return cls._proof
 
     def test_flash_tier_resolves_to_flash_routes(self):
         """Flash tier resolves to deepseek-v4-flash and deepseek-v4.1-flash."""
-        routes = resolve_route_for_tier(ModelTier.FLASH.value)
+        routes = self._get_proof().resolve_allowed_routes_for_tier("flash")
         assert "byteplus/deepseek-v4-flash" in routes
         assert "byteplus/deepseek-v4.1-flash" in routes
         assert "byteplus/deepseek-v4-pro" not in routes
 
     def test_pro_tier_resolves_to_pro_and_flash_routes(self):
         """Pro tier resolves to pro and flash routes (escalation flexibility)."""
-        routes = resolve_route_for_tier(ModelTier.PRO.value)
+        routes = self._get_proof().resolve_allowed_routes_for_tier("pro")
         assert "byteplus/deepseek-v4-pro" in routes
         assert "byteplus/deepseek-v4.1-pro" in routes
         assert "byteplus/deepseek-v4-flash" in routes  # escalation may use flash
 
     def test_unknown_tier_raises(self):
-        """An unknown tier raises AllocationError."""
-        with pytest.raises(AllocationError) as exc:
-            resolve_route_for_tier("unknown")
-        assert "unknown tier" in str(exc.value)
+        """An unknown tier raises RouteProofError."""
+        with pytest.raises(RouteProofError) as exc:
+            self._get_proof().resolve_allowed_routes_for_tier("unknown")
+        assert "unknown" in str(exc.value)
 
-    def test_tier_route_map_keys_match_model_tiers(self):
-        """TIER_ROUTE_MAP keys match ModelTier values."""
-        for tier in ModelTier:
-            assert tier.value in TIER_ROUTE_MAP, (
-                f"ModelTier {tier.value} missing from TIER_ROUTE_MAP"
-            )
+    def test_tier_routes_are_subset_of_approved(self):
+        """Every tier route is in the approved set."""
+        proof = self._get_proof()
+        for tier_name, tier_routes in proof.tier_routes.items():
+            for route in tier_routes:
+                assert route in proof.approved_routes, (
+                    f"tier {tier_name!r} contains route {route!r} "
+                    f"which is not in approved_routes"
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -812,17 +822,20 @@ class TestRouteLockIntegrity:
 
     def test_approved_routes_non_empty(self):
         """The approved BytePlus route set is not empty."""
-        assert len(APPROVED_BYTEPLUS_ROUTES) >= 3  # flash, v4.1-flash, pro at minimum
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        assert len(proof.approved_routes) >= 4  # flash, v4.1-flash, pro, v4.1-pro
 
-    def test_tier_route_map_covers_both_tiers(self):
-        """TIER_ROUTE_MAP covers flash and pro."""
-        assert ModelTier.FLASH.value in TIER_ROUTE_MAP
-        assert ModelTier.PRO.value in TIER_ROUTE_MAP
+    def test_tier_routes_cover_flash_and_pro(self):
+        """Route-proof tier_routes covers flash and pro."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        assert "flash" in proof.tier_routes
+        assert "pro" in proof.tier_routes
 
     def test_flash_tier_routes_are_subset_of_pro(self):
         """Flash routes are a subset of Pro routes (escalation flexibility)."""
-        flash_routes = resolve_route_for_tier(ModelTier.FLASH.value)
-        pro_routes = resolve_route_for_tier(ModelTier.PRO.value)
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        flash_routes = proof.resolve_allowed_routes_for_tier("flash")
+        pro_routes = proof.resolve_allowed_routes_for_tier("pro")
         assert flash_routes.issubset(pro_routes), (
             "Flash routes must be a subset of Pro routes for escalation"
         )
@@ -1939,13 +1952,13 @@ class TestEnvKeyCannotOverrideApprovedRoutes:
             )
         assert "not in allowed_routes" in str(exc.value)
 
-    def test_resolve_route_for_tier_only_returns_byteplus_routes(self):
-        """TIER_ROUTE_MAP only contains byteplus/ routes, never raw names."""
-        for tier in ModelTier:
-            routes = resolve_route_for_tier(tier.value)
-            for route in routes:
+    def test_tier_routes_from_proof_only_returns_byteplus_routes(self):
+        """Route-proof tier_routes only contains byteplus/ routes, never raw names."""
+        proof = RouteProof.load(str(_ROUTE_PROOF_FIXTURE))
+        for tier_name, tier_routes in proof.tier_routes.items():
+            for route in tier_routes:
                 assert route.startswith("byteplus/"), (
-                    f"tier {tier.value} contains non-byteplus route {route!r}"
+                    f"tier {tier_name!r} contains non-byteplus route {route!r}"
                 )
 
 

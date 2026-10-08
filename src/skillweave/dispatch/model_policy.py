@@ -537,46 +537,8 @@ def apply_transfer_observation(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SW-1510-ROUTE-LOCK: Tier-to-route binding and retry attribution.
+# SW-1510-ROUTE-LOCK: Retry attribution.
 # ═══════════════════════════════════════════════════════════════════════════
-
-#: The approved BytePlus routes per capability tier (criterion 3).
-#: ``flash`` tiers map to the cheaper Flash class; ``pro`` tiers map to
-#: the stronger Pro class.  This is the single binding between capability
-#: tiers and concrete provider routes — raw upstream names or global
-#: environment keys cannot override this mapping.
-TIER_ROUTE_MAP: dict[str, frozenset[str]] = {
-    ModelTier.FLASH.value: frozenset({
-        "byteplus/deepseek-v4-flash",
-        "byteplus/deepseek-v4.1-flash",
-    }),
-    ModelTier.PRO.value: frozenset({
-        "byteplus/deepseek-v4-pro",
-        "byteplus/deepseek-v4.1-pro",
-        # Pro escalation may also use Flash routes when budget permits.
-        "byteplus/deepseek-v4-flash",
-        "byteplus/deepseek-v4.1-flash",
-    }),
-}
-
-
-def resolve_route_for_tier(tier: str) -> frozenset[str]:
-    """Return the approved route set for a capability tier (criterion 3).
-
-    The mapping is the single authoritative binding between the provider-
-    neutral ``flash``/``pro`` tier vocabulary and the concrete BytePlus
-    route names.  An unknown tier raises ``AllocationError``, so a caller
-    can never silently route through an unapproved provider.
-    """
-    routes = TIER_ROUTE_MAP.get(tier)
-    if routes is None:
-        raise AllocationError(
-            f"unknown tier {tier!r} for route resolution "
-            f"(expected one of {sorted(TIER_ROUTE_MAP)})"
-        )
-    return routes
-
-
 @dataclass(frozen=True)
 class AttemptAttribution:
     """Retry/escalation attempt attribution (criterion 4).
@@ -652,8 +614,6 @@ __all__ = [
     "ModelReceipt",
     "TransferObservation",
     "apply_transfer_observation",
-    "TIER_ROUTE_MAP",
-    "resolve_route_for_tier",
     "AttemptAttribution",
     "check_attempt_route",
 ]
