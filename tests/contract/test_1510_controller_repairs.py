@@ -10,9 +10,8 @@ SW-MCP-001 controller findings C3, C4, C5:
       OpenClaudeAdapter.execute against a synthetic child, recording the typed
       lifecycle result. If incompatible, state OpenClaude as UNSUPPORTED.
 
-  C5: Global host-config rollout guard: a pure function that inspects active
-      consumers/lock and returns HELD with a named reason. Tests only; no
-      actual host config touched.
+  C5: Global host-config rollout guard uses the production ``rollout_guard()``
+      from ``skillweave.council.rollout_guard``. No actual host config touched.
 """
 from __future__ import annotations
 
@@ -33,6 +32,9 @@ from skillweave.adapters.outcomes import (  # noqa: E402
     SearchAttempt,
     query_digest,
 )
+
+# Import the production rollout guard
+from skillweave.council.rollout_guard import rollout_guard  # noqa: E402
 
 
 # =========================================================================
@@ -516,43 +518,26 @@ class TestC4OpenClaudeUnsupported:
 # =========================================================================
 # C5: Host-config rollout guard
 # =========================================================================
+# Uses the production ``rollout_guard()`` from
+# ``skillweave.council.rollout_guard``.
 
 class TestC5HostConfigRolloutGuard:
     """C5: Global host-config rollout guard.
 
-    A pure function that inspects active consumers/lock state and returns
-    HELD with a named reason. No actual host config is touched.
+    Uses the production ``rollout_guard()`` from
+    ``skillweave.council.rollout_guard``.
 
     The guard checks three conditions:
     - active_consumers: set of consumer IDs currently running
     - deployment_lock: optional lock identifier
     - target_consumer: the consumer being deployed to
+
+    No actual host config is touched.
     """
-
-    def _rollout_guard(
-        self,
-        *,
-        active_consumers: set[str],
-        deployment_lock: str | None = None,
-        target_consumer: str,
-    ) -> tuple[str, str | None]:
-        """Pure function: inspect active consumers/lock and return HELD or GO.
-
-        Returns:
-            ("GO", None) if the rollout can proceed.
-            ("HELD", reason) if the rollout must wait.
-        """
-        if target_consumer in active_consumers:
-            return ("HELD", f"consumer '{target_consumer}' is currently running")
-
-        if deployment_lock is not None:
-            return ("HELD", f"deployment lock held: {deployment_lock}")
-
-        return ("GO", None)
 
     def test_rollout_go_when_no_active_consumers(self):
         """Rollout proceeds when no active consumers and no lock."""
-        status, reason = self._rollout_guard(
+        status, reason = rollout_guard(
             active_consumers=set(),
             target_consumer="claude-desktop",
         )
@@ -561,7 +546,7 @@ class TestC5HostConfigRolloutGuard:
 
     def test_rollout_held_when_consumer_active(self):
         """Rollout is HELD when target consumer is running."""
-        status, reason = self._rollout_guard(
+        status, reason = rollout_guard(
             active_consumers={"claude-desktop"},
             target_consumer="claude-desktop",
         )
@@ -572,7 +557,7 @@ class TestC5HostConfigRolloutGuard:
 
     def test_rollout_go_when_different_consumer_active(self):
         """Rollout proceeds when a different consumer is running."""
-        status, reason = self._rollout_guard(
+        status, reason = rollout_guard(
             active_consumers={"claude-code"},
             target_consumer="claude-desktop",
         )
@@ -581,7 +566,7 @@ class TestC5HostConfigRolloutGuard:
 
     def test_rollout_held_when_deployment_lock_present(self):
         """Rollout is HELD when a deployment lock exists."""
-        status, reason = self._rollout_guard(
+        status, reason = rollout_guard(
             active_consumers=set(),
             deployment_lock="rollout-2026-10-04",
             target_consumer="claude-desktop",
@@ -592,7 +577,7 @@ class TestC5HostConfigRolloutGuard:
 
     def test_rollout_held_consumer_and_lock(self):
         """Rollout is HELD when both consumer active and lock present."""
-        status, reason = self._rollout_guard(
+        status, reason = rollout_guard(
             active_consumers={"claude-desktop"},
             deployment_lock="rollout-2026-10-04",
             target_consumer="claude-desktop",
@@ -604,7 +589,7 @@ class TestC5HostConfigRolloutGuard:
 
     def test_rollout_multiple_consumers_held(self):
         """Rollout held when target among multiple active consumers."""
-        status, reason = self._rollout_guard(
+        status, reason = rollout_guard(
             active_consumers={"cursor", "claude-desktop", "opencode"},
             deployment_lock=None,
             target_consumer="cursor",
@@ -614,7 +599,7 @@ class TestC5HostConfigRolloutGuard:
 
     def test_rollout_multiple_consumers_go(self):
         """Rollout proceeds when target not among active consumers."""
-        status, reason = self._rollout_guard(
+        status, reason = rollout_guard(
             active_consumers={"cursor", "opencode"},
             deployment_lock=None,
             target_consumer="claude-desktop",
@@ -624,7 +609,7 @@ class TestC5HostConfigRolloutGuard:
 
     def test_rollout_held_reason_is_named(self):
         """HELD reason must name the blocking fact."""
-        status, reason = self._rollout_guard(
+        status, reason = rollout_guard(
             active_consumers={"claude-desktop"},
             target_consumer="claude-desktop",
         )
@@ -635,7 +620,7 @@ class TestC5HostConfigRolloutGuard:
     def test_rollout_empty_consumers_no_lock(self):
         """Edge case: no consumers, no lock, always GO."""
         for target in ("antigravity", "claude-code", "codex", "cursor", "opencode", "claude-desktop"):
-            status, reason = self._rollout_guard(
+            status, reason = rollout_guard(
                 active_consumers=set(),
                 target_consumer=target,
             )
@@ -645,7 +630,7 @@ class TestC5HostConfigRolloutGuard:
     def test_rollout_lock_held_for_any_target(self):
         """Deployment lock holds for any target consumer."""
         for target in ("antigravity", "claude-code", "codex", "cursor", "opencode", "claude-desktop"):
-            status, reason = self._rollout_guard(
+            status, reason = rollout_guard(
                 active_consumers=set(),
                 deployment_lock="global-freeze",
                 target_consumer=target,
@@ -656,7 +641,7 @@ class TestC5HostConfigRolloutGuard:
     def test_rollout_clears_after_consumer_stops(self):
         """Rollout proceeds after consumer stops running."""
         # Simulate: consumer was running, now stopped
-        status, reason = self._rollout_guard(
+        status, reason = rollout_guard(
             active_consumers=set(),  # consumer has stopped
             target_consumer="claude-desktop",
         )
@@ -666,7 +651,7 @@ class TestC5HostConfigRolloutGuard:
     def test_rollout_clears_after_lock_released(self):
         """Rollout proceeds after deployment lock is released."""
         # Simulate: lock was released
-        status, reason = self._rollout_guard(
+        status, reason = rollout_guard(
             active_consumers=set(),
             deployment_lock=None,  # lock released
             target_consumer="claude-desktop",
@@ -677,7 +662,7 @@ class TestC5HostConfigRolloutGuard:
     def test_rollout_all_six_frameworks_go_when_idle(self):
         """All six declared frameworks can roll out when idle."""
         for framework in ("antigravity", "claude-code", "codex", "cursor", "opencode", "claude-desktop"):
-            status, reason = self._rollout_guard(
+            status, reason = rollout_guard(
                 active_consumers=set(),
                 target_consumer=framework,
             )
@@ -686,12 +671,23 @@ class TestC5HostConfigRolloutGuard:
     def test_rollout_all_six_frameworks_held_when_running(self):
         """All six declared frameworks are HELD when running."""
         for framework in ("antigravity", "claude-code", "codex", "cursor", "opencode", "claude-desktop"):
-            status, reason = self._rollout_guard(
+            status, reason = rollout_guard(
                 active_consumers={framework},
                 target_consumer=framework,
             )
             assert status == "HELD", f"{framework} should be HELD when running"
             assert framework in reason
+
+    def test_rollout_imported_from_production_module(self):
+        """rollout_guard is imported from the production module."""
+        from skillweave.council.rollout_guard import rollout_guard as rg
+        assert rg is rollout_guard
+
+    def test_rollout_production_module_has_docstring(self):
+        """The production module has a module-level docstring."""
+        import skillweave.council.rollout_guard
+        assert skillweave.council.rollout_guard.__doc__ is not None
+        assert len(skillweave.council.rollout_guard.__doc__) > 50
 
 
 # =========================================================================

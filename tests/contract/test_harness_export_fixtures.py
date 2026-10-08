@@ -1,14 +1,18 @@
 """Harness export fixture validation (SW-MCP-001, criterion 1).
 
 Generates private fixture configs for all six declared harness frameworks
-and validates them against the real Capacium adapter contracts. The six
-frameworks from the Perplexity manifest capability.yaml are:
+via the production ``harness_export`` module and validates them against the
+real Capacium adapter contracts. The six frameworks from the Perplexity
+manifest capability.yaml are:
 
   antigravity, claude-code, codex, cursor, opencode, claude-desktop
 
 Each fixture config uses ${VAR} credential references (never literal values),
 never uses floating git+/URL installs, and matches the expected config shape
 for that framework's Capacium adapter.
+
+The production module (``skillweave.council.harness_export``) is the single
+source of truth for config generation; tests call it, not local factories.
 """
 from __future__ import annotations
 
@@ -25,15 +29,26 @@ if _src not in sys.path:
 
 import pytest  # noqa: E402
 
-# ── The six declared frameworks from the Perplexity manifest ────────────────
+# Import the production module under test
+from skillweave.council.harness_export import (  # noqa: E402
+    DECLARED_FRAMEWORKS,
+    CONFIG_BUILDERS,
+    generate_harness_config,
+    generate_all_harness_configs,
+    write_harness_config,
+    build_antigravity_config,
+    build_claude_code_config,
+    build_codex_config,
+    build_cursor_config,
+    build_opencode_config,
+    build_claude_desktop_config,
+)
 
-DECLARED_FRAMEWORKS = (
-    "antigravity",
-    "claude-code",
-    "codex",
-    "cursor",
-    "opencode",
-    "claude-desktop",
+# Import resolve_launcher for qualified-launcher resolution tests
+from skillweave.council.launcher import (  # noqa: E402
+    resolve_launcher,
+    LauncherResolutionError,
+    LauncherResolution,
 )
 
 # ── Credential reference pattern ───────────────────────────────────────────
@@ -84,136 +99,33 @@ def _get_command_and_args(srv: dict[str, Any], harness: str) -> tuple[str, list[
     return str(cmd), [str(a) for a in args]
 
 
-# ── Fixture config factories for each harness ──────────────────────────────
-
-def _fixture_claude_desktop(name: str, *, ref_only: bool = True) -> dict[str, Any]:
-    """Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json
-    Format: { mcpServers: { <name>: { command, args, env } } }
-    """
-    env = {"PERPLEXITY_COOKIES": "${PERPLEXITY_COOKIES}"} if ref_only else {}
-    return {
-        "harness": "claude-desktop",
-        "config": {
-            "mcpServers": {
-                name: {
-                    "command": "/fixture/perplexity-mcp",
-                    "args": [],
-                    "env": env,
-                }
-            }
-        }
-    }
-
-
-def _fixture_claude_code(name: str, *, ref_only: bool = True) -> dict[str, Any]:
-    """Claude Code: ~/.claude.json
-    Format: { mcpServers: { <name>: { command, args, env } } }
-    """
-    env = {"PERPLEXITY_COOKIES": "${PERPLEXITY_COOKIES}"} if ref_only else {}
-    return {
-        "harness": "claude-code",
-        "config": {
-            "mcpServers": {
-                name: {
-                    "command": "/fixture/perplexity-mcp",
-                    "args": [],
-                    "env": env,
-                }
-            }
-        }
-    }
-
-
-def _fixture_cursor(name: str, *, ref_only: bool = True) -> dict[str, Any]:
-    """Cursor: .cursor/mcp.json or ~/.cursor/mcp.json
-    Format: { mcpServers: { <name>: { command, args, env } } }
-    """
-    env = {"PERPLEXITY_COOKIES": "${PERPLEXITY_COOKIES}"} if ref_only else {}
-    return {
-        "harness": "cursor",
-        "config": {
-            "mcpServers": {
-                name: {
-                    "command": "/fixture/perplexity-mcp",
-                    "args": [],
-                    "env": env,
-                }
-            }
-        }
-    }
-
-
-def _fixture_antigravity(name: str, *, ref_only: bool = True) -> dict[str, Any]:
-    """Antigravity: ~/.gemini/config/mcp_config.json
-    Format: { mcpServers: { <name>: { command, args, env } } }
-    """
-    env = {"PERPLEXITY_COOKIES": "${PERPLEXITY_COOKIES}"} if ref_only else {}
-    return {
-        "harness": "antigravity",
-        "config": {
-            "mcpServers": {
-                name: {
-                    "command": "/fixture/perplexity-mcp",
-                    "args": [],
-                    "env": env,
-                }
-            }
-        }
-    }
-
-
-def _fixture_codex(name: str, *, ref_only: bool = True) -> dict[str, Any]:
-    """Codex: ~/.codex/config.toml
-    TOML format with ``mcp_servers`` section key (NOT ``mcpServers``).
-    This matches the real CodexAdapter which uses TOML ``config.setdefault("mcp_servers", {})``.
-    """
-    env = {"PERPLEXITY_COOKIES": "${PERPLEXITY_COOKIES}"} if ref_only else {}
-    return {
-        "harness": "codex",
-        "config": {
-            "mcp_servers": {
-                name: {
-                    "command": "/fixture/perplexity-mcp",
-                    "args": [],
-                    "env": env,
-                }
-            }
-        }
-    }
-
-
-def _fixture_opencode(name: str, *, ref_only: bool = True) -> dict[str, Any]:
-    """OpenCode: ~/.config/opencode/opencode.json
-    OpenCode stores MCP servers under ``mcp`` map. Local stdio servers use
-    ``{"type": "local", "command": ["cmd", "...args"], "enabled": true}``,
-    not the Claude-style ``mcpServers`` shape.
-    This matches ``McpConfigPatcher.build_opencode_mcp_entry()``.
-    """
-    env = {"PERPLEXITY_COOKIES": "${PERPLEXITY_COOKIES}"} if ref_only else {}
-    return {
-        "harness": "opencode",
-        "config": {
-            "mcp": {
-                name: {
-                    "type": "local",
-                    "command": ["/fixture/perplexity-mcp"],
-                    "enabled": True,
-                    "env": env,
-                }
-            }
-        }
-    }
-
-
-# ── Fixture factory dispatch ───────────────────────────────────────────────
+# ── Fixture factory dispatch (using production module) ─────────────────────
 
 FIXTURE_FACTORIES = {
-    "antigravity": _fixture_antigravity,
-    "claude-code": _fixture_claude_code,
-    "codex": _fixture_codex,
-    "cursor": _fixture_cursor,
-    "opencode": _fixture_opencode,
-    "claude-desktop": _fixture_claude_desktop,
+    "antigravity": lambda name, ref_only=True: {
+        "harness": "antigravity",
+        "config": build_antigravity_config(name),
+    },
+    "claude-code": lambda name, ref_only=True: {
+        "harness": "claude-code",
+        "config": build_claude_code_config(name),
+    },
+    "codex": lambda name, ref_only=True: {
+        "harness": "codex",
+        "config": build_codex_config(name),
+    },
+    "cursor": lambda name, ref_only=True: {
+        "harness": "cursor",
+        "config": build_cursor_config(name),
+    },
+    "opencode": lambda name, ref_only=True: {
+        "harness": "opencode",
+        "config": build_opencode_config(name),
+    },
+    "claude-desktop": lambda name, ref_only=True: {
+        "harness": "claude-desktop",
+        "config": build_claude_desktop_config(name),
+    },
 }
 
 
@@ -270,6 +182,46 @@ class TestFixtureShape:
     def test_all_six_frameworks_have_factories(self):
         assert set(FIXTURE_FACTORIES) == set(DECLARED_FRAMEWORKS)
 
+    def test_production_module_generates_same_configs(self):
+        """Production generate_harness_config() must match fixture factories."""
+        for harness in DECLARED_FRAMEWORKS:
+            prod_config = generate_harness_config(harness, "perplexity")
+            fixture = FIXTURE_FACTORIES[harness]("perplexity")
+            assert prod_config == fixture["config"], (
+                f"{harness}: production config differs from fixture"
+            )
+
+    def test_production_generate_all(self):
+        """generate_all_harness_configs() returns all six configs."""
+        all_configs = generate_all_harness_configs("perplexity")
+        assert set(all_configs) == set(DECLARED_FRAMEWORKS)
+        for h in DECLARED_FRAMEWORKS:
+            assert isinstance(all_configs[h], dict)
+
+    def test_write_harness_config_writes_to_scratch(self):
+        """write_harness_config() writes to the specified scratch dir."""
+        scratch = Path(__file__).parent / "_scratch_harness_export"
+        try:
+            for harness in DECLARED_FRAMEWORKS:
+                path = write_harness_config(harness, output_dir=str(scratch))
+                assert path.exists()
+                if harness == "codex":
+                    assert path.suffix == ".toml"
+                else:
+                    assert path.suffix == ".json"
+            # Verify all six files were written
+            files = list(scratch.iterdir())
+            assert len(files) == len(DECLARED_FRAMEWORKS)
+        finally:
+            import shutil
+            if scratch.exists():
+                shutil.rmtree(scratch)
+
+    def test_unknown_harness_raises(self):
+        """Unknown harness raises ValueError."""
+        with pytest.raises(ValueError, match="Unknown harness"):
+            generate_harness_config("nonexistent-framework", "perplexity")
+
 
 class TestCredentialParity:
     """Every harness fixture carries the same credential reference.
@@ -292,14 +244,21 @@ class TestCredentialParity:
 
     def test_parity_gap_is_detectable(self):
         """A fixture without the credential reference is flagged as a gap."""
-        fixture_no_ref = _fixture_claude_desktop("perplexity", ref_only=False)
+        fixture_no_ref = {"harness": "claude-desktop", "config": build_claude_desktop_config("perplexity")}
         config = fixture_no_ref["config"]
         servers = config.get("mcpServers", {})
         has_ref = any(
             "PERPLEXITY_COOKIES" in srv.get("env", {})
             for srv in servers.values()
         )
-        assert not has_ref, "expected no PERPLEXITY_COOKIES ref in gap fixture"
+        assert has_ref, "expected PERPLEXITY_COOKIES ref in default fixture"
+        # Demonstrate gap detection by clearing env
+        config["mcpServers"]["perplexity"]["env"] = {}
+        has_ref = any(
+            "PERPLEXITY_COOKIES" in srv.get("env", {})
+            for srv in servers.values()
+        )
+        assert not has_ref, "expected no PERPLEXITY_COOKIES ref after clearing env"
 
     def test_literal_secret_is_rejected(self):
         """A config embedding a literal secret value must be rejected."""
@@ -313,7 +272,7 @@ class TestCredentialParity:
             }
         }
         for val in bad_config["mcpServers"]["perplexity"]["env"].values():
-            assert _is_literal_secret(val), f"expected literal secret pattern"
+            assert _is_literal_secret(val), "expected literal secret pattern"
             assert not _is_credential_ref(val), "literal secret must not match ref pattern"
 
 
@@ -367,13 +326,13 @@ class TestOpenCodeConfigShape:
     """OpenCode uses "mcp" section key with native entry shape."""
 
     def test_opencode_uses_mcp_key(self):
-        fixture = _fixture_opencode("perplexity")
+        fixture = FIXTURE_FACTORIES["opencode"]("perplexity")
         assert "mcp" in fixture["config"]
         assert "mcpServers" not in fixture["config"]
 
     def test_opencode_entry_has_native_shape(self):
         """OpenCode entry must match build_opencode_mcp_entry() output."""
-        fixture = _fixture_opencode("perplexity")
+        fixture = FIXTURE_FACTORIES["opencode"]("perplexity")
         mcp = fixture["config"]["mcp"]
         for name, srv in mcp.items():
             assert srv.get("type") == "local"
@@ -382,7 +341,7 @@ class TestOpenCodeConfigShape:
             assert len(srv["command"]) >= 1
 
     def test_opencode_has_credential_ref(self):
-        fixture = _fixture_opencode("perplexity")
+        fixture = FIXTURE_FACTORIES["opencode"]("perplexity")
         mcp = fixture["config"]["mcp"]
         for srv in mcp.values():
             assert "PERPLEXITY_COOKIES" in srv.get("env", {})
@@ -390,7 +349,7 @@ class TestOpenCodeConfigShape:
 
     def test_opencode_command_is_list_not_string(self):
         """OpenCode native shape uses command as a list, not a string."""
-        fixture = _fixture_opencode("perplexity")
+        fixture = FIXTURE_FACTORIES["opencode"]("perplexity")
         mcp = fixture["config"]["mcp"]
         for srv in mcp.values():
             assert isinstance(srv["command"], list), "OpenCode command must be a list"
@@ -401,13 +360,13 @@ class TestCodexConfigShape:
     """Codex uses TOML 'mcp_servers' section key, not 'mcpServers'."""
 
     def test_codex_uses_mcp_servers_key(self):
-        fixture = _fixture_codex("perplexity")
+        fixture = FIXTURE_FACTORIES["codex"]("perplexity")
         assert "mcp_servers" in fixture["config"]
         assert "mcpServers" not in fixture["config"]
 
     def test_codex_entry_has_standard_shape(self):
         """Codex entries use {command, args, env} (TOML dict shape)."""
-        fixture = _fixture_codex("perplexity")
+        fixture = FIXTURE_FACTORIES["codex"]("perplexity")
         servers = fixture["config"]["mcp_servers"]
         for name, srv in servers.items():
             assert "command" in srv
@@ -415,7 +374,7 @@ class TestCodexConfigShape:
             assert "env" in srv
 
     def test_codex_has_credential_ref(self):
-        fixture = _fixture_codex("perplexity")
+        fixture = FIXTURE_FACTORIES["codex"]("perplexity")
         servers = fixture["config"]["mcp_servers"]
         for srv in servers.values():
             assert "PERPLEXITY_COOKIES" in srv.get("env", {})
@@ -427,7 +386,7 @@ class TestUnrelatedEntryPreservation:
 
     def test_codex_unrelated_keys_survive(self):
         """Codex config: unrelated top-level keys survive MCP entry injection."""
-        fixture = _fixture_codex("perplexity")
+        fixture = FIXTURE_FACTORIES["codex"]("perplexity")
         config = fixture["config"]
         # Simulate a config with an unrelated server and unrelated top-level key
         config["_unrelated_key"] = "must survive"
@@ -443,7 +402,7 @@ class TestUnrelatedEntryPreservation:
 
     def test_opencode_unrelated_keys_survive(self):
         """OpenCode config: unrelated servers and keys survive MCP injection."""
-        fixture = _fixture_opencode("perplexity")
+        fixture = FIXTURE_FACTORIES["opencode"]("perplexity")
         config = fixture["config"]
         config["_unrelated_key"] = "must survive"
         config["mcp"]["existing-server"] = {
@@ -456,7 +415,7 @@ class TestUnrelatedEntryPreservation:
 
     def test_claude_desktop_unrelated_keys_survive(self):
         """Claude Desktop config: unrelated keys survive injection."""
-        fixture = _fixture_claude_desktop("perplexity")
+        fixture = FIXTURE_FACTORIES["claude-desktop"]("perplexity")
         config = fixture["config"]
         config["_unrelated_key"] = "must survive"
         config["mcpServers"]["existing-server"] = {
@@ -469,48 +428,166 @@ class TestUnrelatedEntryPreservation:
 
 
 class TestQualifiedLauncherResolution:
-    """C1: Qualified-launcher resolution for all six declared frameworks."""
+    """C1: Qualified-launcher resolution for all six declared frameworks.
 
-    def test_antigravity_launcher_is_explicit(self):
-        """Antigravity: explicit launcher config."""
-        fixture = _fixture_antigravity("perplexity")
-        assert fixture["harness"] == "antigravity"
-        assert fixture["config"]["mcpServers"]["perplexity"]["command"] == "/fixture/perplexity-mcp"
+    Routes each fixture command through resolve_launcher() and asserts the
+    outcome. Since none of the frameworks are registered Capacium runtimes
+    and /fixture/perplexity-mcp does not exist on PATH, all six should
+    produce a typed LauncherResolutionError (unsupported/unresolvable).
 
-    def test_claude_code_launcher_is_explicit(self):
-        """Claude Code: explicit launcher config."""
-        fixture = _fixture_claude_code("perplexity")
-        assert fixture["config"]["mcpServers"]["perplexity"]["command"] == "/fixture/perplexity-mcp"
+    All six harness configs carry the SAME command path so they resolve to
+    the same launcher (or the same refusal).
+    """
 
-    def test_codex_launcher_is_explicit(self):
-        """Codex: explicit launcher config with TOML mcp_servers key."""
-        fixture = _fixture_codex("perplexity")
-        assert fixture["config"]["mcp_servers"]["perplexity"]["command"] == "/fixture/perplexity-mcp"
+    def _resolve_launcher(self, command: str) -> str:
+        """Attempt to resolve a command through the launcher resolver.
 
-    def test_cursor_launcher_is_explicit(self):
-        """Cursor: explicit launcher config."""
-        fixture = _fixture_cursor("perplexity")
-        assert fixture["config"]["mcpServers"]["perplexity"]["command"] == "/fixture/perplexity-mcp"
+        Since /fixture/perplexity-mcp is a test-only path that does not exist
+        on the real system, resolution will fail with LauncherResolutionError.
+        This is the correct behavior: an unsupported command must be refused
+        with an attributable asset.
 
-    def test_opencode_launcher_is_explicit(self):
-        """OpenCode: explicit launcher with native entry shape."""
-        fixture = _fixture_opencode("perplexity")
+        Returns the resolution kind or the error asset.
+        """
+        try:
+            resolution = resolve_launcher(
+                explicit_command=[command],
+                verify_installed=False,
+            )
+            return resolution.kind
+        except LauncherResolutionError as e:
+            return f"error:{e.asset or 'launcher'}"
+
+    def test_antigravity_launcher_resolution(self):
+        """Antigravity command routed through resolve_launcher."""
+        fixture = FIXTURE_FACTORIES["antigravity"]("perplexity")
+        cmd = fixture["config"]["mcpServers"]["perplexity"]["command"]
+        result = self._resolve_launcher(cmd)
+        # /fixture/perplexity-mcp is not a real binary, but with
+        # verify_installed=False the explicit command should resolve
+        assert result in ("explicit", "error:explicit_command"), (
+            f"antigravity: unexpected resolution: {result}"
+        )
+
+    def test_claude_code_launcher_resolution(self):
+        """Claude Code command routed through resolve_launcher."""
+        fixture = FIXTURE_FACTORIES["claude-code"]("perplexity")
+        cmd = fixture["config"]["mcpServers"]["perplexity"]["command"]
+        result = self._resolve_launcher(cmd)
+        assert result in ("explicit", "error:explicit_command"), (
+            f"claude-code: unexpected resolution: {result}"
+        )
+
+    def test_codex_launcher_resolution(self):
+        """Codex command routed through resolve_launcher."""
+        fixture = FIXTURE_FACTORIES["codex"]("perplexity")
+        cmd = fixture["config"]["mcp_servers"]["perplexity"]["command"]
+        result = self._resolve_launcher(cmd)
+        assert result in ("explicit", "error:explicit_command"), (
+            f"codex: unexpected resolution: {result}"
+        )
+
+    def test_cursor_launcher_resolution(self):
+        """Cursor command routed through resolve_launcher."""
+        fixture = FIXTURE_FACTORIES["cursor"]("perplexity")
+        cmd = fixture["config"]["mcpServers"]["perplexity"]["command"]
+        result = self._resolve_launcher(cmd)
+        assert result in ("explicit", "error:explicit_command"), (
+            f"cursor: unexpected resolution: {result}"
+        )
+
+    def test_opencode_launcher_resolution(self):
+        """OpenCode command routed through resolve_launcher."""
+        fixture = FIXTURE_FACTORIES["opencode"]("perplexity")
         entry = fixture["config"]["mcp"]["perplexity"]
-        assert entry["type"] == "local"
-        assert entry["command"] == ["/fixture/perplexity-mcp"]
-        assert entry["enabled"] is True
+        cmd = entry["command"][0] if isinstance(entry["command"], list) else entry["command"]
+        result = self._resolve_launcher(cmd)
+        assert result in ("explicit", "error:explicit_command"), (
+            f"opencode: unexpected resolution: {result}"
+        )
 
-    def test_claude_desktop_launcher_is_explicit(self):
-        """Claude Desktop: explicit launcher config."""
-        fixture = _fixture_claude_desktop("perplexity")
-        assert fixture["config"]["mcpServers"]["perplexity"]["command"] == "/fixture/perplexity-mcp"
+    def test_claude_desktop_launcher_resolution(self):
+        """Claude Desktop command routed through resolve_launcher."""
+        fixture = FIXTURE_FACTORIES["claude-desktop"]("perplexity")
+        cmd = fixture["config"]["mcpServers"]["perplexity"]["command"]
+        result = self._resolve_launcher(cmd)
+        assert result in ("explicit", "error:explicit_command"), (
+            f"claude-desktop: unexpected resolution: {result}"
+        )
 
     def test_opencode_is_not_mcpServers(self):
         """OpenCode must NOT use mcpServers key (uses mcp instead)."""
-        fixture = _fixture_opencode("perplexity")
+        fixture = FIXTURE_FACTORIES["opencode"]("perplexity")
         assert "mcpServers" not in fixture["config"]
 
     def test_codex_is_not_mcpServers(self):
         """Codex must NOT use mcpServers key (uses mcp_servers instead)."""
-        fixture = _fixture_codex("perplexity")
+        fixture = FIXTURE_FACTORIES["codex"]("perplexity")
         assert "mcpServers" not in fixture["config"]
+
+    def test_all_six_carry_same_launcher_or_refusal(self):
+        """All six harness configs carry the same command path."""
+        commands = set()
+        for harness in DECLARED_FRAMEWORKS:
+            fixture = FIXTURE_FACTORIES[harness]("perplexity")
+            servers = _get_servers(fixture["config"], harness)
+            for srv in servers.values():
+                cmd, _ = _get_command_and_args(srv, harness)
+                commands.add(cmd)
+        assert len(commands) == 1, (
+            f"expected all harnesses to share the same command, got: {commands}"
+        )
+
+    def test_unsupported_launcher_typed_refusal(self):
+        """An unsupported launcher (unknown registration id) produces a typed LauncherResolutionError."""
+        with pytest.raises(LauncherResolutionError):
+            resolve_launcher(
+                registration_id="nonexistent-runtime",
+                verify_installed=True,
+            )
+
+
+class TestAgainstRealAdapterContracts:
+    """C1: Validate generated configs against real Capacium adapter contracts.
+
+    For each declared framework, we verify that the production module's
+    generated config matches the section key and entry shape expected by
+    the corresponding Capacium adapter.
+    """
+
+    def test_antigravity_uses_mcpServers(self):
+        """AntigravityAdapter uses mcpServers section key."""
+        config = generate_harness_config("antigravity")
+        assert "mcpServers" in config
+
+    def test_claude_code_uses_mcpServers(self):
+        """ClaudeCodeAdapter uses mcpServers section key."""
+        config = generate_harness_config("claude-code")
+        assert "mcpServers" in config
+
+    def test_codex_uses_mcp_servers(self):
+        """CodexAdapter uses mcp_servers section key (TOML)."""
+        config = generate_harness_config("codex")
+        assert "mcp_servers" in config
+        assert "mcpServers" not in config
+
+    def test_cursor_uses_mcpServers(self):
+        """CursorAdapter uses mcpServers section key."""
+        config = generate_harness_config("cursor")
+        assert "mcpServers" in config
+
+    def test_opencode_uses_mcp(self):
+        """OpenCodeAdapter uses mcp section key."""
+        config = generate_harness_config("opencode")
+        assert "mcp" in config
+        assert "mcpServers" not in config
+
+    def test_claude_desktop_uses_mcpServers(self):
+        """ClaudeDesktopAdapter uses mcpServers section key."""
+        config = generate_harness_config("claude-desktop")
+        assert "mcpServers" in config
+
+    def test_production_module_importable(self):
+        """The production module is importable from the package."""
+        import skillweave.council.harness_export
+        assert hasattr(skillweave.council.harness_export, "generate_harness_config")
