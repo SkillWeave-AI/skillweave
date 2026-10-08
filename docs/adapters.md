@@ -113,6 +113,72 @@ compliant server answers a bare first `tools/call` with `-32002`
 conformance against a fake server*. They do **not** establish live Perplexity
 availability, and no live provider is ever called by the tests.
 
+## The Council-owned Perplexity MCP repair (SW-COUNCIL-003)
+
+The addendum's Perplexity MCP defect lived in the *consumer*, so Council repairs
+it **inside Council's own write scope** (`src/skillweave/council/`) rather than
+rewriting the SW-ADAPT-001 substrate. Council's `search_registry()` rebuilds the
+one registry with the Perplexity `mcp-stdio` binding's backend swapped for
+Council's `PerplexityMcpBackend` — *same adapter id, same descriptor axes*, so
+provider resolution, the Discovery provider map and the facade are unaffected,
+and the `skillweave.adapters` package is untouched. Discovery still resolves its
+built-in Perplexity binding from the substrate.
+
+Council-owned modules:
+
+* `skillweave/council/mcp_client.py` — a protocol-conformant stdio client. It
+  performs the full lifecycle, **negotiates and records** the protocol version,
+  capabilities and `serverInfo`, and **correlates request ids** across
+  interleaved notifications/stale responses. It owns its child
+  (`start_new_session=True`), so a timeout/cancellation tears down only that
+  process group; stderr is drained and any secret sentinel is **redacted**
+  before it is surfaced.
+* `skillweave/council/perplexity.py` — normalization + the typed driver.
+  `normalize_records` reads every real Perplexity result shape
+  (`structuredContent.results`/`citations`, top-level `citations`/`results`, or
+  a bare URL) and **drops every non-`http(s)` value**; `content` `text` blocks
+  are synthesis, *never* a source. A JSON-RPC error, closed stream, `isError`
+  result, missing tool, malformed payload, or a synthesis with no cited URL each
+  become a **typed non-success with zero results**.
+* `skillweave/council/launcher.py` — the launcher resolver, in a fixed
+  precedence: explicit `SearchConfig.mcp_command` → registered compatible
+  runtime → verified installed binary → uvx fallback (only with an **exact**
+  `name==version` pin, an **explicit** network grant and recorded provenance).
+  A floating `git+`/URL command or an unpinned `uvx` spec is refused before any
+  process is spawned.
+
+**Criterion 2 at the consumer boundary.** The resolver is not the only place a
+refused launcher could slip through. `WebSearch._backend_argument` populates
+`command` **only** from an accepted resolution — a refused explicit command
+leaves no `command` behind — and `PerplexityMcpBackend.invoke` /
+`run_perplexity_mcp` re-check a *raw* command, so a floating `git+`/URL install
+or an unpinned `uvx` spec becomes a typed `no_binding` that spawns **nothing**,
+whatever path supplied it. The check skips a *resolver-produced* command (one
+carrying a `launcher_kind`), because its resolved `uvx --from name==version name`
+shape is already validated and must not be misread as unpinned.
+
+**Cross-owner hold (Discovered, not fixed here).** Discovery's
+`resolve_search_outcome` **defaults** to the SW-ADAPT-001 substrate registry,
+whose Perplexity MCP binding (`skillweave.adapters.search_backends.
+_fetch_perplexity_mcp`, plus `skillweave.adapters.mcp_client`) lives outside
+Council's write scope. On that default path a floating `git+` command is refused
+before spawn (as a raised client error rather than Council's typed `no_binding`),
+but an **unpinned `uvx` spec is NOT refused** — the substrate spawns it. Closing
+that requires SW-ADAPT-001 scope; the criterion-2 regressions drive the function
+with Council's owned registry and record the substrate default's behaviour
+explicitly (see `tests/contract/test_council_launcher_refusal_consumers.py`).
+
+The Council caller (`WebSearch.search`) stays a **formatted-string** API; the
+Discovery research invocation is proven to consume Council's typed outcome (a
+real cited source on success, an explicit failure state otherwise). Both are
+proven on the **installed** artifact.
+
+**Criterion 6 caveat (live availability).** An owned *live* Perplexity search
+that returns real cited sources requires a configured credential and network
+egress. Where either is absent the external proof stays **pending/blocked** — no
+fixture result is promoted in its place (see
+`tests/fixtures/council/LIVE_PROOF_PENDING.md`).
+
 ## Adding a local tool (zero format)
 
 A local tool that speaks no package format is registered directly; its
