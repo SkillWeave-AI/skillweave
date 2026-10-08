@@ -154,39 +154,84 @@ async def _in_executor(fn: Callable[[], Any]) -> Any:
 
 
 def _ddg_parse(html: str) -> list[SearchResultRecord]:
-    links = re.findall(
-        r'<a[^>]*class="[^"]*result-link[^"]*"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
-        html,
-        re.DOTALL,
+    """Parse DuckDuckGo Lite HTML into typed search result records.
+
+    Handles multiple DOM variants observed in the Lite page:
+    * ``class=\"result-link\"`` or ``class='result-link'``
+    * ``href`` before or after ``class`` attribute
+    * ``class=\"result-snippet\"`` or ``class='result-snippet'``
+    * ``<a>`` inside a ``<td>`` (standard) or bare ``<a>`` in a result row
+    * paired by table-row proximity -- never separate-list indexing.
+
+    Returns zero records for empty pages, challenge pages or malformed HTML
+    with no parseable results.
+    """
+    # Normalise quotes to double so one regex works for both quote styles.
+    normalised = html.replace("'", '"')
+
+    # --- 1. Detect challenge/empty pages early -------------------------------
+    _challenge_indicators = (
+        "challenge", "captcha", "verify you are human",
+        "please confirm", "unusual traffic",
     )
-    snippets = re.findall(
-        r'<td[^>]*class="[^"]*result-snippet[^"]*"[^>]*>(.*?)</td>',
-        html,
+    lower = normalised.lower()
+    if any(ind in lower for ind in _challenge_indicators) and "result-link" not in normalised:
+        return []
+
+    # --- 2. Extract result rows by scanning for <a class="result-link" --------
+    # Each result is wrapped in a <tr> that contains the link anchor and
+    # may be followed by a sibling <tr> with the snippet.  We use a
+    # pattern that works across attribute order variants:
+    #
+    #   <a [anything] class="result-link" [anything] href="URL" [anything]>TITLE</a>
+    #   <a [anything] href="URL" [anything] class="result-link" [anything]>TITLE</a>
+    #
+    # Use a lookahead to match both "class" and "href" in any order within the
+    # <a> tag, capturing the href and the inner HTML.
+    # Then locate the nearest following result-snippet <td> (same or next row).
+    LINK_RE = re.compile(
+        r'<a\s(?=[^>]*?class="result-link")(?=[^>]*?href="([^"]*)")(?:[^>]*)>(.*?)</a>',
         re.DOTALL,
     )
     out: list[SearchResultRecord] = []
-    for i, (href, title_html) in enumerate(links):
+    for m_link in LINK_RE.finditer(normalised):
+        href = m_link.group(1).strip()
+        title_html = m_link.group(2)
+        link_end = m_link.end()
+
+        # Decode uddg redirect
         url = href
         if "uddg=" in url:
-            m = re.search(r"uddg=([^&]+)", url)
-            if m:
-                url = unquote(m.group(1))
-        if not url.startswith("http"):
+            m_uddg = re.search(r"uddg=([^&]+)", url)
+            if m_uddg:
+                url = unquote(m_uddg.group(1))
+        if not (url.startswith("http://") or url.startswith("https://")):
             continue
+
         title = re.sub(r"<[^>]+>", "", title_html).strip()
+        if not title:
+            continue
+
+        # --- 3. Find the nearest result-snippet after the link -----------------
         snippet = ""
-        if i < len(snippets):
-            snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip()
-        if title:
-            out.append(
-                SearchResultRecord(
-                    title=title,
-                    url=url,
-                    snippet=snippet[:500],
-                    source="web",
-                    provider="duckduckgo",
-                )
+        after_link = normalised[link_end:]
+        m_snip = re.search(
+            r'<td[^>]*?class="result-snippet"[^>]*>(.*?)</td>',
+            after_link,
+            re.DOTALL,
+        )
+        if m_snip:
+            snippet = re.sub(r"<[^>]+>", "", m_snip.group(1)).strip()
+
+        out.append(
+            SearchResultRecord(
+                title=title,
+                url=url,
+                snippet=snippet[:500],
+                source="web",
+                provider="duckduckgo",
             )
+        )
     return out
 
 
@@ -198,10 +243,49 @@ async def _fetch_duckduckgo(query: str, opts: Mapping[str, Any]) -> list[SearchR
         req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:  # nosec
-                return resp.read().decode("utf-8", errors="replace")
+                status_code = resp.status
+                if status_code == 429:
+                    raise ProviderCallError(
+                        "HTTP 429 rate limited by DuckDuckGo Lite",
+                        status="blocked", code="http_429",
+                    )
+                if status_code >= 500:
+                    raise ProviderCallError(
+                        f"HTTP {status_code} server error from DuckDuckGo Lite",
+                        status="unavailable", code=f"http_{status_code}",
+                    )
+                raw = resp.read()
+                text = raw.decode("utf-8", errors="replace")
+                # Empty body or whitespace-only is "empty" (no results).
+                if not text.strip():
+                    return ""
+                # HTML challenge pages contain no "result-link" class but may
+                # include a challenge form or captcha.  Detect via size +
+                # known challenge markers.
+                _challenge_markers = (
+                    "challenge", "captcha", "verify you are human",
+                    "please confirm", "unusual traffic", "h-captcha",
+                )
+                lower = text.lower()
+                if any(m in lower for m in _challenge_markers) and "result-link" not in text:
+                    raise ProviderCallError(
+                        "DuckDuckGo Lite returned a challenge/captcha page",
+                        status="blocked", code="challenge",
+                    )
+                return text
         except urllib.error.HTTPError as exc:
+            code = exc.code
+            if code == 429:
+                raise ProviderCallError(
+                    "HTTP 429 rate limited", status="blocked", code="http_429",
+                ) from exc
+            if code >= 500:
+                raise ProviderCallError(
+                    f"HTTP {code} server error", status="unavailable",
+                    code=f"http_{code}",
+                ) from exc
             raise ProviderCallError(
-                f"HTTP {exc.code}", status="blocked", code=f"http_{exc.code}"
+                f"HTTP {code}", status="blocked", code=f"http_{code}",
             ) from exc
         except urllib.error.URLError as exc:
             raise ProviderCallError(
@@ -210,8 +294,25 @@ async def _fetch_duckduckgo(query: str, opts: Mapping[str, Any]) -> list[SearchR
                 code="network_error",
             ) from exc
 
-    html = await _in_executor(_run)
-    return _ddg_parse(html)
+    try:
+        html = await _in_executor(_run)
+    except asyncio.TimeoutError:
+        raise ProviderCallError(
+            "DuckDuckGo Lite request timed out",
+            status="unavailable", code="timeout",
+        )
+
+    # An empty string means no results (empty page) -- return zero records.
+    if not html.strip():
+        return []
+
+    records = _ddg_parse(html)
+    # Filter out unsafe URL schemes from parsed results.
+    safe: list[SearchResultRecord] = []
+    for r in records:
+        if r.url.startswith("http://") or r.url.startswith("https://"):
+            safe.append(r)
+    return safe
 
 
 async def _fetch_serper(query: str, opts: Mapping[str, Any]) -> list[SearchResultRecord]:
