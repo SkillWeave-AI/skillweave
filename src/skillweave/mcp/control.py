@@ -20,7 +20,10 @@ Three things the module owns:
 * **Transport/capability negotiation.** :class:`TransportProfile` +
   :func:`negotiate_capabilities` describe stdio and scoped Streamable HTTP, and
   negotiate experimental MCP Tasks only where a profile supports them, with
-  ordinary asynchronous tools + poll cursors as the fallback.
+  ordinary asynchronous tools + poll cursors as the fallback. A scoped HTTP
+  bind is validated up front by :func:`require_scoped_bind` (loopback-only
+  default, non-loopback refused without explicit opt-in, a scope token
+  required) so no server is ever built for a bind that must not be served.
 
 No ``mcp`` import appears at module import time: the package is optional and its
 absence is a *reported state*, never an import-time crash.
@@ -74,6 +77,21 @@ DEGRADED_REASON = (
     "server refuses to serve rather than advertise a non-functional surface"
 )
 
+#: The default loopback host a scoped HTTP bind uses when none is named.
+DEFAULT_HTTP_HOST = "127.0.0.1"
+
+#: The default port a scoped HTTP bind uses when none is named.
+DEFAULT_HTTP_PORT = 8765
+
+#: Environment variable carrying the scope token required for a scoped HTTP
+#: bind. A client-facing HTTP surface must be scoped to an authenticated
+#: caller; there is no anonymous default.
+HTTP_AUTH_ENV = "SKILLWEAVE_MCP_HTTP_TOKEN"
+
+#: Hosts treated as loopback. A bind outside this set is refused unless the
+#: caller explicitly opts into a remote bind.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 #: A tool a control client calls. ``async_tool`` marks an ordinary asynchronous
 #: tool (the fallback execution shape when experimental Tasks are unavailable).
 @dataclass(frozen=True)
@@ -90,6 +108,19 @@ class McpDependencyUnavailable(RuntimeError):
     """The ``mcp`` package is required to serve but cannot be imported."""
 
     def __init__(self, reason: str = DEGRADED_REASON):
+        self.reason = reason
+        super().__init__(reason)
+
+
+class ScopedHttpRefused(RuntimeError):
+    """A scoped Streamable HTTP bind was refused before any server was built.
+
+    The refusal is *structural*: a non-loopback bind without explicit remote
+    opt-in, or a missing scope token. ``reason`` names the refused bind so a
+    caller can act on it without inspecting a stack trace.
+    """
+
+    def __init__(self, reason: str):
         self.reason = reason
         super().__init__(reason)
 
@@ -137,12 +168,73 @@ def unavailable_payload(**extra: Any) -> dict[str, Any]:
     return payload
 
 
+# ---------------------------------------------------------------------------
+# Scoped HTTP bind contract
+# ---------------------------------------------------------------------------
+
+def require_scoped_bind(
+    host: str,
+    *,
+    auth_token: str = "",
+    allow_remote: bool = False,
+    environ: Optional[Mapping[str, str]] = None,
+) -> tuple[str, str]:
+    """Validate a scoped Streamable HTTP bind *before* any server is built.
+
+    Returns the ``(effective_host, token)`` a scoped bind would use, or raises
+    :class:`ScopedHttpRefused` -- a structural refusal, so no server is ever
+    built for a bind that must not be served:
+
+    * the host defaults to :data:`DEFAULT_HTTP_HOST` (loopback), so the *relied
+      upon* default is a loopback bind, not a fail-open wildcard;
+    * a non-loopback host is refused unless *allow_remote* is explicitly set;
+    * a scope token is required (the ``auth_token`` argument or
+      :data:`HTTP_AUTH_ENV`). A token is never echoed in the refusal reason.
+    """
+    env = os.environ if environ is None else environ
+    effective_host = host or DEFAULT_HTTP_HOST
+    if effective_host not in LOOPBACK_HOSTS and not allow_remote:
+        raise ScopedHttpRefused(
+            f"refusing to bind scoped HTTP to non-loopback host "
+            f"{effective_host!r} without explicit remote opt-in "
+            f"(allow_remote=True)"
+        )
+    token = auth_token or env.get(HTTP_AUTH_ENV, "")
+    if not token:
+        raise ScopedHttpRefused(
+            f"refusing to serve scoped HTTP without a scope token; pass "
+            f"auth_token or set {HTTP_AUTH_ENV}"
+        )
+    return effective_host, token
+
+
+def _load_fastmcp() -> Any:
+    """Return the ``mcp.server.fastmcp`` module used to build servers.
+
+    This is the single *injectable seam* for the serving path: a test replaces
+    it with a fake FastMCP module to pin exactly *what* :func:`serve` would run
+    without a live ``mcp`` install (see ``tests/unit/test_1510_mcp_control.py``).
+    The default is the real dependency, so production and the stub tests share
+    one code path instead of the test asserting against a re-implementation.
+    """
+    return require_mcp()
+
+
 def _build_server(fastmcp: Any):
     """Build the real ``FastMCP`` server carrying the six legacy tools."""
     server = fastmcp.FastMCP(SERVER_NAME)
     for spec in legacy_tool_specs():
         server.tool()(spec.handler)
     return server
+
+
+def _apply_scoped_settings(server: Any, host: str, port: int) -> None:
+    """Bind the scoped host/port onto a server's settings when it exposes them."""
+    settings = getattr(server, "settings", None)
+    if settings is not None:
+        settings.host = host
+        if port:
+            settings.port = port
 
 
 def serve_legacy_stdio() -> None:
@@ -152,34 +244,66 @@ def serve_legacy_stdio() -> None:
     With no ``mcp`` package it raises :class:`McpDependencyUnavailable` -- the
     server refuses rather than serving an empty dummy.
     """
-    fastmcp = require_mcp()
+    fastmcp = _load_fastmcp()
     _build_server(fastmcp).run()
 
 
-def serve(transport: str = "stdio", *, host: str = "", port: int = 0) -> None:
-    """Serve over ``stdio`` or a scoped Streamable HTTP transport.
+def serve(
+    transport: str = "stdio",
+    *,
+    host: str = "",
+    port: int = 0,
+    auth_token: str = "",
+    allow_remote: bool = False,
+    fastmcp_factory: Optional[Callable[[], Any]] = None,
+) -> None:
+    """Serve over ``stdio`` or a *scoped* Streamable HTTP transport.
 
     The transport is *honoured*, not described: ``stdio`` runs the stdio server
     and ``http`` runs the scoped Streamable HTTP server (the real
     ``streamable-http`` transport). An unknown transport is refused before any
     server is built, and a missing ``mcp`` package refuses with the explicit
     diagnostic.
+
+    The scoped HTTP bind is validated **before any server is built or run**
+    (:func:`require_scoped_bind`): it defaults to loopback, refuses a
+    non-loopback host unless *allow_remote* is set, and requires a scope token
+    (``auth_token`` or :data:`HTTP_AUTH_ENV`). *fastmcp_factory* overrides the
+    FastMCP module loader (the injectable seam); production leaves it unset.
     """
     profile = transport_profile(transport, host=host, port=port)
     if not profile.supported:
         raise McpDependencyUnavailable(profile.reason or DEGRADED_REASON)
-    fastmcp = require_mcp()
-    server = _build_server(fastmcp)
+    loader = fastmcp_factory or _load_fastmcp
     if profile.scoped:
-        settings = getattr(server, "settings", None)
-        if settings is not None:
-            if host:
-                settings.host = host
-            if port:
-                settings.port = port
+        effective_host, _token = require_scoped_bind(
+            host, auth_token=auth_token, allow_remote=allow_remote
+        )
+        effective_port = port or DEFAULT_HTTP_PORT
+        server = _build_server(loader())
+        _apply_scoped_settings(server, effective_host, effective_port)
         server.run(transport="streamable-http")
-    else:
-        server.run()
+        return
+    _build_server(loader()).run()
+
+
+def serve_scoped_http(
+    *,
+    host: str = "",
+    port: int = 0,
+    auth_token: str = "",
+    allow_remote: bool = False,
+    fastmcp_factory: Optional[Callable[[], Any]] = None,
+) -> None:
+    """Serve the scoped Streamable HTTP transport (loopback + scope token)."""
+    serve(
+        "http",
+        host=host,
+        port=port,
+        auth_token=auth_token,
+        allow_remote=allow_remote,
+        fastmcp_factory=fastmcp_factory,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -720,14 +844,19 @@ __all__ = [
     "CONTROL_NAMESPACE",
     "CONTROL_SURFACE",
     "CONTROL_VERSION",
+    "DEFAULT_HTTP_HOST",
+    "DEFAULT_HTTP_PORT",
     "DEGRADED_REASON",
+    "HTTP_AUTH_ENV",
     "LEGACY_TOOLS",
+    "LOOPBACK_HOSTS",
     "MCP_PROTOCOL_VERSION",
     "McpDependencyUnavailable",
     "RUN_SNAPSHOT_VERSION",
     "SERVER_NAME",
     "SUPPORTED_SNAPSHOT_VERSIONS",
     "SUPPORTED_TRANSPORTS",
+    "ScopedHttpRefused",
     "SnapshotVersionRefused",
     "ToolSpec",
     "TransportProfile",
@@ -746,8 +875,10 @@ __all__ = [
     "mcp_available",
     "negotiate_capabilities",
     "require_mcp",
+    "require_scoped_bind",
     "serve",
     "serve_legacy_stdio",
+    "serve_scoped_http",
     "server_capabilities",
     "snapshot_v1",
     "source_binding",

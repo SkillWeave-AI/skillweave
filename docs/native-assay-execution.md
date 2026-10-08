@@ -132,6 +132,26 @@ exposes:
   negotiated only where the transport supports them **and** the client asks;
   otherwise the negotiated execution shape is the ordinary asynchronous tool
   plus a poll cursor (`control_poll`).
+* **A validated scoped bind.** `serve(transport="http")` runs the real
+  `streamable-http` transport only after `require_scoped_bind` validates the
+  bind *before* any server is built: the default host is loopback
+  (`127.0.0.1`), a non-loopback host is refused (`ScopedHttpRefused`) unless
+  `allow_remote=True` is passed, and a scope token (`auth_token` or
+  `SKILLWEAVE_MCP_HTTP_TOKEN`) is required. A bind that is not scoped refuses;
+  nothing is served open.
+
+### Stub vs live transport proof
+
+`tests/unit/test_1510_mcp_control.py::TestScopedHttpServingPath` executes the
+real `control.serve` code path against an injected fake FastMCP module (the
+module's `fastmcp_factory` seam). Those assertions **pin the serving contract** —
+the exact `run(transport="streamable-http")` call, the host/port settings, the
+loopback default and the pre-serve refusals — and are **not** a live transport
+proof. The live proofs (`*_transport_initialize_and_list`) speak the MCP
+protocol to a real server over stdio and over scoped Streamable HTTP; they
+**skip, naming the missing package**, when the real `mcp` package is not
+importable. On a host without `mcp` the live paths are therefore *unproven*, not
+silently passed.
 
 ## Limitations
 
