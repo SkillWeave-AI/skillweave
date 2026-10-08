@@ -334,9 +334,21 @@ def test_swapping_only_the_router_changes_the_decision():
     assert small.strategy.model_mix == ("tiny-1",)
     assert big.strategy.model_mix == ("big-1", "big-2", "big-3")
     assert small.strategy.strategy != big.strategy.strategy
-    # The plugin's argv follows the router's decision, not a plugin choice.
-    assert adapter.build_command(small) == ["openclaude", "--model", "tiny-1"]
-    assert adapter.build_command(big) == ["openclaude", "--model", "big-1"]
+    # The plugin's argv follows the router's decision — the model is the
+    # decision's primary cast member, never a plugin choice — and the headless
+    # transport prefix is fixed (SW-1510-OPENCLAUDE).
+    _headless_prefix = [
+        "openclaude",
+        "--print",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "default",
+    ]
+    assert adapter.build_command(small) == [*_headless_prefix, "--model", "tiny-1"]
+    assert adapter.build_command(big) == [*_headless_prefix, "--model", "big-1"]
 
 
 def test_adapter_takes_the_router_decision_verbatim():

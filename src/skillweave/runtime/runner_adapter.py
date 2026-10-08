@@ -64,8 +64,10 @@ from typing import Any, List, Optional, Sequence
 
 import hashlib
 import os
+import select
 import signal as _signal
 import subprocess
+import time
 
 from .handoff import ColdStartBundle
 from .registry import ArtifactReceipt, EvidenceQuality, EvidenceType
@@ -74,6 +76,66 @@ from .registry import ArtifactReceipt, EvidenceQuality, EvidenceType
 def _hash_bytes(data: bytes) -> str:
     """Return the hex sha256 of ``data`` (empty input hashes to a stable value)."""
     return hashlib.sha256(data).hexdigest()
+
+
+#: Environment keys that redirect a model request to an *alternate* provider.
+#: A worker launched to run through the approved gateway must not silently
+#: inherit one of these from the ambient shell: a leaked ambient key would let
+#: a child's traffic bypass the gateway (SW-1510-OPENCLAUDE criterion 1). The
+#: names mirror ``routing.harness_adapter.AMBIENT_PROVIDER_ENV_KEYS`` and
+#: ``routing.faigate_adapter.detect_providers``.
+AMBIENT_PROVIDER_ENV_KEYS: tuple[str, ...] = (
+    "FAIGATE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "CLAWROUTER_API_KEY",
+    "KILO_API_KEY",
+    "OMNIROUTE_API_KEY",
+    "NINEROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+)
+
+
+def build_child_environment(
+    *,
+    env_allowlist: Optional[Sequence[str]],
+    extra_env: Optional[dict[str, str]] = None,
+    base_env: Optional[dict[str, str]] = None,
+) -> Optional[dict[str, str]]:
+    """Build a child's environment from an explicit allowlist.
+
+    With ``env_allowlist`` given, *only* those keys are inherited from
+    ``base_env`` (default ``os.environ``); every other ambient key — including
+    every ambient alternate provider credential — is dropped, and any ambient
+    provider key that slips into ``env_allowlist`` is refused (fail closed) so a
+    typo cannot re-open the bypass. ``extra_env`` holds the caller's *pinned*
+    settings (for example the approved gateway base URL) and is applied last.
+
+    With ``env_allowlist=None`` the historical behaviour is preserved: the child
+    inherits the parent environment (optionally extended by ``extra_env``).
+    Returns ``None`` when there is nothing to pass (the child then inherits).
+    """
+    if env_allowlist is None:
+        if not extra_env:
+            return None
+        return {**os.environ, **{str(k): str(v) for k, v in extra_env.items()}}
+    for key in env_allowlist:
+        if key in AMBIENT_PROVIDER_ENV_KEYS:
+            raise ValueError(
+                f"env_allowlist may not carry ambient provider key {key!r}; "
+                "route the worker through the approved gateway instead"
+            )
+    source = os.environ if base_env is None else base_env
+    env = {k: source[k] for k in env_allowlist if k in source}
+    if extra_env:
+        for key, value in extra_env.items():
+            name = str(key)
+            if name in AMBIENT_PROVIDER_ENV_KEYS:
+                raise ValueError(
+                    f"extra_env may not set ambient provider key {name!r}"
+                )
+            env[name] = str(value)
+    return env
 
 
 def _split_returncode(returncode: int) -> tuple[Optional[int], Optional[int]]:
@@ -133,18 +195,32 @@ class ProcessResult:
     message: str = ""
     stdout: bytes = b""
     stderr: bytes = b""
+    #: Bytes of stderr actually observed (equal to ``len(stderr)`` when the
+    #: stream was not capped; larger than ``len(stderr)`` when a bounded run
+    #: truncated the retained copy).
+    stderr_observed_bytes: int = 0
+    #: How many chunks arrived after the stderr retention cap was reached — the
+    #: observable backpressure signal. ``0`` means the cap was never pressed.
+    stderr_backpressure_events: int = 0
+    #: Whether the stderr stream exceeded its configured retention cap.
+    stderr_exceeded_cap: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def succeeded(self) -> bool:
         """True only when the worker exited cleanly with code 0 and produced.
 
-        A cancelled, timed-out, or signal-killed worker never succeeds, even if
-        by chance its process happened to exit 0 at the last instant."""
+        A cancelled, timed-out, signal-killed, or backpressure-failed worker
+        never succeeds, even if by chance its process happened to exit 0 at the
+        last instant. A worker whose stderr exceeded its configured retention
+        cap (``stderr_exceeded_cap``) is a controlled failure: the run *did*
+        produce a defined, non-silent outcome rather than buffering the stream
+        whole."""
         return (
             self.termination == "exited"
             and self.exit_code == 0
             and self.signal is None
+            and not self.stderr_exceeded_cap
         )
 
     @property
@@ -217,10 +293,119 @@ class RunningProcess:
     _model: str
     _created_at: Optional[str] = None
     _cancelled: bool = False
+    _stderr_retain_limit: Optional[int] = None
+    _stderr_observed: int = 0
+    _stderr_backpressure: int = 0
+    _stderr_capped: bool = False
 
     @property
     def pid(self) -> int:
         return self.process.pid
+
+    def _collect(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        input_bytes: Optional[bytes] = None,
+    ) -> tuple[bytes, bytes, bool]:
+        """Drain both pipes, capping the retained stderr at the retain limit.
+
+        Returns ``(stdout, stderr_retained, timed_out)``. stdout is collected
+        unbounded (bounded by the timeout, exactly as before). When a stderr
+        retention cap is configured, bytes beyond the cap are counted and
+        dropped rather than retained, and each capped chunk increments the
+        backpressure counter — the stream is *drained*, never deadlocked, so the
+        child is not blocked on a full pipe. With no cap this is byte-for-byte
+        the previous ``communicate`` behaviour.
+        """
+        cap = self._stderr_retain_limit
+        if cap is None:
+            try:
+                stdout_b, stderr_b = self.process.communicate(
+                    input=input_bytes, timeout=timeout
+                )
+            except subprocess.TimeoutExpired:
+                self._kill_group()
+                stdout_b, stderr_b = self.process.communicate()
+                return stdout_b or b"", stderr_b or b"", True
+            return stdout_b or b"", stderr_b or b"", False
+
+        # Bounded stderr: stream both pipes ourselves so a large stderr burst
+        # is capped rather than buffered whole.
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+        retained = 0
+        started = time.monotonic()
+        if input_bytes:
+            try:
+                self.process.stdin.write(input_bytes)  # type: ignore[union-attr]
+                self.process.stdin.close()  # type: ignore[union-attr]
+            except (BrokenPipeError, OSError):
+                pass
+        elif self.process.stdin is not None:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
+        streams = [fd for fd in (self.process.stdout, self.process.stderr) if fd is not None]
+        timed_out = False
+        while streams:
+            ready, _, _ = select.select(streams, [], [], 0.1)
+            for fd in ready:
+                chunk = os.read(fd.fileno(), 4096)
+                if not chunk:
+                    streams = [s for s in streams if s is not fd]
+                    continue
+                if fd is self.process.stdout:
+                    stdout_chunks.append(chunk)
+                else:
+                    self._stderr_observed += len(chunk)
+                    room = cap - retained
+                    if room > 0:
+                        keep = chunk[:room]
+                        stderr_chunks.append(keep)
+                        retained += len(keep)
+                        if len(chunk) > room:
+                            self._stderr_capped = True
+                            self._stderr_backpressure += 1
+                    else:
+                        self._stderr_capped = True
+                        self._stderr_backpressure += 1
+            if not streams:
+                break
+            if self.process.poll() is not None:
+                # Drain whatever is still buffered, capping stderr the same way.
+                for fd in list(streams):
+                    try:
+                        rest = os.read(fd.fileno(), 1 << 20)
+                    except OSError:
+                        rest = b""
+                    while rest:
+                        if fd is self.process.stdout:
+                            stdout_chunks.append(rest)
+                        else:
+                            self._stderr_observed += len(rest)
+                            room = cap - retained
+                            if room > 0:
+                                keep = rest[:room]
+                                stderr_chunks.append(keep)
+                                retained += len(keep)
+                                self._stderr_capped = True
+                                if len(rest) > room:
+                                    self._stderr_backpressure += 1
+                            else:
+                                self._stderr_backpressure += 1
+                        try:
+                            rest = os.read(fd.fileno(), 1 << 20)
+                        except OSError:
+                            rest = b""
+                    streams = [s for s in streams if s is not fd]
+                break
+            if timeout is not None and (time.monotonic() - started) > timeout:
+                timed_out = True
+                self._kill_group()
+                break
+        return b"".join(stdout_chunks), b"".join(stderr_chunks), timed_out
 
     def _kill_group(self) -> None:
         """Terminate the child's whole process group, then reap it.
@@ -256,12 +441,9 @@ class RunningProcess:
 
         created_at = self._created_at or datetime.now(timezone.utc).isoformat()
 
-        stdout_bytes = b""
-        stderr_bytes = b""
-        if self.process.stdout is not None:
-            stdout_bytes = self.process.stdout.read()
-        if self.process.stderr is not None:
-            stderr_bytes = self.process.stderr.read()
+        # Drain through the same collector so a capped stderr burst is counted
+        # on the cancel path too (criterion 3), not just on a clean wait.
+        stdout_bytes, stderr_bytes, _ = self._collect()
 
         return self._build_result(
             exit_code=None,
@@ -285,15 +467,15 @@ class RunningProcess:
         """
         from datetime import datetime, timezone
 
-        timed_out = False
+        stdout_bytes, stderr_bytes, timed_out = self._collect(
+            timeout=timeout, input_bytes=input_bytes
+        )
+        # Reap the child so ``returncode`` is definite before we split it; the
+        # uncapped path already reaped via ``communicate`` and this is a no-op.
         try:
-            stdout_bytes, stderr_bytes = self.process.communicate(
-                input=input_bytes, timeout=timeout
-            )
+            self.process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
-            timed_out = True
-            self._kill_group()
-            stdout_bytes, stderr_bytes = self.process.communicate()
+            pass
 
         returncode = self.process.returncode
         created_at = self._created_at or datetime.now(timezone.utc).isoformat()
@@ -388,6 +570,9 @@ class RunningProcess:
             message=message,
             stdout=stdout_bytes,
             stderr=stderr_bytes,
+            stderr_observed_bytes=self._stderr_observed,
+            stderr_backpressure_events=self._stderr_backpressure,
+            stderr_exceeded_cap=self._stderr_capped,
             metadata={
                 "run_id": self._run_id,
                 "subject_repo": self._subject_repo,
@@ -395,6 +580,9 @@ class RunningProcess:
                 "created_at": created_at,
                 "tool": self._tool,
                 "model": self._model,
+                "stderr_observed_bytes": self._stderr_observed,
+                "stderr_backpressure_events": self._stderr_backpressure,
+                "stderr_exceeded_cap": self._stderr_capped,
             },
         )
 
@@ -410,6 +598,8 @@ def start_process(
     created_at: Optional[str] = None,
     cwd: Optional[str] = None,
     env: Optional[dict[str, str]] = None,
+    env_allowlist: Optional[Sequence[str]] = None,
+    stderr_retain_limit: Optional[int] = None,
 ) -> RunningProcess:
     """Start ``command`` as a real process and return a live handle.
 
@@ -425,11 +615,26 @@ def start_process(
     ``env`` (optional) is a set of extra environment variables merged into the
     child process's environment. The worker can discover the message channel
     via ``os.environ["SW_MSG_CHANNEL"]`` when ``env`` carries that key.
+
+    ``env_allowlist`` (optional) switches the child environment to an explicit
+    allowlist via :func:`build_child_environment`: only those keys are inherited
+    and every ambient alternate-provider credential is dropped, so a worker
+    pinned to the approved gateway cannot be redirected (criterion 1). With
+    ``env_allowlist=None`` the historical inherit behaviour is preserved and
+    ``env`` is applied as extra variables.
+
+    ``stderr_retain_limit`` (optional) caps how many stderr bytes are retained;
+    bytes beyond the cap are counted as backpressure instead of buffered whole
+    (criterion 3). With ``None`` stderr is retained unbounded as before.
     """
-    child_env = None
-    if env:
-        child_env = dict(os.environ)
-        child_env.update(env)
+    if env_allowlist is None:
+        child_env = build_child_environment(
+            env_allowlist=None, extra_env=env
+        )
+    else:
+        child_env = build_child_environment(
+            env_allowlist=env_allowlist, extra_env=env
+        )
     proc = subprocess.Popen(
         list(command),
         stdin=subprocess.PIPE,
@@ -448,6 +653,7 @@ def start_process(
         _tool=tool,
         _model=model,
         _created_at=created_at,
+        _stderr_retain_limit=stderr_retain_limit,
     )
 
 
@@ -464,6 +670,8 @@ def run_command(
     timeout: Optional[float] = None,
     cwd: Optional[str] = None,
     env: Optional[dict[str, str]] = None,
+    env_allowlist: Optional[Sequence[str]] = None,
+    stderr_retain_limit: Optional[int] = None,
 ) -> ProcessResult:
     """Run ``command`` to completion and return bound evidence.
 
@@ -474,8 +682,8 @@ def run_command(
     dies without producing a result is reported as a failure with a message,
     never a silent success.
 
-    ``env`` (optional) is forwarded to ``start_process`` for the subprocess
-    environment.
+    ``env``, ``env_allowlist`` and ``stderr_retain_limit`` are forwarded to
+    ``start_process`` (criterion 1 allowlist and criterion 3 stderr cap).
     """
     handle = start_process(
         command,
@@ -487,6 +695,8 @@ def run_command(
         created_at=created_at,
         cwd=cwd,
         env=env,
+        env_allowlist=env_allowlist,
+        stderr_retain_limit=stderr_retain_limit,
     )
     return handle.wait(timeout=timeout, input_bytes=input_bytes)
 
@@ -517,6 +727,9 @@ def dispatch_batch(
     model: str,
     created_at: Optional[str] = None,
     cwd: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
+    env_allowlist: Optional[Sequence[str]] = None,
+    stderr_retain_limit: Optional[int] = None,
 ) -> BatchRun:
     """Run exactly the first batch of tasks, then stop.
 
@@ -527,7 +740,8 @@ def dispatch_batch(
     reason to continue (criterion 10).
 
     ``tool`` and ``model`` are required and carry no default — the caller
-    supplies them from the ``RoutingProfile`` (criterion 7).
+    supplies them from the ``RoutingProfile`` (criterion 7). ``env``,
+    ``env_allowlist`` and ``stderr_retain_limit`` reach every task's process.
     """
     if not batches:
         return BatchRun(results=[], ran_batch=0, batches_total=0, stopped=True)
@@ -544,6 +758,9 @@ def dispatch_batch(
             model=model,
             created_at=created_at,
             cwd=cwd,
+            env=env,
+            env_allowlist=env_allowlist,
+            stderr_retain_limit=stderr_retain_limit,
         )
         results.append(result)
 
@@ -605,6 +822,9 @@ class WorkerContext:
         subject_commit: str,
         created_at: Optional[str] = None,
         cwd: Optional[str] = None,
+        env: Optional[dict[str, str]] = None,
+        env_allowlist: Optional[Sequence[str]] = None,
+        stderr_retain_limit: Optional[int] = None,
     ) -> ProcessResult:
         """Run one task for ``run_lane``, refusing any lane but the bound role.
 
@@ -622,6 +842,9 @@ class WorkerContext:
             model=self.model,
             created_at=created_at,
             cwd=cwd,
+            env=env,
+            env_allowlist=env_allowlist,
+            stderr_retain_limit=stderr_retain_limit,
         )
 
 
@@ -634,6 +857,9 @@ def start_from_bundle(
     run_id: str,
     created_at: Optional[str] = None,
     cwd: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
+    env_allowlist: Optional[Sequence[str]] = None,
+    stderr_retain_limit: Optional[int] = None,
 ) -> ProcessResult:
     """Start a worker from its ``ColdStartBundle`` alone (criterion 9).
 
@@ -655,4 +881,7 @@ def start_from_bundle(
         subject_commit=bundle.prd_digest,
         created_at=created_at,
         cwd=cwd,
+        env=env,
+        env_allowlist=env_allowlist,
+        stderr_retain_limit=stderr_retain_limit,
     )
