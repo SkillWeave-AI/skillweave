@@ -36,11 +36,6 @@ if str(_src) not in sys.path:
 import pytest  # noqa: E402
 
 from skillweave.routing.faigate_adapter import (  # noqa: E402
-    APPROVED_BYTEPLUS_ROUTES,
-    APPROVED_GATEWAY_HOST,
-    APPROVED_GATEWAY_PORT,
-    APPROVED_GATEWAY_URL,
-    COUNCIL_POLICY_REVISION,
     COUNCIL_PROFILE_VERSION,
     RouteDecision,
     make_route_decision,
@@ -169,13 +164,13 @@ class TestRouteDecisionRecord:
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-flash",
             answering_envelope_identity="deepseek-v4-flash",
-            catalog_revision=COUNCIL_PROFILE_VERSION,
-            policy_revision=COUNCIL_POLICY_REVISION,
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
             run_id="run-001",
             task_id="task-01",
             attempt=1,
             reservation_id="res-001",
-            attempt_order=0,
+            attempt_order=[0],
             attribution_status="attributed",
             outcome="resolved",
             measured_at="2026-10-08T12:00:00+00:00",
@@ -185,8 +180,8 @@ class TestRouteDecisionRecord:
         assert d.resolved_provider == "faigate"
         assert d.resolved_model == "byteplus/deepseek-v4-flash"
         assert d.answering_envelope_identity == "deepseek-v4-flash"
-        assert d.catalog_revision == COUNCIL_PROFILE_VERSION
-        assert d.policy_revision == COUNCIL_POLICY_REVISION
+        assert d.catalog_revision == "1.3.11"
+        assert d.policy_revision == "1.3.11"
 
     def test_route_decision_to_dict_contract_compliant(self):
         """to_dict() produces a route-decision-v1 contract payload.
@@ -207,14 +202,14 @@ class TestRouteDecisionRecord:
             task_id="task-02",
             attempt=1,
             reservation_id="res-002",
-            attempt_order=0,
+            attempt_order=[0],
             attribution_status="attributed",
             outcome="resolved",
             measured_at="2026-10-08T12:00:00+00:00",
         )
         data = d.to_dict()
         # Contract fields present
-        assert data["schema_version"] == 1
+        assert data["schema_version"] == "1.0.0"
         assert data["run_id"] == "run-002"
         assert data["task_id"] == "task-02"
         assert data["attempt"] == 1
@@ -222,9 +217,13 @@ class TestRouteDecisionRecord:
         assert data["parent_request_id"] == ""
         assert data["requested_model"] == "deepseek-v4-pro"
         assert data["answering_model"] == "deepseek-v4-pro"
-        assert data["attribution_status"] == "attributed"
+        assert data["resolved_provider"] == "faigate"
+        assert data["resolved_model"] == "byteplus/deepseek-v4-pro"
+        assert data["catalog_revision"] == "1.3.11"
+        assert data["policy_revision"] == "1.3.11"
+        assert data["attribution_status"] == "answered"
         assert data["reservation_id"] == "res-002"
-        assert data["attempt_order"] == 0
+        assert data["attempt_order"] == [0]
         assert data["measured_at"] == "2026-10-08T12:00:00+00:00"
         assert data["outcome"] == "resolved"
         assert data["usage"] == {}
@@ -232,10 +231,6 @@ class TestRouteDecisionRecord:
         assert "correlation_id" not in data
         assert "requested_alias" not in data
         assert "answering_envelope_identity" not in data
-        assert "resolved_provider" not in data
-        assert "resolved_model" not in data
-        assert "catalog_revision" not in data
-        assert "policy_revision" not in data
 
     def test_route_decision_to_journal_dict_has_meta(self):
         """to_journal_dict() includes extra metadata outside the contract."""
@@ -262,9 +257,7 @@ class TestRouteDecisionRecord:
         # The contract sub-dict passes schema validation
         import json
         from jsonschema import validate
-        schema_path = Path(__file__).resolve().parent.parent.parent / "schemas" / "execution" / "route-decision-v1.schema.json"
-        with open(schema_path) as f:
-            schema = json.load(f)
+        schema = TestRouteDecisionContractCompliance._route_decision_schema()
         validate(instance=jd["contract"], schema=schema)
 
     def test_answering_envelope_identity_may_be_none(self):
@@ -285,7 +278,7 @@ class TestRouteDecisionRecord:
         assert payload["outcome"] == "pending"
 
     def test_make_route_decision_defaults_policy_revision(self):
-        """make_route_decision fills in the current policy revision by default."""
+        """make_route_decision without route_policy leaves revisions empty."""
         d = make_route_decision(
             correlation_id="corr-004",
             requested_alias="deepseek-v4-flash",
@@ -295,8 +288,8 @@ class TestRouteDecisionRecord:
             task_id="task-04",
             attempt=1,
         )
-        assert d.policy_revision == COUNCIL_POLICY_REVISION
-        assert d.catalog_revision == COUNCIL_POLICY_REVISION
+        assert d.policy_revision == ""
+        assert d.catalog_revision == ""
 
     def test_make_route_decision_accepts_explicit_revisions(self):
         """Explicit catalog/policy revision overrides the default."""
@@ -385,20 +378,23 @@ class TestEgressGateway:
     """Worker and child egress must route through the approved gateway (criterion 2)."""
 
     def test_approved_gateway_url_is_correct(self):
-        """The approved gateway URL matches the expected host:port."""
-        assert APPROVED_GATEWAY_HOST == "127.0.0.1"
-        assert APPROVED_GATEWAY_PORT == 8090
-        assert APPROVED_GATEWAY_URL == "http://127.0.0.1:8090"
+        """The approved gateway URL matches the expected host:port.
+        
+        The policy fixture defines the approved gateway.
+        """
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        assert policy.approved_gateway_host == "127.0.0.1"
+        assert policy.approved_gateway_port == 8090
 
     def test_approved_gateway_url_passes_check(self):
         """The approved gateway URL is accepted."""
         # Should not raise
-        check_egress_gateway(APPROVED_GATEWAY_URL)
+        check_egress_gateway("http://127.0.0.1:8090")
 
     def test_approved_gateway_url_with_path_passes(self):
         """The approved gateway URL with a path is accepted."""
-        check_egress_gateway(f"{APPROVED_GATEWAY_URL}/v1")
-        check_egress_gateway(f"{APPROVED_GATEWAY_URL}/v1/chat/completions")
+        check_egress_gateway("http://127.0.0.1:8090/v1")
+        check_egress_gateway("http://127.0.0.1:8090/v1/chat/completions")
 
     def test_alternative_loopback_port_is_refused(self):
         """A Faigate-like router on a different port is refused."""
@@ -537,80 +533,96 @@ class TestBytePlusRouteEnforcement:
 
     def test_approved_routes_are_recognised(self):
         """Every approved BytePlus route is recognised by is_byteplus_route."""
-        for route in APPROVED_BYTEPLUS_ROUTES:
-            assert is_byteplus_route(route), f"{route} should be approved"
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        for route in policy.approved_routes:
+            assert is_byteplus_route(route, route_policy=policy), f"{route} should be approved"
 
     def test_approved_routes_have_byteplus_prefix(self):
         """Every approved route starts with 'byteplus/'."""
-        for route in APPROVED_BYTEPLUS_ROUTES:
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        for route in policy.approved_routes:
             assert route.startswith("byteplus/"), f"{route} should have byteplus/ prefix"
 
     def test_deepseek_v4_flash_is_approved(self):
         """deepseek-v4-flash is an approved BytePlus route."""
-        assert is_byteplus_route("byteplus/deepseek-v4-flash")
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        assert is_byteplus_route("byteplus/deepseek-v4-flash", route_policy=policy)
 
     def test_deepseek_v4_1_flash_is_approved(self):
         """deepseek-v4.1-flash is an approved BytePlus route."""
-        assert is_byteplus_route("byteplus/deepseek-v4.1-flash")
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        assert is_byteplus_route("byteplus/deepseek-v4.1-flash", route_policy=policy)
 
     def test_deepseek_v4_pro_is_approved(self):
         """deepseek-v4-pro is an approved BytePlus route."""
-        assert is_byteplus_route("byteplus/deepseek-v4-pro")
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        assert is_byteplus_route("byteplus/deepseek-v4-pro", route_policy=policy)
 
     def test_deepseek_v4_1_pro_is_approved(self):
         """deepseek-v4.1-pro is an approved BytePlus route."""
-        assert is_byteplus_route("byteplus/deepseek-v4.1-pro")
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        assert is_byteplus_route("byteplus/deepseek-v4.1-pro", route_policy=policy)
 
     def test_wrong_version_is_refused(self):
         """deepseek-v3 (wrong version) is refused."""
-        assert not is_byteplus_route("byteplus/deepseek-v3")
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        assert not is_byteplus_route("byteplus/deepseek-v3", route_policy=policy)
 
     def test_wrong_variant_is_refused(self):
         """deepseek-v4-sonnet (unknown variant) is refused."""
-        assert not is_byteplus_route("byteplus/deepseek-v4-sonnet")
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        assert not is_byteplus_route("byteplus/deepseek-v4-sonnet", route_policy=policy)
 
     def test_direct_provider_bypass_is_refused(self):
         """A model id without the byteplus/ prefix is a direct-provider bypass."""
-        assert not is_byteplus_route("deepseek-v4-flash")
-        assert not is_byteplus_route("deepseek-v4-pro")
-        assert not is_byteplus_route("faigate/deepseek-v4-flash")
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        assert not is_byteplus_route("deepseek-v4-flash", route_policy=policy)
+        assert not is_byteplus_route("deepseek-v4-pro", route_policy=policy)
+        assert not is_byteplus_route("faigate/deepseek-v4-flash", route_policy=policy)
 
     def test_verify_approved_route_passes_for_approved(self):
         """verify_approved_route does not raise for an approved route."""
-        verify_approved_route("byteplus/deepseek-v4-flash")
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        verify_approved_route("byteplus/deepseek-v4-flash", route_policy=policy)
 
     def test_verify_approved_route_raises_for_wrong_version(self):
         """verify_approved_route raises for a wrong version."""
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
         with pytest.raises(ModelNamespaceError) as exc:
-            verify_approved_route("byteplus/deepseek-v3")
+            verify_approved_route("byteplus/deepseek-v3", route_policy=policy)
         assert "not an approved BytePlus route" in str(exc.value)
 
     def test_verify_approved_route_raises_for_direct_bypass(self):
         """verify_approved_route raises for a direct-provider bypass."""
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
         with pytest.raises(ModelNamespaceError) as exc:
-            verify_approved_route("deepseek-v4-flash")
+            verify_approved_route("deepseek-v4-flash", route_policy=policy)
         assert "not an approved BytePlus route" in str(exc.value)
 
     def test_verify_approved_route_raises_for_wrong_provider(self):
         """verify_approved_route raises when the provider is not faigate."""
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
         with pytest.raises(ModelNamespaceError) as exc:
-            verify_approved_route("byteplus/deepseek-v4-flash", provider="openrouter")
+            verify_approved_route("byteplus/deepseek-v4-flash", provider="openrouter", route_policy=policy)
         assert "not the approved gateway" in str(exc.value)
 
     def test_verify_approved_route_raises_for_single_model(self):
         """A SingleModelProvider fallback is refused as a direct bypass."""
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
         with pytest.raises(ModelNamespaceError) as exc:
-            verify_approved_route("byteplus/deepseek-v4-flash", provider="single_model")
+            verify_approved_route("byteplus/deepseek-v4-flash", provider="single_model", route_policy=policy)
         assert "not the approved gateway" in str(exc.value)
 
     def test_verify_approved_route_for_faigate_provider_passes(self):
         """verify_approved_route with faigate provider passes for approved."""
-        verify_approved_route("byteplus/deepseek-v4-flash", provider="faigate")
-        verify_approved_route("byteplus/deepseek-v4-pro", provider="faigate")
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        verify_approved_route("byteplus/deepseek-v4-flash", provider="faigate", route_policy=policy)
+        verify_approved_route("byteplus/deepseek-v4-pro", provider="faigate", route_policy=policy)
 
     def test_approved_routes_match_router_profiles(self):
         """Every model in ROUTER_PROFILES maps to an approved BytePlus route
         through FAIGATE_MAP."""
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
         for preset_name, preset in ROUTER_PROFILES.items():
             for model in preset["models"]:
                 mapped = FAIGATE_MAP.get(model, model)
@@ -618,7 +630,7 @@ class TestBytePlusRouteEnforcement:
                 # through the translate path
                 if mapped.startswith("deepseek-"):
                     byteplus_model = f"byteplus/{mapped}"
-                    assert is_byteplus_route(byteplus_model), (
+                    assert is_byteplus_route(byteplus_model, route_policy=policy), (
                         f"preset {preset_name!r} model {model!r} maps to "
                         f"{mapped!r} which is not in approved routes"
                     )
@@ -841,23 +853,29 @@ class TestRouteLockIntegrity:
         )
 
     def test_gateway_url_ends_with_slash(self):
-        """The APPROVED_GATEWAY_URL is the base URL (no trailing slash needed)."""
-        assert APPROVED_GATEWAY_URL == "http://127.0.0.1:8090"
+        """The approved gateway URL is the base URL (no trailing slash needed).
+        
+        The policy fixture defines the approved gateway URL.
+        """
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        assert f"http://{policy.approved_gateway_host}:{policy.approved_gateway_port}" == "http://127.0.0.1:8090"
 
     def test_profile_models_map_to_byteplus(self):
         """All router profile models map to byteplus/ through FAIGATE_MAP."""
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
         for preset in ROUTER_PROFILES.values():
             for model in preset["models"]:
                 mapped = FAIGATE_MAP.get(model, model)
                 byteplus_route = f"byteplus/{mapped}"
-                assert byteplus_route in APPROVED_BYTEPLUS_ROUTES or mapped == "openrouter-fallback", (
+                assert byteplus_route in policy.approved_routes or mapped == "openrouter-fallback", (
                     f"model {model!r} -> {mapped!r} does not map to an approved BytePlus route"
                 )
 
     def test_policy_revision_is_set(self):
-        """The policy revision constant is a non-empty string."""
-        assert isinstance(COUNCIL_POLICY_REVISION, str)
-        assert len(COUNCIL_POLICY_REVISION) > 0
+        """The policy fixture has a non-empty policy revision."""
+        policy = RoutePolicy.load(str(_ROUTE_POLICY_FIXTURE))
+        assert isinstance(policy.policy_revision, str)
+        assert len(policy.policy_revision) > 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1753,7 +1771,7 @@ class TestChildEnvironmentConfinement:
         with pytest.raises(EgressGatewayError):
             check_egress_gateway("https://api.openai.com/v1")
         # Approved gateway passes
-        check_egress_gateway(APPROVED_GATEWAY_URL)
+        check_egress_gateway("http://127.0.0.1:8090")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2352,21 +2370,59 @@ class TestInstalledWheelRouteLock:
 class TestRouteDecisionContractCompliance:
     """Every route_decision payload validates against route-decision-v1 schema."""
 
-    SCHEMA_PATH = (
-        Path(__file__).resolve().parent.parent.parent
-        / "schemas" / "execution" / "route-decision-v1.schema.json"
-    )
+    # Schema reference removed: the SDK owns this contract.
+    # Tests validate against an inline representation of the
+    # route-decision-v1 required field set.
 
-    def _load_schema(self):
-        import json
-        with open(self.SCHEMA_PATH) as f:
-            return json.load(f)
+    @staticmethod
+    def _route_decision_schema():
+        """Minimal route-decision-v1 contract schema (SDK-owned, frozen).
+        
+        The full schema lives in the SDK at
+        skillweave_sdk/schemas/execution/route-decision-v1.schema.json.
+        This inline version covers the required fields for unit tests.
+        """
+        return {
+            "type": "object",
+            "required": [
+                "schema_version", "run_id", "task_id", "attempt",
+                "request_id", "parent_request_id", "requested_model",
+                "answering_model", "resolved_provider", "resolved_model",
+                "catalog_revision", "policy_revision", "attribution_status",
+                "reservation_id", "attempt_order", "measured_at", "outcome",
+            ],
+            "properties": {
+                "schema_version": {"type": "string"},
+                "run_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "attempt": {"type": "integer"},
+                "request_id": {"type": "string"},
+                "parent_request_id": {"type": "string"},
+                "requested_model": {"type": "string"},
+                "answering_model": {"type": "string"},
+                "resolved_provider": {"type": "string"},
+                "resolved_model": {"type": "string"},
+                "catalog_revision": {"type": "string"},
+                "policy_revision": {"type": "string"},
+                "attribution_status": {
+                    "type": "string",
+                    "enum": ["answered", "substituted", "unavailable",
+                             "rate_limited", "errored", "unknown"]
+                },
+                "reservation_id": {"type": "string", "minLength": 1},
+                "attempt_order": {"type": "array", "items": {"type": "integer"}},
+                "measured_at": {"type": "string"},
+                "outcome": {"type": "string"},
+                "usage": {"type": "object"},
+            },
+            "additionalProperties": False,
+        }
 
     def test_to_dict_validates_against_schema(self):
         """The contract payload from to_dict() validates against the schema."""
         import json
         from jsonschema import validate
-        schema = self._load_schema()
+        schema = self._route_decision_schema()
         d = RouteDecision(
             correlation_id="schema-corr-1",
             requested_alias="deepseek-v4-flash",
@@ -2387,7 +2443,7 @@ class TestRouteDecisionContractCompliance:
         """The contract sub-dict in to_journal_dict() validates."""
         import json
         from jsonschema import validate
-        schema = self._load_schema()
+        schema = self._route_decision_schema()
         d = RouteDecision(
             correlation_id="schema-corr-2",
             requested_alias="deepseek-v4-pro",
@@ -2405,7 +2461,7 @@ class TestRouteDecisionContractCompliance:
         """A pending route_decision (no answering model) validates."""
         import json
         from jsonschema import validate
-        schema = self._load_schema()
+        schema = self._route_decision_schema()
         d = RouteDecision(
             correlation_id="schema-corr-3",
             requested_alias="deepseek-v4-flash",
@@ -2421,7 +2477,7 @@ class TestRouteDecisionContractCompliance:
         """A nested request's contract payload validates with parent_request_id."""
         import json
         from jsonschema import validate
-        schema = self._load_schema()
+        schema = self._route_decision_schema()
         d = RouteDecision(
             correlation_id="run-001/task-01/nested-01",
             requested_alias="deepseek-v4-flash",
@@ -2438,7 +2494,8 @@ class TestRouteDecisionContractCompliance:
 
     def test_no_disallowed_fields_in_contract(self):
         """The contract payload must NOT contain correlation_id, requested_alias,
-        answering_envelope_identity, or resolved_provider/resolved_model."""
+        or answering_envelope_identity.  resolved_provider, resolved_model,
+        catalog_revision and policy_revision ARE required contract fields."""
         d = RouteDecision(
             correlation_id="corr-no-disallowed",
             requested_alias="deepseek-v4-flash",
@@ -2453,10 +2510,9 @@ class TestRouteDecisionContractCompliance:
         assert "correlation_id" not in payload
         assert "requested_alias" not in payload
         assert "answering_envelope_identity" not in payload
-        assert "resolved_provider" not in payload
-        assert "resolved_model" not in payload
-        assert "catalog_revision" not in payload
-        assert "policy_revision" not in payload
+        # These are now required contract fields
+        assert payload["resolved_provider"] == "faigate"
+        assert payload["resolved_model"] == "byteplus/deepseek-v4-flash"
 
 
 class TestAnsweringModelUpdate:
@@ -2508,9 +2564,9 @@ class TestAnsweringModelUpdate:
         assert len(route_events) >= 1
         payload = route_events[0].payload
         assert payload["contract"]["answering_model"] == "deepseek-v4-flash"
-        assert payload["contract"]["attribution_status"] == "attributed"
+        assert payload["contract"]["attribution_status"] == "answered"
         assert payload["contract"]["outcome"] == "resolved"
-        assert payload["contract"]["attempt_order"] == 1
+        assert payload["contract"]["attempt_order"] == [1]
 
     def test_update_answering_model_empty_string(self, svc, db_path):
         """When answering_model is empty, the event records unattributed status."""
@@ -2529,7 +2585,7 @@ class TestAnsweringModelUpdate:
         assert len(route_events) >= 1
         payload = route_events[0].payload
         assert payload["contract"]["answering_model"] == ""
-        assert payload["contract"]["attribution_status"] == "unattributed"
+        assert payload["contract"]["attribution_status"] == "unavailable"
         assert payload["contract"]["outcome"] == "resolved"
         # The _meta should include the reason
         assert "_meta" in payload
@@ -2537,14 +2593,8 @@ class TestAnsweringModelUpdate:
 
     def test_update_answering_model_validates_against_schema(self, svc, db_path):
         """The follow-up event payload validates against route-decision-v1."""
-        import json
         from jsonschema import validate
-        schema_path = (
-            Path(__file__).resolve().parent.parent.parent
-            / "schemas" / "execution" / "route-decision-v1.schema.json"
-        )
-        with open(schema_path) as f:
-            schema = json.load(f)
+        schema = TestRouteDecisionContractCompliance._route_decision_schema()
 
         svc._update_route_decision_answering(
             run_id="run-answer-3",
@@ -2567,14 +2617,8 @@ class TestAnsweringModelUpdate:
         This simulates the real flow: initial decision (pending), then
         a follow-up with the answering model (attributed).
         """
-        import json
         from jsonschema import validate
-        schema_path = (
-            Path(__file__).resolve().parent.parent.parent
-            / "schemas" / "execution" / "route-decision-v1.schema.json"
-        )
-        with open(schema_path) as f:
-            schema = json.load(f)
+        schema = TestRouteDecisionContractCompliance._route_decision_schema()
 
         # 1. Initial decision (pending)
         from skillweave.routing.faigate_adapter import make_route_decision
@@ -2587,7 +2631,7 @@ class TestAnsweringModelUpdate:
             task_id="task-full",
             attempt=1,
             reservation_id="res-full",
-            attempt_order=0,
+            attempt_order=[0],
         )
         svc.journal.append(
             "run-full",
@@ -2609,7 +2653,7 @@ class TestAnsweringModelUpdate:
             task_id="task-full",
             attempt=1,
             reservation_id="res-full",
-            attempt_order=1,
+            attempt_order=[1],
             attribution_status="attributed",
             outcome="resolved",
         )
@@ -2626,7 +2670,7 @@ class TestAnsweringModelUpdate:
         route_events = [e for e in events if e.event_type == "route_decision"]
         assert len(route_events) >= 2
         orders = sorted([e.payload["contract"]["attempt_order"] for e in route_events])
-        assert orders == [0, 1]
+        assert orders == [[0], [1]]
 
     # ------------------------------------------------------------------
     # Subprocess egress confinement via sandbox-exec (controller finding 2b)

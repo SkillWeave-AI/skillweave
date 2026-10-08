@@ -238,7 +238,7 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
                      '(subpath "/dev/stdout") (subpath "/dev/stderr"))')
         lines.append(
             f'(allow network-outbound '
-            f'(remote ip "localhost:{port}"))'
+            f'(remote ip "{host}:{port}"))'
         )
         return "\n".join(lines)
 

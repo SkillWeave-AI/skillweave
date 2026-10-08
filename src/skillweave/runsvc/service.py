@@ -572,7 +572,7 @@ class RunApplicationService:
                 from skillweave.routing.faigate_adapter import verify_approved_route
 
                 try:
-                    verify_approved_route(model)
+                    verify_approved_route(model, route_policy=route_policy)
                 except Exception as exc:
                     raise RunIntegrationError(
                         "route_lock_direct_provider",
@@ -1329,7 +1329,6 @@ class RunApplicationService:
         """
         try:
             from skillweave.routing.faigate_adapter import (
-                COUNCIL_POLICY_REVISION,
                 make_route_decision,
             )
             decision = make_route_decision(
@@ -1338,13 +1337,13 @@ class RunApplicationService:
                 resolved_provider=resolved_provider,
                 resolved_model=resolved_model or requested_alias,
                 answering_envelope_identity=answering_envelope_identity,
-                catalog_revision=catalog_revision or COUNCIL_POLICY_REVISION,
-                policy_revision=policy_revision or COUNCIL_POLICY_REVISION,
+                catalog_revision=catalog_revision,
+                policy_revision=policy_revision,
                 run_id=run_id,
                 task_id=task_id,
                 attempt=attempt,
                 reservation_id=reservation_id,
-                attempt_order=attempt_order,
+                attempt_order=[attempt_order] if isinstance(attempt_order, int) else attempt_order,
                 attribution_status=attribution_status,
                 outcome=outcome,
             )
@@ -1390,7 +1389,6 @@ class RunApplicationService:
         """
         try:
             from skillweave.routing.faigate_adapter import (
-                COUNCIL_POLICY_REVISION,
                 make_route_decision,
             )
             is_empty = not answering_model or not answering_model.strip()
@@ -1401,12 +1399,12 @@ class RunApplicationService:
                 resolved_model=resolved_model or requested_alias,
                 answering_envelope_identity=answering_model if not is_empty else None,
                 catalog_revision="",
-                policy_revision=COUNCIL_POLICY_REVISION,
+                policy_revision="",
                 run_id=run_id,
                 task_id=task_id,
                 attempt=attempt,
                 reservation_id=reservation_id,
-                attempt_order=attempt_order,
+                attempt_order=[attempt_order] if isinstance(attempt_order, int) else attempt_order,
                 attribution_status="unattributed" if is_empty else "attributed",
                 outcome="resolved",
             )
@@ -1555,7 +1553,6 @@ class RunApplicationService:
         the proof does not match the pin — the launch is held before any
         budget is consumed.
         """
-        from skillweave.routing.faigate_adapter import verify_approved_route
 
         if route_policy is None:
             raise RunIntegrationError(
@@ -2621,7 +2618,7 @@ class RunApplicationService:
             if route is not None:
                 from skillweave.routing.faigate_adapter import verify_approved_route
                 try:
-                    verify_approved_route(route)
+                    verify_approved_route(route, route_policy=route_policy)
                 except Exception as exc:
                     raise RunIntegrationError(
                         "route_lock_direct_provider",
@@ -3743,7 +3740,7 @@ class RunApplicationService:
             if model is not None:
                 from skillweave.routing.faigate_adapter import verify_approved_route
                 try:
-                    verify_approved_route(model)
+                    verify_approved_route(model, route_policy=route_policy)
                 except Exception as exc:
                     raise RunIntegrationError(
                         "route_lock_direct_provider",
