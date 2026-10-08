@@ -1249,15 +1249,26 @@ class RunApplicationService:
         answering_envelope_identity: Optional[str] = None,
         catalog_revision: str = "",
         policy_revision: str = "",
+        attempt: int = 1,
+        reservation_id: str = "",
+        attempt_order: int = 0,
+        attribution_status: str = "pending",
+        outcome: str = "pending",
     ) -> None:
         """Create a ``RouteDecision`` and persist it as a journal event.
 
         The full identity chain (correlation_id, requested_alias,
         resolved_provider, resolved_model, answering_envelope_identity,
         catalog_revision, policy_revision) is recorded so parent and nested
-        requests are linked through the journal.  When the routing module is
-        not available (optional subpackage) the decision is silently skipped
-        so the legacy path keeps its behaviour.
+        requests are linked through the journal.
+
+        The journal payload conforms to the route-decision-v1 contract schema:
+        ``to_journal_dict()`` emits a ``contract`` sub-dict with the 14 required
+        fields and a ``_meta`` sub-dict with extra routing metadata outside the
+        contract schema.
+
+        When the routing module is not available (optional subpackage) the
+        decision is silently skipped so the legacy path keeps its behaviour.
         """
         try:
             from skillweave.routing.faigate_adapter import (
@@ -1272,11 +1283,85 @@ class RunApplicationService:
                 answering_envelope_identity=answering_envelope_identity,
                 catalog_revision=catalog_revision or COUNCIL_POLICY_REVISION,
                 policy_revision=policy_revision or COUNCIL_POLICY_REVISION,
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                reservation_id=reservation_id,
+                attempt_order=attempt_order,
+                attribution_status=attribution_status,
+                outcome=outcome,
             )
             self.journal.append(
                 run_id,
                 event_type="route_decision",
-                payload=decision.to_dict(),
+                payload=decision.to_journal_dict(),
+                correlation_id=correlation_id,
+            )
+        except Exception:  # noqa: BLE001 - optional subpackage
+            pass
+
+    def _update_route_decision_answering(
+        self,
+        run_id: str,
+        *,
+        task_id: str,
+        correlation_id: str,
+        requested_alias: str,
+        answering_model: str,
+        resolved_provider: str = "faigate",
+        resolved_model: str = "",
+        reservation_id: str = "",
+        attempt: int = 1,
+        attempt_order: int = 1,
+    ) -> None:
+        """Emit a follow-up route_decision event with the answering model.
+
+        After the provider response has been received (carrying the answering
+        model in the response envelope), this method records a conforming
+        follow-up event on the same request id with the answering identity
+        filled in.
+
+        The answering model is ``answering_model`` from the response envelope
+        (``AttributedResponse.answering_model``, read from ``envelope['model']``).
+        When the provider genuinely does not report a model, ``answering_model``
+        is empty and the reason is documented in ``_meta``.
+
+        Only call this when the answering model is genuinely observable.  If the
+        provider did not report a model, pass an empty string and the event is
+        recorded with ``attribution_status=unattributed`` and a reason in
+        ``_meta.no_answering_model_reason``.
+        """
+        try:
+            from skillweave.routing.faigate_adapter import (
+                COUNCIL_POLICY_REVISION,
+                make_route_decision,
+            )
+            is_empty = not answering_model or not answering_model.strip()
+            decision = make_route_decision(
+                correlation_id=correlation_id,
+                requested_alias=requested_alias,  # carry forward from original
+                resolved_provider=resolved_provider,
+                resolved_model=resolved_model or requested_alias,
+                answering_envelope_identity=answering_model if not is_empty else None,
+                catalog_revision="",
+                policy_revision=COUNCIL_POLICY_REVISION,
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                reservation_id=reservation_id,
+                attempt_order=attempt_order,
+                attribution_status="unattributed" if is_empty else "attributed",
+                outcome="resolved",
+            )
+            journal_payload = decision.to_journal_dict()
+            if is_empty:
+                journal_payload.setdefault("_meta", {})["no_answering_model_reason"] = (
+                    "provider response envelope did not report a model field"
+                )
+            self.journal.append(
+                run_id,
+                event_type="route_decision",
+                payload=journal_payload,
                 correlation_id=correlation_id,
             )
         except Exception:  # noqa: BLE001 - optional subpackage

@@ -107,6 +107,14 @@ class TestRouteDecisionRecord:
             answering_envelope_identity="deepseek-v4-flash",
             catalog_revision=COUNCIL_PROFILE_VERSION,
             policy_revision=COUNCIL_POLICY_REVISION,
+            run_id="run-001",
+            task_id="task-01",
+            attempt=1,
+            reservation_id="res-001",
+            attempt_order=0,
+            attribution_status="attributed",
+            outcome="resolved",
+            measured_at="2026-10-08T12:00:00+00:00",
         )
         assert d.correlation_id == "corr-001"
         assert d.requested_alias == "deepseek-v4-flash"
@@ -116,8 +124,13 @@ class TestRouteDecisionRecord:
         assert d.catalog_revision == COUNCIL_PROFILE_VERSION
         assert d.policy_revision == COUNCIL_POLICY_REVISION
 
-    def test_route_decision_to_dict_round_trip(self):
-        """to_dict() produces a faithful record for evidence."""
+    def test_route_decision_to_dict_contract_compliant(self):
+        """to_dict() produces a route-decision-v1 contract payload.
+
+        The payload must contain the 14 required contract fields and
+        must NOT contain disallowed fields (correlation_id,
+        requested_alias, answering_envelope_identity, etc.).
+        """
         d = RouteDecision(
             correlation_id="corr-002",
             requested_alias="deepseek-v4-pro",
@@ -126,14 +139,69 @@ class TestRouteDecisionRecord:
             answering_envelope_identity="deepseek-v4-pro",
             catalog_revision="1.3.11",
             policy_revision="1.3.11",
+            run_id="run-002",
+            task_id="task-02",
+            attempt=1,
+            reservation_id="res-002",
+            attempt_order=0,
+            attribution_status="attributed",
+            outcome="resolved",
+            measured_at="2026-10-08T12:00:00+00:00",
         )
         data = d.to_dict()
-        assert data["correlation_id"] == "corr-002"
-        assert data["requested_alias"] == "deepseek-v4-pro"
-        assert data["resolved_model"] == "byteplus/deepseek-v4-pro"
-        assert data["answering_envelope_identity"] == "deepseek-v4-pro"
-        assert data["catalog_revision"] == "1.3.11"
-        assert data["policy_revision"] == "1.3.11"
+        # Contract fields present
+        assert data["schema_version"] == 1
+        assert data["run_id"] == "run-002"
+        assert data["task_id"] == "task-02"
+        assert data["attempt"] == 1
+        assert data["request_id"] == "corr-002"
+        assert data["parent_request_id"] == ""
+        assert data["requested_model"] == "deepseek-v4-pro"
+        assert data["answering_model"] == "deepseek-v4-pro"
+        assert data["attribution_status"] == "attributed"
+        assert data["reservation_id"] == "res-002"
+        assert data["attempt_order"] == 0
+        assert data["measured_at"] == "2026-10-08T12:00:00+00:00"
+        assert data["outcome"] == "resolved"
+        assert data["usage"] == {}
+        # Disallowed fields must NOT be in the contract payload
+        assert "correlation_id" not in data
+        assert "requested_alias" not in data
+        assert "answering_envelope_identity" not in data
+        assert "resolved_provider" not in data
+        assert "resolved_model" not in data
+        assert "catalog_revision" not in data
+        assert "policy_revision" not in data
+
+    def test_route_decision_to_journal_dict_has_meta(self):
+        """to_journal_dict() includes extra metadata outside the contract."""
+        d = RouteDecision(
+            correlation_id="corr-002",
+            requested_alias="deepseek-v4-pro",
+            resolved_provider="faigate",
+            resolved_model="byteplus/deepseek-v4-pro",
+            answering_envelope_identity="deepseek-v4-pro",
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
+            run_id="run-002",
+            task_id="task-02",
+            attempt=1,
+        )
+        jd = d.to_journal_dict()
+        assert "contract" in jd
+        assert "_meta" in jd
+        assert jd["_meta"]["correlation_id"] == "corr-002"
+        assert jd["_meta"]["requested_alias"] == "deepseek-v4-pro"
+        assert jd["_meta"]["resolved_model"] == "byteplus/deepseek-v4-pro"
+        assert jd["_meta"]["catalog_revision"] == "1.3.11"
+        assert jd["_meta"]["policy_revision"] == "1.3.11"
+        # The contract sub-dict passes schema validation
+        import json
+        from jsonschema import validate
+        schema_path = Path(__file__).resolve().parent.parent.parent / "schemas" / "execution" / "route-decision-v1.schema.json"
+        with open(schema_path) as f:
+            schema = json.load(f)
+        validate(instance=jd["contract"], schema=schema)
 
     def test_answering_envelope_identity_may_be_none(self):
         """When the envelope does not report a model, the field is None."""
@@ -142,8 +210,15 @@ class TestRouteDecisionRecord:
             requested_alias="unknown",
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-flash",
+            run_id="run-003",
+            task_id="task-03",
+            attempt=1,
         )
         assert d.answering_envelope_identity is None
+        # The contract payload uses empty string for unknown answering model
+        payload = d.to_dict()
+        assert payload["answering_model"] == ""
+        assert payload["outcome"] == "pending"
 
     def test_make_route_decision_defaults_policy_revision(self):
         """make_route_decision fills in the current policy revision by default."""
@@ -152,6 +227,9 @@ class TestRouteDecisionRecord:
             requested_alias="deepseek-v4-flash",
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-flash",
+            run_id="run-004",
+            task_id="task-04",
+            attempt=1,
         )
         assert d.policy_revision == COUNCIL_POLICY_REVISION
         assert d.catalog_revision == COUNCIL_POLICY_REVISION
@@ -165,6 +243,9 @@ class TestRouteDecisionRecord:
             resolved_model="byteplus/deepseek-v4-pro",
             catalog_revision="2.0.0",
             policy_revision="2.0.0",
+            run_id="run-005",
+            task_id="task-05",
+            attempt=1,
         )
         assert d.catalog_revision == "2.0.0"
         assert d.policy_revision == "2.0.0"
@@ -178,15 +259,28 @@ class TestRouteDecisionRecord:
             requested_alias="deepseek-v4-flash",
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-flash",
+            run_id="run-001",
+            task_id="task-01",
+            attempt=1,
         )
         nested = make_route_decision(
             correlation_id=nested_corr,
             requested_alias="deepseek-v4-flash",
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-flash",
+            run_id="run-001",
+            task_id="task-01/nested-01",
+            attempt=1,
         )
         # The nested correlation starts with the parent's prefix
         assert nested.correlation_id.startswith(parent.correlation_id)
+        # The contract payload has parent_request_id for nested requests
+        nested_payload = nested.to_dict()
+        assert nested_payload["parent_request_id"] == parent_corr
+        assert nested_payload["request_id"] == nested_corr
+        # Parent has empty parent_request_id
+        parent_payload = parent.to_dict()
+        assert parent_payload["parent_request_id"] == ""
 
     def test_route_decision_serialises_to_json(self):
         """RouteDecision survives JSON serialisation (evidence contract)."""
@@ -198,13 +292,24 @@ class TestRouteDecisionRecord:
             answering_envelope_identity="deepseek-v4-flash",
             catalog_revision="1.3.11",
             policy_revision="1.3.11",
+            run_id="run-json",
+            task_id="task-json",
+            attempt=1,
+            reservation_id="res-json",
+            attribution_status="attributed",
+            outcome="resolved",
+            measured_at="2026-10-08T12:00:00+00:00",
         )
-        serialised = json.dumps(d.to_dict())
+        serialised = json.dumps(d.to_journal_dict())
         restored = json.loads(serialised)
-        assert restored["correlation_id"] == "corr-json"
-        assert restored["requested_alias"] == "deepseek-v4-flash"
-        assert restored["resolved_model"] == "byteplus/deepseek-v4-flash"
-        assert restored["answering_envelope_identity"] == "deepseek-v4-flash"
+        # Contract sub-dict is present
+        assert "contract" in restored
+        assert "_meta" in restored
+        assert restored["contract"]["request_id"] == "corr-json"
+        assert restored["contract"]["requested_model"] == "deepseek-v4-flash"
+        assert restored["contract"]["answering_model"] == "deepseek-v4-flash"
+        assert restored["_meta"]["correlation_id"] == "corr-json"
+        assert restored["_meta"]["resolved_model"] == "byteplus/deepseek-v4-flash"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1129,9 +1234,12 @@ class TestRouteDecisionJournalPersistence:
         route_events = [e for e in events if e.event_type == "route_decision"]
         assert len(route_events) >= 1
         payload = route_events[0].payload
-        assert payload["requested_alias"] == "byteplus/deepseek-v4-flash"
-        assert payload["resolved_provider"] == "faigate"
-        assert "correlation_id" in payload
+        # The payload now has contract/_meta format
+        assert "contract" in payload
+        assert "_meta" in payload
+        assert payload["contract"]["requested_model"] == "byteplus/deepseek-v4-flash"
+        assert payload["_meta"]["resolved_provider"] == "faigate"
+        assert payload["contract"]["request_id"] is not None
 
     def test_start_async_logs_route_decision_event(self, svc, db_path, scratch):
         """start_async writes a route_decision journal event."""
@@ -1153,7 +1261,7 @@ class TestRouteDecisionJournalPersistence:
         route_events = [e for e in events if e.event_type == "route_decision"]
         assert len(route_events) >= 1
         payload = route_events[0].payload
-        assert payload["requested_alias"] == "byteplus/deepseek-v4-flash"
+        assert payload["contract"]["requested_model"] == "byteplus/deepseek-v4-flash"
 
     def test_route_decision_has_correlation_id(self, svc, db_path, scratch):
         """The route decision event carries a correlation_id linking the chain."""
@@ -1180,6 +1288,9 @@ class TestRouteDecisionJournalPersistence:
         assert route_events[0].correlation_id is not None
         # The correlation_id should contain the task_id
         assert "task-rd-3" in route_events[0].correlation_id
+        # The contract payload request_id should match the correlation_id
+        payload = route_events[0].payload
+        assert payload["contract"]["request_id"] == route_events[0].correlation_id
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1716,6 +1827,292 @@ class TestConsoleEntrypointRouteLock:
         assert result.returncode == 0, f"stderr: {result.stderr}"
         assert "GATEWAY_OK" in result.stdout
         assert "GATEWAY_REFUSED" in result.stdout
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Controller Finding 1 & 2: answering_model post-launch update and
+# route-decision-v1 contract schema compliance.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestRouteDecisionContractCompliance:
+    """Every route_decision payload validates against route-decision-v1 schema."""
+
+    SCHEMA_PATH = (
+        Path(__file__).resolve().parent.parent.parent
+        / "schemas" / "execution" / "route-decision-v1.schema.json"
+    )
+
+    def _load_schema(self):
+        import json
+        with open(self.SCHEMA_PATH) as f:
+            return json.load(f)
+
+    def test_to_dict_validates_against_schema(self):
+        """The contract payload from to_dict() validates against the schema."""
+        import json
+        from jsonschema import validate
+        schema = self._load_schema()
+        d = RouteDecision(
+            correlation_id="schema-corr-1",
+            requested_alias="deepseek-v4-flash",
+            resolved_provider="faigate",
+            resolved_model="byteplus/deepseek-v4-flash",
+            answering_envelope_identity="deepseek-v4-flash",
+            run_id="run-schema-1",
+            task_id="task-schema-1",
+            attempt=1,
+            reservation_id="res-schema-1",
+            attribution_status="attributed",
+            outcome="resolved",
+            measured_at="2026-10-08T12:00:00+00:00",
+        )
+        validate(instance=d.to_dict(), schema=schema)
+
+    def test_to_journal_dict_contract_validates_against_schema(self):
+        """The contract sub-dict in to_journal_dict() validates."""
+        import json
+        from jsonschema import validate
+        schema = self._load_schema()
+        d = RouteDecision(
+            correlation_id="schema-corr-2",
+            requested_alias="deepseek-v4-pro",
+            resolved_provider="faigate",
+            resolved_model="byteplus/deepseek-v4-pro",
+            answering_envelope_identity="deepseek-v4-pro",
+            run_id="run-schema-2",
+            task_id="task-schema-2",
+            attempt=1,
+        )
+        jd = d.to_journal_dict()
+        validate(instance=jd["contract"], schema=schema)
+
+    def test_pending_decision_validates_against_schema(self):
+        """A pending route_decision (no answering model) validates."""
+        import json
+        from jsonschema import validate
+        schema = self._load_schema()
+        d = RouteDecision(
+            correlation_id="schema-corr-3",
+            requested_alias="deepseek-v4-flash",
+            resolved_provider="faigate",
+            resolved_model="byteplus/deepseek-v4-flash",
+            run_id="run-schema-3",
+            task_id="task-schema-3",
+            attempt=1,
+        )
+        validate(instance=d.to_dict(), schema=schema)
+
+    def test_nested_request_validates_against_schema(self):
+        """A nested request's contract payload validates with parent_request_id."""
+        import json
+        from jsonschema import validate
+        schema = self._load_schema()
+        d = RouteDecision(
+            correlation_id="run-001/task-01/nested-01",
+            requested_alias="deepseek-v4-flash",
+            resolved_provider="faigate",
+            resolved_model="byteplus/deepseek-v4-flash",
+            answering_envelope_identity="deepseek-v4-flash",
+            run_id="run-001",
+            task_id="task-01/nested-01",
+            attempt=1,
+        )
+        payload = d.to_dict()
+        assert payload["parent_request_id"] == "run-001/task-01"
+        validate(instance=payload, schema=schema)
+
+    def test_no_disallowed_fields_in_contract(self):
+        """The contract payload must NOT contain correlation_id, requested_alias,
+        answering_envelope_identity, or resolved_provider/resolved_model."""
+        d = RouteDecision(
+            correlation_id="corr-no-disallowed",
+            requested_alias="deepseek-v4-flash",
+            resolved_provider="faigate",
+            resolved_model="byteplus/deepseek-v4-flash",
+            answering_envelope_identity="deepseek-v4-flash",
+            run_id="run-nd",
+            task_id="task-nd",
+            attempt=1,
+        )
+        payload = d.to_dict()
+        assert "correlation_id" not in payload
+        assert "requested_alias" not in payload
+        assert "answering_envelope_identity" not in payload
+        assert "resolved_provider" not in payload
+        assert "resolved_model" not in payload
+        assert "catalog_revision" not in payload
+        assert "policy_revision" not in payload
+
+
+class TestAnsweringModelUpdate:
+    """The answering model is recorded as a follow-up event after the response."""
+
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        p = tmp_path / "test_answering_model.db"
+        yield str(p)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @pytest.fixture
+    def scratch(self, tmp_path):
+        a = tmp_path / "artifacts"
+        a.mkdir()
+        return str(a)
+
+    @pytest.fixture
+    def svc(self, db_path, scratch):
+        from skillweave.runtime.store import SQLiteRunStore
+        from skillweave.runtime.journal import EventJournal
+        from skillweave.runtime.registry import RawArtifactStore
+        from skillweave.runtime.stream import DurableStreamStore
+        from skillweave.runtime.reservation import ReservationStore
+        store = SQLiteRunStore(db_path)
+        journal = EventJournal(db_path)
+        raw = RawArtifactStore(scratch)
+        stream = DurableStreamStore(root=scratch)
+        rs = ReservationStore(db_path)
+        return RunApplicationService(store, journal, raw, stream, reservation_store=rs)
+
+    def test_update_answering_model_writes_follow_up_event(self, svc, db_path):
+        """_update_route_decision_answering writes a follow-up event."""
+        svc._update_route_decision_answering(
+            run_id="run-answer-1",
+            task_id="task-answer-1",
+            correlation_id="task-answer-1/attempt-1",
+            requested_alias="deepseek-v4-flash",
+            answering_model="deepseek-v4-flash",
+            reservation_id="res-answer-1",
+            attempt=1,
+            attempt_order=1,
+        )
+        events = svc.journal.get_events("run-answer-1")
+        route_events = [e for e in events if e.event_type == "route_decision"]
+        assert len(route_events) >= 1
+        payload = route_events[0].payload
+        assert payload["contract"]["answering_model"] == "deepseek-v4-flash"
+        assert payload["contract"]["attribution_status"] == "attributed"
+        assert payload["contract"]["outcome"] == "resolved"
+        assert payload["contract"]["attempt_order"] == 1
+
+    def test_update_answering_model_empty_string(self, svc, db_path):
+        """When answering_model is empty, the event records unattributed status."""
+        svc._update_route_decision_answering(
+            run_id="run-answer-2",
+            task_id="task-answer-2",
+            correlation_id="task-answer-2/attempt-1",
+            requested_alias="deepseek-v4-flash",
+            answering_model="",
+            reservation_id="",
+            attempt=1,
+            attempt_order=1,
+        )
+        events = svc.journal.get_events("run-answer-2")
+        route_events = [e for e in events if e.event_type == "route_decision"]
+        assert len(route_events) >= 1
+        payload = route_events[0].payload
+        assert payload["contract"]["answering_model"] == ""
+        assert payload["contract"]["attribution_status"] == "unattributed"
+        assert payload["contract"]["outcome"] == "resolved"
+        # The _meta should include the reason
+        assert "_meta" in payload
+        assert "no_answering_model_reason" in payload["_meta"]
+
+    def test_update_answering_model_validates_against_schema(self, svc, db_path):
+        """The follow-up event payload validates against route-decision-v1."""
+        import json
+        from jsonschema import validate
+        schema_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "schemas" / "execution" / "route-decision-v1.schema.json"
+        )
+        with open(schema_path) as f:
+            schema = json.load(f)
+
+        svc._update_route_decision_answering(
+            run_id="run-answer-3",
+            task_id="task-answer-3",
+            correlation_id="task-answer-3/attempt-1",
+            requested_alias="deepseek-v4-flash",
+            answering_model="deepseek-v4-flash",
+            reservation_id="res-answer-3",
+            attempt=1,
+            attempt_order=1,
+        )
+        events = svc.journal.get_events("run-answer-3")
+        route_events = [e for e in events if e.event_type == "route_decision"]
+        assert len(route_events) >= 1
+        validate(instance=route_events[0].payload["contract"], schema=schema)
+
+    def test_both_initial_and_follow_up_validate(self, svc, db_path):
+        """Both the initial decision and the answering model update validate.
+
+        This simulates the real flow: initial decision (pending), then
+        a follow-up with the answering model (attributed).
+        """
+        import json
+        from jsonschema import validate
+        schema_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "schemas" / "execution" / "route-decision-v1.schema.json"
+        )
+        with open(schema_path) as f:
+            schema = json.load(f)
+
+        # 1. Initial decision (pending)
+        from skillweave.routing.faigate_adapter import make_route_decision
+        initial = make_route_decision(
+            correlation_id="task-full/attempt-1",
+            requested_alias="deepseek-v4-flash",
+            resolved_provider="faigate",
+            resolved_model="byteplus/deepseek-v4-flash",
+            run_id="run-full",
+            task_id="task-full",
+            attempt=1,
+            reservation_id="res-full",
+            attempt_order=0,
+        )
+        svc.journal.append(
+            "run-full",
+            event_type="route_decision",
+            payload=initial.to_journal_dict(),
+            correlation_id="task-full/attempt-1",
+        )
+        validate(instance=initial.to_dict(), schema=schema)
+
+        # 2. Follow-up with answering model (attributed)
+        from skillweave.routing.faigate_adapter import make_route_decision
+        follow_up = make_route_decision(
+            correlation_id="task-full/attempt-1",
+            requested_alias="deepseek-v4-flash",
+            resolved_provider="faigate",
+            resolved_model="byteplus/deepseek-v4-flash",
+            answering_envelope_identity="deepseek-v4-flash",
+            run_id="run-full",
+            task_id="task-full",
+            attempt=1,
+            reservation_id="res-full",
+            attempt_order=1,
+            attribution_status="attributed",
+            outcome="resolved",
+        )
+        svc.journal.append(
+            "run-full",
+            event_type="route_decision",
+            payload=follow_up.to_journal_dict(),
+            correlation_id="task-full/attempt-1",
+        )
+        validate(instance=follow_up.to_dict(), schema=schema)
+
+        # 3. Verify both events are present with correct attempt_order
+        events = svc.journal.get_events("run-full")
+        route_events = [e for e in events if e.event_type == "route_decision"]
+        assert len(route_events) >= 2
+        orders = sorted([e.payload["contract"]["attempt_order"] for e in route_events])
+        assert orders == [0, 1]
 
     # ------------------------------------------------------------------
     # Subprocess egress confinement via sandbox-exec (controller finding 2b)

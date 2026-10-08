@@ -1517,14 +1517,20 @@ class RouteDecision:
     without guessing.  When answering envelope identity is not observable it
     is left as ``None``, never fabricated.
 
-    ``correlation_id`` links parent and nested requests into a single trace.
-    ``requested_alias`` is the model alias the caller asked for (provider-native).
-    ``resolved_provider`` names the gateway/provider that resolved the alias.
-    ``resolved_model`` is the concrete model id the gateway produced.
-    ``answering_envelope_identity`` is the ``model`` field from the response
-    envelope, when available.
-    ``catalog_revision`` and ``policy_revision`` name the profile/policy data
-    versions that produced this decision.
+    The ``to_dict()`` output conforms to the ``route-decision-v1`` contract
+    schema (``https://skillweave.dev/schemas/execution/route-decision/v1``).
+    The contract fields are:
+
+    * ``request_id`` — maps from ``correlation_id`` (the unique request
+      identifier linking parent and nested requests).
+    * ``parent_request_id`` — the parent correlation, empty for root requests.
+    * ``requested_model`` — maps from ``requested_alias``.
+    * ``answering_model`` — maps from ``answering_envelope_identity``;
+      empty string when not yet known or not reported by the provider.
+
+    Extra routing, catalog, and policy revision data that is not part of the
+    contract schema is kept in ``_journal_meta`` and emitted as a separate
+    ``_meta`` field in the journal event payload (outside the contract payload).
     """
 
     correlation_id: str
@@ -1534,16 +1540,89 @@ class RouteDecision:
     answering_envelope_identity: Optional[str] = None
     catalog_revision: str = ""
     policy_revision: str = ""
+    # Contract fields for route-decision-v1 compliance
+    run_id: str = ""
+    task_id: str = ""
+    attempt: int = 0
+    reservation_id: str = ""
+    attempt_order: int = 0
+    attribution_status: str = "pending"
+    outcome: str = "pending"
+    measured_at: str = ""
+
+    def _compute_parent_request_id(self) -> str:
+        """Derive parent_request_id from correlation_id.
+
+        A correlation_id like ``run-001/task-01/nested-01`` has a parent of
+        ``run-001/task-01``.  A root request (no ``/nested`` segment beyond
+        the first) returns empty string.
+        """
+        parts = self.correlation_id.split("/")
+        if len(parts) >= 3:
+            return "/".join(parts[:-1])
+        return ""
 
     def to_dict(self) -> dict[str, Any]:
+        """Return a dict conforming to route-decision-v1 contract schema.
+
+        The payload carries only the 14 required contract fields.  Extra
+        routing metadata (resolved_provider, resolved_model, catalog_revision,
+        policy_revision, correlation_id, requested_alias, answering_envelope_identity)
+        is kept in the ``_meta`` key for journal use only — never in the
+        contract payload.
+        """
+        from datetime import datetime, timezone
+
+        measured = self.measured_at if self.measured_at else datetime.now(timezone.utc).isoformat()
+        answering = self.answering_envelope_identity if self.answering_envelope_identity is not None else ""
+        answering = self.answering_envelope_identity if self.answering_envelope_identity is not None else ""
+        outcome = self.outcome
+        if not outcome or outcome == "pending":
+            if answering:
+                outcome = "resolved"
+            else:
+                outcome = "pending"
+
+        attr_status = self.attribution_status
+        if attr_status == "pending" and answering:
+            attr_status = "attributed"
+
+        contract_payload = {
+            "schema_version": 1,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "attempt": self.attempt,
+            "request_id": self.correlation_id,
+            "parent_request_id": self._compute_parent_request_id(),
+            "requested_model": self.requested_alias,
+            "answering_model": answering,
+            "attribution_status": attr_status,
+            "reservation_id": self.reservation_id,
+            "attempt_order": self.attempt_order,
+            "measured_at": measured,
+            "outcome": outcome,
+            "usage": {},
+        }
+        return contract_payload
+
+    def to_journal_dict(self) -> dict[str, Any]:
+        """Full journal payload: contract payload plus extra metadata.
+
+        The ``_meta`` sub-dict carries routing, catalog, and policy data
+        that is outside the contract schema.  This is the dict persisted
+        to the event journal; the contract payload is ``contract``.
+        """
         return {
-            "correlation_id": self.correlation_id,
-            "requested_alias": self.requested_alias,
-            "resolved_provider": self.resolved_provider,
-            "resolved_model": self.resolved_model,
-            "answering_envelope_identity": self.answering_envelope_identity,
-            "catalog_revision": self.catalog_revision,
-            "policy_revision": self.policy_revision,
+            "contract": self.to_dict(),
+            "_meta": {
+                "correlation_id": self.correlation_id,
+                "requested_alias": self.requested_alias,
+                "resolved_provider": self.resolved_provider,
+                "resolved_model": self.resolved_model,
+                "answering_envelope_identity": self.answering_envelope_identity,
+                "catalog_revision": self.catalog_revision,
+                "policy_revision": self.policy_revision,
+            },
         }
 
 
@@ -1555,13 +1634,29 @@ def make_route_decision(
     answering_envelope_identity: Optional[str] = None,
     catalog_revision: str = "",
     policy_revision: str = "",
+    *,
+    run_id: str = "",
+    task_id: str = "",
+    attempt: int = 0,
+    reservation_id: str = "",
+    attempt_order: int = 0,
+    attribution_status: str = "pending",
+    outcome: str = "pending",
+    measured_at: str = "",
 ) -> RouteDecision:
     """Build a ``RouteDecision`` with the given identity chain.
 
     ``catalog_revision`` and ``policy_revision`` default to the current
     ``COUNCIL_POLICY_REVISION`` when not provided, so a caller that does not
     explicitly track revisions still gets a recorded value.
+
+    The keyword-only contract fields (``run_id``, ``task_id``, ``attempt``,
+    ``reservation_id``, etc.) are passed through to the route-decision-v1
+    conformant ``to_dict()``.
     """
+    from datetime import datetime, timezone
+
+    measured = measured_at or datetime.now(timezone.utc).isoformat()
     return RouteDecision(
         correlation_id=correlation_id,
         requested_alias=requested_alias,
@@ -1570,6 +1665,14 @@ def make_route_decision(
         answering_envelope_identity=answering_envelope_identity,
         catalog_revision=catalog_revision or COUNCIL_POLICY_REVISION,
         policy_revision=policy_revision or COUNCIL_POLICY_REVISION,
+        run_id=run_id,
+        task_id=task_id,
+        attempt=attempt,
+        reservation_id=reservation_id,
+        attempt_order=attempt_order,
+        attribution_status=attribution_status,
+        outcome=outcome,
+        measured_at=measured,
     )
 
 
