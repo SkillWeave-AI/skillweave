@@ -35,6 +35,17 @@ version rather than re-declaring the schema. ``contracts/catalog.json`` is the
 declared catalog home but is absent from this checkout; the id below is the
 literal the task boundary names, kept here so the publish surface is explicit.
 
+Run IDs and exit codes
+----------------------
+The same table publishes the two operational rules the async surfaces share
+so operators and automation can read them from one place rather than infer
+them from a traceback:
+
+* the **run-id rule** (:data:`RUN_ID_PATTERN`) every ``start``/``inspect``/
+  ``kill``/``cancel``/``resume`` run id must satisfy; and
+* the **exit-code table** (:data:`EXIT_CODES`) mapping each meaningful
+  outcome to its documented process exit code.
+
 Exit semantics
 --------------
 The support surface is read-only and additive to the entry surface's codes::
@@ -47,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
@@ -57,6 +69,72 @@ SUPPORT_TABLE_ID = "skillweave.support/1"
 SHARED_STATE_INTERPRETATION_ID = "skillweave.run-state/1"
 #: The versioned public data contract this surface speaks (task boundary).
 RUN_SNAPSHOT_SCHEMA_ID = "run-snapshot-v1"
+
+#: The single run-id rule every async ``start``/``inspect``/``kill``/
+#: ``cancel``/``resume`` id must satisfy. A run id is a *path-less, token-like*
+#: identifier: it must begin with an alphanumeric character, may then contain
+#: only ``[A-Za-z0-9._-]``, and is bounded to 128 characters. This rejects the
+#: traversal/injection shapes an unvalidated id admitted -- ``../x``, ``a b``,
+#: ``x/y``, ```` (empty), ``.``, ``..`` and a 300-character id -- while the
+#: auto-generated uuid hex (``[a-f0-9]{32}``) always satisfies it.
+RUN_ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+_RUN_ID_RE = re.compile(r"\A" + RUN_ID_PATTERN + r"\Z")
+
+#: Documented exit codes. ``2`` is the single invalid-input code shared by
+#: argparse usage errors and a rejected run id; ``127``/``126`` are the POSIX
+#: "command not found" / "command not executable" codes an operator already
+#: knows from a shell. Automation can read this table instead of inferring the
+#: meaning of a bare number.
+EXIT_CODES: Mapping[str, int] = {
+    "ok": 0,
+    "error": 1,
+    "invalid_input": 2,
+    "not_running": 3,
+    "identity_refused": 3,
+    "not_executable": 126,
+    "command_not_found": 127,
+}
+
+
+def is_valid_run_id(run_id: Any) -> bool:
+    """Return whether *run_id* satisfies :data:`RUN_ID_PATTERN`."""
+    return isinstance(run_id, str) and _RUN_ID_RE.match(run_id) is not None
+
+
+def validate_run_id(run_id: Any) -> Optional[str]:
+    """Return a meaningful rejection message for *run_id*, or ``None`` if valid.
+
+    The message names the offending value and the constraint, so a caller can
+    act on it without reading source; it never echoes a control character
+    literally (it is ``repr``-ed into the message).
+    """
+    if not isinstance(run_id, str) or run_id == "":
+        return "run id must be a non-empty string"
+    if len(run_id) > 128:
+        return (
+            f"run id {run_id[:32]!r}... is too long "
+            f"({len(run_id)} chars; maximum 128)"
+        )
+    if _RUN_ID_RE.match(run_id) is None:
+        return (
+            f"invalid run id {run_id!r}: must match {RUN_ID_PATTERN} "
+            "(start with an alphanumeric; then letters, digits, '.', '_' or "
+            "'-'; no whitespace, control characters or path separators)"
+        )
+    return None
+
+
+def validate_run_id_or_exit(run_id: Any, parser: argparse.ArgumentParser) -> None:
+    """Reject an invalid *run_id* through *parser*, exiting with code 2.
+
+    ``parser.error`` prints ``usage`` + the message to stderr and raises
+    ``SystemExit(2)`` -- the documented invalid-input code -- so a bad id is a
+    meaningful usage error, never a downstream path/DB error or a traceback.
+    """
+    message = validate_run_id(run_id)
+    if message is not None:
+        parser.error(message)
+
 
 #: A surface's role in the pipeline. ``decide`` names an intent; ``execute``
 #: performs bounded work; ``operate`` inspects or stops a run; ``legacy`` is a
@@ -306,6 +384,8 @@ def support_table() -> dict[str, Any]:
         "run_snapshot_schema_id": RUN_SNAPSHOT_SCHEMA_ID,
         "surfaces": [surface.to_dict() for surface in SURFACES],
         "state": state_interpretation_payload(),
+        "run_id_rule": RUN_ID_PATTERN,
+        "exit_codes": dict(EXIT_CODES),
     }
 
 
@@ -354,6 +434,13 @@ def _render_human(table: Mapping[str, Any]) -> str:
         "stop reasons    : " + ", ".join(state["stop_reasons"]),
         "lifecycle -> lane: "
         + ", ".join(f"{k}->{v}" for k, v in state["lifecycle_projection"].items()),
+        "",
+        f"run id rule     : {table['run_id_rule']}",
+        "exit codes      : "
+        + ", ".join(
+            f"{k}={v}" for k, v in sorted(table["exit_codes"].items(),
+                                         key=lambda kv: kv[1])
+        ),
     ]
     return "\n".join(lines) + "\n"
 
@@ -384,11 +471,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 __all__ = [
+    "EXIT_CODES",
     "ROLE_DECIDE",
     "ROLE_EXECUTE",
     "ROLE_LEGACY",
     "ROLE_OPERATE",
     "ROUTER_SURFACES",
+    "RUN_ID_PATTERN",
     "RUN_SNAPSHOT_SCHEMA_ID",
     "SHARED_STATE_INTERPRETATION_ID",
     "STATUS_LEGACY",
@@ -400,6 +489,7 @@ __all__ = [
     "build_parser",
     "canonical_states",
     "interpret_state",
+    "is_valid_run_id",
     "legacy_aliases",
     "lifecycle_projection",
     "lookup",
@@ -409,4 +499,6 @@ __all__ = [
     "support_table",
     "surface_help",
     "terminal_states",
+    "validate_run_id",
+    "validate_run_id_or_exit",
 ]

@@ -259,12 +259,29 @@ def inspect_run(
     lane_states: dict[str, Any] = {}
     for ev in events:
         lane_id = ev.get("lane_id") or ev.get("run_id", run_id)
-        if ev.get("event") in ("finished", "error"):
+        if ev.get("event") in ("started", "launched"):
+            lane_states.setdefault(lane_id, "running")
+        elif ev.get("event") in ("finished", "error", "killed", "cancelled"):
             lane_states[lane_id] = "terminal"
-        elif ev.get("event") == "started":
-            lane_states[lane_id] = "running"
+
+    # The lifecycle -> lane projection is *shared* with the support table and
+    # the cancel path (SW-1510-CLI criterion 2).  Applying it here means the
+    # reported lane state can never contradict the reported lifecycle state:
+    # a run whose lifecycle is ``killed`` reports the lane ``advance_or_stop``
+    # (the same value ``cancel`` reports), not a stale event-derived
+    # ``running``.  An unrecognized lifecycle leaves the event-derived value.
+    from skillweave.cli.support import interpret_state, lifecycle_projection
+
+    lane_projection = lifecycle_projection()
+    interpretation = interpret_state(meta.state)
+    canonical_lifecycle = interpretation.canonical or meta.state
+    projected_lane = lane_projection.get(canonical_lifecycle)
+    if projected_lane is not None:
+        lane_states[run_id] = projected_lane
 
     snapshot["lane_states"] = lane_states
+    if projected_lane is not None:
+        snapshot["lane_state"] = projected_lane
     snapshot["event_count"] = len(events)
 
     if mode == InspectMode.SNAPSHOT:

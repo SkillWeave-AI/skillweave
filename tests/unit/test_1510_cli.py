@@ -324,10 +324,11 @@ def test_installed_duplicate_run_id_is_a_reservation_refusal(installed, tmp_path
     first = _run(
         installed,
         ["start", "--async", "--run-id", run_id, "--", py, "-c",
-         "import time; time.sleep(0.5)"],
+         "import time; time.sleep(5)"],
         cwd=tmp_path,
     )
     assert first.returncode == 0, first.stderr
+    pid = json.loads(first.stdout)["pid"]
 
     second = _run(
         installed,
@@ -335,9 +336,14 @@ def test_installed_duplicate_run_id_is_a_reservation_refusal(installed, tmp_path
         cwd=tmp_path,
     )
     # A duplicate bootstrap is a *reservation* refusal, not an uncaught
-    # traceback: a meaningful error and a nonzero exit.
+    # traceback: a meaningful error and a nonzero exit. The message names the
+    # collision ("run already exists") rather than leaking the raw CAS numbers
+    # ("Version conflict ... expected 1, got 6").
     assert second.returncode != 0, second.stdout
-    assert "conflict" in second.stderr.lower(), second.stderr
+    assert f"run already exists: {run_id}" in second.stderr, second.stderr
+    assert "expected 1" not in second.stderr, second.stderr
+
+    _run(installed, ["kill", run_id, str(pid)], cwd=tmp_path)
 
 
 def test_installed_unsupported_methodology_is_refused(installed, tmp_path):
@@ -410,6 +416,171 @@ def test_installed_killed_running_inconsistency_is_nonzero(installed, tmp_path):
     result = json.loads(killed.stdout)
     assert result["result"] in ("already_terminal", "already_dead")
     assert "not running" in killed.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# Criterion 2/3 -- controller-finding regressions on the installed entry
+# ---------------------------------------------------------------------------
+
+# ``-leading`` is deliberately excluded: argparse itself interprets a leading
+# dash as an option, so it never reaches the shared run-id validator. The
+# shapes below all reach the validator and must be rejected as invalid input.
+INVALID_RUN_IDS = ["../x", "a b", "x/y", "", "..", ".", "a" * 300, ".hidden"]
+
+
+def test_installed_support_table_publishes_run_id_rule_and_exit_codes(
+    installed, tmp_path
+):
+    """The run-id rule and exit-code table are published, not merely enforced."""
+    proc = _run(installed, ["support", "--json"], cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    table = json.loads(proc.stdout)
+    assert table["run_id_rule"] == "[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+    codes = table["exit_codes"]
+    assert codes["invalid_input"] == 2
+    assert codes["command_not_found"] == 127
+    assert codes["not_executable"] == 126
+
+
+@pytest.mark.parametrize("run_id", INVALID_RUN_IDS)
+def test_installed_invalid_run_id_is_rejected_with_code_2(installed, tmp_path, run_id):
+    proc = _run(
+        installed,
+        ["start", "--async", "--run-id", run_id, "--", sys.executable, "-c",
+         "print('never')"],
+        cwd=tmp_path,
+    )
+    # An invalid run id is a usage error (documented code 2), never a path
+    # hazard or a downstream traceback.
+    assert proc.returncode == 2, (run_id, proc.returncode, proc.stderr)
+    assert "run id" in proc.stderr.lower(), (run_id, proc.stderr)
+
+
+@pytest.mark.parametrize("argv0", ["inspect", "kill", "cancel", "resume"])
+def test_installed_invalid_run_id_is_rejected_on_every_async_surface(
+    installed, tmp_path, argv0
+):
+    argv = {
+        "inspect": ["inspect", "../x"],
+        "kill": ["kill", "../x", "1"],
+        "cancel": ["cancel", "../x"],
+        "resume": ["resume", "../x"],
+    }[argv0]
+    proc = _run(installed, argv, cwd=tmp_path)
+    assert proc.returncode == 2, (argv0, proc.returncode, proc.stderr)
+
+
+def test_installed_auto_generated_run_id_stays_valid(installed, tmp_path):
+    """The default (uuid hex) id still passes the published rule."""
+    py = str(installed["python"])
+    started = _run(
+        installed,
+        ["start", "--async", "--", py, "-c", "import time; time.sleep(5)"],
+        cwd=tmp_path,
+    )
+    assert started.returncode == 0, started.stderr
+    run_id = json.loads(started.stdout)["run_id"]
+    import re
+
+    assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_id), run_id
+    # Stop the child so the test leaves no live process behind.
+    pid = json.loads(started.stdout)["pid"]
+    _run(installed, ["kill", run_id, str(pid)], cwd=tmp_path)
+
+
+def test_installed_start_missing_command_is_a_meaningful_error(installed, tmp_path):
+    for argv in (["start", "--", "/nonexistent/x"],
+                 ["start", "--async", "--run-id", "nf-sync", "--", "/nonexistent/x"]):
+        proc = _run(installed, argv, cwd=tmp_path)
+        assert proc.returncode == 127, (argv, proc.returncode, proc.stdout, proc.stderr)
+        assert "not found" in proc.stderr.lower(), (argv, proc.stderr)
+        # No raw Python traceback leaks to the operator.
+        assert "Traceback (most recent call last)" not in proc.stderr, proc.stderr
+
+
+def test_installed_async_missing_command_records_a_failed_run(installed, tmp_path):
+    """--async must not leave a silent running record for a command it cannot launch."""
+    proc = _run(
+        installed,
+        ["start", "--async", "--run-id", "nf-async", "--", "/nonexistent/x"],
+        cwd=tmp_path,
+    )
+    assert proc.returncode == 127, (proc.returncode, proc.stdout, proc.stderr)
+    snap = _run(installed, ["inspect", "nf-async"], cwd=tmp_path)
+    assert snap.returncode == 0, snap.stderr
+    state = json.loads(snap.stdout.strip().splitlines()[0])
+    assert state["state"] == "failed", state
+
+
+def test_installed_duplicate_run_id_reports_already_exists(installed, tmp_path):
+    py = str(installed["python"])
+    run_id = "cli-dup-2"
+    first = _run(
+        installed,
+        ["start", "--async", "--run-id", run_id, "--", py, "-c",
+         "import time; time.sleep(5)"],
+        cwd=tmp_path,
+    )
+    assert first.returncode == 0, first.stderr
+    pid = json.loads(first.stdout)["pid"]
+
+    second = _run(
+        installed,
+        ["start", "--async", "--run-id", run_id, "--", py, "-c", "print(1)"],
+        cwd=tmp_path,
+    )
+    assert second.returncode != 0, second.stdout
+    assert f"run already exists: {run_id}" in second.stderr, second.stderr
+    # Not the raw CAS message.
+    assert "expected 1" not in second.stderr, second.stderr
+
+    _run(installed, ["kill", run_id, str(pid)], cwd=tmp_path)
+
+
+def test_installed_inspect_lane_state_agrees_with_the_shared_interpretation(
+    installed, tmp_path
+):
+    """inspect must apply the shared lifecycle->lane projection (finding 1).
+
+    After a kill, ``inspect`` reported ``state=killed`` (finished) but
+    ``lane_states={'<id>':'running'}`` while ``support`` mapped ``killed ->
+    advance_or_stop``: a contradiction. Every shared-interpretation path must
+    now agree.
+    """
+    py = str(installed["python"])
+    run_id = "cli-lane-consistency"
+    started = _run(
+        installed,
+        ["start", "--async", "--run-id", run_id, "--", py, "-c",
+         "import time; time.sleep(60)"],
+        cwd=tmp_path,
+    )
+    assert started.returncode == 0, started.stderr
+    pid = json.loads(started.stdout)["pid"]
+
+    killed = _run(installed, ["kill", run_id, str(pid)], cwd=tmp_path)
+    assert killed.returncode == 0, killed.stderr
+    assert json.loads(killed.stdout)["result"] in ("graceful_kill", "forced_kill")
+
+    # The support table's one authority for this lifecycle value.
+    support = _run(installed, ["support", "--json"], cwd=tmp_path)
+    projection = json.loads(support.stdout)["state"]["lifecycle_projection"]
+    expected_lane = projection["killed"]
+
+    snap = _run(installed, ["inspect", run_id], cwd=tmp_path)
+    assert snap.returncode == 0, snap.stderr
+    snapshot = json.loads(snap.stdout.strip().splitlines()[0])
+    assert snapshot["state"] == "killed"
+    assert snapshot["finished_at"]
+    # The lifecycle and the lane state never contradict: not a stale "running".
+    assert snapshot["lane_states"].get(run_id) == expected_lane, snapshot
+    assert snapshot["lane_states"].get(run_id) != "running", snapshot
+    assert snapshot.get("lane_state") == expected_lane, snapshot
+
+    # cancel reports the same lane state for the same run (a second shared path).
+    cancelled = _run(installed, ["cancel", run_id], cwd=tmp_path)
+    if cancelled.returncode == 0:
+        assert json.loads(cancelled.stdout)["lane_state"] == expected_lane
 
 
 # ---------------------------------------------------------------------------
