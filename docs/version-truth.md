@@ -73,24 +73,47 @@ check treats the tag subject as release metadata.
 ## Discovered vs installed (registry / index)
 
 The *discovered* version is what a registry or index reports as available; the
-*installed* version is what is present locally. They are shown **separately**,
-each with its provenance and freshness, because "the registry says X" is not a
-statement about this machine.
+*installed* version is what is present locally. They are **computed and shown
+separately** — by `scripts/check-version-truth.py`, in both its text and its
+`--json` output — each with its provenance and freshness, because "the registry
+says X" is not a statement about this machine. The two are never merged and
+never compared as if equal; a difference between them is *shown*, not hidden
+(and is not itself a release-claim drift).
 
-Freshness and provenance rules:
+**Installed identity** (provenance `importlib.metadata`): the running
+interpreter's distribution is read for its version, distribution name, resolved
+origin path and how it was installed (`site-packages`, `editable-checkout`
+(`direct_url.json` `dir_info.editable`), `local-vcs`, or `unknown`). This is the
+same identity `skillweave.cli.support.product_version()` consumes. When the
+distribution is absent the check reports **not installed** — it never
+substitutes the candidate or a registry value (no fabricated `1.5.9`).
 
-- **installed** carries provenance `importlib.metadata` and, when present, the
-  distribution's resolved location. When the distribution is absent the check
-  reports **not installed** — it never substitutes the candidate or a registry
-  value (no fabricated `1.5.9`).
-- **discovered** carries the source it was read from (the run snapshot / index
-  the consumer actually queried) and the observation time. It is reported as
-  an *observation*, never as a fact about the local install.
-- Neither may be silently promoted to *released*. `released` is established
-  only by the peeled canonical tag above.
+**Discovered observation** (an explicit registry/index observation, supplied by
+the operator):
+
+- `--discovered-observation <file.json>` reads a small JSON object
+  `{"source": ..., "index_url": ..., "name": "skillweave", "version": "X.Y.Z",
+  "observed_at": "<ISO-8601>"}`. `index_url` and `observed_at` are optional; the
+  rest are required.
+- **This tool performs no live registry query.** It does not open a socket, does
+  not contact an index and does not resolve `index_url`; it *reports the
+  observation it was handed*. The observation's `source`, `index_url` and
+  observation time are printed alongside the version so the reader can weigh it.
+- Age is reported against a freshness threshold (`--freshness-hours`, default
+  `48`). An observation older than the threshold is marked **STALE** — never
+  silently trusted — and `age_hours > freshness_hours` is exposed in `--json`.
+- When **no** observation is supplied the check prints
+  `no discovered observation supplied` (and `--json` reports
+  `"discovered": null`); it never invents a value.
+- A malformed or unreadable observation file is a **setup error** (exit 2): a
+  bad observation is never silently treated as "no observation".
+- Neither the installed nor the discovered fact may be silently promoted to
+  *released*. `released` is established only by the peeled canonical tag above.
 - The run-snapshot contract this surface speaks is pinned by id
   `run-snapshot-v1` (`skillweave.cli.support.RUN_SNAPSHOT_SCHEMA_ID`); the SDK
-  owns the schema bytes.
+  owns the schema bytes. The discovered-observation file is the operator-facing,
+  tool-local carrier of that same "what a registry observed" idea; it is not the
+  run snapshot itself and confers no authority.
 
 ### Forgejo-first release provenance
 
@@ -120,6 +143,15 @@ zero or duplicate Forgejo release objects.
    not as a failure of the tree.
 5. **skill inventory** — the README's skill count and the declared
    `skills/*/capability.yaml` inventory must equal the on-disk inventory.
+
+In addition to those checks, the tool **reports** (it does not gate on) the
+`installed` identity and the operator-supplied `discovered` observation as
+separate lines, each with its provenance and freshness, and mirrors all of the
+above in its `--json` output (`candidate`, `bundle`, `released`, `installed`,
+`discovered`, `skills`, `checks`, `ok`). Absence is reported honestly: a missing
+install prints `not installed`, a missing observation prints
+`no discovered observation supplied` — neither is a drift, and neither is ever
+fabricated.
 
 **Historical references are allowed** when they are explicitly historical. A
 version token is *historical* when it is not presented as the current release —

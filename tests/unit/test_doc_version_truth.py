@@ -23,7 +23,10 @@ criteria, asserted rather than claimed:
 The checker is exercised as a **real subprocess** against the tree and against
 mutated fixtures (fail-closed negative controls), and its installed-identity leg
 is driven with a controlled on-disk distribution — the consumer wiring, not a
-helper name.
+helper name. The **discovered** (registry/index) leg is driven with real
+operator-supplied observation files: fresh, stale, mismatched, malformed,
+missing-field and absent — each asserted on the checker's own printed/`--json`
+output, so "shown separately with freshness/provenance" is proven, not claimed.
 
 Self-contained sys.path handling, following the sibling-test convention
 (`tests/unit/test_doc_arch.py`).
@@ -31,12 +34,13 @@ Self-contained sys.path handling, following the sibling-test convention
 
 from __future__ import annotations
 
+import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import textwrap
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent.parent
@@ -90,15 +94,50 @@ def _head() -> str:
     ).stdout.strip()
 
 
-def _run_check(repo: Path, *, path: Path = _REPO, extra_env: dict | None = None):
+def _run_check(
+    repo: Path,
+    *,
+    extra_args: list[str] | None = None,
+    extra_env: dict | None = None,
+):
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
     if extra_env:
         env.update(extra_env)
-    return subprocess.run(
-        [sys.executable, "-B", str(_CHECK), "--repo", str(repo)],
-        capture_output=True, text=True, env=env,
-    )
+    argv = [sys.executable, "-B", str(_CHECK), "--repo", str(repo)]
+    if extra_args:
+        argv.extend(extra_args)
+    return subprocess.run(argv, capture_output=True, text=True, env=env)
+
+
+def _run_check_json(repo: Path, *extra_args: str) -> dict:
+    proc = _run_check(repo, extra_args=["--json", *extra_args])
+    assert proc.returncode in (0, 1), (proc.returncode, proc.stdout, proc.stderr)
+    return json.loads(proc.stdout)
+
+
+def _write_observation(
+    tmp_path: Path,
+    name: str,
+    *,
+    version: str = "1.5.9",
+    source: str = "forgejo-index",
+    index_url: str | None = "https://forgejo.example/api/packages/skillweave/pypi/simple/",
+    observed_at: str | None = None,
+) -> Path:
+    obs = tmp_path / name
+    payload = {"source": source, "name": "skillweave", "version": version}
+    if index_url is not None:
+        payload["index_url"] = index_url
+    if observed_at is not None:
+        payload["observed_at"] = observed_at
+    obs.write_text(json.dumps(payload), encoding="utf-8")
+    return obs
+
+
+def _now_iso(minutes_ago: int = 0) -> str:
+    dt = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ── criterion 1: candidate / badge / changelog / installed ──────────────────
@@ -162,6 +201,90 @@ def test_discovered_and_installed_are_shown_separately():
     assert "provenance" in doc.lower() and "freshness" in doc.lower(), (
         "version-truth doc must state provenance and freshness for the two facts"
     )
+
+
+def test_check_actually_computes_the_discovered_fact(tmp_path):
+    # The tool -- not just the prose -- must produce the discovered version,
+    # from an operator observation, with its source and observation timestamp.
+    obs = _write_observation(tmp_path, "obs.json", version="1.5.9")
+    proc = _run_check(_REPO, extra_args=["--discovered-observation", str(obs)])
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert "discovered" in proc.stdout
+    assert "forgejo-index" in proc.stdout and "1.5.9" in proc.stdout
+    assert "freshness" in proc.stdout
+    # It is an explicit observation, never a live registry query.
+    doc = _read("docs/version-truth.md")
+    assert "no live registry query" in doc.lower() or (
+        "performs no live query" in doc.lower()
+    )
+
+
+def test_check_json_exposes_installed_and_discovered_separately(tmp_path):
+    obs = _write_observation(
+        tmp_path, "obs.json", version="1.5.10", index_url=None, observed_at=_now_iso()
+    )
+    report = _run_check_json(_REPO, "--discovered-observation", str(obs))
+    assert report["discovered"]["version"] == "1.5.10"
+    assert report["discovered"]["source"] == "forgejo-index"
+    # Never merged: they are two distinct top-level facts.
+    assert "installed" in report and "discovered" in report
+    # The discovered 1.5.10 is not the released fact (released stays 1.5.9).
+    assert report["released"]["version"] == "1.5.9"
+    # Any mismatch between discovered and installed is shown, not hidden.
+    if report["installed"] is not None:
+        assert report["installed"]["version"] != report["discovered"]["version"]
+
+
+def test_check_reports_no_discovered_observation_when_absent():
+    proc = _run_check(_REPO)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert "no discovered observation supplied" in proc.stdout, proc.stdout
+    report = _run_check_json(_REPO)
+    assert report["discovered"] is None
+
+
+def test_check_marks_a_stale_observation_stale(tmp_path):
+    obs = _write_observation(
+        tmp_path, "old.json", observed_at=_now_iso(minutes_ago=600)
+    )  # 10h old
+    fresh = _run_check(
+        _REPO, extra_args=["--discovered-observation", str(obs), "--freshness-hours", "48"]
+    )
+    assert fresh.returncode == 0
+    assert "[STALE]" not in fresh.stdout
+    stale = _run_check(
+        _REPO, extra_args=["--discovered-observation", str(obs), "--freshness-hours", "1"]
+    )
+    assert "[STALE]" in stale.stdout, stale.stdout
+    report = _run_check_json(
+        _REPO, "--discovered-observation", str(obs), "--freshness-hours", "1"
+    )
+    assert report["discovered"]["stale"] is True
+    assert report["discovered"]["age_hours"] > 1
+
+
+def test_check_fails_closed_on_malformed_observation(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    proc = _run_check(_REPO, extra_args=["--discovered-observation", str(bad)])
+    assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
+    assert "malformed" in proc.stderr.lower()
+
+
+def test_check_fails_closed_on_observation_missing_a_field(tmp_path):
+    bad = tmp_path / "missing.json"
+    bad.write_text(json.dumps({"source": "x", "version": "1.5.9"}), encoding="utf-8")
+    proc = _run_check(_REPO, extra_args=["--discovered-observation", str(bad)])
+    assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
+    assert "missing required field" in proc.stderr
+
+
+def test_check_fails_closed_on_absent_observation_file(tmp_path):
+    proc = _run_check(
+        _REPO, extra_args=["--discovered-observation", str(tmp_path / "nope.json")]
+    )
+    assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
+    assert "not found" in proc.stderr
 
 
 # ── criterion 3: setup, providers, zero-key, no leakage, envctl optional ────
@@ -338,7 +461,9 @@ def test_consistency_check_fails_closed_on_early_advertised_version(tmp_path):
     assert proc.returncode != 0, (proc.returncode, proc.stdout, proc.stderr)
 
 
-def _plant_installed(tmp_path: Path, version: str) -> Path:
+def _plant_installed(
+    tmp_path: Path, version: str, *, editable_dir: str | None = None
+) -> Path:
     """Write a minimal on-disk distribution so importlib.metadata finds it."""
     site = tmp_path / "site"
     dist = site / f"skillweave-{version}.dist-info"
@@ -346,6 +471,10 @@ def _plant_installed(tmp_path: Path, version: str) -> Path:
     (dist / "METADATA").write_text(
         "Metadata-Version: 2.1\nName: skillweave\nVersion: %s\n" % version
     )
+    if editable_dir is not None:
+        (dist / "direct_url.json").write_text(
+            json.dumps({"url": editable_dir, "dir_info": {"editable": True}})
+        )
     return site
 
 
@@ -357,6 +486,18 @@ def test_consistency_check_installed_identity_positive(tmp_path):
     proc = _run_check(_REPO, extra_env={"PYTHONPATH": str(site)})
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert "installed==candidate" in proc.stdout and "ok" in proc.stdout
+
+
+def test_consistency_check_reports_installed_origin(tmp_path):
+    # installed identity carries provenance (dist name, version, origin path
+    # and how it was installed), not just a bare number.
+    site = _plant_installed(
+        tmp_path, _peeled_badge(), editable_dir="/repo/skillweave"
+    )
+    proc = _run_check(_REPO, extra_env={"PYTHONPATH": str(site)})
+    assert "installed identity" in proc.stdout, proc.stdout
+    assert "skillweave" in proc.stdout and "editable-checkout" in proc.stdout
+    assert "/repo/skillweave" in proc.stdout, proc.stdout
 
 
 def test_consistency_check_installed_identity_negative(tmp_path):
@@ -374,6 +515,7 @@ def _run_all() -> int:
         test_release_facing_material_does_not_advertise_1510_as_released,
         test_released_face_is_peeled_and_not_branch_head,
         test_discovered_and_installed_are_shown_separately,
+        test_check_reports_no_discovered_observation_when_absent,
         test_readme_advertises_the_released_version_and_inventory,
         test_no_pypi_claim_in_release_facing_material,
         test_setup_section_shows_providers_credentials_and_optional_mcp,

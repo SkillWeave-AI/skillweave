@@ -8,11 +8,15 @@ this tool asks a third, release-facing question:
     Does what the *public release surface* says about the version match the
     facts the tree and an installed artifact actually carry?
 
-The four facts (see ``docs/version-truth.md``) are:
+The facts (see ``docs/version-truth.md``) are:
 
     candidate   pyproject.toml [project].version and the bundle capability.yaml
     released    the latest canonical ANNOTATED tag, by its PEELED commit
-    installed   importlib.metadata.version("skillweave") in this interpreter
+    installed   the local distribution actually present (importlib.metadata):
+                version, dist name, origin path and how it was installed
+    discovered  the version a registry/index OBSERVES as available, taken from
+                an operator-supplied observation file -- this tool performs NO
+                live registry query
     historical  an old version, allowed only when not advertised as current
 
 It checks, and fails closed on each:
@@ -27,6 +31,17 @@ It checks, and fails closed on each:
   5. skill inventory      the README skill count and every on-disk
                           ``skills/*/capability.yaml`` name are present.
 
+The ``installed`` and ``discovered`` facts are also **reported** (as separate
+observations, in both the human text and ``--json`` output) -- never merged and
+never compared as if equal. A discovered observation is shown with its source,
+index URL and observation time; its age is reported against a freshness
+threshold and a stale observation is marked ``STALE``, never silently trusted
+(``--freshness-hours``, default 48). When no observation is supplied the tool
+prints ``no discovered observation supplied`` rather than inventing a value; a
+malformed observation is a setup error. A difference between the discovered and
+the installed/candidate versions is *shown*, not hidden, and is not itself a
+release-claim drift.
+
 Historical references are ALLOWED: the check reads only the *release-advertising
 positions* (the badge, the "What's new in X" heading, the CHANGELOG top). An old
 version mentioned elsewhere as history (e.g. "1.4.0 scope") is not a failure.
@@ -38,18 +53,22 @@ commit (``git rev-parse '<tag>^{}'``) plus the tag's canonical subject, never by
 requiring the tag to equal the current branch HEAD.
 
 Stdlib only. Usage:
-    check-version-truth.py [--repo PATH]
+    check-version-truth.py [--repo PATH] [--discovered-observation PATH]
+                           [--freshness-hours N] [--json]
 Exit 0 = release claims match the facts.
 Exit 1 = at least one release-facing claim drifted.
-Exit 2 = setup error (missing repo files, git unavailable, tag not found).
+Exit 2 = setup error (missing repo files, git unavailable, tag not found,
+         unreadable/malformed discovered-observation file).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
@@ -155,21 +174,140 @@ def _release_face(repo: Path) -> tuple[str, str, str]:
     return tag, peeled, subject
 
 
-def _installed_version() -> str | None:
+def _installed_identity() -> dict | None:
+    """The locally installed distribution identity, or None if absent.
+
+    Real producer/consumer: reads the distribution actually present in this
+    interpreter via importlib.metadata -- version, dist name, origin path and
+    (when available) how it was installed -- so the same numbers the CLI's
+    ``product_version()`` would report are shown here, not a helper's guess.
+    """
     try:
-        from importlib.metadata import PackageNotFoundError, version
+        from importlib.metadata import (
+            PackageNotFoundError,
+            distribution,
+            version,
+        )
 
         try:
-            return str(version("skillweave"))
+            ver = str(version("skillweave"))
         except PackageNotFoundError:
             return None
+        dist = distribution("skillweave")
+
+        origin: str | None = None
+        origin_kind = "unknown"
+        try:
+            direct = dist.read_text("direct_url.json")
+        except Exception:  # noqa: BLE001 - best-effort metadata
+            direct = None
+        if direct:
+            try:
+                du = json.loads(direct)
+                origin = du.get("url")
+                dir_info = du.get("dir_info") or {}
+                origin_kind = "editable-checkout" if dir_info.get("editable") else "local-vcs"
+            except Exception:  # noqa: BLE001 - best-effort metadata
+                origin = None
+        if origin is None:
+            try:
+                loc = str(dist.locate_file(""))
+                origin = loc
+                origin_kind = "site-packages"
+            except Exception:  # noqa: BLE001 - best-effort metadata
+                origin = None
+
+        return {
+            "version": ver,
+            "dist_name": dist.metadata["Name"],
+            "origin": origin,
+            "origin_kind": origin_kind,
+        }
     except Exception:  # noqa: BLE001 - metadata is best-effort
         return None
+
+
+def _load_discovered_observation(fpath: Path, freshness_hours: float) -> dict:
+    """Parse an operator-supplied registry/index observation (no live query).
+
+    Expected JSON::
+
+        {"source": "...", "index_url": "...", "name": "skillweave",
+         "version": "1.5.9", "observed_at": "2026-10-09T00:00:00Z"}
+
+    ``index_url``/``observed_at`` are optional; the rest are required. A
+    malformed or unreadable file is a setup error (exit 2): a bad observation
+    must never be silently treated as "no observation".
+    """
+    if not fpath.is_file():
+        _die(f"discovered-observation file not found: {fpath}")
+    try:
+        data = json.loads(fpath.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        _die(f"malformed discovered-observation JSON in {fpath}: {exc}")
+    if not isinstance(data, dict):
+        _die(f"discovered-observation in {fpath} must be a JSON object")
+
+    for key in ("source", "name", "version"):
+        if not data.get(key):
+            _die(
+                f"discovered-observation {fpath} is missing required field "
+                f"{key!r}"
+            )
+    ver = str(data["version"])
+    if not re.fullmatch(SEMVER, ver):
+        _die(
+            f"discovered-observation {fpath} version {ver!r} is not X.Y.Z"
+        )
+
+    observed_at = data.get("observed_at")
+    age_hours: float | None = None
+    if observed_at:
+        try:
+            ts = str(observed_at).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_hours = round(
+                (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0, 2
+            )
+        except Exception:  # noqa: BLE001
+            _die(
+                f"discovered-observation {fpath} observed_at {observed_at!r} "
+                "is not ISO-8601"
+            )
+
+    stale = age_hours is not None and age_hours > freshness_hours
+    return {
+        "source": str(data["source"]),
+        "index_url": data.get("index_url"),
+        "name": str(data["name"]),
+        "version": ver,
+        "observed_at": observed_at,
+        "age_hours": age_hours,
+        "freshness_hours": freshness_hours,
+        "stale": bool(stale),
+    }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(prog="check-version-truth")
     ap.add_argument("--repo", type=Path, default=Path("."))
+    ap.add_argument(
+        "--discovered-observation",
+        type=Path,
+        default=None,
+        help="operator-supplied registry/index observation JSON "
+        "({source, index_url, name, version, observed_at}); no live query is run",
+    )
+    ap.add_argument(
+        "--freshness-hours",
+        type=float,
+        default=48.0,
+        help="age beyond which a discovered observation is marked STALE "
+        "(default 48)",
+    )
+    ap.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = ap.parse_args()
     repo = args.repo
 
@@ -180,15 +318,16 @@ def main() -> int:
     tag, peeled, subject = _release_face(repo)
     released = tag.lstrip("v")
 
+    checks: list[dict] = []
     failed = False
 
     def check(ok: bool, label: str, detail: str) -> None:
         nonlocal failed
-        if ok:
-            print(f"  ok        {label}: {detail}")
-        else:
+        if not ok:
             failed = True
-            print(f"  DRIFT     {label}: {detail}")
+        checks.append({"label": label, "ok": bool(ok), "detail": detail})
+        if not args.json:
+            print(f"  {'ok       ' if ok else 'DRIFT    '} {label}: {detail}")
 
     # 1. required surfaces agree (candidate == bundle).
     check(
@@ -223,16 +362,53 @@ def main() -> int:
         )
 
     # 4. installed identity matches the candidate (absence is reported).
-    installed = _installed_version()
+    installed = _installed_identity()
     if installed is None:
-        print("  note      installed: not installed in this interpreter "
-              "(reported, not faked)")
+        if not args.json:
+            print("  note      installed: not installed in this interpreter "
+                  "(reported, not faked)")
     else:
+        where = installed["origin"] or "origin unknown"
+        if not args.json:
+            print(
+                f"  installed identity: {installed['dist_name']} "
+                f"{installed['version']} ({installed['origin_kind']}): {where}"
+            )
         check(
-            installed == candidate,
+            installed["version"] == candidate,
             "installed==candidate",
-            f"installed {installed} vs candidate {candidate}",
+            f"installed {installed['version']} vs candidate {candidate}",
         )
+
+    # 4b. discovered (registry/index) version -- an operator observation, never
+    #     a live query, never merged with installed/candidate.
+    discovered = None
+    if args.discovered_observation is not None:
+        discovered = _load_discovered_observation(
+            args.discovered_observation, args.freshness_hours
+        )
+        age = discovered["age_hours"]
+        age_txt = (
+            f"age {age}h" if age is not None else "age unknown (no observed_at)"
+        )
+        # A stale observation is flagged for the reader; freshness is advisory,
+        # so it does not by itself make a release claim drift.
+        mark = " [STALE]" if discovered["stale"] else ""
+        if not args.json:
+            print(
+                f"  discovered: {discovered['name']} {discovered['version']} "
+                f"from {discovered['source']} "
+                f"({discovered['index_url'] or 'no index_url'}), "
+                f"{age_txt} (freshness {discovered['freshness_hours']}h){mark}"
+            )
+        if installed is not None and installed["version"] != discovered["version"]:
+            if not args.json:
+                print(
+                    f"  note      discovered {discovered['version']} != installed "
+                    f"{installed['version']} (shown separately; not merged)"
+                )
+    elif not args.json:
+        print("  note      discovered: no discovered observation supplied")
 
     # 5. skill inventory agrees (count and names).
     on_disk = _skills_on_disk(repo)
@@ -255,14 +431,35 @@ def main() -> int:
         f"missing: {missing}",
     )
 
+    rc = 1 if failed else 0
+
+    if args.json:
+        report = {
+            "candidate": candidate,
+            "bundle": bundle,
+            "released": {
+                "tag": tag,
+                "version": released,
+                "peeled": peeled,
+                "subject": subject,
+            },
+            "installed": installed,
+            "discovered": discovered,
+            "skills": {"count": n, "names": on_disk},
+            "checks": checks,
+            "ok": not failed,
+        }
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return rc
+
     if failed:
         print("check-version-truth: FAIL — a release-facing claim drifted")
-        return 1
-    print(
-        f"check-version-truth: OK — candidate {candidate}, released {tag} "
-        f"(peeled {peeled[:12]}), {n} skills"
-    )
-    return 0
+    else:
+        print(
+            f"check-version-truth: OK — candidate {candidate}, released {tag} "
+            f"(peeled {peeled[:12]}), {n} skills"
+        )
+    return rc
 
 
 if __name__ == "__main__":
