@@ -4077,12 +4077,18 @@ class RunApplicationService:
         # is not observable from the parent.  Record a null answering model with
         # a reason so the identity chain is honest rather than silently absent.
         if reservation_rec is not None:
+            # SW-1510-ROUTE-LOCK: carry forward catalog/policy revision from
+            # the route proof so the follow-up event also satisfies minLength:1.
+            _rd_catalog = getattr(route_proof, "catalog_revision", "") if route_proof is not None else ""
+            _rd_policy = getattr(route_proof, "policy_revision", "") if route_proof is not None else ""
             self._update_route_decision_answering(
                 run_id,
                 task_id=task_id or run_id,
                 correlation_id=f"{task_id or run_id}/attempt-{attempt}",
                 requested_alias=model or "",
                 answering_model="",
+                catalog_revision=_rd_catalog,
+                policy_revision=_rd_policy,
                 reservation_id=reservation_rec.reservation_id,
                 attempt=int(attempt),
                 attempt_order=1,

@@ -2553,7 +2553,7 @@ class TestRouteDecisionContractCompliance:
             outcome="resolved",
         )
 
-        # --- 4. Append to journal (production persistence path) ---
+        # --- 4. Append initial decision to journal (production persistence path) ---
         from skillweave.runtime.journal import EventJournal
         db_path = tmp_path / "test_sdk_validator.db"
         journal = EventJournal(str(db_path))
@@ -2561,6 +2561,33 @@ class TestRouteDecisionContractCompliance:
             "run-sdk-test",
             event_type="route_decision",
             payload=decision.to_journal_dict(),
+            correlation_id="sdk-test/attempt-1",
+        )
+
+        # --- 4b. Append answering-model update (follow-up event) to journal.
+        # The follow-up event must carry the same catalog_revision and
+        # policy_revision as the initial decision so the frozen schema
+        # minLength:1 constraint is satisfied.
+        update = make_route_decision(
+            correlation_id="sdk-test/attempt-1",
+            requested_alias="deepseek-v4-flash",
+            resolved_provider="faigate",
+            resolved_model="byteplus/deepseek-v4-flash",
+            answering_envelope_identity="deepseek-v4-flash",
+            catalog_revision=proof.catalog_revision,
+            policy_revision=proof.policy_revision,
+            run_id="run-sdk-test",
+            task_id="task-sdk-test",
+            attempt=1,
+            reservation_id="res-sdk-test",
+            attempt_order=["attempt-1"],
+            attribution_status="attributed",
+            outcome="resolved",
+        )
+        journal.append(
+            "run-sdk-test",
+            event_type="route_decision",
+            payload=update.to_journal_dict(),
             correlation_id="sdk-test/attempt-1",
         )
 
