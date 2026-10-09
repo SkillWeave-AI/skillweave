@@ -224,7 +224,8 @@ def test_websearch_search_reports_a_non_success_as_a_visible_error():
     # The stub returned a non-success outcome: Council gets a visible notice,
     # never a fabricated source line.
     assert isinstance(text, str)
-    assert "No search results found" in text or "did not succeed" in text
+    assert "did not succeed" in text
+    assert "Status: blocked" in text
     assert "https://" not in text
 
 
@@ -234,10 +235,7 @@ def test_websearch_search_timeout_is_reported_not_silent(monkeypatch):
     async def _hang(*_a, **_k):
         await asyncio.sleep(5)
 
-    monkeypatch.setattr(ws, "_search_provider", _hang)
-    # Shrink the wrapper's own timeout by monkeypatching wait_for is overkill;
-    # instead assert the timeout branch exists and is reachable by calling with
-    # a tiny override through a patched asyncio.wait_for.
+    monkeypatch.setattr(ws, "search_outcome", _hang)
     import skillweave.council.search as mod
 
     real_wait_for = asyncio.wait_for
