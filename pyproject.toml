@@ -48,10 +48,11 @@ dev = [
 # Deliberately NOT a base dependency. src/skillweave/mcp/server.py imports the
 # SDK inside try/except and degrades to an inert stub, so the base install runs
 # without it; this extra is the one-line way to add the real server. Run
-# scripts/check-optional-capability.py (or `python -m
-# skillweave.scripts.check_optional_capability`) for an actionable diagnostic
-# when it is absent. Python floor matches the project's own `requires-python`;
-# the MCP SDK itself is a pure-Python wheel on the supported range.
+# `python -m skillweave.scripts.check_optional_capability` for an actionable
+# diagnostic when it is absent (the packaged module; scripts/
+# check-optional-capability.py is a source-tree wrapper over it). Python floor
+# matches the project's own `requires-python`; the MCP SDK itself is a
+# pure-Python wheel on the supported range.
 mcp = [
     "mcp>=1.0; python_version >= '3.9'",
 ]

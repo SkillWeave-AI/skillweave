@@ -10,8 +10,11 @@ shared Desktop/agent install.
 Scope note: this ticket (SW-ENV-001) repairs *provisioning* — metadata, the
 console entrypoints, the base-vs-optional dependency boundary, and the smoke
 tests. It does **not** re-implement native CLI behavior. The final composed
-installed smoke check consumes qualified SW-1510-CLI semantics and is a **held
-composition gate**; see [Held composition gate](#held-composition-gate).
+installed smoke check **consumes** qualified SW-1510-CLI semantics through the
+installed console script; see [Composed installed gate](#composed-installed-gate).
+The gate runs wherever the built wheel carries the SW-1510-CLI surface
+(`skillweave.cli.support`); on a base that predates that integration it is
+skipped with an explicit reason, never fabricated into a pass.
 
 ## What is declared
 
@@ -55,12 +58,14 @@ Optional capabilities are **never** base dependencies:
 
 ### Optional-capability diagnostic
 
-When a capability is missing, the failure should be actionable, not silent:
+When a capability is missing, the failure should be actionable, not silent. The
+diagnostic ships **inside the distribution** so the documented invocation works
+from a fresh wheel with no checkout on the path:
 
 ```console
-$ check-optional-capability.py mcp        # or: python scripts/check-optional-capability.py mcp
+$ python -m skillweave.scripts.check_optional_capability mcp
 {
-  "capabilities": { "mcp": { "status": "missing",
+  "capabilities": { "mcp": { "status": "missing", "available": false,
                              "install_hint": "pip install 'skillweave[mcp]'" } },
   "missing": ["mcp"]
 }
@@ -68,8 +73,15 @@ $ echo $?
 1
 ```
 
+`scripts/check-optional-capability.py` is a thin source-tree wrapper over that
+same packaged module (the two can never drift):
+
+```console
+$ python scripts/check-optional-capability.py mcp
+```
+
 Exit `0` = available, `1` = missing (with the exact `pip install 'skillweave[…]'`
-hint), `2` = unknown capability name. The script is stdlib-only and mutates
+hint), `2` = unknown capability name. The module is stdlib-only and mutates
 nothing.
 
 ## Environment activation
@@ -187,10 +199,11 @@ working directory so the checkout's `src/` cannot shadow the install, and with
 
 ```bash
 cd "$(mktemp -d)"
+export HOME="$(mktemp -d)"                       # isolate, never a shared env
 env -u PYTHONPATH python -c "import skillweave, importlib.metadata as m; \
     print(skillweave.__file__); print(m.requires('skillweave'))"
 env -u PYTHONPATH skillweave --help
-env -u PYTHONPATH python scripts/check-optional-capability.py mcp   # base has no MCP
+env -u PYTHONPATH python -m skillweave.scripts.check_optional_capability mcp  # base has no MCP
 ```
 
 The `tests/packaging/test_install_provisioning.py` suite automates exactly this
@@ -200,28 +213,81 @@ against a freshly built wheel and a freshly created editable install, asserting:
 2. all four console-script targets import and expose a callable `main`;
 3. `skillweave.<module>` resolves under the *installed* location, not `src/`;
 4. the base install imports and runs with no MCP SDK present;
-5. a missing optional capability yields the actionable hint (exit 1).
+5. **every non-optional runtime module under `skillweave` imports** in the base
+   install (the whole-runtime-surface sweep — see [Runtime-surface import
+   audit](#runtime-surface-import-audit));
+6. a missing optional capability yields the actionable hint (exit 1) via
+   `python -m skillweave.scripts.check_optional_capability`;
+7. the composed installed smoke below reproduces the accepted SW-1510-CLI
+   semantics through the installed console script.
 
-## Held composition gate
+### Runtime-surface import audit
+
+A stale base or an unqualified `skillweave_sdk` copy can hide an import break
+inside a module that no smoke command happens to touch — the pre-existing
+`skillweave_sdk.validator.AuthenticatedServiceContext` drift was exactly such a
+case. Criterion 2 is therefore checked by *walking* the installed package:
+`pkgutil.walk_packages` enumerates every non-optional module under
+`skillweave` (the optional `mcp` extra and the packaged `test_*` modules are
+excluded) and imports each. The sweep asserts **zero** import failures, so a
+base-install import break fails loudly rather than silently. Where the running
+interpreter has no *pinned* SDK the sweep is a **setup HOLD** (skip with the
+reason), never a fabricated pass.
+
+## Composed installed gate
 
 Criterion 5 of SW-ENV-001 — "consume qualified SW-1510-CLI semantics in the
-final composed installed smoke test" — is **held**. The provisioning repairs and
-the smoke checks above are complete and independently runnable, but the *final
-composed* smoke check depends on the native CLI behavior gate owned by
-SW-1510-CLI, which has not yet been independently qualified in this sequence.
-This ticket repairs provisioning; it does not duplicate or bypass that gate.
-
-The exact future invocation, once SW-1510-CLI is qualified, is the composed
-installed smoke — the base checks above **plus** the native CLI semantics
-substituted in at the `skillweave --help` / `skillweave <subcommand>` step:
+final composed installed smoke test" — is exercised by running the **installed**
+`skillweave` console script through the accepted CLI surface. The tests assert
+the accepted semantics; they do **not** re-implement or duplicate them. On a
+built wheel that carries the SW-1510-CLI surface (`skillweave.cli.support`,
+integration head `67c35c8c`), each case runs in its own isolated `HOME` and
+project directory with `PYTHONPATH` unset:
 
 ```bash
-# after SW-1510-CLI qualification (not run today):
-cd "$(mktemp -d)"
-env -u PYTHONPATH skillweave <qualified-cli-invocation>
+cd "$(mktemp -d)"; export HOME="$(mktemp -d)"
+env -u PYTHONPATH skillweave --help                       # async surfaces listed
+env -u PYTHONPATH skillweave support --json               # skillweave.support/1 table
+env -u PYTHONPATH skillweave start --async --run-id demo -- sleep 30
+env -u PYTHONPATH skillweave inspect demo                 # state=running, lane preflight
+env -u PYTHONPATH skillweave kill demo <wrong-pid>        # exit 2, refused
+env -u PYTHONPATH skillweave kill demo <recorded-pid>     # ok -> killed, lane advance_or_stop
+env -u PYTHONPATH skillweave inspect ../x                 # exit 2 (invalid run id)
+env -u PYTHONPATH skillweave start --async --run-id x -- /no/such/binary  # exit 127
 ```
 
-Until then, treat the composed criterion as **HOLD**, not PASS.
+Asserted accepted semantics (observed against the installed console script, not
+the checkout):
+
+* `skillweave support` prints the versioned table `skillweave.support/1`, whose
+  `surfaces` are exactly `entry`, `run`, `start`, `inspect`, `kill`, `cancel`,
+  `resume`, `mcp`, `dispatch`, with the shared `run_id_rule` and exit-code
+  table (`invalid_input` = 2, `command_not_found` = 127).
+* `start --async` yields a `running` record; `inspect` agrees
+  (`state` = `running`, `lane_states` = `{<id>: "preflight"}`).
+* `kill <id> <wrong-pid>` is refused with **exit 2**; `kill <id> <recorded-pid>`
+  succeeds, and `inspect` then shows `state` = `killed` with lane state
+  `advance_or_stop`.
+* an invalid run id (e.g. `../x`) is refused with **exit 2** on
+  `start`/`inspect`/`kill`, and a command the OS cannot launch is reported with
+  **exit 127** — both without a Python traceback.
+
+If the built wheel predates the SW-1510-CLI integration (no
+`skillweave.cli.support` module — e.g. the bare checkout base), the composed
+gate is **skipped with an explicit "composed gate not present on this base"
+reason**. It is never reported as a fabricated pass.
+
+## Known defects (not fixed here)
+
+* **`skillweave-interactive-mode` exits 1.** In a fresh install the declared
+  console script `skillweave-interactive-mode`
+  (`skillweave.scripts.interactive_mode:main`) fails with
+  `'RiskModeResolver' object has no attribute 'get_effective_risk_mode'`. This
+  is **pre-existing and outside this ticket's scope** (SW-ENV-001 repairs
+  provisioning, not the interactive selector's internal call). It is recorded
+  here so the defect is not mistaken for a provisioning regression, it is **not
+  fixed** by this ticket, and it is **not asserted as passing** in the smoke
+  suite — only its *importability* as a declared entry target is (criterion 2).
 
 ## Version markers and Python support
 
@@ -232,6 +298,26 @@ are owned by the separate SW-DOC-004 version-truth ticket and are not made here.
 Apache license metadata is preserved as-is; PEP 639 SPDX normalization is owned
 by the separate LICENSE task and is not performed here.
 
+### Tested Python versions
+
+The classifiers *declare* 3.9–3.12; that is a claim, not a measurement. What was
+actually **exercised** for this ticket, and what is only declared, is stated
+explicitly so the gap is visible rather than implied:
+
+| Version | Status | How exercised |
+|---|---|---|
+| 3.9  | declared only | no interpreter available in this environment |
+| 3.10 | declared only | no interpreter available in this environment |
+| 3.11 | **verified host**   | built-wheel install + runtime-surface sweep in this lane |
+| 3.12 | verified by CI    | CI pins 3.12 for the suite |
+| 3.13 | declared only | no interpreter available in this environment |
+| 3.14 | **verified host**   | built-wheel install + full composed CLI smoke on the controller host |
+
+"Verified host" means the provisioning suite (build, install, entrypoint and —
+where the wheel carries the SW-1510-CLI surface — the composed CLI smoke) was
+actually run on that interpreter. The declared-only rows are covered by the
+preserved `requires-python`/classifier metadata, not by a run.
+
 ## Honest limits
 
 * A fully offline/hermetic **base** install additionally requires `PyYAML` and
@@ -239,3 +325,9 @@ by the separate LICENSE task and is not performed here.
   they are absent from the private material and network installs are
   disallowed, the base install is a **setup HOLD** — an explicit blocker, not a
   fabricated pass.
+* The runtime-surface sweep needs a *pinned* `skillweave-sdk` exposing
+  `validator.AuthenticatedServiceContext`. An unqualified SDK copy on the path
+  makes the sweep a **setup HOLD** (explicit skip), not a pass.
+* The composed SW-1510-CLI gate needs a wheel that carries
+  `skillweave.cli.support`. On the bare checkout base it is **skipped with a
+  reason**; it is only a real pass on the SW-1510-CLI-composed head.

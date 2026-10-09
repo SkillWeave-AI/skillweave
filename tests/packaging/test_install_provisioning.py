@@ -11,19 +11,28 @@ removed. What they prove could not be proven from the source tree:
   ``PYTHONPATH`` unset.
 * criterion 2 -- the base distribution's declared requirements are exactly
   ``PyYAML>=6.0`` + ``skillweave-sdk==0.2.0``; ``jsonschema`` (dev) and ``mcp``
-  (optional) are absent from the base install; and a missing optional capability
-  yields an actionable ``pip install 'skillweave[mcp]'`` diagnostic (exit 1).
+  (optional) are absent from the base install; a missing optional capability
+  yields an actionable ``pip install 'skillweave[mcp]'`` diagnostic (exit 1),
+  **through the packaged ``python -m skillweave.scripts.check_optional_capability``
+  invocation** so the documented command works from a fresh wheel; and *every*
+  non-optional runtime module under ``skillweave`` imports in the base install
+  (the R1 whole-runtime-surface sweep) so a base-install import break cannot
+  recur silently.
 * criterion 3 -- the declared ``requires-python >=3.9`` and Python classifiers
   are preserved, so no breaking support change is silently introduced.
 * criterion 5 -- the *composed* installed smoke that consumes qualified
-  SW-1510-CLI semantics is explicitly **HELD**; this suite asserts the hold is
-  recorded rather than fabricating a composed pass.
+  SW-1510-CLI semantics runs the **installed** ``skillweave`` console script
+  through the accepted CLI surface and asserts the accepted semantics without
+  re-implementing them (support table, async start/inspect/kill roundtrip,
+  wrong-pid refusal, invalid-run-id usage error, missing-executable code). On a
+  base that predates the SW-1510-CLI integration the composed gate is absent, so
+  it is **skipped with an explicit reason** rather than fabricated into a pass.
 
 Source and build artifacts never touch the checkout: the source is copied into
 scratch first, and every build/install happens under ``tmp_path``. The media may
-not contain PyYAML (a needed base dependency); when a needed local dependency is
-genuinely unavailable the affected test is skipped with an explicit setup-hold
-reason -- never weakened into a semantic false pass.
+not contain PyYAML (a needed base dependency) or the pinned SDK; when a needed
+local dependency is genuinely unavailable the affected test is skipped with an
+explicit setup-hold reason -- never weakened into a semantic false pass.
 """
 
 import json
@@ -51,6 +60,38 @@ _COPY_IGNORE = shutil.ignore_patterns(
 _SEED_PACKAGES = ("setuptools", "wheel", "_distutils_hack", "yaml", "_yaml")
 _SEED_DISTINFOS = ("setuptools", "wheel", "pyyaml")
 
+# The pinned SDK is a *base* dependency and is seeded too when the running
+# interpreter has it, so the runtime-surface sweep can import the modules that
+# genuinely require it.
+_SDK_PACKAGE = "skillweave_sdk"
+_SDK_DISTINFOS = ("skillweave_sdk", "skillweave-sdk")
+
+# The whole-runtime-surface import sweep (R1). It walks every non-optional
+# module under the installed ``skillweave`` and imports it, skipping the optional
+# ``mcp`` extra and the packaged test modules (which need the dev toolchain).
+# ``walk_packages`` silently skips submodules whose *parent* package fails to
+# import, so the sweep additionally asserts the count and reports failures as
+# JSON for the test to assert on.
+_SWEEP_PROBE = r'''
+import importlib, json, pkgutil
+import skillweave
+
+failures = []
+modules = []
+for info in pkgutil.walk_packages(skillweave.__path__, "skillweave."):
+    name = info.name
+    parts = name.split(".")
+    if "mcp" in parts or "tests" in parts or parts[-1].startswith("test_"):
+        continue
+    modules.append(name)
+    try:
+        importlib.import_module(name)
+    except Exception as exc:  # noqa: BLE001 - the sweep records every failure
+        failures.append([name, type(exc).__name__ + ": " + str(exc)[:200]])
+
+print(json.dumps({"modules": len(modules), "failures": failures}))
+'''
+
 
 def _bin_dir(venv_dir: Path) -> Path:
     return venv_dir / ("Scripts" if os.name == "nt" else "bin")
@@ -75,11 +116,13 @@ def _unrelated_cwd(tmp_path: Path) -> Path:
     return cwd
 
 
-def _clean_env(tmp_path: Path) -> dict:
+def _clean_env(tmp_path: Path, home: Path = None) -> dict:
     """Environment with PYTHONPATH removed and temp dirs pinned to the sandbox.
 
     ``PYTHONPATH`` must be *unset*, not merely empty, so the subprocess cannot
-    import the checkout's ``src`` -- only the installed package.
+    import the checkout's ``src`` -- only the installed package. ``home``, when
+    given, isolates ``$HOME`` for a single test so no shared/user state is read
+    or written.
     """
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
@@ -88,6 +131,8 @@ def _clean_env(tmp_path: Path) -> dict:
     env["TMPDIR"] = str(tmp)
     env["TEMP"] = str(tmp)
     env["TMP"] = str(tmp)
+    if home is not None:
+        env["HOME"] = str(home)
     return env
 
 
@@ -98,25 +143,39 @@ def _run(cmd, *, cwd, env):
     )
 
 
+def _isolated_home(tmp_path: Path, name: str) -> Path:
+    home = tmp_path / name
+    home.mkdir(parents=True, exist_ok=True)
+    return home
+
+
 def _seed_bare_venv(venv_dir: Path) -> None:
     """Make a bare venv able to build offline by copying named packages in.
 
     Offline environments cannot let pip resolve the build backend, and a
     ``--system-site-packages`` venv would leak ambient packages (including a
     possibly-installed ``mcp``) into the very base install we are proving is
-    minimal. Seeding by copy keeps the venv's ``sys.path`` closed.
+    minimal. Seeding by copy keeps the venv's ``sys.path`` closed. The pinned
+    SDK is copied too when the running interpreter has it (it is a base
+    dependency), so the runtime-surface sweep can import the modules that need
+    it.
     """
     purelib = Path(sysconfig.get_paths()["purelib"])
     site = next(venv_dir.glob("lib/python*/site-packages"))
+    wanted = list(_SEED_PACKAGES)
+    distinfos = list(_SEED_DISTINFOS)
+    if (purelib / _SDK_PACKAGE).exists():
+        wanted.append(_SDK_PACKAGE)
+        distinfos += list(_SDK_DISTINFOS)
     missing = []
-    for name in _SEED_PACKAGES:
+    for name in wanted:
         src = purelib / name
         if src.exists():
             shutil.copytree(src, site / name, dirs_exist_ok=True)
-        else:
+        elif name in _SEED_PACKAGES:
             missing.append(name)
     for distinfo in purelib.glob("*.dist-info"):
-        if distinfo.name.split("-")[0].lower() in _SEED_DISTINFOS:
+        if distinfo.name.split("-")[0].lower() in distinfos:
             shutil.copytree(distinfo, site / distinfo.name, dirs_exist_ok=True)
     pth = purelib / "distutils-precedence.pth"
     if pth.exists():
@@ -135,6 +194,22 @@ def _make_venv(tmp_path: Path, name: str) -> Path:
     venv.EnvBuilder(with_pip=True).create(venv_dir)
     _seed_bare_venv(venv_dir)
     return venv_dir
+
+
+def _qualified_sdk_available() -> bool:
+    """Whether *this* interpreter has a pinned SDK exposing the runtime symbol.
+
+    The runtime surface imports ``AuthenticatedServiceContext`` from
+    ``skillweave_sdk.validator``. An older/unqualified SDK on the path (the same
+    drift the cold review flagged as R1) cannot satisfy the sweep; that is a
+    setup HOLD, not a product failure, so callers skip with that reason.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "from skillweave_sdk.validator import AuthenticatedServiceContext"],
+        capture_output=True, text=True,
+    )
+    return proc.returncode == 0
 
 
 @pytest.fixture(scope="module")
@@ -198,6 +273,11 @@ def _origin(venv_dir: Path, tmp_path: Path) -> str:
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)
+
+
+def _cli(venv_dir: Path, args, *, cwd, env):
+    """Run the *installed* ``skillweave`` console script."""
+    return _run([_script(venv_dir, "skillweave")] + list(args), cwd=cwd, env=env)
 
 
 # ── criterion 1 + 2 + 3: declared wheel metadata ────────────────────────────
@@ -267,6 +347,36 @@ def test_base_entry_targets_import_without_optional_capabilities(tmp_path, wheel
     assert proc.returncode == 0, proc.stderr
 
 
+def test_base_install_whole_runtime_surface_imports_cleanly(tmp_path, wheel):
+    """criterion 2 (R1): every non-optional module under the *installed*
+    ``skillweave`` imports in the base install (no MCP SDK, no dev extras).
+
+    The cold review found that a stale base/SDK could hide an import break
+    (``skillweave_sdk.validator.AuthenticatedServiceContext``); sweeping the
+    whole runtime surface makes such a break fail loudly instead of silently.
+    The pinned SDK is seeded from the running interpreter, so a missing or
+    unqualified local SDK is a setup HOLD, reported as a skip -- not a pass.
+    """
+    venv_dir = _make_venv(tmp_path, "sweep")
+    _install_wheel(venv_dir, wheel, tmp_path)
+    env = _clean_env(tmp_path)
+    cwd = _unrelated_cwd(tmp_path)
+
+    if not _qualified_sdk_available():
+        pytest.skip(
+            "setup HOLD: the running interpreter has no pinned skillweave_sdk "
+            "exposing validator.AuthenticatedServiceContext (missing or "
+            "unqualified SDK copy). The runtime-surface sweep needs the pinned "
+            "skillweave-sdk==0.2.0; install it and re-run."
+        )
+
+    proc = _run([_python(venv_dir), "-c", _SWEEP_PROBE], cwd=cwd, env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    report = json.loads(proc.stdout)
+    assert report["modules"] > 0, report
+    assert report["failures"] == [], report["failures"]
+
+
 # ── criterion 1: installed origins, entrypoint, no PYTHONPATH ───────────────
 
 
@@ -313,22 +423,26 @@ def test_editable_install_resolves_back_to_its_source_tree(tmp_path, source_copy
     assert "usage: skillweave" in help_proc.stdout
 
 
-# ── criterion 2: actionable optional-capability diagnostic ──────────────────
+# ── criterion 2: actionable optional-capability diagnostic (R2) ─────────────
 
 
 def test_missing_optional_capability_reports_actionable_hint(tmp_path, wheel):
-    """criterion 2: with no MCP SDK the diagnostic exits 1 and names the exact
-    ``pip install 'skillweave[mcp]'`` remedy -- degradation is not silent."""
+    """criterion 2 (R2): with no MCP SDK the *packaged* diagnostic runs from the
+    fresh install via ``python -m skillweave.scripts.check_optional_capability``,
+    exits 1 and names the exact ``pip install 'skillweave[mcp]'`` remedy -- and
+    the source-tree wrapper reports the identical remedy. Degradation is not
+    silent."""
     venv_dir = _make_venv(tmp_path, "diag")
     _install_wheel(venv_dir, wheel, tmp_path)
     env = _clean_env(tmp_path)
     cwd = _unrelated_cwd(tmp_path)
 
-    script = REPO_ROOT / "scripts" / "check-optional-capability.py"
-    proc = _run([_python(venv_dir), str(script)], cwd=cwd, env=env)
-    assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr)
-
-    report = json.loads(proc.stdout)
+    packaged = _run(
+        [_python(venv_dir), "-m", "skillweave.scripts.check_optional_capability", "mcp"],
+        cwd=cwd, env=env,
+    )
+    assert packaged.returncode == 1, (packaged.returncode, packaged.stdout, packaged.stderr)
+    report = json.loads(packaged.stdout)
     entry = report["capabilities"]["mcp"]
     assert entry["status"] == "missing"
     assert entry["available"] is False
@@ -336,24 +450,171 @@ def test_missing_optional_capability_reports_actionable_hint(tmp_path, wheel):
     assert entry["module_path"] is None
     assert report["missing"] == ["mcp"]
 
+    unknown = _run(
+        [_python(venv_dir), "-m", "skillweave.scripts.check_optional_capability", "not-a-capability"],
+        cwd=cwd, env=env,
+    )
+    assert unknown.returncode == 2, unknown.returncode
+
+    # The source-tree wrapper delegates to the same packaged module.
+    wrapper = REPO_ROOT / "scripts" / "check-optional-capability.py"
+    wrapped = _run([_python(venv_dir), str(wrapper)], cwd=cwd, env=env)
+    assert wrapped.returncode == 1, (wrapped.returncode, wrapped.stdout, wrapped.stderr)
+    assert json.loads(wrapped.stdout)["capabilities"]["mcp"]["install_hint"] == \
+        "pip install 'skillweave[mcp]'"
+
     # The hint is the *declared extra*, so `pip install` would in fact resolve.
     with zipfile.ZipFile(wheel) as zf:
         metadata = zf.read(next(n for n in zf.namelist() if n.endswith("METADATA"))).decode()
     assert "Provides-Extra: mcp" in metadata
     assert 'extra == "mcp"' in metadata
 
-    unknown = _run([_python(venv_dir), str(script), "not-a-capability"], cwd=cwd, env=env)
-    assert unknown.returncode == 2, unknown.returncode
+
+# ── criterion 5: composed installed CLI smoke (SW-1510-CLI semantics) ───────
+
+_COMPOSED_SKIP = (
+    "composed gate not present on this base: the built wheel exposes no "
+    "skillweave.cli.support surface (it predates the SW-1510-CLI integration). "
+    "Run this suite on the SW-1510-CLI-composed head to exercise the composed "
+    "installed smoke."
+)
 
 
-# ── criterion 5: the composed gate is HELD, not faked ───────────────────────
+@pytest.fixture(scope="module")
+def composed_install(tmp_path_factory, wheel) -> Path:
+    """A fresh wheel install that carries the SW-1510-CLI surface, else skip.
+
+    The composed gate must run against the *installed* console script, not the
+    checkout. When the built wheel has no ``skillweave.cli.support`` module the
+    SW-1510-CLI semantics are simply not present on this base, so the gate is
+    skipped with an explicit reason -- never reported as a fabricated pass.
+    """
+    tmp_path = tmp_path_factory.mktemp("composed")
+    venv_dir = _make_venv(tmp_path, "venv")
+    _install_wheel(venv_dir, wheel, tmp_path)
+    env = _clean_env(tmp_path)
+    cwd = _unrelated_cwd(tmp_path)
+    probe = _run(
+        [_python(venv_dir), "-c",
+         "import importlib.util as u; "
+         "print(u.find_spec('skillweave.cli.support') is not None)"],
+        cwd=cwd, env=env,
+    )
+    if probe.returncode != 0 or probe.stdout.strip() != "True":
+        pytest.skip(_COMPOSED_SKIP)
+    return venv_dir
 
 
-def test_composed_cli_smoke_is_explicitly_held():
-    """criterion 5: provisioning is repaired, but the *composed* installed smoke
-    that consumes qualified SW-1510-CLI semantics is a held gate. This asserts
-    the hold is documented -- it must never be reported as PASS here."""
-    doc = (REPO_ROOT / "docs" / "provisioning.md").read_text()
-    assert "Held composition gate" in doc
-    assert "SW-1510-CLI" in doc
-    assert "HELD" in doc or "HOLD" in doc
+def _composed_case(composed_install: Path, tmp_path: Path, name: str):
+    """One isolated case: its own HOME and project dir, PYTHONPATH unset."""
+    home = _isolated_home(tmp_path, name + "-home")
+    proj = tmp_path / (name + "-proj")
+    proj.mkdir(parents=True, exist_ok=True)
+    env = _clean_env(tmp_path, home=home)
+    return composed_install, proj, env
+
+
+def _sleep_command(venv_dir: Path):
+    """A harmless, portable command the async run can hold open briefly."""
+    return [str(_python(venv_dir)), "-c", "import time; time.sleep(30)"]
+
+
+def test_composed_support_table_lists_the_accepted_surfaces(composed_install, tmp_path):
+    """criterion 5: the installed CLI ``--help`` exposes the async surfaces and
+    the installed ``skillweave support`` prints the versioned
+    ``skillweave.support/1`` table naming entry/run/start/inspect/kill/cancel/
+    resume/mcp/dispatch -- read from the table, not re-derived here."""
+    venv_dir, proj, env = _composed_case(composed_install, tmp_path, "support")
+
+    help_proc = _cli(venv_dir, ["--help"], cwd=proj, env=env)
+    assert help_proc.returncode == 0, help_proc.stderr
+    for surface in ("support", "start", "inspect", "kill"):
+        assert surface in help_proc.stdout, help_proc.stdout
+
+    table_proc = _cli(venv_dir, ["support", "--json"], cwd=proj, env=env)
+    assert table_proc.returncode == 0, table_proc.stderr
+    table = json.loads(table_proc.stdout)
+    assert table["schema_id"] == "skillweave.support/1", table.get("schema_id")
+    names = {row["name"] for row in table["surfaces"]}
+    assert names == {
+        "entry", "run", "start", "inspect", "kill", "cancel", "resume",
+        "mcp", "dispatch",
+    }, names
+    # The shared rule and exit table are the accepted ones, published once.
+    assert table["run_id_rule"] == r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+    assert table["exit_codes"]["invalid_input"] == 2
+    assert table["exit_codes"]["command_not_found"] == 127
+
+
+def test_composed_async_start_inspect_kill_roundtrip(composed_install, tmp_path):
+    """criterion 5: an async run starts, inspects consistently, refuses a wrong
+    PID (exit 2) and accepts the recorded PID, and the killed run projects to
+    the ``advance_or_stop`` lane -- the accepted lifecycle semantics, observed
+    through the installed console script."""
+    venv_dir, proj, env = _composed_case(composed_install, tmp_path, "roundtrip")
+    run_id = "composed0001"
+
+    start = _cli(venv_dir, ["start", "--async", "--run-id", run_id, "--",
+                            *_sleep_command(venv_dir)], cwd=proj, env=env)
+    assert start.returncode == 0, start.stderr
+    started = json.loads(start.stdout)
+    assert started["run_id"] == run_id
+    assert started["state"] == "running"
+    pid = started["pid"]
+    assert isinstance(pid, int) and pid > 0
+
+    insp1 = _cli(venv_dir, ["inspect", run_id], cwd=proj, env=env)
+    assert insp1.returncode == 0, insp1.stderr
+    snap1 = json.loads(insp1.stdout)
+    assert snap1["state"] == "running"
+    assert snap1["lane_states"] == {run_id: "preflight"}, snap1["lane_states"]
+    assert snap1["lane_state"] == "preflight"
+
+    wrong = _cli(venv_dir, ["kill", run_id, str(pid + 1)], cwd=proj, env=env)
+    assert wrong.returncode == 2, (wrong.returncode, wrong.stdout, wrong.stderr)
+    assert "Traceback" not in wrong.stderr
+
+    right = _cli(venv_dir, ["kill", run_id, str(pid)], cwd=proj, env=env)
+    assert right.returncode == 0, (right.returncode, right.stdout, right.stderr)
+    assert json.loads(right.stdout)["state"] == "killed"
+
+    insp2 = _cli(venv_dir, ["inspect", run_id], cwd=proj, env=env)
+    assert insp2.returncode == 0, insp2.stderr
+    snap2 = json.loads(insp2.stdout)
+    assert snap2["state"] == "killed"
+    assert snap2["lane_states"] == {run_id: "advance_or_stop"}, snap2["lane_states"]
+    assert snap2["lane_state"] == "advance_or_stop"
+
+
+def test_composed_invalid_run_id_is_a_usage_error(composed_install, tmp_path):
+    """criterion 5: an invalid run id (path traversal) is refused with exit 2 on
+    ``start``/``inspect``/``kill`` -- the shared run-id rule, not a per-surface
+    ad-hoc check, and never a raw traceback."""
+    venv_dir, proj, env = _composed_case(composed_install, tmp_path, "badid")
+
+    cases = [
+        ["start", "--async", "--run-id", "../x", "--", *_sleep_command(venv_dir)],
+        ["inspect", "../x"],
+        ["kill", "../x", "1"],
+    ]
+    for argv in cases:
+        proc = _cli(venv_dir, argv, cwd=proj, env=env)
+        assert proc.returncode == 2, (argv, proc.returncode, proc.stdout, proc.stderr)
+        assert "invalid run id" in proc.stderr, proc.stderr
+        assert "Traceback" not in proc.stderr
+
+
+def test_composed_missing_executable_is_reported_as_127(composed_install, tmp_path):
+    """criterion 5: a command that cannot be launched is reported with the
+    documented ``command_not_found`` code (127) and a message, with no Python
+    traceback and no silent ``running`` record."""
+    venv_dir, proj, env = _composed_case(composed_install, tmp_path, "nobin")
+    missing = str(tmp_path / "definitely-not-a-real-binary-xyz")
+
+    proc = _cli(venv_dir, ["start", "--async", "--run-id", "nobin0001", "--", missing],
+                cwd=proj, env=env)
+    assert proc.returncode == 127, (proc.returncode, proc.stdout, proc.stderr)
+    assert "Traceback" not in proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["state"] == "failed"
+    assert "command not found" in payload["error"]
