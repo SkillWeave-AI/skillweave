@@ -33,6 +33,12 @@ class ExecutionCapability(Flag):
     RESUME = auto()                 # Resume from a prior checkpoint
     PERSISTENT_STORE = auto()       # Persist intermediate results to store
     OBSERVER = auto()               # Attach a runtime observer
+    RE_REVIEW = auto()              # Brand-new, independent *re*-review
+    #: ``RE_REVIEW`` is deliberately distinct from ``FRESH_CONTEXT``: a cold
+    #: first-run is fresh (no warm state) but is not a *re*-review.  Marking a
+    #: re-review explicitly keeps "fresh" and "brand-new independent re-review"
+    #: separable, so the Pro bound (SW-1510-ADAPTIVE criterion 2) can admit a
+    #: re-review without also admitting every fresh run.
 
 
 # ── Strategy contract ──────────────────────────────────────────────────────
@@ -104,6 +110,32 @@ class ExecutionStrategy:
     @property
     def has_observer(self) -> bool:
         return bool(self._capabilities & ExecutionCapability.OBSERVER)
+
+    @property
+    def has_re_review(self) -> bool:
+        """True when the strategy is marked as a brand-new independent
+        *re*-review (the ``RE_REVIEW`` capability)."""
+        return bool(self._capabilities & ExecutionCapability.RE_REVIEW)
+
+    @property
+    def is_fresh_independent_re_review(self) -> bool:
+        """True when the strategy is a *fresh independent re-review*.
+
+        SW-1510-ADAPTIVE (criterion 2): a Pro allocation is permitted for a
+        brand-new, independent re-review — and only that.  A re-review is
+        marked ``RE_REVIEW`` (a brand-new re-review, not a first cold run),
+        carries no warm state over (FRESH_CONTEXT) and is gated by a separate
+        reviewer role (INDEPENDENT_REVIEWER).  All three must be present.
+
+        The ``RE_REVIEW`` marking is what separates a re-review from an
+        ordinary cold first-run: both are fresh and independently reviewed, so
+        freshness and independence alone cannot tell them apart.
+        """
+        return (
+            self.has_re_review
+            and self.has_fresh_context
+            and self.has_independent_reviewer
+        )
 
     # ── Composition helpers ─────────────────────────────────────────────
 
@@ -203,6 +235,19 @@ RECIPE_MINIMAL = from_capabilities(
     recipe_name="minimal",
 )
 
+#: A brand-new, independent re-review: marked ``RE_REVIEW`` (so it is a
+#: *re*-review and not a first cold run), with no warm state carried over
+#: (FRESH_CONTEXT) and gated by a separate reviewer role (INDEPENDENT_REVIEWER).
+#: This is the capability projection SW-1510-ADAPTIVE criterion 2 names as one
+#: of the only two reasons a Pro allocation is permitted.
+RECIPE_RE_REVIEW = from_capabilities(
+    ExecutionCapability.RE_REVIEW,
+    ExecutionCapability.FRESH_CONTEXT,
+    ExecutionCapability.INDEPENDENT_REVIEWER,
+    ExecutionCapability.NAMED_REFERENCE,
+    recipe_name="re-review",
+)
+
 RECIPE_FULL = from_capabilities(
     ExecutionCapability.FRESH_CONTEXT,
     ExecutionCapability.INDEPENDENT_REVIEWER,
@@ -219,6 +264,12 @@ RECIPE_FULL = from_capabilities(
 #
 # All named recipes indexed by name.  Every entry is a pure capability
 # projection — no runtime path, no store reference, no file location.
+#
+# The registry is the addressable-by-name set; it is deliberately left as the
+# established five.  ``RECIPE_RE_REVIEW`` above is a canonical *capability
+# projection* (the re-review composition) exported by symbol rather than
+# registered by name, so the re-review marking rides on the composable
+# ``RE_REVIEW`` capability rather than a new registry entry.
 
 NAMED_RECIPES: dict[str, ExecutionStrategy] = {
     "cold": RECIPE_COLD,
@@ -302,6 +353,7 @@ __all__ = [
     "RECIPE_RESUME",
     "RECIPE_MINIMAL",
     "RECIPE_FULL",
+    "RECIPE_RE_REVIEW",
     "NAMED_RECIPES",
     "resolve_recipe",
     "compose_strategy",
