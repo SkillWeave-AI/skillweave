@@ -48,6 +48,25 @@ PROTECTED_STORE_NAMES: tuple[str, ...] = (
 READ_PROTECTED_STORE_NAMES: frozenset[str] = frozenset({"observer_signing"})
 
 
+def _is_loopback(host: str) -> bool:
+    """Return True when *host* is a loopback address (SBPL-confinable).
+
+    macOS Seatbelt (``sandbox-exec``) only accepts ``"*"`` or
+    ``"localhost"`` as the host part of a ``remote ip`` or ``remote tcp``
+    rule.  Loopback addresses (``127.0.0.1``, ``::1``, ``localhost``, and
+    the full ``127.0.0.0/8`` range) map to ``localhost`` in the profile.
+    Any non-loopback host cannot be expressed, and the caller must HOLD
+    before admission.
+    """
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return True
+    try:
+        from ipaddress import ip_address
+        return ip_address(host).is_loopback
+    except (ValueError, ImportError):
+        return False
+
+
 class IsolationUnavailableError(RuntimeError):
     """No real isolation adapter is available; the protected path fails closed.
 
@@ -236,9 +255,14 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
         lines.append("(allow file-read*)")
         lines.append('(allow file-write* (subpath "/dev/null") '
                      '(subpath "/dev/stdout") (subpath "/dev/stderr"))')
+        # macOS SBPL accepts only "*" or "localhost" as the host part
+        # of a remote ip / remote tcp rule.  Map loopback addresses to
+        # "localhost"; non-loopback hosts cannot be confined via SBPL
+        # and the caller must HOLD before calling this method.
+        sbpl_host = "localhost" if _is_loopback(host) else host
         lines.append(
             f'(allow network-outbound '
-            f'(remote ip "{host}:{port}"))'
+            f'(remote ip "{sbpl_host}:{port}"))'
         )
         return "\n".join(lines)
 
@@ -514,4 +538,5 @@ __all__ = [
     "select_adapter",
     "StoreProtection",
     "protect_stores",
+    "_is_loopback",
 ]

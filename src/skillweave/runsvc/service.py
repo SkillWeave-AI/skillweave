@@ -1523,6 +1523,18 @@ class RunApplicationService:
                 f"refusing to launch with an unapproved gateway (HOLD)",
             ) from exc
 
+        # macOS SBPL can only confine loopback hosts; a non-loopback
+        # approved gateway cannot be expressed in a Seatbelt profile.
+        from skillweave.runtime.worker_launcher import _is_loopback
+        if not _is_loopback(policy_host):
+            raise RunIntegrationError(
+                "route_lock",
+                f"egress_host_not_confinable: approved gateway host "
+                f"{policy_host!r} is not a loopback address; macOS "
+                f"Seatbelt (sandbox-exec) can only confine loopback "
+                f"hosts; refusing to launch without OS confinement (HOLD)",
+            )
+
         adapter = SandboxExecAdapter()
         if not adapter.available():
             raise RunIntegrationError(

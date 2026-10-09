@@ -2673,6 +2673,76 @@ class TestAnsweringModelUpdate:
         assert orders == [[0], [1]]
 
     # ------------------------------------------------------------------
+    # Egress profile generation (SBPL syntax verification)
+    # ------------------------------------------------------------------
+
+    def test_build_egress_profile_text_loopback_uses_localhost(self):
+        """build_egress_profile emits 'localhost:PORT' for loopback hosts.
+
+        macOS Seatbelt only accepts ``"*"`` or ``"localhost"`` as the
+        host part of a ``remote ip`` rule.  Verify the generated profile
+        text uses ``localhost`` for ``127.0.0.1``, ``::1`` and
+        ``localhost`` itself.
+        """
+        from skillweave.runtime.worker_launcher import SandboxExecAdapter
+        adapter = SandboxExecAdapter()
+
+        for loopback_host in ("127.0.0.1", "::1", "localhost"):
+            profile = adapter.build_egress_profile(loopback_host, 8090)
+            assert 'localhost:8090' in profile, (
+                f"profile for {loopback_host!r} should use "
+                f"'localhost:8090', got: {profile}"
+            )
+            assert '127.0.0.1:8090' not in profile, (
+                f"profile for {loopback_host!r} should NOT contain "
+                f"the IP literal, got: {profile}"
+            )
+
+    def test_build_egress_profile_text_non_loopback_uses_raw_host(self):
+        """build_egress_profile passes through non-loopback host verbatim.
+
+        For non-loopback hosts the SBPL profile will be invalid (macOS
+        Seatbelt rejects non-localhost IPs), but the caller (service.py
+        ``_enforce_route_proof_egress``) is expected to HOLD before
+        reaching this point.  The builder itself does not refuse non-
+        loopback hosts — it produces the text the caller asked for.
+        """
+        from skillweave.runtime.worker_launcher import SandboxExecAdapter
+        adapter = SandboxExecAdapter()
+
+        profile = adapter.build_egress_profile("10.0.0.5", 8090)
+        assert '10.0.0.5:8090' in profile, (
+            f"profile for non-loopback host should contain the host "
+            f"verbatim, got: {profile}"
+        )
+
+    def test_build_egress_profile_parse_only_validity(self):
+        """build_egress_profile produces a profile sandbox-exec accepts.
+
+        Run ``sandbox-exec -p "<profile>" /usr/bin/true`` to verify the
+        generated SBPL text is syntactically valid.  Skipped when
+        sandbox-exec itself is unavailable (same probe as
+        ``_sandbox_available``).
+        """
+        if not self._sandbox_available():
+            pytest.skip(
+                "sandbox-exec (Seatbelt) is not available on this host; "
+                "this test requires a macOS host where sandbox-exec exists"
+            )
+        import subprocess as _subprocess
+        from skillweave.runtime.worker_launcher import SandboxExecAdapter
+        adapter = SandboxExecAdapter()
+        profile = adapter.build_egress_profile("127.0.0.1", 8090)
+        sandbox_exec = _subprocess.run(
+            ["sandbox-exec", "-p", profile, "/usr/bin/true"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert sandbox_exec.returncode == 0, (
+            f"sandbox-exec rejected the generated profile: "
+            f"stdout={sandbox_exec.stdout!r} stderr={sandbox_exec.stderr!r}"
+        )
+
+    # ------------------------------------------------------------------
     # Subprocess egress confinement via sandbox-exec (controller finding 2b)
     # ------------------------------------------------------------------
 
