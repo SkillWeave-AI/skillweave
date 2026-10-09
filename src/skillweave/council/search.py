@@ -162,21 +162,36 @@ class WebSearch:
         return self._registry
 
     async def search(self, query: str, config: SearchConfig | None = None) -> str:
-        """Execute search and return formatted context string for council prompts."""
+        """Execute search and return formatted context string for council prompts.
+
+        Formatting rules (criterion 4):
+        - Real sources (http/https URLs from a success outcome) are numbered
+          ``Result 1``, ``Result 2``, etc.
+        - Failure, capability or provenance information is reported *outside*
+          the result numbering, as a separate note at the top of the context.
+        - A non-success outcome produces *zero* numbered results.
+        """
         if config is None:
             config = SearchConfig()
         config = self._apply_defaults(config)
 
+        outcome: Optional[SearchOutcome] = None
         try:
-            results = await asyncio.wait_for(
-                self._search_provider(query, config),
+            outcome = await asyncio.wait_for(
+                self.search_outcome(query, config),
                 timeout=60.0
             )
         except asyncio.TimeoutError:
-            return "SEARCH ERROR: Search timed out after 60 seconds."
+            return (
+                f"Web Search: {config.provider} timed out after 60 seconds.\n"
+                "No search results retrieved."
+            )
 
-        if not results:
-            return "No search results found for this query."
+        # ── non-success: report status outside result numbering ───────────
+        if outcome.status != "success":
+            return self._format_failure(outcome, config)
+
+        results = [_to_search_result(r) for r in outcome.results]
 
         # Time-range filter (post-hoc for providers without native support)
         if config.time_range != "any":
@@ -229,22 +244,30 @@ class WebSearch:
         argument = self._backend_argument(query, config, adapter_id)
         return await entry.backend.invoke(SEARCH_OPERATION, argument, {})
 
-    async def _search_provider(self, query: str, config: SearchConfig) -> list[SearchResult]:
-        """Dispatch to the configured search provider through the registry."""
-        outcome = await self.search_outcome(query, config)
-        if outcome.status != "success":
-            return [SearchResult(
-                title=f"{config.provider.title()} Error",
-                url="",
-                snippet=(
-                    f"{config.provider} search did not succeed "
-                    f"(status={outcome.status}"
-                    + (f", code={outcome.error_code}" if outcome.error_code else "")
-                    + ")."
-                ),
-                source="error",
-            )]
-        return [_to_search_result(r) for r in outcome.results]
+    # ── failure formatting (criterion 4) ─────────────────────────────────
+
+    def _format_failure(self, outcome: SearchOutcome, config: SearchConfig) -> str:
+        """Format a non-success outcome: status outside result numbering.
+
+        Returns a context string with a typed failure header and *zero*
+        numbered results.  The typed outcome (status, error_code, attempts)
+        is preserved for Discovery/Council consumers.
+        """
+        parts: list[str] = [
+            f"Web Search: {config.provider} search did not succeed.",
+            f"Status: {outcome.status}",
+        ]
+        if outcome.error_code:
+            parts.append(f"Code: {outcome.error_code}")
+        if outcome.attempts:
+            for a in outcome.attempts:
+                parts.append(
+                    f"Attempt: provider={a.provider} transport={a.transport} "
+                    f"status={a.status}"
+                    + (f" code={a.error_code}" if a.error_code else "")
+                )
+        parts.append("No search results retrieved.")
+        return "\n".join(parts)
 
     def _backend_argument(self, query: str, config: SearchConfig, adapter_id: str) -> dict:
         """The argument mapping handed to a search backend."""

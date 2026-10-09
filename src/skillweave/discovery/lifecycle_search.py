@@ -204,12 +204,26 @@ async def resolve_search_outcome(
     same facade.
     """
     resolved_id = adapter_id_for(provider, mcp_command=mcp_command, adapter_id=adapter_id)
+    spec = ADAPTER_SPEC.get(resolved_id)
+
+    # ── Derive credential_availability from the spec's credential_refs ─────
+    # If the caller supplied an explicit credential_availability it wins;
+    # otherwise we derive it from the spec and the api_key argument so that
+    # a provider with a credential_ref but no api_key is reported as "missing"
+    # before any live call.
+    effective_credential_avail = credential_availability
+    if effective_credential_avail is None and spec is not None and spec.credential_refs:
+        effective_credential_avail = {
+            ref: ("available" if api_key else "missing")
+            for ref in spec.credential_refs
+        }
+
     facade = facade_for(
         resolved_id,
         registry=registry,
         allow_network=allow_network,
         endpoint_allowlist=endpoint_allowlist,
-        credential_availability=credential_availability,
+        credential_availability=effective_credential_avail,
         extra_adapters=extra_adapters,
     )
     argument: dict[str, Any] = {
@@ -217,7 +231,6 @@ async def resolve_search_outcome(
         "max_results": max_results,
         "api_key": api_key,
     }
-    spec = ADAPTER_SPEC.get(resolved_id)
     if spec is not None and spec.transport == "mcp-stdio":
         argument["command"] = list(mcp_command) if mcp_command else None
         argument["env_allowlist"] = tuple(mcp_env_allowlist)
@@ -226,6 +239,6 @@ async def resolve_search_outcome(
         operation=SEARCH_OPERATION,
         argument=argument,
         adapter_id=resolved_id,
-        credential_availability=credential_availability,
+        credential_availability=effective_credential_avail,
         endpoint=endpoint_for(resolved_id),
     )

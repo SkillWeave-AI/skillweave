@@ -1,24 +1,46 @@
-# Contract CI — Cross-Repository Contract Validation (SW-160-CONTRACT-003)
+# Contract CI — Cross-Repository Contract Validation
 #
-# Validates the contract boundary between SkillWeave Core, the SDK, and
-# external consumers:
+# Original: SW-160-CONTRACT-003. Requalified by SW-1510-SDK-CI.
 #
-#   1. SDK and Core pin a full tested SHA / exact version.
-#   2. Every SDK schema and every Core fixture is actually validated.
-#   3. An intentional one-byte SDK schema drift makes the consumer gate red.
-#   4. The tested-combination manifest checks exact Core SHA, SDK SHA, SDK
-#      version and canonical digest — not only non-null values.
-#   5. Contract CI does not depend on an unpublished local checkout.
+# This workflow validates the contract boundary between SkillWeave Core, the
+# SDK, and external consumers:
 #
-# The SDK is resolved from its pinned version in pyproject.toml, cloned from
-# the published Forgejo (contract authority) or GitHub (read-only mirror)
-# source and recorded as tag plus full commit SHA — never from a sibling
-# checkout or unpublished path.
+#   1. The SDK pin, the installed wheel's schema path, its canonical digest and
+#      its ownership inventory are one consistent combination.
+#   2. A fresh external consumer is green; a single declared schema drift makes
+#      the consumer gate red on a *specific* assertion; restoration is green.
+#   3. The gate records the dependency origins, the runner's declared
+#      Python/platform compatibility, any collection error and every justified
+#      skip. A historical allow-list of pre-existing failures is a pardon list,
+#      never a clean release certificate.
+#
+# What SW-1510-SDK-CI repaired (source-confirmed contradictions):
+#   * the consumer gate looked for ``<sdk>/schemas/*.schema.json`` while the SDK
+#     ships ``skillweave_sdk/schemas/**`` and has no root ``schemas/``;
+#   * the canonical digest it compared against was a flat-only string that
+#     matches neither the SDK's own algorithm nor the installed wheel;
+#   * the ownership inventory lived only in an unpublished source tree.
+# The authoritative gate is now ``tests/unit/test_1510_sdk_ci.py``, which runs
+# against the *installed wheel* built from the pinned SDK.
 #
 # SW-1591-CI-001: the "Resolve pinned SDK version" inline Python is indented to
 # the block scalar's own indentation. Commit 16e95d5 fixed exactly these six
 # lines; without them YAML parsing stops at the `import re` line and the whole
 # workflow never runs (a false-green boundary).
+#
+# Publication hold: the published SDK tag ``v0.2.0`` predates the frozen
+# execution/adapter contract set, so the gate pins the *qualified commit*
+# (SDK_QUALIFIED_SHA) rather than the tag. The pin MUST be a commit whose wheel
+# ships the ownership payload INSIDE the installed package: the wheel at
+# ``a663a947`` carries no ``skillweave_sdk/_authority`` files at all, and the
+# wheel at ``bc86910`` ships them as a ``.data/data`` payload that a real
+# ``pip install`` lands at ``<sys.prefix>/skillweave_sdk/_authority`` (and drops
+# under ``--target``), so ``importlib.resources.files("skillweave_sdk") /
+# "_authority"`` finds nothing and the gate is RED at that pin. The pin is
+# therefore the SDK head that ships the inventory as installed package data.
+# When an authorized publisher cuts a tag that carries the frozen set,
+# SDK_QUALIFIED_SHA may be replaced by that tag. This lane cannot publish; it
+# can only name the qualified combination.
 
 name: Contract CI — Cross-Repo Contract Validation
 
@@ -28,6 +50,20 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The exact SDK commit qualified against the Core frozen canonical digest.
+  # This must be a commit whose wheel ships skillweave_sdk/_authority INSIDE
+  # the installed package. a663a947 ships no payload; bc86910 ships it as a
+  # .data/data payload that a real pip install places outside the package, so
+  # the gate would be red at either pin.
+  SDK_QUALIFIED_SHA: "7688f665669fc1be35ae40c70ecf3870518a9d23"
+  # The frozen canonical digest of the full schema set (flat + execution +
+  # adapter), computed with the SDK's own algorithm over the installed wheel.
+  QUALIFIED_DIGEST: "3dd247f604017bac4ff37ff4f3e9b46c5d1bc48fc8ef225de88ec4b6d14d2e64"
 
 jobs:
   contract-ci:
@@ -44,7 +80,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pytest PyYAML jsonschema referencing
+          # `python -m build --no-isolation` runs the SDK's build backend in
+          # this interpreter, so the PEP 639 floor the SDK declares
+          # (setuptools>=77) must be present here, not fetched into an isolated
+          # env that --no-isolation deliberately skips.
+          pip install pytest PyYAML jsonschema referencing build "setuptools>=77" wheel
 
       - name: Resolve pinned SDK version from pyproject.toml
         id: sdk-pin
@@ -60,15 +100,14 @@ jobs:
             echo "::error::Could not resolve skillweave-sdk pin from pyproject.toml"
             exit 1
           fi
-          echo "SDK pin: v${SDK_PIN}"
+          echo "SDK pin: ${SDK_PIN}"
           echo "version=${SDK_PIN}" >> "$GITHUB_OUTPUT"
 
-      - name: Check out pinned SDK from a published source
+      - name: Check out the qualified SDK from a published source
         env:
           SDK_VERSION: ${{ steps.sdk-pin.outputs.version }}
         run: |
           set -eu
-          TAG="v${SDK_VERSION}"
           # Published sources, in authority order: Forgejo is canonical, the
           # GitHub mirror is read-only distribution. No sibling checkout, no
           # unpublished local path.
@@ -76,12 +115,11 @@ jobs:
           CLONED=0
           for SOURCE in ${SOURCES}; do
             rm -rf /tmp/skillweave-sdk
-            # Prefer an exact tag clone; fall back to a shallow clone plus
-            # checkout for sources where the tag is not the default branch tip.
-            if git clone --depth 1 --branch "${TAG}" "${SOURCE}" /tmp/skillweave-sdk 2>/dev/null; then
-              CLONED=1
-            elif git clone --depth 50 "${SOURCE}" /tmp/skillweave-sdk 2>/dev/null &&
-                 git -C /tmp/skillweave-sdk checkout "${TAG}" 2>/dev/null; then
+            # Clone enough history to reach the qualified commit, then check
+            # it out. A tag is recorded alongside for provenance, but the pin
+            # is the exact commit: the tag may lag the frozen contract set.
+            if git clone "${SOURCE}" /tmp/skillweave-sdk 2>/dev/null &&
+               git -C /tmp/skillweave-sdk checkout "${SDK_QUALIFIED_SHA}" 2>/dev/null; then
               CLONED=1
             fi
             if [ "${CLONED}" -eq 1 ]; then
@@ -90,28 +128,22 @@ jobs:
             fi
           done
           if [ "${CLONED}" -ne 1 ]; then
-            echo "::error::SDK tag ${TAG} not found on any published source"
+            echo "::error::qualified SDK commit ${SDK_QUALIFIED_SHA} not found on any published source"
             exit 1
           fi
           SDK_SHA="$(git -C /tmp/skillweave-sdk rev-parse HEAD)"
+          if [ "${SDK_SHA}" != "${SDK_QUALIFIED_SHA}" ]; then
+            echo "::error::checked-out SDK ${SDK_SHA} is not the qualified ${SDK_QUALIFIED_SHA}"
+            exit 1
+          fi
           SDK_REMOTE="$(git -C /tmp/skillweave-sdk remote get-url origin)"
-          echo "SDK checked out at: ${TAG} -> ${SDK_SHA}"
+          SDK_TAG="$(git -C /tmp/skillweave-sdk describe --tags --exact-match 2>/dev/null || echo '(no exact tag)')"
+          echo "SDK checked out at: ${SDK_SHA}"
           echo "SKILLWEAVE_SDK_DIR=/tmp/skillweave-sdk" >> "$GITHUB_ENV"
-          echo "SKILLWEAVE_SDK_TAG=${TAG}" >> "$GITHUB_ENV"
           echo "SKILLWEAVE_SDK_SHA=${SDK_SHA}" >> "$GITHUB_ENV"
           echo "SKILLWEAVE_SDK_REMOTE=${SDK_REMOTE}" >> "$GITHUB_ENV"
-
-      - name: Record SDK tag and full commit SHA
-        run: |
-          set -eu
-          echo "### Contract CI — pinned SDK" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| field | value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| tag | ${SKILLWEAVE_SDK_TAG} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| commit | ${SKILLWEAVE_SDK_SHA} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| remote | ${SKILLWEAVE_SDK_REMOTE} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| core | $(git rev-parse HEAD) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "SKILLWEAVE_SDK_TAG=${SDK_TAG}" >> "$GITHUB_ENV"
+          echo "SKILLWEAVE_SDK_PIN=${SDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Verify SDK is from a published source (not a local checkout)
         run: |
@@ -126,17 +158,80 @@ jobs:
               ;;
           esac
 
-      - name: Run cross-repo contract CI tests
-        env:
-          SKILLWEAVE_SDK_DIR: /tmp/skillweave-sdk
+      - name: Record dependency origins and declared compatibility
         run: |
-          python3 -m pytest tests/integration/test_cross_repo_contract_ci.py \
-            -v --tb=short 2>&1
+          set -eu
+          echo "### Contract CI — qualified combination" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| field | value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| core commit | $(git rev-parse HEAD) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| sdk source (origin) | ${SKILLWEAVE_SDK_REMOTE} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| sdk qualified commit | ${SKILLWEAVE_SDK_SHA} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| sdk tag | ${SKILLWEAVE_SDK_TAG} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| sdk pin (pyproject) | skillweave-sdk==${SKILLWEAVE_SDK_PIN} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| frozen canonical digest | ${QUALIFIED_DIGEST} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| runner python | $(python3 -V 2>&1) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| runner platform | $(uname -srm) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          # The compatibility the *gate* runs on and the compatibility Core
+          # *declares* are both recorded, so a mismatch is visible.
+          echo "Core declared compatibility:" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import re, tomllib
+          data = tomllib.load(open("pyproject.toml", "rb"))
+          proj = data["project"]
+          print(f"- requires-python: {proj.get('requires-python')}")
+          for c in proj.get("classifiers", []):
+              if c.startswith("Programming Language :: Python"):
+                  print(f"- classifier: {c}")
+          PY
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tool origins:" >> "$GITHUB_STEP_SUMMARY"
+          pip show pytest jsonschema referencing PyYAML \
+            | awk '/^Name:|^Version:|^Location:/ {print "- " $0}' >> "$GITHUB_STEP_SUMMARY"
 
-  # SW-1591-CI-001 AC5: prove that a one-byte SDK schema drift turns an
-  # external-consumer run red under the same shell and workflow commands as the
-  # green job above. This job must fail (the drift is intentional); a green run
-  # here means the drift went undetected and Contract CI is false-green.
+      - name: Run the cross-repo contract gate
+        run: |
+          set -eu
+          # --continue-on-collection-errors: a collection error must be recorded
+          #   as an ERROR node, never abort the run with every test "passed".
+          # -rs: justified skips are printed with their reason.
+          set +e
+          python3 -m pytest tests/unit/test_1510_sdk_ci.py \
+            -v --tb=short -rs --continue-on-collection-errors -p no:cacheprovider \
+            2>&1 | tee /tmp/contract-gate.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "### Contract CI — gate result"
+            echo ""
+            echo '```'
+            grep -E "collected|passed|failed|error|skipped|ERROR|FAILED|SKIPPED" /tmp/contract-gate.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # The pytest EXIT CODE is the decisive verdict: a collection error, a
+          # failure, and an unexpected skip-with-error all make it non-zero. The
+          # grep below is a belt-and-braces name for the *collection* shape so a
+          # reader of the log sees the specific cause. Newer pytest prints the
+          # collection-error summary as ``ERROR tests/...`` (an ERROR node, which
+          # the first pattern covers) and, on older/unformatted output, as an
+          # ``_____ ERROR collecting <node> _____`` banner, which the second
+          # pattern covers. Either way the run is red on the exit code alone.
+          if grep -qE "^(ERROR|FAILED) |^_+ ERROR collecting" /tmp/contract-gate.log; then
+            echo "::error::the contract gate recorded a collection error or failure"
+            exit 1
+          fi
+          if [ "${RC}" -ne 0 ]; then
+            echo "::error::contract gate failed (pytest exit ${RC})"
+            exit 1
+          fi
+
+  # SW-1510-SDK-CI criterion 2: prove that a *declared* schema drift turns an
+  # external-consumer run red on a SPECIFIC assertion under the same shell and
+  # workflow as the green job above. This job must fail (the drift is
+  # intentional); a green run here means the drift went undetected and Contract
+  # CI is false-green.
   drift-counterproof:
     runs-on: ubuntu-latest
     steps:
@@ -151,73 +246,69 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pytest PyYAML jsonschema referencing
+          pip install pytest PyYAML jsonschema referencing build "setuptools>=77" wheel
 
-      - name: Check out pinned SDK from a published source
+      - name: Check out the qualified SDK from a published source
         run: |
           set -eu
-          SDK_PIN="$(python3 -c "
-          import re
-          with open('pyproject.toml') as f:
-              text = f.read()
-          m = re.search(r'\"skillweave-sdk==([^\"]+)\"', text)
-          print(m.group(1) if m else '')
-          ")"
-          if [ -z "${SDK_PIN}" ]; then
-            echo "::error::Could not resolve skillweave-sdk pin from pyproject.toml"
-            exit 1
-          fi
-          TAG="v${SDK_PIN}"
-          for SOURCE in git@git.langevc.com:skillweave/skillweave-sdk.git https://github.com/LangeVC/skillweave-sdk.git; do
+          SOURCES="git@git.langevc.com:skillweave/skillweave-sdk.git https://github.com/LangeVC/skillweave-sdk.git"
+          CLONED=0
+          for SOURCE in ${SOURCES}; do
             rm -rf /tmp/skillweave-sdk
-            if git clone --depth 1 --branch "${TAG}" "${SOURCE}" /tmp/skillweave-sdk 2>/dev/null; then
-              break
-            elif git clone --depth 50 "${SOURCE}" /tmp/skillweave-sdk 2>/dev/null &&
-                 git -C /tmp/skillweave-sdk checkout "${TAG}" 2>/dev/null; then
-              break
+            if git clone "${SOURCE}" /tmp/skillweave-sdk 2>/dev/null &&
+               git -C /tmp/skillweave-sdk checkout "${SDK_QUALIFIED_SHA}" 2>/dev/null; then
+              CLONED=1
             fi
+            [ "${CLONED}" -eq 1 ] && break
           done
-          if [ ! -d /tmp/skillweave-sdk/schemas ]; then
-            echo "::error::SDK tag ${TAG} not found on any published source"
+          if [ "${CLONED}" -ne 1 ]; then
+            echo "::error::qualified SDK commit ${SDK_QUALIFIED_SHA} not found on any published source"
             exit 1
           fi
           echo "SKILLWEAVE_SDK_DIR=/tmp/skillweave-sdk" >> "$GITHUB_ENV"
 
-      - name: Inject one-byte drift into a published SDK schema
+      - name: Inject one declared drift into a frozen SDK schema
         run: |
           set -eu
-          TARGET="/tmp/skillweave-sdk/schemas/run-state.schema.json"
+          TARGET="/tmp/skillweave-sdk/src/skillweave_sdk/schemas/run-state.schema.json"
+          if [ ! -f "${TARGET}" ]; then
+            echo "::error::frozen schema not found at ${TARGET}"
+            exit 1
+          fi
           echo "Before: $(sha256sum "${TARGET}" | cut -d' ' -f1)"
-          # One byte, appended: the drift a consumer must not miss. The schema
-          # stays parseable so the failure is a validation failure, not a
-          # JSON parse error.
+          # A *declared* contract drift: one schema-semantic key added. The
+          # canonical digest is over the sorted-key canonical JSON, so a bare
+          # whitespace/byte edit is not a contract change — the drift must be a
+          # declared schema edit, and it stays parseable so the failure is a
+          # digest failure, not a JSON error.
           python3 - "${TARGET}" <<'PY'
-          import sys, pathlib
+          import json, pathlib, sys
           p = pathlib.Path(sys.argv[1])
-          data = p.read_bytes()
-          p.write_bytes(data + b"\n")
+          doc = json.loads(p.read_text(encoding="utf-8"))
+          doc["$comment"] = "SW-1510-SDK-CI declared drift"
+          p.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           PY
           echo "After:  $(sha256sum "${TARGET}" | cut -d' ' -f1)"
 
-      - name: Assert the drifted consumer run is red
+      - name: Assert the drifted consumer run is red on the specific digest assertion
         run: |
           set -eu
           export SKILLWEAVE_SDK_DIR=/tmp/skillweave-sdk
           # The canonical-digest check covers every schema byte, so it is red
-          # for exactly one reason here: the file we just appended a byte to.
-          # That isolates the proof to the drift instead of riding on any
+          # for exactly one reason here: the schema we just edited. Targeting
+          # --k isolates the proof to the drift instead of riding on any
           # pre-existing red elsewhere in the suite.
           set +e
-          python3 -m pytest tests/integration/test_cross_repo_contract_ci.py \
-            -q -p no:randomly \
-            -k test_every_sdk_schema_byte_matches_the_pinned_canonical_digest 2>&1
+          python3 -m pytest tests/unit/test_1510_sdk_ci.py \
+            -q -p no:cacheprovider \
+            -k test_canonical_digest_algorithm_matches_installed_bytes 2>&1
           RC=$?
           set -e
           if [ "${RC}" -eq 0 ]; then
             echo "::error::Drifted SDK passed the consumer gate — false green"
             exit 1
           fi
-          echo "Drift counterproof: one-byte drift detected, consumer gate red (pytest exit ${RC})"
+          echo "Drift counterproof: declared schema drift detected, consumer gate red (pytest exit ${RC})"
           echo "### Contract CI — drift counterproof" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "A one-byte append to schemas/run-state.schema.json turned the consumer gate red (pytest exit ${RC})." >> "$GITHUB_STEP_SUMMARY"
+          echo "A declared edit to src/skillweave_sdk/schemas/run-state.schema.json turned the consumer gate red (pytest exit ${RC}) on test_canonical_digest_algorithm_matches_installed_bytes." >> "$GITHUB_STEP_SUMMARY"

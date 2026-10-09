@@ -31,10 +31,13 @@ absence is a *reported state*, never an import-time crash.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import shlex
 import sqlite3
+import sys
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -231,6 +234,225 @@ def require_scoped_bind(
     return effective_host, token
 
 
+# ---------------------------------------------------------------------------
+# Per-request scoped HTTP enforcement (SW-1510-MCP-AUTH criterion 3)
+# ---------------------------------------------------------------------------
+#
+# ``require_scoped_bind`` validates the *bind* (loopback, token present) before
+# any server is built. That is necessary but **not sufficient**: a token checked
+# only at startup does not authenticate a *request*. This section enforces the
+# scope token on **every** HTTP request, before any MCP handling, and binds the
+# authenticated principal into the per-operation authority so the per-tool
+# gating sees an authenticated principal over HTTP (not only over stdio).
+
+#: The WWW-Authenticate challenge returned with a 401. It names no token and
+#: echoes nothing the caller sent.
+WWW_AUTHENTICATE = "Bearer"
+
+#: The refusal record body for a failed HTTP authentication. It is a constant:
+#: it never carries the presented token, the expected token or any host detail.
+HTTP_UNAUTHENTICATED_BODY = b'{"error":"unauthenticated","code":"http_unauthenticated"}'
+
+
+class HttpRequestUnauthorized(Exception):
+    """An HTTP request failed the per-request scope-token check.
+
+    Raised by the request guard so the transport returns ``401`` with a
+    ``WWW-Authenticate`` challenge and no MCP handling runs. ``reason`` is a
+    short, token-free diagnostic for the operator's own logs.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def strip_bearer_scheme(header: str) -> str:
+    """The token from an ``Authorization`` header value (any case), else ``""``.
+
+    ``Authorization: Bearer <token>`` is the scheme this surface issues. A bare
+    token (no scheme) is accepted for operator-facing clients that send one; an
+    absent header yields ``""``. It never raises on a malformed header -- a
+    malformed credential is simply an absent one.
+    """
+    value = (header or "").strip()
+    if not value:
+        return ""
+    if " " in value:
+        scheme, _, rest = value.partition(" ")
+        if scheme.lower() == "bearer":
+            return rest.strip()
+        # An unrecognized scheme is not a credential this surface issued.
+        return ""
+    return value
+
+
+def bearer_token_from_headers(headers: Mapping[str, Any]) -> str:
+    """The bearer token from a request's headers (case-insensitive lookup)."""
+    if not headers:
+        return ""
+    getter = getattr(headers, "get", None)
+    value = ""
+    if callable(getter):
+        # Starlette/ASGI headers are case-insensitive; a plain dict is not.
+        value = headers.get("authorization") or headers.get("Authorization") or ""
+    return strip_bearer_scheme(str(value))
+
+
+def tokens_match(presented: str, expected: str) -> bool:
+    """Constant-time token comparison (never short-circuits on length)."""
+    if not presented or not expected:
+        return False
+    return hmac.compare_digest(presented, expected)
+
+
+def check_http_authorization(headers: Mapping[str, Any], token: str) -> str:
+    """Return the request's bearer token, or refuse with a token-free 401.
+
+    The per-request half of the scoped HTTP contract: a missing or wrong token
+    is refused *before* any MCP handling. Constant-time comparison; the
+    presented value is never logged or echoed.
+    """
+    presented = bearer_token_from_headers(headers)
+    if not presented:
+        raise HttpRequestUnauthorized("missing bearer token")
+    if not tokens_match(presented, token):
+        raise HttpRequestUnauthorized("invalid bearer token")
+    return presented
+
+
+#: The session authority a served HTTP request resolves its principal against.
+#: Bound once at serve time (``bind_http_authority``); the request middleware
+#: verifies the presented token and binds the principal for the call. Process-
+#: local, never the wire.
+_HTTP_AUTHORITY: Any = None
+
+
+def bind_http_authority(authority: Any) -> Any:
+    """Bind the authority the HTTP request middleware authenticates against."""
+    global _HTTP_AUTHORITY
+    _HTTP_AUTHORITY = authority
+    return authority
+
+
+def http_authority() -> Any:
+    """The authority bound for the HTTP serving path, or ``None``."""
+    return _HTTP_AUTHORITY
+
+
+#: The authenticated principal for the *current* request. The per-request
+#: middleware sets it; a protected HTTP tool call reads it. A ``ContextVar`` so
+#: concurrent requests never see each other's principal. Reset to ``None``
+#: between requests, so one request can never inherit another's authority.
+_CURRENT_HTTP_PRINCIPAL: "ContextVar[Any]" = ContextVar(
+    "skillweave_http_principal", default=None
+)
+
+#: The presented bearer token for the *current* request. A protected HTTP tool
+#: call resolves its principal from this (the client presents the token on the
+#: Authorization header, not in each tool's arguments). Reset between requests
+#: so a token never leaks across requests; the value is never logged.
+_CURRENT_HTTP_TOKEN: "ContextVar[str]" = ContextVar(
+    "skillweave_http_token", default=""
+)
+
+
+def current_http_principal() -> Any:
+    """The authenticated principal of the current HTTP request, or ``None``."""
+    return _CURRENT_HTTP_PRINCIPAL.get()
+
+
+def current_http_token() -> str:
+    """The bearer token of the current HTTP request (empty outside a request)."""
+    return _CURRENT_HTTP_TOKEN.get()
+
+
+def _load_asgi_http_types():
+    """The Starlette request/response types the HTTP middleware uses.
+
+    Imported lazily: ``starlette`` ships with the optional ``mcp`` dependency,
+    so this module still imports (and its dependency diagnostic still works)
+    where ``starlette`` is absent. ``None`` when unavailable.
+    """
+    try:
+        from starlette.requests import Request as _Request
+        from starlette.responses import PlainTextResponse as _Resp
+    except Exception:  # noqa: BLE001 - absence is a reported state, not a crash
+        return None, None
+    return _Request, _Resp
+
+
+def _make_http_auth_middleware(token: str, *, authority: Any = None):
+    """Build the ASGI middleware enforcing *token* on every request.
+
+    The middleware runs ahead of the MCP app: it authenticates each request,
+    binds the resolved principal for the call (when an *authority* is bound),
+    and only then hands the request to the MCP app. A failure returns ``401``
+    with ``WWW-Authenticate: Bearer`` and a constant body -- no MCP handler is
+    reached and no token is echoed.
+    """
+    request_cls, response_cls = _load_asgi_http_types()
+
+    if request_cls is None:
+        # Without starlette there is no HTTP app to wrap; the caller must have
+        # the same dependency, so this is only reached on a broken install.
+        raise McpDependencyUnavailable(
+            "scoped HTTP serving requires the 'starlette' dependency "
+            "(installed with 'mcp')"
+        )
+
+    class _ScopedHttpAuthMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") != "http":
+                await self.app(scope, receive, send)
+                return
+            request = request_cls(scope)
+            try:
+                presented = check_http_authorization(request.headers, token)
+            except HttpRequestUnauthorized as exc:
+                # No token in the log line; the reason names only the failure.
+                print(
+                    f"skillweave-mcp http refused: {exc.reason}", file=sys.stderr
+                )
+                response = response_cls(
+                    HTTP_UNAUTHENTICATED_BODY.decode("utf-8"),
+                    status_code=401,
+                    headers={"WWW-Authenticate": WWW_AUTHENTICATE},
+                )
+                await response(scope, receive, send)
+                return
+            auth = authority if authority is not None else _HTTP_AUTHORITY
+            # When an authority is bound, resolve the principal the presented
+            # token names and attach it for the call; a token that passed the
+            # comparison but is unknown to the registry is refused. With no
+            # authority bound (direct in-process serving) the token check above
+            # still governs admission and no per-request principal is attached.
+            principal = None
+            if auth is not None:
+                try:
+                    principal = auth.verify_session(presented)
+                except Exception:  # noqa: BLE001 - any failure is unauth
+                    response = response_cls(
+                        HTTP_UNAUTHENTICATED_BODY.decode("utf-8"),
+                        status_code=401,
+                        headers={"WWW-Authenticate": WWW_AUTHENTICATE},
+                    )
+                    await response(scope, receive, send)
+                    return
+            reset_p = _CURRENT_HTTP_PRINCIPAL.set(principal)
+            reset_t = _CURRENT_HTTP_TOKEN.set(presented)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                _CURRENT_HTTP_PRINCIPAL.reset(reset_p)
+                _CURRENT_HTTP_TOKEN.reset(reset_t)
+
+    return _ScopedHttpAuthMiddleware
+
+
 def _load_fastmcp() -> Any:
     """Return the ``mcp.server.fastmcp`` module used to build servers.
 
@@ -299,15 +521,81 @@ def serve(
         raise McpDependencyUnavailable(profile.reason or DEGRADED_REASON)
     loader = fastmcp_factory or _load_fastmcp
     if profile.scoped:
-        effective_host, _token = require_scoped_bind(
+        effective_host, token = require_scoped_bind(
             host, auth_token=auth_token, allow_remote=allow_remote
         )
         effective_port = port or DEFAULT_HTTP_PORT
+        # The scope token authenticates *requests*, not merely the bind. Bind
+        # it into a live session so the request guard can attach an
+        # authenticated principal to each call (the per-tool gating then sees
+        # a principal over HTTP, exactly as it does over stdio).
+        _bind_http_scope_principal(token, effective_host, effective_port)
         server = _build_server(loader())
         _apply_scoped_settings(server, effective_host, effective_port)
+        _install_http_request_guard(server, token)
         server.run(transport="streamable-http")
         return
     _build_server(loader()).run()
+
+
+def _bind_http_scope_principal(token: str, host: str, port: int) -> Any:
+    """Register *token* as the live HTTP-serving principal on a bound authority.
+
+    The request middleware needs a session the presented token resolves to. The
+    server module owns the process authority (:func:`skillweave.mcp.server.
+    bind_authority`); when it is bound we register the scope token there so the
+    authenticated principal carries the controller role and its scoped
+    operations. When no authority is bound (direct in-process serving) this is
+    a no-op -- the request guard still enforces the token, but there is no
+    per-operation principal to attach, and the tool-level gate remains the
+    unbound direct-caller path. Returns the authority, or ``None``.
+    """
+    try:
+        from skillweave.mcp import server as _server
+    except Exception:  # noqa: BLE001 - never fatal to serving
+        return None
+    authority = _server.get_authority()
+    if authority is None:
+        return None
+    authority.register_scope_token(
+        token,
+        role="controller",
+        client_id=f"http:{host}:{port}",
+        transport="http",
+        allowed_routes=["skillweave-local"],
+    )
+    bind_http_authority(authority)
+    return authority
+
+
+def _install_http_request_guard(server: Any, token: str) -> None:
+    """Install the per-request bearer guard on *server*'s HTTP surface.
+
+    FastMCP exposes ``streamable_http_app()`` (a Starlette app) and a
+    ``settings`` object carrying middleware hooks. The most portable seam that
+    does **not** reimplement the transport is to wrap the built ASGI app: we
+    expose a guarded ``streamable_http_app`` on the server so the MCP stack
+    builds its app through us. Where the server exposes no such hook (the fake
+    test seam), the wrap is recorded on the server for the contract to observe.
+    """
+    middleware = _make_http_auth_middleware(token, authority=http_authority())
+
+    original = getattr(server, "streamable_http_app", None)
+    if callable(original):
+        def guarded(*args, **kwargs):
+            app = original(*args, **kwargs)
+            return middleware(app)
+
+        try:
+            server.streamable_http_app = guarded
+        except Exception:  # noqa: BLE001 - read-only attr; fall through
+            pass
+    # Record the guard so the serving contract is observable even on a server
+    # whose app is built internally (and for the injected-fake seam).
+    try:
+        server.http_auth_middleware = middleware
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def serve_scoped_http(
@@ -1075,6 +1363,8 @@ __all__ = [
     "DEFAULT_HTTP_PORT",
     "DEGRADED_REASON",
     "HTTP_AUTH_ENV",
+    "HTTP_UNAUTHENTICATED_BODY",
+    "HttpRequestUnauthorized",
     "LEGACY_TOOLS",
     "LOOPBACK_HOSTS",
     "MCP_PROTOCOL_VERSION",
@@ -1087,8 +1377,12 @@ __all__ = [
     "SnapshotVersionRefused",
     "ToolSpec",
     "TransportProfile",
+    "WWW_AUTHENTICATE",
     "artifact_evidence_list",
     "analysis_binding",
+    "bearer_token_from_headers",
+    "bind_http_authority",
+    "check_http_authorization",
     "control_cancel",
     "control_evidence",
     "control_poll",
@@ -1096,8 +1390,11 @@ __all__ = [
     "control_status",
     "control_tool_specs",
     "create_run_payload",
+    "current_http_principal",
+    "current_http_token",
     "default_stream_root",
     "get_run_service",
+    "http_authority",
     "legacy_tool_specs",
     "mcp_available",
     "negotiate_capabilities",
@@ -1109,7 +1406,9 @@ __all__ = [
     "server_capabilities",
     "snapshot_v1",
     "source_binding",
+    "strip_bearer_scheme",
     "structured_error",
+    "tokens_match",
     "tool_schema",
     "transport_profile",
     "unavailable_payload",

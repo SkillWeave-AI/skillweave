@@ -2626,6 +2626,7 @@ class TestRouteDecisionContractCompliance:
         assert len(route_events) >= 1, "no route_decision events found in journal"
 
         # --- 6. Validate every route_decision contract with the SDK validator ---
+        pytest.importorskip("skillweave_sdk.validator")
         import skillweave_sdk.validator as sdk_validator
 
         # Monkey-patch SCHEMA_FILENAMES so load_registry picks up the new schema

@@ -25,6 +25,7 @@ never dressed up as a retrieved source.
 from __future__ import annotations
 
 import asyncio
+import html as html_mod
 import json
 import re
 import urllib.error
@@ -95,6 +96,11 @@ class SearchProviderSpec:
     ``endpoint_host`` is the egress destination the policy allowlist is checked
     against; it is ``None`` for the in-process MCP stdio binding (the child is
     launched locally, and its own network egress is the server's concern).
+
+    ``credential_refs`` are the credential reference ids the adapter's
+    descriptor declares.  The facade checks these against the caller's
+    ``credential_availability`` mapping before the call; a missing credential
+    for a required ref causes a hard refusal.
     """
 
     adapter_id: str
@@ -103,6 +109,7 @@ class SearchProviderSpec:
     capabilities: tuple[str, ...]
     endpoint_host: Optional[str]
     fetcher: Callable[..., Any]
+    credential_refs: tuple[str, ...] = ()
 
 
 # ── provider fetchers (return typed records; raise ProviderCallError) ──────
@@ -153,40 +160,112 @@ async def _in_executor(fn: Callable[[], Any]) -> Any:
     return await loop.run_in_executor(None, fn)
 
 
+def _normalise_tag_quotes(html: str) -> str:
+    """Normalise single quotes to double quotes only inside HTML tags.
+
+    This avoids corrupting apostrophes in title or snippet text content.
+    """
+    def _replace_tag(m: re.Match) -> str:
+        return m.group(0).replace("'", '"')
+    return re.sub(r"<[^>]+>", _replace_tag, html)
+
+
 def _ddg_parse(html: str) -> list[SearchResultRecord]:
-    links = re.findall(
-        r'<a[^>]*class="[^"]*result-link[^"]*"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
-        html,
-        re.DOTALL,
+    """Parse DuckDuckGo Lite HTML into typed search result records.
+
+    Handles multiple DOM variants observed in the Lite page:
+    * ``class=\"result-link\"`` or ``class='result-link'``
+    * ``href`` before or after ``class`` attribute
+    * ``class=\"result-snippet\"`` or ``class='result-snippet'``
+    * ``<a>`` inside a ``<td>`` (standard) or bare ``<a>`` in a result row
+    * paired by table-row proximity -- never separate-list indexing.
+
+    Returns zero records for empty pages, challenge pages or malformed HTML
+    with no parseable results.
+    """
+    # Normalise quotes to double *only inside HTML tags* so apostrophes in
+    # free text (titles, snippets) are never corrupted.
+    normalised = _normalise_tag_quotes(html)
+
+    # --- 1. Detect challenge/empty pages early -------------------------------
+    _challenge_indicators = (
+        "challenge", "captcha", "verify you are human",
+        "please confirm", "unusual traffic",
     )
-    snippets = re.findall(
-        r'<td[^>]*class="[^"]*result-snippet[^"]*"[^>]*>(.*?)</td>',
-        html,
+    lower = normalised.lower()
+    if any(ind in lower for ind in _challenge_indicators) and "result-link" not in normalised:
+        return []
+
+    # --- 2. Extract result rows by scanning for <a class="result-link" --------
+    # Each result is wrapped in a <tr> that contains the link anchor and
+    # may be followed by a sibling <tr> with the snippet.  We use a
+    # pattern that works across attribute order variants:
+    #
+    #   <a [anything] class="result-link" [anything] href="URL" [anything]>TITLE</a>
+    #   <a [anything] href="URL" [anything] class="result-link" [anything]>TITLE</a>
+    #
+    # Use a lookahead to match both "class" and "href" in any order within the
+    # <a> tag, capturing the href and the inner HTML.
+    # Then locate the nearest following result-snippet <td> (same or next row).
+    LINK_RE = re.compile(
+        r'<a\s(?=[^>]*?class="result-link")(?=[^>]*?href="([^"]*)")(?:[^>]*)>(.*?)</a>',
         re.DOTALL,
     )
     out: list[SearchResultRecord] = []
-    for i, (href, title_html) in enumerate(links):
+    for m_link in LINK_RE.finditer(normalised):
+        href = m_link.group(1).strip()
+        title_html = m_link.group(2)
+        link_end = m_link.end()
+
+        # Decode uddg redirect
         url = href
         if "uddg=" in url:
-            m = re.search(r"uddg=([^&]+)", url)
-            if m:
-                url = unquote(m.group(1))
-        if not url.startswith("http"):
+            m_uddg = re.search(r"uddg=([^&]+)", url)
+            if m_uddg:
+                url = unquote(m_uddg.group(1))
+        # HTML-unescape the href so &amp; and other entities are decoded.
+        url = html_mod.unescape(url)
+        if not (url.startswith("http://") or url.startswith("https://")):
             continue
+
         title = re.sub(r"<[^>]+>", "", title_html).strip()
+        # HTML-unescape the title text too.
+        title = html_mod.unescape(title)
+        if not title:
+            continue
+
+        # --- 3. Find the snippet for *this* result only ------------------------
+        # Scan from just after this link's </a> until the next <a with
+        # class="result-link" (or end of string).  This prevents a row that
+        # has no snippet from leaking into the next result's snippet.
         snippet = ""
-        if i < len(snippets):
-            snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip()
-        if title:
-            out.append(
-                SearchResultRecord(
-                    title=title,
-                    url=url,
-                    snippet=snippet[:500],
-                    source="web",
-                    provider="duckduckgo",
-                )
+        after_link = normalised[link_end:]
+        next_link_match = re.search(
+            r'<a\s(?=[^>]*?class="result-link")',
+            after_link,
+        )
+        if next_link_match:
+            snippet_region = after_link[: next_link_match.start()]
+        else:
+            snippet_region = after_link
+        m_snip = re.search(
+            r'<td[^>]*?class="result-snippet"[^>]*>(.*?)</td>',
+            snippet_region,
+            re.DOTALL,
+        )
+        if m_snip:
+            snippet = re.sub(r"<[^>]+>", "", m_snip.group(1)).strip()
+            snippet = html_mod.unescape(snippet)
+
+        out.append(
+            SearchResultRecord(
+                title=title,
+                url=url,
+                snippet=snippet[:500],
+                source="web",
+                provider="duckduckgo",
             )
+        )
     return out
 
 
@@ -198,10 +277,49 @@ async def _fetch_duckduckgo(query: str, opts: Mapping[str, Any]) -> list[SearchR
         req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:  # nosec
-                return resp.read().decode("utf-8", errors="replace")
+                status_code = resp.status
+                if status_code == 429:
+                    raise ProviderCallError(
+                        "HTTP 429 rate limited by DuckDuckGo Lite",
+                        status="blocked", code="http_429",
+                    )
+                if status_code >= 500:
+                    raise ProviderCallError(
+                        f"HTTP {status_code} server error from DuckDuckGo Lite",
+                        status="unavailable", code=f"http_{status_code}",
+                    )
+                raw = resp.read()
+                text = raw.decode("utf-8", errors="replace")
+                # Empty body or whitespace-only is "empty" (no results).
+                if not text.strip():
+                    return ""
+                # HTML challenge pages contain no "result-link" class but may
+                # include a challenge form or captcha.  Detect via size +
+                # known challenge markers.
+                _challenge_markers = (
+                    "challenge", "captcha", "verify you are human",
+                    "please confirm", "unusual traffic", "h-captcha",
+                )
+                lower = text.lower()
+                if any(m in lower for m in _challenge_markers) and "result-link" not in text:
+                    raise ProviderCallError(
+                        "DuckDuckGo Lite returned a challenge/captcha page",
+                        status="blocked", code="challenge",
+                    )
+                return text
         except urllib.error.HTTPError as exc:
+            code = exc.code
+            if code == 429:
+                raise ProviderCallError(
+                    "HTTP 429 rate limited", status="blocked", code="http_429",
+                ) from exc
+            if code >= 500:
+                raise ProviderCallError(
+                    f"HTTP {code} server error", status="unavailable",
+                    code=f"http_{code}",
+                ) from exc
             raise ProviderCallError(
-                f"HTTP {exc.code}", status="blocked", code=f"http_{exc.code}"
+                f"HTTP {code}", status="blocked", code=f"http_{code}",
             ) from exc
         except urllib.error.URLError as exc:
             raise ProviderCallError(
@@ -210,8 +328,25 @@ async def _fetch_duckduckgo(query: str, opts: Mapping[str, Any]) -> list[SearchR
                 code="network_error",
             ) from exc
 
-    html = await _in_executor(_run)
-    return _ddg_parse(html)
+    try:
+        html = await _in_executor(_run)
+    except asyncio.TimeoutError:
+        raise ProviderCallError(
+            "DuckDuckGo Lite request timed out",
+            status="unavailable", code="timeout",
+        )
+
+    # An empty string means no results (empty page) -- return zero records.
+    if not html.strip():
+        return []
+
+    records = _ddg_parse(html)
+    # Filter out unsafe URL schemes from parsed results.
+    safe: list[SearchResultRecord] = []
+    for r in records:
+        if r.url.startswith("http://") or r.url.startswith("https://"):
+            safe.append(r)
+    return safe
 
 
 async def _fetch_serper(query: str, opts: Mapping[str, Any]) -> list[SearchResultRecord]:
@@ -428,6 +563,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="lite.duckduckgo.com",
         fetcher=_fetch_duckduckgo,
+        # DuckDuckGo Lite requires no API key; no credential_ref needed.
     ),
     "serper": SearchProviderSpec(
         adapter_id="serper-search",
@@ -436,6 +572,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="google.serper.dev",
         fetcher=_fetch_serper,
+        credential_refs=("serper_api_key",),
     ),
     "serpapi": SearchProviderSpec(
         adapter_id="serpapi-search",
@@ -444,6 +581,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="serpapi.com",
         fetcher=_fetch_serpapi,
+        credential_refs=("serpapi_api_key",),
     ),
     "tavily": SearchProviderSpec(
         adapter_id="tavily-search",
@@ -452,6 +590,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="api.tavily.com",
         fetcher=_fetch_tavily,
+        credential_refs=("tavily_api_key",),
     ),
     "brave": SearchProviderSpec(
         adapter_id="brave-search",
@@ -460,6 +599,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="api.search.brave.com",
         fetcher=_fetch_brave,
+        credential_refs=("brave_api_key",),
     ),
     "perplexity-mcp": SearchProviderSpec(
         adapter_id="perplexity-search-mcp",
@@ -468,6 +608,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES,
         endpoint_host=None,
         fetcher=_fetch_perplexity_mcp,
+        credential_refs=("perplexity_api_key",),
     ),
     "perplexity-http": SearchProviderSpec(
         adapter_id="perplexity-search-http",
@@ -476,6 +617,7 @@ SEARCH_PROVIDER_SPECS: dict[str, SearchProviderSpec] = {
         capabilities=BASE_SEARCH_CAPABILITIES + (EGRESS_CAPABILITY,),
         endpoint_host="api.perplexity.ai",
         fetcher=_fetch_perplexity_http,
+        credential_refs=("perplexity_api_key",),
     ),
 }
 
@@ -585,6 +727,15 @@ def build_search_registry(
             ),
             transport=spec.transport,
             capabilities=tuple(spec.capabilities),
+            # Only declare credential_refs on the descriptor for egress
+            # transports.  Non-egress transports (e.g. mcp-stdio) handle
+            # credentials at the backend level and must not be gated here,
+            # which would alter substrate default behaviour.
+            credential_refs=(
+                spec.credential_refs
+                if spec.transport in ("http", "https", "http+json", "grpc")
+                else ()
+            ),
         )
         registry.register(descriptor, SearchAdapterBackend(spec), source="builtin_search")
     return registry

@@ -72,6 +72,81 @@ def _free_loopback_port() -> int:
         return sock.getsockname()[1]
 
 
+def _wait_for_port(port: int, *, timeout: float = 30.0) -> None:
+    """Block until *port* accepts a TCP connection (readiness before connect).
+
+    A scoped HTTP server binds asynchronously; a client that connects before it
+    listens gets ``ConnectionError``. Poll instead of racing.
+    """
+    import socket as _socket
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        with _socket.socket() as sock:
+            sock.settimeout(0.5)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                return
+        _time.sleep(0.05)
+    raise AssertionError(f"scoped HTTP server never listened on 127.0.0.1:{port}")
+
+
+def _asgi_get(app, headers: dict) -> tuple:
+    """Drive one ASGI ``GET`` through *app*, returning (status, headers, body).
+
+    A minimal, dependency-free driver: it runs the ASGI app to completion on a
+    fresh event loop and collects the response start/body messages. Starlette
+    is the only dependency and ships with ``mcp``; no live socket is opened.
+    """
+    import asyncio as _asyncio
+
+    raw = [
+        (k.lower().encode("latin-1"), v.encode("latin-1"))
+        for k, v in headers.items()
+    ]
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "root_path": "",
+        "headers": raw,
+        "server": ("127.0.0.1", 8765),
+        "client": ("127.0.0.1", 51234),
+    }
+    messages: list = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    loop = _asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(app(scope, receive, send))
+    finally:
+        loop.close()
+
+    status = 0
+    out_headers: dict = {}
+    body = b""
+    for message in messages:
+        if message["type"] == "http.response.start":
+            status = message["status"]
+            out_headers = {
+                k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in message.get("headers", [])
+            }
+        elif message["type"] == "http.response.body":
+            body += message.get("body", b"")
+    return status, out_headers, body
+
+
 class _FakeSettings:
     """The ``settings`` object a FastMCP-shaped server exposes."""
 
@@ -775,6 +850,181 @@ class TestScopedHttpServingPath:
 
 
 # ===========================================================================
+# Criterion 3: the scope token is enforced on EVERY HTTP request (per-request)
+# ===========================================================================
+
+
+class _FakeStreamableServer(_FakeServer):
+    """A FastMCP-shaped server that also exposes ``streamable_http_app``."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.streamable_calls = 0
+
+        async def _app(scope, receive, send):
+            # A stand-in for the MCP app: any request that reaches it "executes".
+            self.reached = getattr(self, "reached", 0) + 1
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": []}
+            )
+            await send({"type": "http.response.body", "body": b"mcp"})
+
+        self._app = _app
+
+    def streamable_http_app(self, *args, **kwargs):  # noqa: D401 - mirrors real
+        self.streamable_calls += 1
+        return self._app
+
+
+class _FakeStreamableModule:
+    """A ``mcp.server.fastmcp`` stand-in whose servers expose the HTTP app."""
+
+    def __init__(self) -> None:
+        self.servers: list = []
+
+    def FastMCP(self, name):  # noqa: N802 - mirrors the real attribute name
+        server = _FakeStreamableServer(name)
+        self.servers.append(server)
+        return server
+
+
+class TestScopedHttpPerRequestEnforcement:
+    """The scope token authenticates *requests*, not merely the bind.
+
+    These drive the real ASGI request guard via a dependency-free ASGI driver:
+    no token executes the MCP app; the good token does, with its authenticated
+    principal attached. The live end-to-end proof (a real server over a real
+    socket) is ``TestTransportNegotiation.test_real_scoped_http_*`` and skips
+    without the real ``mcp`` package.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_http_globals(self):
+        """No test leaks the process-wide HTTP authority or request context."""
+        previous_authority = control._HTTP_AUTHORITY
+        control._HTTP_AUTHORITY = None
+        try:
+            yield
+        finally:
+            control._HTTP_AUTHORITY = previous_authority
+            control._CURRENT_HTTP_PRINCIPAL.set(None)
+            control._CURRENT_HTTP_TOKEN.set("")
+
+    @pytest.fixture
+    def bound_authority(self):
+        from skillweave.runtime.authority import MCPPrincipalAuthority
+
+        auth = MCPPrincipalAuthority()
+        auth.register_scope_token(
+            "tok", client_id="http:127.0.0.1:8765", transport="http",
+        )
+        return auth
+
+    def test_good_token_reaches_the_app_with_its_principal(self, bound_authority):
+        reached = {}
+
+        async def inner(scope, receive, send):
+            reached["principal"] = control.current_http_principal()
+            reached["token"] = control.current_http_token()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        middleware = control._make_http_auth_middleware(
+            "tok", authority=bound_authority
+        )
+        status, _headers, body = _asgi_get(
+            middleware(inner), {"Authorization": "Bearer tok"}
+        )
+        assert status == 200
+        assert body == b"ok"
+        # The authenticated principal (role read from the registry) is bound
+        # for the call, and the presented token is visible to the tool gate.
+        assert reached["principal"] is not None
+        assert reached["principal"].role == "controller"
+        assert reached["token"] == "tok"
+        # No request in scope => no leaked principal/token across requests.
+        assert control.current_http_principal() is None
+        assert control.current_http_token() == ""
+
+    def test_wrong_token_is_refused_before_any_mcp_handling(self, bound_authority):
+        async def inner(scope, receive, send):  # pragma: no cover - must not run
+            raise AssertionError("the MCP app must not be reached without a token")
+
+        middleware = control._make_http_auth_middleware(
+            "tok", authority=bound_authority
+        )
+        status, headers, body = _asgi_get(
+            middleware(inner), {"Authorization": "Bearer WRONG"}
+        )
+        assert status == 401
+        assert headers.get("www-authenticate") == "Bearer"
+        # The refusal body echoes neither the presented nor the expected token.
+        assert b"WRONG" not in body and b"tok" not in body
+
+    def test_missing_token_is_refused_before_any_mcp_handling(self, bound_authority):
+        async def inner(scope, receive, send):  # pragma: no cover - must not run
+            raise AssertionError("the MCP app must not be reached without a token")
+
+        middleware = control._make_http_auth_middleware(
+            "tok", authority=bound_authority
+        )
+        status, headers, _body = _asgi_get(middleware(inner), {})
+        assert status == 401
+        assert headers.get("www-authenticate") == "Bearer"
+
+    def test_a_bare_token_header_is_accepted(self, bound_authority):
+        reached = {}
+
+        async def inner(scope, receive, send):
+            reached["ok"] = True
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        middleware = control._make_http_auth_middleware(
+            "tok", authority=bound_authority
+        )
+        status, _headers, _body = _asgi_get(middleware(inner), {"Authorization": "tok"})
+        assert status == 200 and reached.get("ok") is True
+
+    def test_a_token_unknown_to_the_authority_is_refused(self):
+        """Even a matching string is refused when the authority does not know it."""
+        from skillweave.runtime.authority import MCPPrincipalAuthority
+
+        empty = MCPPrincipalAuthority()  # knows no token
+
+        async def inner(scope, receive, send):  # pragma: no cover - must not run
+            raise AssertionError("an unknown token must not reach the app")
+
+        middleware = control._make_http_auth_middleware("tok", authority=empty)
+        status, _headers, _body = _asgi_get(
+            middleware(inner), {"Authorization": "Bearer tok"}
+        )
+        assert status == 401
+
+    def test_install_guard_wraps_the_streamable_http_app(self, bound_authority):
+        module = _FakeStreamableModule()
+        control.serve(
+            "http", host="127.0.0.1", port=8765, auth_token="tok",
+            fastmcp_factory=lambda: module,
+        )
+        server = module.servers[0]
+        # The built server carries the request guard...
+        assert callable(getattr(server, "http_auth_middleware", None))
+        # ...and its ``streamable_http_app`` is wrapped so the running transport
+        # cannot bypass it: a no-token request is refused with 401 and the
+        # underlying MCP app is never reached.
+        guarded = server.streamable_http_app()
+        status, headers, _body = _asgi_get(guarded, {})
+        assert status == 401
+        assert headers.get("www-authenticate") == "Bearer"
+        assert getattr(server, "reached", 0) == 0, "MCP app ran without a token"
+        # The good token passes through to the MCP app exactly once.
+        status2, _h2, body2 = _asgi_get(guarded, {"Authorization": "Bearer tok"})
+        assert status2 == 200 and body2 == b"mcp"
+        assert server.reached == 1
+
+
+# ===========================================================================
 # Criterion 3: stdio + scoped HTTP transports, experimental Tasks negotiation
 # ===========================================================================
 
@@ -842,6 +1092,28 @@ class TestTransportNegotiation:
         assert built is not None
         assert getattr(built, "name", control.SERVER_NAME) == control.SERVER_NAME
 
+    @requires_real_mcp
+    def test_real_stdio_refuses_cleanly_without_a_supervisor_identity(self, tmp_path):
+        """Start the REAL stdio server with no supervisor identity.
+
+        Without ``SKILLWEAVE_MCP_SUPERVISOR`` the production stdio entry must
+        refuse: a one-line actionable diagnostic on stderr and the documented
+        non-zero exit code -- never a bare traceback. (Runs only where the real
+        ``mcp`` package is importable; skipped with a named reason otherwise.)
+        """
+        env = _child_env()
+        env.pop(mcp_server.SUPERVISOR_ENV, None)
+        proc = subprocess.run(
+            [sys.executable, "-B", "-m", "skillweave.mcp.server"],
+            capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=60,
+        )
+        assert proc.returncode == mcp_server.EXIT_REFUSED
+        assert mcp_server.SUPERVISOR_ENV in proc.stderr
+        assert "supervisor" in proc.stderr.lower()
+        # A friendly refusal, not a crash: no exception traceback.
+        assert "Traceback" not in proc.stderr
+        assert "refused" in proc.stderr.lower()
+
     def test_real_stdio_transport_initialize_and_list(self, tmp_path):
         """Drive the *real* product server over a real stdio MCP transport.
 
@@ -858,9 +1130,13 @@ class TestTransportNegotiation:
             "import asyncio, os\n"
             "from mcp import ClientSession\n"
             "from mcp.client.stdio import stdio_client, StdioServerParameters\n"
+            "# SW-1510-MCP-AUTH: a real local stdio launcher names the explicit\n"
+            "# supervisor identity the server now requires.\n"
+            "server_env = dict(os.environ)\n"
+            "server_env['SKILLWEAVE_MCP_SUPERVISOR'] = os.environ['SUP']\n"
             "params = StdioServerParameters(\n"
             "    command=os.environ['PY'], args=['-B', '-m', 'skillweave.mcp.server'],\n"
-            "    env=dict(os.environ), cwd=os.environ['WORK'])\n"
+            "    env=server_env, cwd=os.environ['WORK'])\n"
             "async def main():\n"
             "    async with stdio_client(params) as (r, w):\n"
             "        async with ClientSession(r, w) as s:\n"
@@ -873,6 +1149,7 @@ class TestTransportNegotiation:
         env = _child_env()
         env["PY"] = sys.executable
         env["WORK"] = str(tmp_path)
+        env["SUP"] = "supervisor:ops-stdio"
         proc = subprocess.run(
             [sys.executable, "-B", str(driver)],
             capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120,
@@ -934,6 +1211,10 @@ class TestTransportNegotiation:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         try:
+            # The server binds asynchronously; poll for readiness before the
+            # client connects, else the client races the listener and fails
+            # with httpx.ConnectError.
+            _wait_for_port(port)
             proc = subprocess.run(
                 [sys.executable, "-B", str(client_driver)],
                 capture_output=True, text=True, env=env, cwd=str(tmp_path),
@@ -956,6 +1237,82 @@ class TestTransportNegotiation:
         )
         assert "Run not found" in out["CALL"]
 
+    @requires_real_mcp
+    def test_real_scoped_http_transport_enforces_token_per_request(self, tmp_path):
+        """The scope token authenticates *every* request, not merely the bind.
+
+        A real scoped HTTP server is started on a loopback port; a real HTTP
+        client then sends three requests to ``/mcp``: with no token, with a
+        wrong token and with the good token. The first two are refused with
+        ``401`` and a ``WWW-Authenticate: Bearer`` challenge *before* any MCP
+        handling (so no tool can execute -- the guard runs ahead of the MCP
+        app, proven in-process by ``test_wrong_token_is_refused_before_any_mcp
+        _handling``); the good token is admitted past the guard (the endpoint
+        no longer answers ``401``). Skips -- naming the missing package -- when
+        the real ``mcp`` package is not importable.
+        """
+        if not control.mcp_available():
+            pytest.skip("real 'mcp' package not importable on this host")
+        pytest.importorskip("mcp")
+        port = _free_loopback_port()
+        token = "test-scope-token"
+        server_code = (
+            "from skillweave.mcp import control\n"
+            f"control.serve_scoped_http(host='127.0.0.1', port={port}, "
+            f"auth_token={token!r})\n"
+        )
+        client_driver = tmp_path / "http_probe.py"
+        client_driver.write_text(
+            "import os\n"
+            "import httpx\n"
+            "URL = os.environ['URL']\n"
+            "TOK = os.environ['TOK']\n"
+            "with httpx.Client(timeout=10.0) as c:\n"
+            "    none = c.post(URL, json={})\n"
+            "    wrong = c.post(URL, json={}, headers={'Authorization': 'Bearer WRONG-TOKEN'})\n"
+            "    good = c.post(URL, json={}, headers={'Authorization': 'Bearer ' + TOK})\n"
+            "print('NONE', none.status_code, none.headers.get('www-authenticate', ''))\n"
+            "print('WRONG', wrong.status_code, wrong.headers.get('www-authenticate', ''))\n"
+            "print('GOOD', good.status_code)\n"
+            "print('LEAK_NONE', TOK in none.text or 'WRONG-TOKEN' in none.text)\n"
+            "print('LEAK_WRONG', TOK in wrong.text or 'WRONG-TOKEN' in wrong.text)\n"
+        )
+        env = _child_env()
+        env["URL"] = f"http://127.0.0.1:{port}/mcp"
+        env["TOK"] = token
+        server = subprocess.Popen(
+            [sys.executable, "-B", "-c", server_code],
+            env=env, cwd=str(tmp_path),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            _wait_for_port(port)
+            proc = subprocess.run(
+                [sys.executable, "-B", str(client_driver)],
+                capture_output=True, text=True, env=env, cwd=str(tmp_path),
+                timeout=120,
+            )
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=10)
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        out = dict(
+            ln.split(" ", 1) for ln in proc.stdout.splitlines() if " " in ln
+        )
+        # No token and a wrong token are both refused, with the challenge.
+        assert out["NONE"].split()[0] == "401"
+        assert out["NONE"].split()[1].lower() == "bearer"
+        assert out["WRONG"].split()[0] == "401"
+        assert out["WRONG"].split()[1].lower() == "bearer"
+        # The good token is admitted past the guard (the endpoint no longer 401s).
+        assert out["GOOD"] != "401"
+        # No refusal echoes the presented or expected token.
+        assert out["LEAK_NONE"] == "False"
+        assert out["LEAK_WRONG"] == "False"
 
 # ===========================================================================
 # SW-1510-ROUTE-LOCK Finding 3: route_proof enforcement at MCP entrypoints
@@ -1066,6 +1423,33 @@ class TestMCPRouteProofEnforcement:
             methodology="ralph",
             task_id="t-server-route-proof",
             attempt=1,
+            route_proof=wrong_revision_fixture,
+        )
+        result = json.loads(result_json)
+        assert "error" in result, (
+            f"server.create_run with wrong-revision route_proof must return "
+            f"error, got {result}"
+        )
+        assert "route_lock" in result.get("error", "") or "revision" in result.get("error", "") or "HOLD" in result.get("error", ""), (
+            f"error message must mention route_lock/revision/HOLD, got {result}"
+        )
+
+    def test_server_create_run_forwards_route_proof_with_session_token(self, tmp_path, wrong_revision_fixture):
+        """The ``server.create_run`` tool forwards route_proof with session_token."""
+        db = str(tmp_path / "store.db")
+        art = str(tmp_path / "artifacts")
+        result_json = mcp_server.create_run(
+            tool="opencode",
+            model="byteplus/deepseek-v4-flash",
+            subject_repo="skillweave",
+            subject_commit="d34dbeef" * 5,
+            command=f"{sys.executable} -c print(4242)",
+            db_path=db,
+            artifacts_path=art,
+            methodology="ralph",
+            task_id="t-server-route-proof-auth",
+            attempt=1,
+            session_token="",
             route_proof=wrong_revision_fixture,
         )
         result = json.loads(result_json)
