@@ -766,9 +766,13 @@ class TestScopedHttpServingPath:
         # Host/port are taken from the scoped settings, not left undefined.
         assert server.settings.host == "127.0.0.1"
         assert server.settings.port == 8765
-        # The server carries the product name and the six legacy tools.
+        # The server carries the product name and the *complete* served
+        # surface -- the legacy six plus the SW-1510-MCP-AGENTS tools -- in
+        # registration order (legacy first, then the agents tools).
         assert server.name == control.SERVER_NAME
-        assert [fn.__name__ for fn in server.registered] == list(control.LEGACY_TOOLS)
+        assert [fn.__name__ for fn in server.registered] == [
+            *control.LEGACY_TOOLS, *control.MCP_AGENT_TOOLS,
+        ]
 
     def test_scoped_http_default_bind_is_loopback(self):
         """With no host/port named, the default bind is loopback, never wildcard."""
@@ -1159,9 +1163,10 @@ class TestTransportNegotiation:
             ln.split(" ", 1) for ln in proc.stdout.splitlines() if " " in ln
         )
         assert out["INIT"] == control.SERVER_NAME
-        assert out["TOOLS"] == (
-            "cancel_run,create_run,get_evidence,resume_run,review_run,status_run"
-        )
+        # The served surface is the legacy six *plus* the SW-1510-MCP-AGENTS
+        # durable handoff/mailbox tools (mailbox_*, agent_capabilities), read
+        # from the one place the surface is enumerated rather than re-listed.
+        assert out["TOOLS"] == ",".join(control.mcp_tool_names())
 
     def test_real_scoped_http_transport_initialize_list_and_call(self, tmp_path):
         """Drive the *real* product server over scoped Streamable HTTP.
@@ -1232,9 +1237,8 @@ class TestTransportNegotiation:
             ln.split(" ", 1) for ln in proc.stdout.splitlines() if " " in ln
         )
         assert out["INIT"] == control.SERVER_NAME
-        assert out["TOOLS"] == (
-            "cancel_run,create_run,get_evidence,resume_run,review_run,status_run"
-        )
+        # Same full served surface over the scoped HTTP transport as over stdio.
+        assert out["TOOLS"] == ",".join(control.mcp_tool_names())
         assert "Run not found" in out["CALL"]
 
     @requires_real_mcp

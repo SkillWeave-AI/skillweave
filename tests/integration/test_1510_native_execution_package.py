@@ -48,6 +48,7 @@ import pytest  # noqa: E402
 _SEQ_ROOT = _SRC.parents[3]
 
 try:  # noqa: SIM105 - a hard import error becomes a module-wide skip.
+    from skillweave.mcp import control  # noqa: F401
     from skillweave.runsvc import RunApplicationService, RunIntegrationError
     from skillweave.runtime.stream import DurableStreamStore
     from skillweave.runtime.snapshot import progress_frames
@@ -709,9 +710,11 @@ def test_real_mcp_transport_initialize_call_and_status(tmp_path):
         if " " in ln
     }
     assert lines["INIT"] == "SkillWeave 1.26.0"
-    assert lines["TOOLS"] == (
-        "cancel_run,create_run,get_evidence,resume_run,review_run,status_run"
-    )
+    # The full served surface: the legacy six plus the SW-1510-MCP-AGENTS
+    # durable handoff/mailbox tools, taken from the one place the served
+    # surface is enumerated (``control``). The wire form is the sorted
+    # comma-joined tool names (the driver prints exactly that).
+    assert lines["TOOLS"] == ",".join(control.mcp_tool_names())
     # (a) A client-supplied command is refused over the real transport; the
     # ethical refusal carries no run id (nothing was launched).
     assert lines["CMDREFUSE"] == "command_injection_refused False"

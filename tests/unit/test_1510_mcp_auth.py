@@ -383,6 +383,8 @@ class TestEveryToolIsGated:
         self, authority, tmp_path
     ):
         db, _root = _make_run(tmp_path, "run-1")
+        from skillweave.mcp import control as _control
+
         calls = {
             "create_run": lambda: mcp_server.create_run(
                 "cli", "m", "repo", "commit", command="true", db_path=db,
@@ -394,7 +396,18 @@ class TestEveryToolIsGated:
             "review_run": lambda: mcp_server.review_run(
                 "run-1", "pass", "ok", db_path=db
             ),
+            # SW-1510-MCP-AGENTS: the durable handoff/mailbox tools are gated at
+            # the same seam as the legacy six -- an unauthenticated principal is
+            # refused before any mailbox is opened.
+            "mailbox_post": lambda: mcp_server.mailbox_post(
+                kind="handoff", recipient="worker-1",
+            ),
+            "mailbox_read": lambda: mcp_server.mailbox_read(recipient="worker-1"),
+            "mailbox_replay": lambda: mcp_server.mailbox_replay(recipient="worker-1"),
+            "mailbox_ack": lambda: mcp_server.mailbox_ack("m-1"),
+            "agent_capabilities": lambda: mcp_server.agent_capabilities(),
         }
+        assert set(calls) == set(_control.LEGACY_TOOLS) | set(_control.MCP_AGENT_TOOLS)
         for name, call in calls.items():
             record = _assert_typed_refusal(call(), "unauthenticated")
             assert record["status"] == "refused", name
