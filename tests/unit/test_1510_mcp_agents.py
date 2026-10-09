@@ -26,9 +26,11 @@ produced records round-trip through the pinned contract.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parent.parent.parent / "src"
@@ -108,6 +110,25 @@ def _msg(**kw):
 
 def _mailbox(tmp_path, name="m.jsonl"):
     return AgentMailbox(str(tmp_path / name))
+
+
+# --- top-level workers for the real process-race stress (must be picklable) -
+
+
+def _worker_post_distinct(path, prefix, count, barrier):
+    """Post ``count`` distinct ids, releasing all workers at one barrier."""
+    mb = AgentMailbox(path)
+    barrier.wait(timeout=60)
+    for i in range(count):
+        mb.post(_msg(message_id=f"{prefix}-{i}", run_id="r", attempt=1))
+
+
+def _worker_post_same(path, message_id, count, barrier):
+    """Post the *same* id ``count`` times across racing workers."""
+    mb = AgentMailbox(path)
+    barrier.wait(timeout=60)
+    for _ in range(count):
+        mb.post(_msg(message_id=message_id, run_id="r", attempt=1))
 
 
 # ===========================================================================
@@ -373,6 +394,180 @@ class TestIdempotentReconnect:
     def test_cursor_round_trips(self):
         cursor = MailboxCursor(after_seq=7, last_digest="abc")
         assert MailboxCursor.decode(cursor.encode()) == cursor
+
+
+class TestConcurrentDelivery:
+    """Criterion 2 under a real thread race *and* a real process race.
+
+    ``post()`` does a read-check-append; without a lock that is a non-atomic
+    read-modify-write and N concurrent deliveries of one id create N records
+    with a reused ``seq``. These tests reproduce the race (threads, forked
+    processes via multiprocessing) and prove the fix: exactly one record per id,
+    ``seq`` strictly ``1..N`` with no gaps or reuse, and no durable work lost on
+    resume.
+    """
+
+    def _assert_seqs(self, path):
+        mb = AgentMailbox(path)
+        records = mb._load()
+        seqs = [int(r["seq"]) for r in records]
+        assert sorted(seqs) == list(range(1, len(records) + 1)), seqs
+        return records
+
+    def test_thread_race_on_one_id_yields_exactly_one_record(self, tmp_path):
+        path = str(tmp_path / "mb.jsonl")
+        barrier = threading.Barrier(20)
+        errors = []
+
+        def worker():
+            mb = AgentMailbox(path)
+            barrier.wait()
+            try:
+                for _ in range(3):
+                    mb.post(_msg(message_id="same", run_id="r", attempt=1))
+            except Exception as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors
+        records = self._assert_seqs(path)
+        assert len(records) == 1
+        assert records[0]["seq"] == 1
+
+    def test_thread_race_on_distinct_ids_yields_a_gapfree_total_order(self, tmp_path):
+        path = str(tmp_path / "mb.jsonl")
+        workers_n, per = 20, 5  # 100 distinct ids
+        barrier = threading.Barrier(workers_n)
+        errors = []
+
+        def worker(w):
+            mb = AgentMailbox(path)
+            barrier.wait()
+            try:
+                for i in range(per):
+                    mb.post(_msg(message_id=f"w{w}-{i}", run_id="r", attempt=1))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(w,)) for w in range(workers_n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors
+        records = self._assert_seqs(path)
+        assert len(records) == workers_n * per
+        ids = {r["message_id"] for r in records}
+        assert len(ids) == workers_n * per  # no id duplicated or lost
+
+    def test_process_race_on_one_id_yields_exactly_one_record(self, tmp_path):
+        path = str(tmp_path / "mb.jsonl")
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(8)
+        procs = [
+            ctx.Process(target=_worker_post_same, args=(path, "same", 3, barrier))
+            for _ in range(8)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=120)
+        assert [p.exitcode for p in procs] == [0] * 8
+        # Re-open fresh and validate only after every writer has exited.
+        records = self._assert_seqs(path)
+        assert len(records) == 1
+        assert records[0]["seq"] == 1
+
+    def test_process_race_on_distinct_ids_yields_a_gapfree_total_order(self, tmp_path):
+        path = str(tmp_path / "mb.jsonl")
+        ctx = multiprocessing.get_context("spawn")
+        workers_n, per = 8, 6  # 48 distinct ids
+        barrier = ctx.Barrier(workers_n)
+        procs = [
+            ctx.Process(target=_worker_post_distinct, args=(path, f"p{w}", per, barrier))
+            for w in range(workers_n)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=120)
+        assert [p.exitcode for p in procs] == [0] * workers_n
+        records = self._assert_seqs(path)
+        assert len(records) == workers_n * per
+        assert len({r["message_id"] for r in records}) == workers_n * per
+
+    def test_the_real_mcp_tool_is_idempotent_under_a_thread_race(self, tmp_path, authority):
+        # Exercise the *actual consumer* -- the MCP tool a client invokes --
+        # not the mailbox directly. Each call re-opens the server-owned mailbox,
+        # so this proves the inter-process lock (not a per-instance thread lock)
+        # is what makes the tool idempotent.
+        token = authority.issue_session(role="controller", client_id="A", transport="stdio")
+        barrier = threading.Barrier(16)
+        results = []
+        errors = []
+
+        def caller():
+            barrier.wait()
+            try:
+                for _ in range(3):
+                    out = json.loads(mcp_server.mailbox_post(
+                        kind="handoff", recipient="worker-1", message_id="mcp-id",
+                        run_id="run-1", attempt=1, session_token=token,
+                    ))
+                    results.append(out)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=caller) for _ in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors
+        seqs = {r["message"]["seq"] for r in results if r["status"] == "posted"}
+        assert seqs == {1}
+        replayed = json.loads(mcp_server.mailbox_replay(
+            recipient="worker-1", session_token=token,
+        ))
+        assert len(replayed["messages"]) == 1
+        assert [r["seq"] for r in replayed["messages"]] == [1]
+
+    def test_a_cursor_resume_never_skips_a_concurrently_written_record(self, tmp_path):
+        # Accept the first record, then let racing writers add the rest; a
+        # resume from the accepted cursor must deliver *every* later record and
+        # skip none (the collision the finding reproduced).
+        path = str(tmp_path / "mb.jsonl")
+        mb = AgentMailbox(path)
+        mb.post(_msg(message_id="m0", run_id="r", attempt=1))
+        seen = mb.read(recipient="worker-1", principal="mcp:controller:A")
+        token = seen[-1]["resume_token"]
+        barrier = threading.Barrier(12)
+        errors = []
+
+        def worker(w):
+            m = AgentMailbox(path)
+            barrier.wait()
+            try:
+                for i in range(4):
+                    m.post(_msg(message_id=f"r{w}-{i}", run_id="r", attempt=1))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(w,)) for w in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors
+        resumed = mb.read(
+            recipient="worker-1", principal="mcp:controller:A", resume_token=token,
+        )
+        assert len(resumed) == 12 * 4  # nothing skipped
+        assert "m0" not in {m["message_id"] for m in resumed}  # nothing re-delivered
 
 
 # ===========================================================================

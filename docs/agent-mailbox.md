@@ -55,7 +55,13 @@ agent tool at an arbitrary path.
   stored record and appends nothing; the same id with *different* content fails
   closed (`MessageMismatchRefused`, `code="message_id_mismatch"`). The
   server-assigned `created_at` is excluded from the identity digest, so a
-  re-delivery of the same logical message is idempotent.
+  re-delivery of the same logical message is idempotent. The **whole**
+  read-check-append runs under an exclusive inter-process `flock` on a sidecar
+  `<mailbox>.lock` file (plus a `threading.Lock` for the thread race), so N
+  concurrent deliveries of one id — racing threads, forked processes, or
+  separate processes on the host — resolve to exactly one record; `seq` is
+  assigned under that lock so it is strictly `1..N` with no gaps or reuse, and
+  the appended line is `fsync`-ed before the lock is released.
 - `AgentMailbox.read` -- pure and cursor-based. `MailboxCursor` pins both the
   sequence (`after_seq`) and the digest of the anchored record, so a mailbox
   that was **truncated or rewritten** under a stale resume token is refused by
@@ -100,7 +106,20 @@ raises rather than defaulting to a wildcard).
 - `agent_capabilities` -- registration/capability attestation; reports each
   client's transports/adapter and the frozen contract version + digest.
 
+## Concurrency
+
+Idempotency must hold under a *real* race, not just sequential retries.
+`tests/unit/test_1510_mcp_agents.py::TestConcurrentDelivery` reproduces the
+thread race (20 threads) and the process race (spawned processes sharing one
+host) on both a single repeated id and many distinct ids, and asserts exactly one
+record per id with `seq` strictly `1..N`, no gap, no reuse — plus that a cursor
+resume after the race skips no record. The same idempotency is proven through
+the **actual MCP tool** `mailbox_post` (each call re-opens the server-owned
+mailbox, so it is the inter-process lock, not a per-instance lock, that is
+exercised).
+
 ## Conformance
 
 `python3 -m pytest tests/unit/test_1510_mcp_agents.py` -- the lane check covering
-all three acceptance criteria, the frozen contract, and the polling fallback.
+all three acceptance criteria, the frozen contract, the polling fallback, and the
+thread/process concurrency guarantees.

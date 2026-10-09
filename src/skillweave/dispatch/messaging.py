@@ -27,14 +27,17 @@ Usage (worker side, in any language)::
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
 import tempfile
+import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Iterator, Mapping, Optional, Sequence
 
 
 #: The environment variable the controller sets for the worker to discover the
@@ -95,10 +98,13 @@ class MessageChannel:
     The channel file is removed when ``close()`` is called or when the
     channel is used as a context manager.
 
-    Thread-safety: the file is opened once for appending; concurrent writes
-    from the same worker process are serialised by the kernel on the
-    underlying file descriptor (append-mode writes are atomic on most
-    platforms up to PIPE_BUF). Multiple workers writing to the same channel
+    Thread-safety: this is a raw at-most-once append sink. The file is opened
+    once for appending; concurrent writes from the same worker process are
+    serialised by the kernel on the underlying file descriptor (append-mode
+    writes are atomic on most platforms up to PIPE_BUF). It provides **no**
+    ``message_id`` de-duplication, no monotonic sequence and no cross-process
+    locking — for durable, addressed, idempotent delivery use
+    :class:`AgentMailbox` instead. Multiple workers writing to the same channel
     file is supported but discouraged — each worker should have its own
     channel for message provenance.
     """
@@ -501,8 +507,13 @@ class AgentMailbox:
       same record and re-reading a cursor range yields identical content;
     * a *missed* MCP notification loses nothing — the consumer resumes from its
       durable cursor token and receives every record it has not yet accepted;
-    * concurrent writers append atomically (single-line writes) and never create
-      a second execution for the same ``message_id``.
+    * concurrent writers append atomically and never create a second execution
+      for the same ``message_id``. The whole read-check-append is serialised
+      under an exclusive inter-process ``flock`` on a sidecar lockfile plus an
+      in-process :class:`threading.Lock`, so both a thread race and a process
+      race in one host resolve to exactly one record; ``seq`` is assigned under
+      that lock and is strictly monotonic (1..N, never reused). See
+      :meth:`post`.
 
     Authority: a consumer reads/acknowledges only messages addressed to its
     ``recipient`` under its scoped ``principal``; the mailbox never reveals a
@@ -511,6 +522,14 @@ class AgentMailbox:
 
     def __init__(self, path: Optional[str] = None) -> None:
         self._path = path or tempfile.mktemp(prefix="sw-mailbox-", suffix=".jsonl")
+        # The sidecar lockfile serialises writers across *processes*; the
+        # in-process lock serialises writers across *threads*. ``flock`` is
+        # per-open-file-description, so each mailbox instance needs its own fd
+        # and its own in-process lock, while every instance on one host
+        # contends for the same lockfile inode.
+        self._lock_path = self._path + ".lock"
+        self._lock_file: Optional[Any] = None
+        self._thread_lock = threading.Lock()
         # Touch the file so a fresh mailbox has a durable home immediately.
         if not os.path.exists(self._path):
             open(self._path, "a", encoding="utf-8").close()
@@ -519,6 +538,25 @@ class AgentMailbox:
     def path(self) -> str:
         """The filesystem path of the durable mailbox."""
         return self._path
+
+    @contextmanager
+    def _exclusive(self) -> Iterator[None]:
+        """Hold the writer lock over a full read-check-append critical section.
+
+        The in-process :class:`threading.Lock` is held first (so two threads in
+        one process never contend on the same fd, which could interleave
+        ``flock`` state), then the inter-process ``flock`` is acquired so a
+        *process* race serialises against every other writer on the host. Both
+        are released on exit, including on error.
+        """
+        with self._thread_lock:
+            if self._lock_file is None:
+                self._lock_file = open(self._lock_path, "a", encoding="utf-8")
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
 
     # -- durable load -------------------------------------------------------
 
@@ -562,28 +600,40 @@ class AgentMailbox:
         delivery cannot create duplicate execution). The same ``message_id``
         with *different* content fails closed with
         :class:`MessageMismatchRefused`.
+
+        The **entire** read-check-append is held under an exclusive
+        inter-process lock (and an in-process lock for threads), so N
+        concurrent deliveries of the same id — whether racing threads in one
+        process, forked processes, or separate processes on the host — resolve
+        to exactly one durable record with one ``seq``. ``seq`` is assigned
+        under that lock from the count of committed records, so it is strictly
+        monotonic with no gaps or reuse. The appended line is ``fsync``-ed
+        before the lock is released, so the record is durable before the next
+        writer observes it.
         """
-        records = self._load()
         digest = message.digest()
-        for record in records:
-            if record.get("message_id") == message.message_id:
-                if record.get("digest") != digest:
-                    raise MessageMismatchRefused(
-                        f"message id {message.message_id!r} was already stored "
-                        f"with different content"
-                    )
-                return record
-        seq = len(records) + 1
-        record = message.to_record(seq)
-        try:
-            with open(self._path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, sort_keys=True) + "\n")
-                fh.flush()
-        except OSError as exc:
-            raise MessageChannelError(
-                f"cannot append to mailbox '{self._path}': {exc}"
-            ) from exc
-        return record
+        with self._exclusive():
+            records = self._load()
+            for record in records:
+                if record.get("message_id") == message.message_id:
+                    if record.get("digest") != digest:
+                        raise MessageMismatchRefused(
+                            f"message id {message.message_id!r} was already "
+                            f"stored with different content"
+                        )
+                    return record
+            seq = len(records) + 1
+            record = message.to_record(seq)
+            try:
+                with open(self._path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record, sort_keys=True) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except OSError as exc:
+                raise MessageChannelError(
+                    f"cannot append to mailbox '{self._path}': {exc}"
+                ) from exc
+            return record
 
     # -- durable, cursor-based read ----------------------------------------
 
@@ -704,15 +754,28 @@ class AgentMailbox:
     # -- lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
-        """No held handle to close; provided for symmetry (idempotent)."""
+        """Release the writer lock handle; idempotent.
+
+        The durable record stays on disk (the mailbox is not consumed); only
+        the sidecar lock descriptor is released.
+        """
+        with self._thread_lock:
+            if self._lock_file is not None:
+                try:
+                    self._lock_file.close()
+                except OSError:
+                    pass
+                self._lock_file = None
 
     def cleanup(self) -> None:
-        """Remove the mailbox file (idempotent). Tests and teardown only."""
-        if self._path and os.path.exists(self._path):
-            try:
-                os.remove(self._path)
-            except OSError:
-                pass
+        """Remove the mailbox + lockfile (idempotent). Tests and teardown only."""
+        self.close()
+        for target in (self._lock_path, self._path):
+            if target and os.path.exists(target):
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
 
     def __enter__(self) -> "AgentMailbox":
         return self
