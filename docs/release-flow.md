@@ -42,3 +42,11 @@ release object on GitHub for this repository, which has a Forgejo canonical.
 - **PyPI** — no publication, no claim. There is no operator-approved PyPI product
   and no credentialed PyPI release contract, so no workflow publishes to PyPI and
   no documentation claims a PyPI distribution.
+
+## Version truth
+
+Which version is *released* (the canonical annotated tag, by its peeled commit)
+versus *candidate*, *installed* or *advertised early* is stated once in
+[docs/version-truth.md](version-truth.md) and checked by
+`scripts/check-version-truth.py`. This file names the flow; that one names the
+version facts.

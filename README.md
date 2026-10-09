@@ -1,26 +1,33 @@
 # SkillWeave
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.5.5-blue)](https://github.com/LangeVC/skillweave/releases/tag/v1.5.5)
+[![Version](https://img.shields.io/badge/version-1.5.9-blue)](https://github.com/LangeVC/skillweave/releases/tag/v1.5.9)
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
-[![Skills](https://img.shields.io/badge/skills-13-blue)](skills/)
+[![Skills](https://img.shields.io/badge/skills-15-blue)](skills/)
 [![Status](https://img.shields.io/badge/status-production--stable-green)](https://github.com/LangeVC/skillweave)
 [![Capacium](https://img.shields.io/badge/Capacium-Install%20via%20cap-0B1020?style=flat-square&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjIwMCA1MCAyNTAgNTAwIj48cGF0aCBmaWxsPSIjRjdGQUZDIiBkPSJNMzA4LjgzLDU5MC40N2wtMzYuMDItMzYuMjQtMjExLjMyLS4wNC0uMDItMjExLjczLTMzLjExLTMzLjk3LDMzLjEtMzIuODMuMDYtMjE1Ljc0LDIxMy43NC0uMDQsMzMuNDQtMzIuOTcsMzIuNzIsMzIuOTUsMjE0LjAxLjA2LjA5LDIxNS42MiwzMi44NSwzMi43Ni0zMi45OCwzMy4xMS4wNywyMTIuNzQtMjEwLjQuMTItMzYuMjMsMzYuMjJaTTMwOS4wNiw1NTQuMzhsNzUuNTktNzYuODQsMTM5LjgzLTE0MS4zMSwyNy43MS0yOC4xNi05MC42NS05MC43Mi0xNTMuMjItMTUzLjE0LTEyMS41MiwxMjAuNTQtOTQuOTMsOTUuNDYtMjguMTIsMjguNDQsMTA0Ljc1LDEwNS41LDc0LjA4LDczLjY2LDY2LjQ3LDY2LjU3Wk0yMTcuMjYsMTE4LjQ0bDMyLjE0LTMyLjAyLTE2Mi41MS0uMDMuMDQsMTYyLjQ4TDIxNy4yNiwxMTguNDRaTTUyOS44OSw4Ni4zNmwtMTYyLjY1LjA2LDE2Mi42MSwxNjIuNDguMDQtMTYyLjUzWk0yMTIuNTksNDk0LjQ4bC04MC41NS04MS44Ny00NS4wMi00NS43Mi0uMTEsMTYyLjA2LDE1OS40Ny0uMDUtMzMuNzktMzQuNDJaTTM2OC4zNSw1MjguOTRoMTYxLjUzcy0uMDUtMTYyLjA0LS4wNS0xYy4wNGwtNTUuMSw1NC45OS0xMDYuMzgsMTA3LjA1WiIvPjxwYXRoIGZpbGw9IiNGOEZBRkMiIGQ9Ik0zMDguODIsNDgwLjA3bC03OS43Ny00Ny43My02Ny4xMi00MC4wNy0uMDItMTcwLjczLDE0Ni43Mi04NC4yNSw2NC44MywzNi44NSw4Mi45Miw0Ny4xNS4wMiwxNzEuNDgtMTQ3LjU5LDg3LjNaTTMyNi41OSwyMzEuNTRjMTYuMDgsNC4zNiwyOS43MywxMy4zOCw0MC40NywyNi4xNmw0OS41OS0yOC40OS0xMDcuNzgtNjIuODEtMTA3LjE3LDYyLjQzLDQ5Ljc1LDI4LjU1YzE4LjI2LTIyLjY2LDQ2Ljk5LTMyLjg0LDc1LjE1LTI1Ljg0Wk0yOTUuODIsMzg2LjQ2Yy00Ny41OS0xMC4yMS03NC45Ni02MC44My01Ny4xOC0xMDYuMzlsLTUwLjktMjkuNjEtLjA4LDEyOC40LDEwOC4wNiw2Mi4zMi4xLTU0LjdWTTMyMS45NSwzODYuNmwuMjgsNTQuNjQsMTA3LjktNjIuMjktLjA1LTEyOC4yNC00OS43NCwyOS4yN2MxMy43MSwzNS41OS41OSw3NS40My0zMS4zOSw5NS43My04LjMyLDUuNzEtMTcuMTgsOC44Ni0yNi45OSwxMC44OFoiLz48L3N2Zz4%3D&labelColor=0B1020&logoColor=F7FAFC)](https://github.com/Capacium/capacium)
 
-**Multi-agent AI skill orchestration — 13 skills, 7 lifecycle phases, any AI coding agent.**
+**Multi-agent AI skill orchestration — 15 skills, 7 lifecycle phases, any AI coding agent.**
 
 SkillWeave orchestrates AI-assisted product development from idea to post-release. It works with Claude Code, Codex, Gemini CLI, Cursor, Windsurf, OpenCode, and any agent that reads Markdown or speaks MCP.
 
 ---
 
-## What's new in 1.5.5
+## What's new in 1.5.9
 
-- Inspect multi-repository worktrees and their ownership before cleanup.
-- Provision exact-base workspaces and release them through explicit receipts.
-- Preview and observe operator dispatches before an ops worker can write.
-- Reject dispatch plans that omit, duplicate, or misassign acceptance criteria.
+- **Contract Authority**: Core validates against the published `skillweave-sdk`
+  0.2.0 contract set, with cross-repo contract CI and a drift counterproof.
+- **Work Contracts & Methodology Registry**: discriminated `SubjectRef`
+  variants and a versioned registry for the REX, Ralph, Gauntlet and Assay
+  methodologies.
+- **Assay methodology**: an append-only
+  PIN → HYPOTHESIS → PROBE → MEASURE → CLASSIFY → REMEDIATE → PASS/HOLD state
+  machine with conservative, moderate and unicorn autonomy policies.
+- **Durable async run lifecycle**: `start`/`inspect`/`kill` with durable state.
 
-See the [1.5.5 changelog](CHANGELOG.md#v155-2026-09-25--workspaces-and-dispatches-you-can-inspect-before-they-act) for the full release contract.
+See the [1.5.9 changelog](CHANGELOG.md#v159-2026-09-30--contract-authority-work-contracts--methodology-registry)
+for the full release contract. Earlier release notes remain in the
+[changelog](CHANGELOG.md) as history.
 
 ---
 
@@ -74,6 +81,14 @@ The wizard asks 5 simple questions and starts the right tool for you.
 
 ## Install
 
+SkillWeave is distributed from source and via **Capacium**. There is **no PyPI
+distribution** for this repository (see [docs/release-flow.md](docs/release-flow.md)):
+installing SkillWeave from PyPI is not a supported install path, and no workflow
+publishes it there.
+
+Install paths, all exercised by the packaging suite
+(`tests/packaging/test_install_provisioning.py`):
+
 ### Via Capacium (recommended)
 
 Works with Claude Desktop, Claude Code, Codex, Gemini CLI, Cursor, Windsurf, OpenCode, and more.
@@ -83,19 +98,58 @@ brew install capacium/tap/capacium
 cap install skillweave
 ```
 
-### Via Python installer
+### From a built wheel
+
+```bash
+python -m pip install ./skillweave-1.5.9-py3-none-any.whl
+```
+
+`skillweave` declares `requires-python >=3.9`; Python 3.9 is the supported
+floor. See [docs/provisioning.md](docs/provisioning.md) for the tested-Python
+matrix and the full offline/venv/`uv`/`pipx` flows.
+
+### From a source checkout (editable, for development)
 
 ```bash
 git clone https://github.com/LangeVC/skillweave.git
-cd SkillWeave
-python3 -m skillweave.installer --interactive
+cd skillweave
+pip install -e .
 ```
 
-### Via pip
+### Optional: MCP server
+
+The Model Context Protocol server is an **optional extra**, never a base
+dependency. The base install runs without it and reports an actionable hint if
+the server is requested while absent:
 
 ```bash
-pip install skillweave
+python -m skillweave.scripts.check_optional_capability mcp
+# -> missing; remedy: pip install 'skillweave[mcp]'
 ```
+
+Add it explicitly when you want the real server:
+
+```bash
+pip install 'skillweave[mcp]'
+```
+
+### Providers, credentials and the zero-key default
+
+Search is served through six providers, one of which needs **no credential**:
+
+- **DuckDuckGo Lite** is the **zero-key default** — no API key, no account.
+- **Serper / SerpApi / Tavily / Brave / Perplexity** are keyed providers,
+  selected by name. Each reads its key from the environment:
+  `SERPER_API_KEY`, `SERPAPI_API_KEY`, `TAVILY_API_KEY`, `BRAVE_API_KEY`,
+  `PERPLEXITY_API_KEY`. No key is ever required to *install* SkillWeave.
+
+Honest zero-key failure behavior: if a **keyed** provider is selected and its
+credential is absent, the call **fails closed** with an explicit
+`<ENV_VAR> not set` / missing-credential refusal — it is never silently served
+by DuckDuckGo. An unrecognised provider name likewise fails closed.
+
+`envctl` is optional convenience (if present); SkillWeave performs no component
+and does not require it.
 
 ---
 
@@ -104,7 +158,7 @@ pip install skillweave
 ```
 Layer 0 — Wizard          /skillweave start         (5 questions, routes to skill)
 Layer 1 — Meta-Commands   /skillweave plan|build|…  (7 commands, maps to skills)
-Layer 2 — Direct Skills   /skillweave-blueprint …   (13 skills, full control)
+Layer 2 — Direct Skills   /skillweave-blueprint …   (15 skills, full control)
 ```
 
 ### 7-Phase Lifecycle
@@ -125,10 +179,16 @@ Discovery → Blueprint → Design → Build → Release → Launch → Post-Rel
 
 **Global skills** (available in any phase): lifecycle, repo-health, observe, council
 
-### 13 Skills
+### 15 Skills
+
+The set below is the exact `skills/*/capability.yaml` inventory; the
+machine check in `scripts/check-version-truth.py` fails if this list and the
+on-disk inventory drift apart.
 
 | Skill | Type | Description |
 |-------|------|-------------|
+| `skillweave-entry` | facade | Entry-point facade — start, continue, inspect or onboard via the shared EntryService |
+| `skillweave-onboarding` | plan | Operator onboarding — role, purpose, autonomy, risk boundary; durable profile |
 | `skillweave-lifecycle` | plan | Phase navigation, planning board, testing, wizard, reports |
 | `skillweave-discovery` | plan | Problem exploration, user research, 11 prompts |
 | `skillweave-blueprint` | plan | Structured PRD creation with complexity assessment |
@@ -253,25 +313,49 @@ capability-based (`target_agent: any`); any retained host-specific invocation
 lives under `references/adapters/<host>.md` as a non-binding adapter example.
 
 Stable, host-neutral Command/Intent semantics and full cross-transport
-(Command ⇄ MCP/Intent) parity are **1.4.0 scope** and are not implemented in
-the current release.
+(Command ⇄ MCP/Intent) parity were scoped as **1.4.0 scope**. (Historical note:
+that line was written against the 1.4.0 train; this README does not restate a
+current-release status for it.)
 
 ---
 
 ## Free / Studio
 
-SkillWeave is **Forever Free** — all 13 skills, all 7 phases, no limits.
+SkillWeave is **Forever Free** — all 15 skills, all 7 phases, no limits.
 
 **SkillWeave Studio** (coming soon) adds advanced and team features:
 
 | Free | Studio |
 |------|--------|
-| 13 skills, 7 phases | Everything in Free |
+| 15 skills, 7 phases | Everything in Free |
 | Testing pyramid | Webhook/event hooks |
 | Planning board | Team collaboration |
 | Wizard + meta-commands | Analytics dashboard |
 | Council deliberation | Priority support |
 | Reports + documentation | Custom skill authoring |
+
+---
+
+## Version truth
+
+Version labels on this page distinguish four facts, which are **not** one
+number. The declared, machine-checked inventory is
+[docs/version-truth.md](docs/version-truth.md), verified by
+`scripts/check-version-truth.py`:
+
+| Fact | Meaning | Current value |
+|------|---------|---------------|
+| **candidate** | `[project].version` in `pyproject.toml` (the source of truth) and the bundle `capability.yaml` | `1.5.9` |
+| **released** | the latest canonical annotated product tag, by its **peeled commit** | `v1.5.9` → `11a6fe7…` |
+| **installed** | the distribution metadata of a local install (`importlib.metadata`) | `1.5.9` (may be absent) |
+| **advertised early** | a version named but not yet released | `1.5.10` (work in progress; **not** released) |
+
+The version badge above advertises the **released** fact. Candidate `1.5.10` is
+in progress and is deliberately **not** presented as released. Historical
+versions (for example the `1.4.0` note in *Host-Neutral Scope*) appear only as
+explicitly historical statements. See
+[docs/version-truth.md](docs/version-truth.md) for the full rule, the
+peeled-tag policy and the provenance of each figure.
 
 ---
 
