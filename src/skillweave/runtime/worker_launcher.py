@@ -48,6 +48,25 @@ PROTECTED_STORE_NAMES: tuple[str, ...] = (
 READ_PROTECTED_STORE_NAMES: frozenset[str] = frozenset({"observer_signing"})
 
 
+def _is_loopback(host: str) -> bool:
+    """Return True when *host* is a loopback address (SBPL-confinable).
+
+    macOS Seatbelt (``sandbox-exec``) only accepts ``"*"`` or
+    ``"localhost"`` as the host part of a ``remote ip`` or ``remote tcp``
+    rule.  Loopback addresses (``127.0.0.1``, ``::1``, ``localhost``, and
+    the full ``127.0.0.0/8`` range) map to ``localhost`` in the profile.
+    Any non-loopback host cannot be expressed, and the caller must HOLD
+    before admission.
+    """
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return True
+    try:
+        from ipaddress import ip_address
+        return ip_address(host).is_loopback
+    except (ValueError, ImportError):
+        return False
+
+
 class IsolationUnavailableError(RuntimeError):
     """No real isolation adapter is available; the protected path fails closed.
 
@@ -188,7 +207,17 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
             return False
         return probe.returncode == 0 and probe.stdout.strip() == b"ok"
 
-    def build_profile(self, writable_scope: Path, protected: ProtectedStores) -> str:
+    def build_profile(self, writable_scope: Path, protected: ProtectedStores,
+                      *,
+                      allowed_egress_host: str = "",
+                      allowed_egress_port: int = 0) -> str:
+        """Build a Seatbelt sandbox profile.
+
+        When *allowed_egress_host* and *allowed_egress_port* are set, the
+        profile allows outbound TCP to only that address (SW-1510-ROUTE-LOCK
+        criterion 2).  Without them, the default ``(deny default)`` still
+        denies all network by virtue of not explicitly allowing any.
+        """
         lines = ["(version 1)", "(deny default)", "(allow process*)"]
         lines.append("(allow sysctl-read)")
         lines.append("(allow mach-lookup)")
@@ -198,6 +227,43 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
         lines.append(f'(allow file-write* (subpath "{writable_scope}"))')
         for literal in ('"/dev/null"', '"/dev/stdout"', '"/dev/stderr"'):
             lines.append(f"(allow file-write-data (literal {literal}))")
+        # SW-1510-ROUTE-LOCK: network confinement — allow only the approved
+        # gateway host:port.  Without this the default ``(deny default)``
+        # blocks all network, which is safe but breaks legitimate gateway
+        # access.
+        if allowed_egress_host and allowed_egress_port:
+            lines.append(
+                f'(allow network-outbound '
+                f'(remote ip "localhost:{allowed_egress_port}"))'
+            )
+        return "\n".join(lines)
+
+    def build_egress_profile(self, host: str, port: int) -> str:
+        """Build a standalone Seatbelt profile for network egress only.
+
+        Allows outbound TCP to only *host:port* plus minimal process
+        machinery.  Used when wrapping a child without a full worker-
+        protection window (e.g. the route-proof async path).
+
+        File access is broadly allowed since this profile is strictly
+        about *network* confinement — the child must read its binary,
+        libraries, and any data files to function.
+        """
+        lines = ["(version 1)", "(deny default)", "(allow process*)"]
+        lines.append("(allow sysctl-read)")
+        lines.append("(allow mach-lookup)")
+        lines.append("(allow file-read*)")
+        lines.append('(allow file-write* (subpath "/dev/null") '
+                     '(subpath "/dev/stdout") (subpath "/dev/stderr"))')
+        # macOS SBPL accepts only "*" or "localhost" as the host part
+        # of a remote ip / remote tcp rule.  Map loopback addresses to
+        # "localhost"; non-loopback hosts cannot be confined via SBPL
+        # and the caller must HOLD before calling this method.
+        sbpl_host = "localhost" if _is_loopback(host) else host
+        lines.append(
+            f'(allow network-outbound '
+            f'(remote ip "{sbpl_host}:{port}"))'
+        )
         return "\n".join(lines)
 
     def wrap_command(
@@ -206,6 +272,8 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
         *,
         writable_scope: Path,
         protected: ProtectedStores,
+        allowed_egress_host: str = "",
+        allowed_egress_port: int = 0,
     ) -> list[str]:
         sandbox_exec = shutil.which("sandbox-exec")
         if not sandbox_exec:
@@ -213,7 +281,11 @@ class SandboxExecAdapter(WorkerIsolationAdapter):
         return [
             sandbox_exec,
             "-p",
-            self.build_profile(Path(writable_scope), protected),
+            self.build_profile(
+                Path(writable_scope), protected,
+                allowed_egress_host=allowed_egress_host,
+                allowed_egress_port=allowed_egress_port,
+            ),
             *[str(c) for c in command],
         ]
 
@@ -420,11 +492,21 @@ class StoreProtection:
             self.sealed = False
         return False
 
-    def wrap_command(self, command: Sequence[str], *, writable_scope: Path) -> list[str]:
-        """Return the argv to actually spawn (adapter may wrap it)."""
+    def wrap_command(self, command: Sequence[str], *,
+                     writable_scope: Path,
+                     allowed_egress_host: str = "",
+                     allowed_egress_port: int = 0) -> list[str]:
+        """Return the argv to actually spawn (adapter may wrap it).
+
+        When *allowed_egress_host*/*allowed_egress_port* are set, the
+        Seatbelt profile also allows outbound TCP to only that address
+        (SW-1510-ROUTE-LOCK criterion 2, composed WITH the store protection).
+        """
         if isinstance(self.adapter, SandboxExecAdapter):
             return self.adapter.wrap_command(
-                command, writable_scope=writable_scope, protected=self.protected
+                command, writable_scope=writable_scope, protected=self.protected,
+                allowed_egress_host=allowed_egress_host,
+                allowed_egress_port=allowed_egress_port,
             )
         return [str(c) for c in command]
 
@@ -456,4 +538,5 @@ __all__ = [
     "select_adapter",
     "StoreProtection",
     "protect_stores",
+    "_is_loopback",
 ]

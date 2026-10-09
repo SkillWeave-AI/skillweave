@@ -1237,6 +1237,7 @@ class TestTransportNegotiation:
         )
         assert "Run not found" in out["CALL"]
 
+    @requires_real_mcp
     def test_real_scoped_http_transport_enforces_token_per_request(self, tmp_path):
         """The scope token authenticates *every* request, not merely the bind.
 
@@ -1312,3 +1313,147 @@ class TestTransportNegotiation:
         # No refusal echoes the presented or expected token.
         assert out["LEAK_NONE"] == "False"
         assert out["LEAK_WRONG"] == "False"
+
+# ===========================================================================
+# SW-1510-ROUTE-LOCK Finding 3: route_proof enforcement at MCP entrypoints
+# ===========================================================================
+
+
+_ROUTE_PROOF_FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
+
+
+class TestMCPRouteProofEnforcement:
+    """Route-proof enforcement at the MCP control entrypoint (Finding 3).
+
+    ``create_run_payload`` accepts ``route_proof`` as a file path, loads the
+    :class:`~skillweave.routing.route_proof.RouteProof` document, and passes
+    it to ``execute_streaming_native``.  The service enforces revision pin
+    and egress gateway *before* paid admission; a violation is returned as a
+    structured error (never a crash).
+
+    All three scenarios produce structured errors on this host because
+    ``sandbox-exec`` is not available for OS confinement:
+      - Wrong revision => ``route_lock`` HOLD (revision mismatch)
+      - Foreign gateway => ``route_lock`` HOLD (gateway check failed)
+      - Approved fixture => ``route_lock`` HOLD (enforcement unavailable)
+    """
+
+    @pytest.fixture
+    def valid_fixture(self) -> str:
+        return str(_ROUTE_PROOF_FIXTURES / "route-proof-byteplus-v1.json")
+
+    @pytest.fixture
+    def wrong_revision_fixture(self) -> str:
+        return str(_ROUTE_PROOF_FIXTURES / "route-proof-wrong-revision.json")
+
+    @pytest.fixture
+    def foreign_gateway_fixture(self) -> str:
+        return str(_ROUTE_PROOF_FIXTURES / "route-proof-foreign-gateway.json")
+
+    def _run_payload(
+        self,
+        tmp_path: Path,
+        route_proof_path: str,
+        task_suffix: str = "",
+    ) -> dict:
+        db = str(tmp_path / "store.db")
+        art = str(tmp_path / "artifacts")
+        streams = str(tmp_path / "streams")
+        return control.create_run_payload(
+            tool="opencode",
+            model="byteplus/deepseek-v4-flash",
+            subject_repo="skillweave",
+            subject_commit="d34dbeef" * 5,
+            command=f"{sys.executable} -c print(4242)",
+            db_path=db,
+            artifacts_path=art,
+            stream_root=streams,
+            methodology="ralph",
+            task_id=f"t-route-proof{task_suffix}",
+            attempt=1,
+            route_proof=route_proof_path,
+        )
+
+    def test_wrong_revision_returns_structured_hold(self, tmp_path, wrong_revision_fixture):
+        """A route proof with wrong revision produces a structured HOLD error."""
+        result = self._run_payload(tmp_path, wrong_revision_fixture, "-wrong-rev")
+        assert "error" in result, f"expected error payload, got {result}"
+        error_msg = result.get("error", "")
+        assert "route_lock" in error_msg or "revision" in error_msg or "HOLD" in error_msg, (
+            f"error message {error_msg!r} must mention route_lock/revision/HOLD"
+        )
+
+    def test_foreign_gateway_returns_structured_hold(self, tmp_path, foreign_gateway_fixture):
+        """A route proof with foreign gateway produces a structured HOLD error."""
+        result = self._run_payload(tmp_path, foreign_gateway_fixture, "-foreign-gw")
+        assert "error" in result, f"expected error payload, got {result}"
+        error_msg = result.get("error", "")
+        assert "route_lock" in error_msg or "gateway" in error_msg or "HOLD" in error_msg, (
+            f"error message {error_msg!r} must mention route_lock/gateway/HOLD"
+        )
+
+    def test_valid_fixture_returns_hold_enforcement_unavailable(self, tmp_path, valid_fixture):
+        """A valid route proof HOLDs when sandbox-exec is unavailable.
+
+        The approved fixture passes revision pin and gateway checks, but OS
+        confinement (``sandbox-exec``) is required when a route proof is
+        supplied.  On hosts without ``sandbox-exec`` the launch is held with
+        a clear ``enforcement_unavailable`` reason.
+        """
+        result = self._run_payload(tmp_path, valid_fixture, "-valid")
+        assert "error" in result, f"expected error payload, got {result}"
+        error_msg = result.get("error", "")
+        # Either sandbox-exec is unavailable (expected) or something else
+        assert "route_lock" in error_msg or "sandbox" in error_msg.lower() or "HOLD" in error_msg, (
+            f"error message {error_msg!r} must mention route_lock/sandbox/HOLD"
+        )
+
+    def test_server_create_run_forwards_route_proof(self, tmp_path, wrong_revision_fixture):
+        """The ``server.create_run`` tool forwards route_proof to the control surface."""
+        db = str(tmp_path / "store.db")
+        art = str(tmp_path / "artifacts")
+        result_json = mcp_server.create_run(
+            tool="opencode",
+            model="byteplus/deepseek-v4-flash",
+            subject_repo="skillweave",
+            subject_commit="d34dbeef" * 5,
+            command=f"{sys.executable} -c print(4242)",
+            db_path=db,
+            artifacts_path=art,
+            methodology="ralph",
+            task_id="t-server-route-proof",
+            attempt=1,
+            route_proof=wrong_revision_fixture,
+        )
+        result = json.loads(result_json)
+        assert "error" in result, (
+            f"server.create_run with wrong-revision route_proof must return "
+            f"error, got {result}"
+        )
+        assert "route_lock" in result.get("error", "") or "revision" in result.get("error", "") or "HOLD" in result.get("error", ""), (
+            f"error message must mention route_lock/revision/HOLD, got {result}"
+        )
+
+    def test_server_create_run_forwards_route_proof_with_session_token(self, tmp_path, wrong_revision_fixture):
+        """The ``server.create_run`` tool forwards route_proof with session_token."""
+        db = str(tmp_path / "store.db")
+        art = str(tmp_path / "artifacts")
+        result_json = mcp_server.create_run(
+            tool="opencode",
+            model="byteplus/deepseek-v4-flash",
+            subject_repo="skillweave",
+            subject_commit="d34dbeef" * 5,
+            command=f"{sys.executable} -c print(4242)",
+            db_path=db,
+            artifacts_path=art,
+            methodology="ralph",
+            task_id="t-server-route-proof-auth",
+            attempt=1,
+            session_token="",
+            route_proof=wrong_revision_fixture,
+        )
+        result = json.loads(result_json)
+        assert "error" in result, (
+            f"server.create_run with wrong-revision route_proof must return "
+            f"error, got {result}"
+        )

@@ -103,6 +103,17 @@ def build_start_parser() -> argparse.ArgumentParser:
         default=None,
         help="Explicit run ID (default: auto-generated uuid hex).",
     )
+    parser.add_argument(
+        "--route-proof",
+        dest="route_proof",
+        default=None,
+        help=(
+            "Path to a route-proof JSON document that declares the approved "
+            "gateway, route set, and tier-to-route binding. When supplied, "
+            "egress is restricted to the approved routes (default-deny). "
+            "When absent, the legacy unlimited path is used."
+        ),
+    )
     # NOTE: the REMAINDER positional is deliberately *not* named ``command``.
     # ``skillweave.cli.main`` builds the router with
     # ``add_subparsers(dest="command")`` and mounts this parser as a *parent*;
@@ -224,9 +235,16 @@ def main_start(argv: Optional[Sequence[str]] = None) -> int:
     from skillweave.runsvc.service import RunIntegrationError
 
     try:
+        # SW-1510-ROUTE-LOCK: load route proof when supplied.
+        route_proof = None
+        if args.route_proof:
+            from skillweave.routing.route_proof import RouteProof
+            route_proof = RouteProof.load(args.route_proof)
+
         handle = start_async(
             command=command,
             run_id=args.run_id,
+            route_proof=route_proof,
         )
     except VersionConflictError:
         sys.stderr.write(f"error: run already exists: {args.run_id}\n")
@@ -302,6 +320,17 @@ def build_resume_parser() -> argparse.ArgumentParser:
         default=None,
         help="Idempotency key for the restart (defaults to restart:<run_id>).",
     )
+    parser.add_argument(
+        "--route-proof",
+        dest="route_proof",
+        default=None,
+        help=(
+            "Path to a route-proof JSON document that declares the approved "
+            "gateway, route set, and tier-to-route binding. When supplied, "
+            "egress is restricted to the approved routes (default-deny). "
+            "When absent, the source run's persisted route proof is used."
+        ),
+    )
     return parser
 
 
@@ -334,9 +363,15 @@ def main_resume(argv: Optional[Sequence[str]] = None) -> int:
     if args.resume_command:
         import shlex
         command = shlex.split(args.resume_command)
+    # SW-1510-ROUTE-LOCK: load route proof when supplied on resume.
+    route_proof = None
+    if args.route_proof:
+        from skillweave.routing.route_proof import RouteProof
+        route_proof = RouteProof.load(args.route_proof)
     try:
         result = restart_attempt(
-            args.run_id, command, idempotency_key=args.idempotency_key
+            args.run_id, command, idempotency_key=args.idempotency_key,
+            route_proof=route_proof,
         )
     except (StoreError, RunStateError) as exc:
         # ``RunStateError`` covers "no run found" and "no recorded command";

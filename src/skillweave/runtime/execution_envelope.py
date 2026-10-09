@@ -84,6 +84,7 @@ class ExecutionEnvelopeV1:
                 max_in_flight=self.max_in_flight,
                 max_per_request_bytes=self.max_per_request_bytes,
                 max_per_request_tokens=self.max_per_request_tokens,
+                allowed_routes=self.allowed_routes,
             )
         return ReservationEnvelope(
             max_cost=self.max_cost,
@@ -94,6 +95,7 @@ class ExecutionEnvelopeV1:
             max_in_flight=self.max_in_flight,
             max_per_request_bytes=self.max_per_request_bytes,
             max_per_request_tokens=self.max_per_request_tokens,
+            allowed_routes=self.allowed_routes,
         )
 
     def conservative_per_request_bounds(self) -> dict[str, Any]:

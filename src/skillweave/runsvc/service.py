@@ -33,6 +33,7 @@ import hashlib
 import importlib
 import json as _json
 import os
+import shutil
 import signal as _signal
 import subprocess
 import sys
@@ -85,6 +86,50 @@ def _is_full_sha(value: Any) -> bool:
 #: against; a content/configuration/deployment/incident subject never has a Git
 #: base and is never forced to synthesize one.
 _BOUND_GIT_SUBJECT_KIND = "repository"
+
+#: SW-1510-ROUTE-LOCK: The ambient provider env keys that must be stripped
+#: from the child launch environment when the lock is enabled. A child must
+#: never inherit an ambient alternate provider credential that would let it
+#: bypass the approved gateway.
+_AMBIENT_PROVIDER_ENV_KEYS: tuple[str, ...] = (
+    "FAIGATE_API_KEY",
+    "FAIGATE_BASE_URL",
+    "FAIGATE_HOST",
+    "FAIGATE_PORT",
+    "OPENROUTER_API_KEY",
+    "CLAWROUTER_API_KEY",
+    "KILO_API_KEY",
+    "KILO_BASE_URL",
+    "OMNIROUTE_API_KEY",
+    "OMNIROUTE_BASE_URL",
+    "NINEROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_BASE_URL",
+    "COUNCIL_MODEL",
+)
+
+#: SW-1510-ROUTE-LOCK: The only environment keys a child may inherit when the
+#: lock is enabled. Everything else is dropped so the child cannot redirect
+#: model traffic away from the approved gateway.
+_LOCKED_CHILD_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "SYSTEMROOT",
+    "PYTHONPATH",
+    "TERM",
+)
+
+#: SW-1510-ROUTE-LOCK (criterion 3): The owner-controlled route policy is
+#: loaded from configuration (``SKILLWEAVE_ROUTE_POLICY`` env var) and is the
+#: single source of truth for the approved route set, required policy revision,
+#: and approved egress gateway.  No provider literals, no port constant and no
+#: revision literal live in generic Core source — the policy document supplies
+#: them all.  When a route proof is supplied but no policy is configured, the
+#: launch is HELD with a named reason.
 
 
 def _work_contract_bound_base(work_contract: Any) -> Optional[str]:
@@ -340,6 +385,7 @@ class RunApplicationService:
         artifact_evidence: Optional[Sequence[Any]] = None,
         source_resolver: Optional[Any] = None,
         analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
+        route_proof: Optional[Any] = None,
     ) -> RunExecution:
         """Run ``command`` through the six-stage integration path.
 
@@ -510,6 +556,38 @@ class RunApplicationService:
                 self._fail_run(run_id, f"assay admission refused: {exc}")
                 raise
 
+        # SW-1510-ROUTE-LOCK: when a route proof is supplied, validate the
+        # route proof pin and approved-combination checks FIRST (pure logic,
+        # host-independent), so wrong-version and direct-provider bypass
+        # produce named HOLDs before any OS confinement check.  Only then
+        # check egress gateway and OS confinement availability.
+        if route_proof is not None:
+            from skillweave.routing.route_policy import resolve_route_policy
+            route_policy = resolve_route_policy()
+            # Criterion 3: pin validation (host-independent, pure logic).
+            self._verify_route_proof_against_pin(
+                route_proof, route_policy=route_policy
+            )
+            if model is not None:
+                from skillweave.routing.faigate_adapter import verify_approved_route
+
+                try:
+                    verify_approved_route(model, route_policy=route_policy)
+                except Exception as exc:
+                    raise RunIntegrationError(
+                        "route_lock_direct_provider",
+                        f"route {model!r} is not an approved BytePlus route; "
+                        f"refusing unapproved route (HOLD: {exc})",
+                    ) from exc
+            # Criterion 2: egress gateway check and OS confinement
+            # (may require sandbox-exec).  This runs after the pure-logic
+            # checks so that on a host without sandbox-exec the named HOLD
+            # reasons above still discriminate wrong-version from
+            # enforcement-unavailable.
+            self._enforce_route_proof_egress(
+                route_proof, route_policy=route_policy
+            )
+
         # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the worker
         # is launched.  This is the admission gate: no provider or tool
         # execution can run without an acquired slot.  The envelope's finite
@@ -546,6 +624,33 @@ class RunApplicationService:
             except Exception as exc:  # noqa: BLE001 - typed admission refusal
                 self._fail_run(run_id, f"reservation refused: {exc}")
                 raise RunIntegrationError("reservation", str(exc)) from exc
+
+        # SW-1510-ROUTE-LOCK: log the route decision when the reservation
+        # succeeded.  The model parameter is the requested route; the resolved
+        # provider is always the approved gateway (faigate) for the lock path.
+        #
+        # answering_envelope_identity is explicitly None here because the
+        # provider response (which carries the answering model) has not yet
+        # been received at decision time — the child process has not launched.
+        # A later route_decision update below carries the answering identity
+        # from the response envelope when the provider reports it.
+        if reservation_rec is not None:
+            # SW-1510-ROUTE-LOCK: when route_proof is available, fill
+            # catalog_revision and policy_revision from the proof document
+            # so the contract payload satisfies the frozen schema minLength:1.
+            _rd_catalog = getattr(route_proof, "catalog_revision", "") if route_proof is not None else ""
+            _rd_policy = getattr(route_proof, "policy_revision", "") if route_proof is not None else ""
+            self._log_route_decision(
+                run_id,
+                task_id=task_id or run_id,
+                correlation_id=f"{task_id or run_id}/attempt-{attempt}",
+                requested_alias=model,
+                resolved_provider="faigate",
+                resolved_model=model,
+                answering_envelope_identity=None,
+                catalog_revision=_rd_catalog,
+                policy_revision=_rd_policy,
+            )
 
         # Stage 2: launch the worker as a real subprocess. On the protected
         # (identity-authenticated) path the worker is launched inside a real
@@ -618,7 +723,14 @@ class RunApplicationService:
                 # unavailable or insufficient enforcement raises a typed HOLD
                 # here, so an unisolated launch never happens (criterion 2).
                 enforcement.attest()
-                argv = enforcement.wrap_command(argv)
+                if route_proof is not None:
+                    argv = enforcement.wrap_command(
+                        argv,
+                        allowed_egress_host=route_proof.approved_gateway_host,
+                        allowed_egress_port=route_proof.approved_gateway_port,
+                    )
+                else:
+                    argv = enforcement.wrap_command(argv)
                 # Run the real child inside the host-assigned owned scope the
                 # host mapped for this attempt: its working directory *is* the
                 # attempt checkout, and the declared output root is exported so
@@ -629,7 +741,30 @@ class RunApplicationService:
                 child_cwd = enforcement.checkout_root
                 child_env = {"SKILLWEAVE_ATTEMPT_CHECKOUT": str(enforcement.checkout_root)}
             elif protection is not None:
-                argv = protection.wrap_command(argv, writable_scope=protection.writable_scope)
+                if route_proof is not None:
+                    argv = protection.wrap_command(
+                        argv, writable_scope=protection.writable_scope,
+                        allowed_egress_host=route_proof.approved_gateway_host,
+                        allowed_egress_port=route_proof.approved_gateway_port,
+                    )
+                else:
+                    argv = protection.wrap_command(
+                        argv, writable_scope=protection.writable_scope
+                    )
+            # SW-1510-ROUTE-LOCK fallback: when a route proof is supplied but
+            # neither enforcement nor protection wrap exists, install the
+            # standalone egress-only sandbox profile so egress confinement is
+            # still applied.
+            if route_proof is not None and enforcement is None and protection is None:
+                argv = self._sandbox_wrap_egress(list(argv), route_proof)
+            # SW-1510-ROUTE-LOCK: confine the child launch environment to the
+            # locked allowlist only when a route proof is supplied.  Without a
+            # route proof the lock is inert and the child inherits the ambient
+            # environment unchanged, preserving existing behaviour for non-lock
+            # paths (controller finding B).
+            lock_env_allowlist = (
+                list(_LOCKED_CHILD_ENV_ALLOWLIST) if route_proof is not None else None
+            )
             result = run_command(
                 argv,
                 run_id=run_id,
@@ -640,6 +775,7 @@ class RunApplicationService:
                 created_at=created_at,
                 cwd=child_cwd,
                 env=child_env,
+                env_allowlist=lock_env_allowlist,
             )
         except scope_refusals:
             # A write-scope refusal (traversal/symlink/protected-store escape)
@@ -691,6 +827,30 @@ class RunApplicationService:
                     "reservation",
                     f"reservation completion failed: {exc}",
                 ) from exc
+
+        # SW-1510-ROUTE-LOCK (criterion 1): emit a follow-up route_decision
+        # event with the answering identity now that the child has completed.
+        # The subprocess-based execute path captures raw stdout, not the
+        # structured provider response envelope, so the answering model is not
+        # observable from the parent.  Record a null answering model with a
+        # reason so the identity chain is honest rather than silently absent.
+        if reservation_rec is not None:
+            # SW-1510-ROUTE-LOCK: carry forward catalog/policy revision from
+            # the route proof so the follow-up event also satisfies minLength:1.
+            _rd_catalog = getattr(route_proof, "catalog_revision", "") if route_proof is not None else ""
+            _rd_policy = getattr(route_proof, "policy_revision", "") if route_proof is not None else ""
+            self._update_route_decision_answering(
+                run_id,
+                task_id=task_id or run_id,
+                correlation_id=f"{task_id or run_id}/attempt-{attempt}",
+                requested_alias=model or "",
+                answering_model="",
+                catalog_revision=_rd_catalog,
+                policy_revision=_rd_policy,
+                reservation_id=reservation_rec.reservation_id,
+                attempt=int(attempt),
+                attempt_order=1,
+            )
 
         # Stage 3: raw artifact (content-addressed bytes).
         raw_bytes = result.stdout or b""
@@ -1139,6 +1299,357 @@ class RunApplicationService:
             tools=("Bash",),
         )
         return enforcement, declared
+
+    # ------------------------------------------------------------------
+    # SW-1510-ROUTE-LOCK helpers: route decision logging and child env
+    # confinement.  These are wired into the execution paths below.
+    # ------------------------------------------------------------------
+
+    def _log_route_decision(
+        self,
+        run_id: str,
+        *,
+        task_id: str,
+        correlation_id: str,
+        requested_alias: str,
+        resolved_provider: str = "faigate",
+        resolved_model: str = "",
+        answering_envelope_identity: Optional[str] = None,
+        catalog_revision: str = "",
+        policy_revision: str = "",
+        attempt: int = 1,
+        reservation_id: str = "",
+        attempt_order: int = 0,
+        attribution_status: str = "pending",
+        outcome: str = "pending",
+    ) -> None:
+        """Create a ``RouteDecision`` and persist it as a journal event.
+
+        The full identity chain (correlation_id, requested_alias,
+        resolved_provider, resolved_model, answering_envelope_identity,
+        catalog_revision, policy_revision) is recorded so parent and nested
+        requests are linked through the journal.
+
+        The journal payload conforms to the route-decision-v1 contract schema:
+        ``to_journal_dict()`` emits a ``contract`` sub-dict with the 14 required
+        fields and a ``_meta`` sub-dict with extra routing metadata outside the
+        contract schema.
+
+        When the routing module is not available (optional subpackage) the
+        decision is silently skipped so the legacy path keeps its behaviour.
+        """
+        try:
+            from skillweave.routing.faigate_adapter import (
+                make_route_decision,
+            )
+            decision = make_route_decision(
+                correlation_id=correlation_id,
+                requested_alias=requested_alias,
+                resolved_provider=resolved_provider,
+                resolved_model=resolved_model or requested_alias,
+                answering_envelope_identity=answering_envelope_identity,
+                catalog_revision=catalog_revision,
+                policy_revision=policy_revision,
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                reservation_id=reservation_id,
+                attempt_order=[f"attempt-{attempt_order}"] if isinstance(attempt_order, int) else attempt_order,
+                attribution_status=attribution_status,
+                outcome=outcome,
+            )
+            self.journal.append(
+                run_id,
+                event_type="route_decision",
+                payload=decision.to_journal_dict(),
+                correlation_id=correlation_id,
+            )
+        except Exception:  # noqa: BLE001 - optional subpackage
+            pass
+
+    def _update_route_decision_answering(
+        self,
+        run_id: str,
+        *,
+        task_id: str,
+        correlation_id: str,
+        requested_alias: str,
+        answering_model: str,
+        resolved_provider: str = "faigate",
+        resolved_model: str = "",
+        catalog_revision: str = "",
+        policy_revision: str = "",
+        reservation_id: str = "",
+        attempt: int = 1,
+        attempt_order: int = 1,
+    ) -> None:
+        """Emit a follow-up route_decision event with the answering model.
+
+        After the provider response has been received (carrying the answering
+        model in the response envelope), this method records a conforming
+        follow-up event on the same request id with the answering identity
+        filled in.
+
+        The answering model is ``answering_model`` from the response envelope
+        (``AttributedResponse.answering_model``, read from ``envelope['model']``).
+        When the provider genuinely does not report a model, ``answering_model``
+        is empty and the reason is documented in ``_meta``.
+
+        ``catalog_revision`` and ``policy_revision`` carry forward the values
+        from the initial route decision so the follow-up event also satisfies
+        the frozen schema ``minLength:1`` constraint.
+
+        Only call this when the answering model is genuinely observable.  If the
+        provider did not report a model, pass an empty string and the event is
+        recorded with ``attribution_status=unattributed`` and a reason in
+        ``_meta.no_answering_model_reason``.
+        """
+        try:
+            from skillweave.routing.faigate_adapter import (
+                make_route_decision,
+            )
+            is_empty = not answering_model or not answering_model.strip()
+            decision = make_route_decision(
+                correlation_id=correlation_id,
+                requested_alias=requested_alias,  # carry forward from original
+                resolved_provider=resolved_provider,
+                resolved_model=resolved_model or requested_alias,
+                answering_envelope_identity=answering_model if not is_empty else None,
+                catalog_revision=catalog_revision,
+                policy_revision=policy_revision,
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                reservation_id=reservation_id,
+                attempt_order=[f"attempt-{attempt_order}"] if isinstance(attempt_order, int) else attempt_order,
+                attribution_status="unattributed" if is_empty else "attributed",
+                outcome="resolved",
+            )
+            journal_payload = decision.to_journal_dict()
+            if is_empty:
+                journal_payload.setdefault("_meta", {})["no_answering_model_reason"] = (
+                    "provider response envelope did not report a model field"
+                )
+            self.journal.append(
+                run_id,
+                event_type="route_decision",
+                payload=journal_payload,
+                correlation_id=correlation_id,
+            )
+        except Exception:  # noqa: BLE001 - optional subpackage
+            pass
+
+    def _build_locked_child_env(
+        self,
+        *,
+        base_env: Optional[dict[str, str]] = None,
+        extra_vars: Optional[dict[str, str]] = None,
+    ) -> dict[str, str]:
+        """Build the child launch environment from the lock allowlist.
+
+        Only keys in ``_LOCKED_CHILD_ENV_ALLOWLIST`` are carried over from
+        ``base_env`` (default ``os.environ``); every other key — in
+        particular every ambient provider credential — is dropped.
+        ``extra_vars`` are the caller's own approved gateway settings and
+        are the only non-allowlisted keys added.  A key in ``extra_vars``
+        that matches an ambient provider key is refused so pinning cannot
+        be a back door for the very key the allowlist drops.
+        """
+        base = os.environ if base_env is None else base_env
+        env: dict[str, str] = {}
+        for k in _LOCKED_CHILD_ENV_ALLOWLIST:
+            v = base.get(k)
+            if v is not None:
+                env[k] = str(v)
+        if extra_vars:
+            for key, value in extra_vars.items():
+                name = str(key)
+                if name in _AMBIENT_PROVIDER_ENV_KEYS:
+                    raise RunIntegrationError(
+                        "route_lock",
+                        f"locked child env may not set ambient provider "
+                        f"key {name!r}; route the child through the approved "
+                        "gateway instead",
+                    )
+                env[name] = str(value)
+        return env
+
+    # ------------------------------------------------------------------
+    # SW-1510-ROUTE-LOCK: route-proof egress enforcement and sandbox
+    # confinement (controller findings 1-2 on commit 103f847).
+    #
+    # When a route proof is supplied, egress is restricted to the
+    # approved gateway host:port BEFORE the reservation (before paid
+    # admission).  The child's network is confined via sandbox-exec
+    # (Seatbelt); if the OS mechanism is unavailable the launch is
+    # refused (HOLD) with a clear reason.
+    # ------------------------------------------------------------------
+
+    def _enforce_route_proof_egress(
+        self,
+        route_proof: Any,
+        *,
+        route_policy: Optional[Any] = None,
+    ) -> None:
+        """Verify egress gateway and OS confinement before paid admission.
+
+        Called BEFORE reservation (``reserve()``) when a route proof is
+        supplied.  Checks:
+
+        1. The approved gateway URL routes through the enforcing Faigate
+           gateway (``check_egress_gateway``), using the policy gateway
+           host:port (not a module constant).
+        2. ``sandbox-exec`` (Seatbelt) is available to confine the child's
+           network egress to only the approved host:port.
+
+        Raises ``RunIntegrationError`` with stage ``"route_lock"`` when
+        either check fails — the launch is held before any budget is
+        consumed.
+        """
+        from skillweave.runtime.worker_launcher import SandboxExecAdapter
+        from skillweave.routing.faigate_adapter import check_egress_gateway, EgressGatewayError
+
+        # Use the policy gateway for the egress check (not a module constant).
+        # Fall back to the proof's gateway when no policy is configured
+        # (should not happen in practice since _verify_route_proof_against_pin
+        # already refused a proof without a policy, but guard defensively).
+        policy_host = (
+            route_policy.approved_gateway_host if route_policy is not None
+            else route_proof.approved_gateway_host
+        )
+        policy_port = (
+            route_policy.approved_gateway_port if route_policy is not None
+            else route_proof.approved_gateway_port
+        )
+
+        approved_url = (
+            f"http://{route_proof.approved_gateway_host}:"
+            f"{route_proof.approved_gateway_port}"
+        )
+        try:
+            check_egress_gateway(
+                approved_url,
+                approved_host=policy_host,
+                approved_port=policy_port,
+            )
+        except Exception as exc:
+            raise RunIntegrationError(
+                "route_lock",
+                f"egress_gateway check failed for {approved_url!r}: "
+                f"{exc}; "
+                f"refusing to launch with an unapproved gateway (HOLD)",
+            ) from exc
+
+        # macOS SBPL can only confine loopback hosts; a non-loopback
+        # approved gateway cannot be expressed in a Seatbelt profile.
+        from skillweave.runtime.worker_launcher import _is_loopback
+        if not _is_loopback(policy_host):
+            raise RunIntegrationError(
+                "route_lock",
+                f"egress_host_not_confinable: approved gateway host "
+                f"{policy_host!r} is not a loopback address; macOS "
+                f"Seatbelt (sandbox-exec) can only confine loopback "
+                f"hosts; refusing to launch without OS confinement (HOLD)",
+            )
+
+        adapter = SandboxExecAdapter()
+        if not adapter.available():
+            raise RunIntegrationError(
+                "route_lock",
+                f"OS confinement (sandbox-exec) is required when a route "
+                f"proof is supplied, but it is not available on this host; "
+                f"refusing to launch an unconfined worker (HOLD)",
+            )
+
+    def _verify_route_proof_against_pin(
+        self,
+        route_proof: Any,
+        *,
+        route_policy: Optional[Any] = None,
+    ) -> None:
+        """Validate *route_proof* against the owner-controlled policy pin (criterion 3).
+
+        Checks:
+        1. A route policy is configured (absent policy while a route proof is
+           supplied => HOLD with a named reason).
+        2. The proof's revision matches the policy's required revision.
+        3. Every route in the proof's ``approved_routes`` is within the
+           policy-approved set.  A route outside the pin (wrong version, wrong
+           provider, direct-provider bypass) is refused at ingestion regardless
+        4. The proof's approved gateway host:port matches the policy.
+
+        Raises ``RunIntegrationError`` with stage ``"route_lock"`` when
+        the proof does not match the pin — the launch is held before any
+        budget is consumed.
+        """
+
+        if route_policy is None:
+            raise RunIntegrationError(
+                "route_lock",
+                "a route proof was supplied but no route policy is configured "
+                "(set SKILLWEAVE_ROUTE_POLICY); "
+                "refusing to enforce an unpinned route set (HOLD)",
+            )
+
+        # Check revision pin against the policy, not a module constant
+        proof_revision = getattr(route_proof, "policy_revision", "")
+        if proof_revision != route_policy.required_revision:
+            raise RunIntegrationError(
+                "route_lock",
+                f"route proof revision {proof_revision!r} does not match "
+                f"policy required revision {route_policy.required_revision!r}; "
+                f"refusing out-of-date policy (HOLD)",
+            )
+
+        # Check every approved route is within the policy-approved set
+        for r in route_proof.approved_routes:
+            if r not in route_policy.approved_routes:
+                raise RunIntegrationError(
+                    "route_lock",
+                    f"route proof declares route {r!r} which is not in the "
+                    f"policy-approved set; refusing unapproved route (HOLD)",
+                )
+
+        # Check the proof's approved gateway matches the policy gateway
+        if (
+            route_proof.approved_gateway_host != route_policy.approved_gateway_host
+            or route_proof.approved_gateway_port != route_policy.approved_gateway_port
+        ):
+            raise RunIntegrationError(
+                "route_lock",
+                f"route proof approved gateway "
+                f"{route_proof.approved_gateway_host}:{route_proof.approved_gateway_port} "
+                f"does not match policy gateway "
+                f"{route_policy.approved_gateway_host}:{route_policy.approved_gateway_port}; "
+                f"refusing mismatched gateway (HOLD)",
+            )
+
+    def _sandbox_wrap_egress(
+        self,
+        argv: list[str],
+        route_proof: Any,
+    ) -> list[str]:
+        """Wrap *argv* with sandbox-exec using the route-proof egress profile.
+
+        Builds a Seatbelt profile that allows network egress to only the
+        approved gateway host:port and delegates all other access (file,
+        process, Mach) through default allow rules so the child can
+        function normally except for network confinement.
+        """
+        from skillweave.runtime.worker_launcher import SandboxExecAdapter
+
+        sandbox_exec = shutil.which("sandbox-exec")
+        if not sandbox_exec:
+            raise RunIntegrationError(
+                "route_lock",
+                "sandbox-exec is not installed; cannot apply egress confinement",
+            )
+        adapter = SandboxExecAdapter()
+        profile = adapter.build_egress_profile(
+            route_proof.approved_gateway_host,
+            route_proof.approved_gateway_port,
+        )
+        return [sandbox_exec, "-p", profile] + [str(c) for c in argv]
 
     def _fail_run(self, run_id: str, reason: str) -> None:
         """Mark a run terminal with a stop reason when a stage raises.
@@ -2071,6 +2582,8 @@ class RunApplicationService:
         task_id: Optional[str] = None,
         restarted_from: Optional[dict[str, Any]] = None,
         reservation_envelope: Optional[Any] = None,
+        route: Optional[str] = None,
+        route_proof: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Start *command* as a detached background process.
 
@@ -2119,6 +2632,37 @@ class RunApplicationService:
             "restarted_from": dict(restarted_from) if restarted_from else None,
         }
 
+        # SW-1510-ROUTE-LOCK: when a route proof is supplied, validate the
+        # route proof pin and approved-combination checks FIRST (pure logic,
+        # host-independent), so wrong-version and direct-provider bypass
+        # produce named HOLDs before any OS confinement check.  Only then
+        # check egress gateway and OS confinement availability.
+        if route_proof is not None:
+            from skillweave.routing.route_policy import resolve_route_policy
+            route_policy = resolve_route_policy()
+            # Criterion 3: pin validation (host-independent, pure logic).
+            self._verify_route_proof_against_pin(
+                route_proof, route_policy=route_policy
+            )
+            if route is not None:
+                from skillweave.routing.faigate_adapter import verify_approved_route
+                try:
+                    verify_approved_route(route, route_policy=route_policy)
+                except Exception as exc:
+                    raise RunIntegrationError(
+                        "route_lock_direct_provider",
+                        f"route {route!r} is not an approved BytePlus route; "
+                        f"refusing unapproved route (HOLD: {exc})",
+                    ) from exc
+            # Criterion 2: egress gateway check and OS confinement
+            # (may require sandbox-exec).  This runs after the pure-logic
+            # checks so that on a host without sandbox-exec the named HOLD
+            # reasons above still discriminate wrong-version from
+            # enforcement-unavailable.
+            self._enforce_route_proof_egress(
+                route_proof, route_policy=route_policy
+            )
+
         # SW-1510-BUDGET: acquire an atomic reservation slot BEFORE the detached
         # child is launched.  The async/restart path must be admitted through
         # the same reservation gate as the synchronous execute paths.  The
@@ -2136,16 +2680,45 @@ class RunApplicationService:
                     scope_id=scope_id,
                     idempotency_key=f"start_async:{rid}:{scope_id}",
                     envelope=reservation_envelope,
+                    route=route,
                 )
             except Exception as exc:  # noqa: BLE001
                 raise RunIntegrationError(
                     "reservation", f"async reservation refused: {exc}") from exc
+
+        # SW-1510-ROUTE-LOCK: log the route decision when the reservation
+        # succeeded, so the async path records the identity chain too.
+        #
+        # answering_envelope_identity is explicitly None because the async
+        # child has not launched yet — the provider response (which carries
+        # the answering model) is not available at decision time.  A later
+        # wrapper-completion or poll step should carry the answering identity
+        # when the provider reports it.
+        if reservation_rec is not None and route is not None:
+            # SW-1510-ROUTE-LOCK: when route_proof is available, fill
+            # catalog_revision and policy_revision from the proof document.
+            _rd_catalog = getattr(route_proof, "catalog_revision", "") if route_proof is not None else ""
+            _rd_policy = getattr(route_proof, "policy_revision", "") if route_proof is not None else ""
+            self._log_route_decision(
+                rid,
+                task_id=effective_task_id,
+                correlation_id=f"{effective_task_id}/attempt-{effective_attempt}",
+                requested_alias=route,
+                resolved_provider="faigate",
+                resolved_model=route,
+                answering_envelope_identity=None,
+                catalog_revision=_rd_catalog,
+                policy_revision=_rd_policy,
+            )
 
         # Store initial lifecycle metadata BEFORE launching the child, so the
         # wrapper starts at version 2 (not version 1).  This prevents a race
         # where a fast child completes before the parent gets to write its
         # own lifecycle metadata: the parent would see VersionConflictError
         # because the wrapper already bumped the version.
+        route_proof_ref = None
+        if route_proof is not None:
+            route_proof_ref = route_proof.to_dict()
         self.store.update_metadata(
             rid,
             expected_version=1,
@@ -2156,6 +2729,7 @@ class RunApplicationService:
                     "lifecycle_state": "running",
                 },
                 "lineage": lineage,
+                "route_proof": route_proof_ref,
             },
         )
 
@@ -2225,16 +2799,32 @@ class RunApplicationService:
             if _sp not in _pp:
                 _env["PYTHONPATH"] = _pp + ":" + _sp if _pp else _sp
 
+        # SW-1510-ROUTE-LOCK: when a route proof is supplied, confine the
+        # child launch environment to the locked allowlist so ambient provider
+        # credentials are stripped, and wrap the detached wrapper process with
+        # sandbox-exec to confine network egress to only the approved gateway
+        # host:port.  Without a route proof the lock is inert — the child
+        # inherits the ambient environment unchanged, preserving existing
+        # behaviour for non-lock paths (controller finding B).
+        if route_proof is not None:
+            locked_env = self._build_locked_child_env(base_env=_env)
+            child_argv = [sys.executable, "-c", wrapper_src, rid, db_path,
+                          reservation_id_arg] + list(command)
+            child_argv = self._sandbox_wrap_egress(child_argv, route_proof)
+        else:
+            locked_env = _env or os.environ
+            child_argv = [sys.executable, "-c", wrapper_src, rid, db_path,
+                          reservation_id_arg] + list(command)
+
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-c", wrapper_src, rid, db_path,
-                 reservation_id_arg] + list(command),
+                child_argv,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
                 cwd=child_cwd,
-                env=_env,
+                env=locked_env,
             )
         except Exception as exc:  # noqa: BLE001
             # Launch failure: cancel the reservation slot before propagating.
@@ -2577,6 +3167,8 @@ class RunApplicationService:
         cwd: Optional[Path] = None,
         _env: Optional[dict[str, str]] = None,
         reservation_envelope: Optional[Any] = None,
+        route: Optional[str] = None,
+        route_proof: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Launch a NEW identified attempt that continues *run_id*.
 
@@ -2611,6 +3203,79 @@ class RunApplicationService:
         source_lineage = (source.metadata or {}).get("lineage") or {}
         root_run_id = source_lineage.get("root_run_id") or source.run_id
         next_attempt = int(source_lineage.get("attempt") or 1) + 1
+
+        # SW-1510-ROUTE-LOCK: re-verify the route proof on resume/restart.
+        # When route_proof is not explicitly supplied, recover it from the
+        # source run's persisted metadata.  If the source has a route proof
+        # but the new attempt cannot supply one (or it no longer approves the
+        # route), the restart is refused (HOLD) before any state is written.
+        resolved_route_proof = route_proof
+        source_route_proof_dict = (source.metadata or {}).get("route_proof")
+        if source_route_proof_dict is not None and resolved_route_proof is None:
+            from skillweave.routing.route_proof import RouteProof
+            try:
+                resolved_route_proof = RouteProof.from_dict(source_route_proof_dict)
+            except Exception as exc:
+                raise StoreError(
+                    f"source run {run_id} has an invalid persisted route proof; "
+                    f"restart refused (HOLD): {exc}"
+                ) from exc
+        if resolved_route_proof is not None and route is not None:
+            try:
+                resolved_route_proof.check_route_allowed(route)
+            except Exception as exc:
+                raise StoreError(
+                    f"route {route!r} is not approved by the route proof; "
+                    f"restart refused (HOLD): {exc}"
+                ) from exc
+        # SW-1510-ROUTE-LOCK (criterion 3): validate the resolved route proof
+        # against the owner-controlled policy pin on restart too.
+        if resolved_route_proof is not None:
+            from skillweave.routing.route_policy import resolve_route_policy
+            route_policy = resolve_route_policy()
+            self._verify_route_proof_against_pin(
+                resolved_route_proof, route_policy=route_policy
+            )
+        # Emit a route_decision event for the new attempt on restart with
+        # a route proof, so resume/restart records the identity chain.
+        #
+        # answering_envelope_identity is explicitly None because the restart
+        # has not launched the child yet — the provider response (which carries
+        # the answering model) is not available at decision time.  A later
+        # route_decision update should carry the answering identity when the
+        # provider reports it.
+        if resolved_route_proof is not None and route is not None:
+            self._log_route_decision(
+                run_id,
+                task_id=task_id or source_lineage.get("task_id") or run_id,
+                correlation_id=f"{task_id or source_lineage.get('task_id') or run_id}/attempt-{next_attempt}",
+                requested_alias=route,
+                resolved_provider="faigate",
+                resolved_model=route,
+                answering_envelope_identity=None,
+                catalog_revision=getattr(resolved_route_proof, "catalog_revision", ""),
+                policy_revision=getattr(resolved_route_proof, "policy_revision", ""),
+            )
+
+        # SW-1510-ROUTE-LOCK: verify retry attribution before proceeding.
+        # Each restart attempt must carry valid attribution (attempt >= 1)
+        # and the requested route must be within the approved route set.
+        # When a reservation_envelope with allowed_routes is supplied, the
+        # retry route is checked against it.
+        from skillweave.dispatch.model_policy import AttemptAttribution, check_attempt_route
+        try:
+            attribution = AttemptAttribution(
+                attempt=next_attempt,
+                requested_route=route or "restart",
+                reserved_budget=0.0,
+            )
+            # When the envelope has allowed_routes, check the route against it.
+            if reservation_envelope is not None:
+                allowed = getattr(reservation_envelope, "allowed_routes", None)
+                if allowed is not None:
+                    check_attempt_route(attribution, allowed_routes=frozenset(allowed) if allowed else None)
+        except Exception as exc:
+            raise StoreError(f"restart retry attribution refused: {exc}") from exc
 
         # SW-1510-BUDGET: inherit the source run's task identity so the retry
         # is bounded by the same owner envelope and task aggregate.  An explicit
@@ -2682,6 +3347,8 @@ class RunApplicationService:
             task_id=task_id,
             restarted_from=restarted_from,
             reservation_envelope=reservation_envelope,
+            route=route,
+            route_proof=resolved_route_proof,
         )
         result["parent_run_id"] = run_id
         result["root_run_id"] = root_run_id
@@ -2991,6 +3658,7 @@ class RunApplicationService:
         artifact_evidence: Optional[Sequence[Any]] = None,
         source_resolver: Optional[Any] = None,
         analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
+        route_proof: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Protected native execution whose output is durably streamed.
 
@@ -3090,6 +3758,37 @@ class RunApplicationService:
         CompletionContract = _runtime_attr("verify", "CompletionContract")
         GateState = _runtime_attr("verify", "GateState")
 
+        # SW-1510-ROUTE-LOCK: when a route proof is supplied, validate the
+        # route proof pin and approved-combination checks FIRST (pure logic,
+        # host-independent), so wrong-version and direct-provider bypass
+        # produce named HOLDs before any OS confinement check.  Only then
+        # check egress gateway and OS confinement availability.
+        if route_proof is not None:
+            from skillweave.routing.route_policy import resolve_route_policy
+            route_policy = resolve_route_policy()
+            # Criterion 3: pin validation (host-independent, pure logic).
+            self._verify_route_proof_against_pin(
+                route_proof, route_policy=route_policy
+            )
+            if model is not None:
+                from skillweave.routing.faigate_adapter import verify_approved_route
+                try:
+                    verify_approved_route(model, route_policy=route_policy)
+                except Exception as exc:
+                    raise RunIntegrationError(
+                        "route_lock_direct_provider",
+                        f"route {model!r} is not an approved BytePlus route; "
+                        f"refusing unapproved route (HOLD: {exc})",
+                    ) from exc
+            # Criterion 2: egress gateway check and OS confinement
+            # (may require sandbox-exec).  This runs after the pure-logic
+            # checks so that on a host without sandbox-exec the named HOLD
+            # reasons above still discriminate wrong-version from
+            # enforcement-unavailable.
+            self._enforce_route_proof_egress(
+                route_proof, route_policy=route_policy
+            )
+
         # Stage 1: Run — walk the lane to ``verify`` under CAS, as ``execute`` does.
         self.store.create_run(run_id)
         for from_state, to_state in (
@@ -3180,6 +3879,31 @@ class RunApplicationService:
                 "a missing budget guard cannot silently admit unguarded execution",
             )
 
+        # SW-1510-ROUTE-LOCK: log the route decision when the reservation
+        # succeeded, so the streaming path also records the identity chain.
+        #
+        # answering_envelope_identity is explicitly None here because the
+        # streaming child has not launched yet — the provider response (which
+        # carries the answering model) is not available at decision time.  A
+        # later route_decision update should carry the answering identity when
+        # the provider reports it.
+        if reservation_rec is not None:
+            # SW-1510-ROUTE-LOCK: when route_proof is available, fill
+            # catalog_revision and policy_revision from the proof document.
+            _rd_catalog = getattr(route_proof, "catalog_revision", "") if route_proof is not None else ""
+            _rd_policy = getattr(route_proof, "policy_revision", "") if route_proof is not None else ""
+            self._log_route_decision(
+                run_id,
+                task_id=task_id or run_id,
+                correlation_id=f"{task_id or run_id}/attempt-{attempt}",
+                requested_alias=model,
+                resolved_provider="faigate",
+                resolved_model=model,
+                answering_envelope_identity=None,
+                catalog_revision=_rd_catalog,
+                policy_revision=_rd_policy,
+            )
+
         # Stage 2: the real protected launch + durable streaming collection.
         # The streaming path composes the *same* SCOPE boundary as ``execute``:
         # the declared write scope is authorized and the real isolation attested
@@ -3235,8 +3959,18 @@ class RunApplicationService:
                 if declared:
                     enforcement.authorize_writes(declared)
                 enforcement.attest()
-                def wrap(argv, _e=enforcement):
-                    return _e.wrap_command(argv)
+                # SW-1510-ROUTE-LOCK (criterion 2): compose egress confinement
+                # WITH the worker/scope wrap when a route proof is present.
+                if route_proof is not None:
+                    def wrap(argv, _e=enforcement, _rp=route_proof):
+                        return _e.wrap_command(
+                            argv,
+                            allowed_egress_host=_rp.approved_gateway_host,
+                            allowed_egress_port=_rp.approved_gateway_port,
+                        )
+                else:
+                    def wrap(argv, _e=enforcement):
+                        return _e.wrap_command(argv)
                 # Run the real child inside the host-assigned owned scope: its
                 # working directory *is* the attempt checkout the host mapped
                 # for this attempt, and that root is exported so a tool resolves
@@ -3248,10 +3982,35 @@ class RunApplicationService:
                     "SKILLWEAVE_ATTEMPT_CHECKOUT": str(enforcement.checkout_root)
                 }
             elif protection is not None:
-                def wrap(argv, _p=protection):
-                    return _p.wrap_command(
-                        argv, writable_scope=_p.writable_scope
-                    )
+                # SW-1510-ROUTE-LOCK (criterion 2): compose egress confinement
+                # WITH the protection wrap when a route proof is present.
+                if route_proof is not None:
+                    def wrap(argv, _p=protection, _rp=route_proof):
+                        return _p.wrap_command(
+                            argv, writable_scope=_p.writable_scope,
+                            allowed_egress_host=_rp.approved_gateway_host,
+                            allowed_egress_port=_rp.approved_gateway_port,
+                        )
+                else:
+                    def wrap(argv, _p=protection):
+                        return _p.wrap_command(
+                            argv, writable_scope=_p.writable_scope
+                        )
+            # SW-1510-ROUTE-LOCK: when a route proof is supplied but no
+            # identity-based protection is active (credential is None), apply
+            # the sandbox egress wrapper to confine the child's network to
+            # only the approved gateway host:port.
+            if route_proof is not None and wrap is None:
+                def wrap(argv, _rp=route_proof, _self=self):
+                    return _self._sandbox_wrap_egress(list(argv), _rp)
+            # SW-1510-ROUTE-LOCK: confine the child launch environment to the
+            # locked allowlist only when a route proof is supplied.  Without a
+            # route proof the lock is inert and the child inherits the ambient
+            # environment unchanged, preserving existing behaviour for non-lock
+            # paths (controller finding B).
+            stream_lock_env_allowlist = (
+                list(_LOCKED_CHILD_ENV_ALLOWLIST) if route_proof is not None else None
+            )
             result = run_process_streaming(
                 list(command),
                 run_id=run_id,
@@ -3263,6 +4022,7 @@ class RunApplicationService:
                 stdout_retain_limit=stdout_retain_limit,
                 stderr_retain_limit=stderr_retain_limit,
                 cwd=child_cwd,
+                env_allowlist=stream_lock_env_allowlist,
                 extra_env=child_env,
                 wrap_command=wrap,
             )
@@ -3309,6 +4069,30 @@ class RunApplicationService:
                     "reservation",
                     f"reservation completion failed: {exc}",
                 ) from exc
+
+        # SW-1510-ROUTE-LOCK (criterion 1): emit a follow-up route_decision
+        # event with the answering identity now that the streaming child has
+        # completed.  The subprocess-based streaming path captures raw stdout,
+        # not the structured provider response envelope, so the answering model
+        # is not observable from the parent.  Record a null answering model with
+        # a reason so the identity chain is honest rather than silently absent.
+        if reservation_rec is not None:
+            # SW-1510-ROUTE-LOCK: carry forward catalog/policy revision from
+            # the route proof so the follow-up event also satisfies minLength:1.
+            _rd_catalog = getattr(route_proof, "catalog_revision", "") if route_proof is not None else ""
+            _rd_policy = getattr(route_proof, "policy_revision", "") if route_proof is not None else ""
+            self._update_route_decision_answering(
+                run_id,
+                task_id=task_id or run_id,
+                correlation_id=f"{task_id or run_id}/attempt-{attempt}",
+                requested_alias=model or "",
+                answering_model="",
+                catalog_revision=_rd_catalog,
+                policy_revision=_rd_policy,
+                reservation_id=reservation_rec.reservation_id,
+                attempt=int(attempt),
+                attempt_order=1,
+            )
 
         fact = result.fact
         out_summary = self.stream_store.summary(

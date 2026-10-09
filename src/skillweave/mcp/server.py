@@ -445,7 +445,7 @@ def _auth_error_payload(exc) -> str:
 
 
 @mcp.tool()
-def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, command: str, db_path: str = ".skillweave/store.db", artifacts_path: str = ".skillweave/artifacts", methodology: str = "ralph", autonomy_policy: str = "", task_id: str = "", attempt: int = 1, output_root: str = "", stream_root: str = "", artifact_evidence: str = "", source_root: str = "", analysis_root: str = "", session_token: str = "") -> str:
+def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, command: str, db_path: str = ".skillweave/store.db", artifacts_path: str = ".skillweave/artifacts", methodology: str = "ralph", autonomy_policy: str = "", task_id: str = "", attempt: int = 1, output_root: str = "", stream_root: str = "", artifact_evidence: str = "", source_root: str = "", analysis_root: str = "", session_token: str = "", route_proof: str = "") -> str:
     """Create and execute a new SkillWeave run.
 
     ``methodology`` is the declared methodology binding (default ``ralph``).
@@ -482,6 +482,7 @@ def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, co
     if refusal is not None:
         return refusal
     payload = control.create_run_payload(
+        route_proof=route_proof,
         tool=tool,
         model=model,
         subject_repo=subject_repo,

@@ -843,6 +843,7 @@ def create_run_payload(
     artifact_evidence: str = "",
     source_root: str = "",
     analysis_root: str = "",
+    route_proof: str = "",
 ) -> dict[str, Any]:
     """Execute one native run through the shared service and return its payload.
 
@@ -868,6 +869,23 @@ def create_run_payload(
     run_id = generate_run_id()
     from skillweave.runtime.reservation import ReservationEnvelope as _ReservationEnvelope
 
+    # SW-1510-ROUTE-LOCK: load the route-proof document when supplied.
+    # A malformed route proof produces a structured route_lock error
+    # (exit nonzero, no traceback).
+    route_proof_obj = None
+    if route_proof:
+        from skillweave.routing.route_proof import RouteProof as _RouteProof, RouteProofError
+        try:
+            route_proof_obj = _RouteProof.load(route_proof)
+        except RouteProofError as exc:
+            return _contract_guard(
+                "",
+                exc=RunIntegrationError(
+                    "route_lock",
+                    f"malformed route proof: {exc}",
+                ),
+            )
+
     try:
         effective_task_id = task_id or run_id
         scope_id = f"{effective_task_id}/attempt-{attempt}"
@@ -875,7 +893,14 @@ def create_run_payload(
         if existing is not None:
             owner_env = existing
         else:
-            owner_env = _ReservationEnvelope()
+            # SW-1510-ROUTE-LOCK: when a route-proof is loaded, set allowed_routes
+            # on the envelope to the approved route set (default-deny).
+            if route_proof_obj is not None:
+                owner_env = _ReservationEnvelope(
+                    allowed_routes=sorted(route_proof_obj.approved_routes),
+                )
+            else:
+                owner_env = _ReservationEnvelope()
             svc.reservation_store.set_envelope(run_id, scope_id, owner_env)
 
         cmd_list = shlex.split(command)
@@ -895,6 +920,7 @@ def create_run_payload(
             artifact_evidence=artifact_evidence_list(artifact_evidence),
             source_resolver=source_binding(source_root, subject_commit),
             analysis_reader=analysis_binding(analysis_root),
+            route_proof=route_proof_obj,
         )
     except (ControlStorageError, RunSnapshotContractError, RunIntegrationError) as exc:
         return _contract_guard("", exc=exc)

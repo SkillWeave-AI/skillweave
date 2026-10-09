@@ -2261,7 +2261,7 @@ class TestCheckRouteAllowed:
         store.set_envelope("route-run", "route-scope", env)
         rec = store.reserve(
             run_id="route-run", task_id="route-task", attempt=1,
-            scope_id="route-scope",
+            scope_id="route-scope", route="route-a",
         )
         assert rec is not None
 
@@ -2312,14 +2312,26 @@ class TestCheckRouteAllowed:
         )
         assert rec is not None
 
-    def test_reserve_with_route_none_skips_check(self, store):
-        """reserve() with route=None skips route enforcement."""
+    def test_reserve_with_route_none_refused_when_allowed_set(self, store):
+        """reserve() with route=None raises when allowed_routes is set (AC4)."""
         env = ReservationEnvelope(allowed_routes=["approved"], max_in_flight=5)
         store.set_envelope("route-none-run", "route-none-scope", env)
-        # route=None should not raise even if allowed_routes is set
+        with pytest.raises(QuotaRefused) as exc:
+            store.reserve(
+                run_id="route-none-run", task_id="route-none-task", attempt=1,
+                scope_id="route-none-scope",
+                route=None,
+            )
+        assert "route" in str(exc.value)
+        assert "None" in str(exc.value)
+
+    def test_reserve_with_route_none_permits_when_allowed_not_set(self, store):
+        """reserve() with route=None permits when allowed_routes is None."""
+        env = ReservationEnvelope(max_in_flight=5)
+        store.set_envelope("route-none-free-run", "route-none-free-scope", env)
         rec = store.reserve(
-            run_id="route-none-run", task_id="route-none-task", attempt=1,
-            scope_id="route-none-scope",
+            run_id="route-none-free-run", task_id="route-none-free-task", attempt=1,
+            scope_id="route-none-free-scope",
             route=None,
         )
         assert rec is not None

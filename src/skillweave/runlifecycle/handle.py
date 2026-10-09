@@ -126,6 +126,7 @@ def start_async(
     run_id: Optional[str] = None,
     cwd: Optional[Path] = None,
     reservation_envelope: Optional[Any] = None,
+    route_proof: Optional[Any] = None,
 ) -> RunHandle:
     """Start *command* as a detached background process.
 
@@ -183,6 +184,7 @@ def start_async(
         project_root=root,
         _env=env,
         reservation_envelope=reservation_envelope,
+        route_proof=route_proof,
     )
 
     return RunHandle(
@@ -475,6 +477,7 @@ def restart_attempt(
     cwd: Optional[Path] = None,
     idempotency_key: Optional[str] = None,
     reservation_envelope: Optional[Any] = None,
+    route_proof: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Launch a NEW identified attempt that continues *run_id*.
 
@@ -510,6 +513,7 @@ def restart_attempt(
         idempotency_key=idempotency_key,
         _env=env,
         reservation_envelope=reservation_envelope,
+        route_proof=route_proof,
     )
 
 
