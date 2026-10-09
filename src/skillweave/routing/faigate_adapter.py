@@ -1546,7 +1546,7 @@ class RouteDecision:
     task_id: str = ""
     attempt: int = 0
     reservation_id: str = ""
-    attempt_order: list[int] = field(default_factory=list)
+    attempt_order: list[str] = field(default_factory=list)
     attribution_status: str = "unknown"
     outcome: str = "pending"
     measured_at: str = ""
@@ -1653,7 +1653,7 @@ def make_route_decision(
     task_id: str = "",
     attempt: int = 0,
     reservation_id: str = "",
-    attempt_order: Optional[list[int]] = None,
+    attempt_order: Optional[list[str]] = None,
     attribution_status: str = "unknown",
     outcome: str = "pending",
     measured_at: str = "",

@@ -170,7 +170,7 @@ class TestRouteDecisionRecord:
             task_id="task-01",
             attempt=1,
             reservation_id="res-001",
-            attempt_order=[0],
+            attempt_order=["attempt-0"],
             attribution_status="attributed",
             outcome="resolved",
             measured_at="2026-10-08T12:00:00+00:00",
@@ -202,7 +202,7 @@ class TestRouteDecisionRecord:
             task_id="task-02",
             attempt=1,
             reservation_id="res-002",
-            attempt_order=[0],
+            attempt_order=["attempt-0"],
             attribution_status="attributed",
             outcome="resolved",
             measured_at="2026-10-08T12:00:00+00:00",
@@ -223,7 +223,7 @@ class TestRouteDecisionRecord:
         assert data["policy_revision"] == "1.3.11"
         assert data["attribution_status"] == "answered"
         assert data["reservation_id"] == "res-002"
-        assert data["attempt_order"] == [0]
+        assert data["attempt_order"] == ["attempt-0"]
         assert data["measured_at"] == "2026-10-08T12:00:00+00:00"
         assert data["outcome"] == "resolved"
         assert data["usage"] == {}
@@ -2402,15 +2402,15 @@ class TestRouteDecisionContractCompliance:
                 "answering_model": {"type": "string"},
                 "resolved_provider": {"type": "string"},
                 "resolved_model": {"type": "string"},
-                "catalog_revision": {"type": "string"},
-                "policy_revision": {"type": "string"},
+                "catalog_revision": {"type": "string", "minLength": 1},
+                "policy_revision": {"type": "string", "minLength": 1},
                 "attribution_status": {
                     "type": "string",
                     "enum": ["answered", "substituted", "unavailable",
                              "rate_limited", "errored", "unknown"]
                 },
                 "reservation_id": {"type": "string", "minLength": 1},
-                "attempt_order": {"type": "array", "items": {"type": "integer"}},
+                "attempt_order": {"type": "array", "items": {"type": "string"}},
                 "measured_at": {"type": "string"},
                 "outcome": {"type": "string"},
                 "usage": {"type": "object"},
@@ -2429,6 +2429,8 @@ class TestRouteDecisionContractCompliance:
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-flash",
             answering_envelope_identity="deepseek-v4-flash",
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
             run_id="run-schema-1",
             task_id="task-schema-1",
             attempt=1,
@@ -2450,6 +2452,8 @@ class TestRouteDecisionContractCompliance:
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-pro",
             answering_envelope_identity="deepseek-v4-pro",
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
             run_id="run-schema-2",
             task_id="task-schema-2",
             attempt=1,
@@ -2467,6 +2471,8 @@ class TestRouteDecisionContractCompliance:
             requested_alias="deepseek-v4-flash",
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-flash",
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
             run_id="run-schema-3",
             task_id="task-schema-3",
             attempt=1,
@@ -2484,6 +2490,8 @@ class TestRouteDecisionContractCompliance:
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-flash",
             answering_envelope_identity="deepseek-v4-flash",
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
             run_id="run-001",
             task_id="task-01/nested-01",
             attempt=1,
@@ -2502,6 +2510,8 @@ class TestRouteDecisionContractCompliance:
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-flash",
             answering_envelope_identity="deepseek-v4-flash",
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
             run_id="run-nd",
             task_id="task-nd",
             attempt=1,
@@ -2513,6 +2523,130 @@ class TestRouteDecisionContractCompliance:
         # These are now required contract fields
         assert payload["resolved_provider"] == "faigate"
         assert payload["resolved_model"] == "byteplus/deepseek-v4-flash"
+
+    def test_sdk_validator_accepts_production_route_decision(self, tmp_path):
+        """Production route_decision validates with the SDK validator.
+
+        Controller finding 3 requires an authoritative test that runs the
+        production path (make_route_decision + journal) and validates every
+        route_decision event with skillweave_sdk.validator.validate() against
+        the frozen route-decision-v1 schema, asserting an empty error list.
+
+        This test:
+        1. Writes a minimal route policy and route proof to temp files
+        2. Loads both via RoutePolicy.load() and RouteProof.load()
+        3. Builds a RouteDecision via make_route_decision() with catalog_revision
+           and policy_revision sourced from the proof
+        4. Appends to a journal (production persistence path)
+        5. Reads back the journal events
+        6. Validates every route_decision contract with the SDK validator
+        """
+        import json
+        import tempfile
+
+        # Path to the scratch schemas dir that includes route-decision-v1.schema.json
+        scratch_schemas = Path(
+            "/Users/andrelange/Documents/repositories/forgejo/skillweave/"
+            "skillweave-planning/.skillweave/sequences/2026-10-04-sw1510-controller-recovery/"
+            "runtime/SW-1510-ROUTE-LOCK-ops-4c9cd968b2f4/tmp/schemas"
+        )
+        assert scratch_schemas.is_dir(), (
+            f"scratch schemas dir not found: {scratch_schemas}"
+        )
+        assert (scratch_schemas / "route-decision-v1.schema.json").is_file(), (
+            "route-decision-v1.schema.json missing from scratch schemas"
+        )
+
+        # --- 1. Write route policy and route proof to temp files ---
+        policy_data = {
+            "schema": "route-policy-v1",
+            "required_revision": "1.3.11",
+            "approved_gateway": {"host": "127.0.0.1", "port": 8090},
+            "approved_routes": [
+                "byteplus/deepseek-v4-flash",
+                "byteplus/deepseek-v4-pro",
+            ],
+        }
+        proof_data = {
+            "schema": "route-proof-v1",
+            "revision": "1.3.11",
+            "catalog_revision": "1.3.11",
+            "approved_gateway": {"host": "127.0.0.1", "port": 8090},
+            "approved_routes": [
+                "byteplus/deepseek-v4-flash",
+                "byteplus/deepseek-v4-pro",
+            ],
+            "tier_routes": {
+                "flash": ["byteplus/deepseek-v4-flash"],
+                "pro": ["byteplus/deepseek-v4-pro"],
+            },
+        }
+        policy_path = tmp_path / "route_policy.json"
+        proof_path = tmp_path / "route_proof.json"
+        policy_path.write_text(json.dumps(policy_data), encoding="utf-8")
+        proof_path.write_text(json.dumps(proof_data), encoding="utf-8")
+
+        # --- 2. Load policy and proof ---
+        policy = RoutePolicy.load(str(policy_path))
+        proof = RouteProof.load(str(proof_path))
+
+        # --- 3. Build RouteDecision via make_route_decision ---
+        from skillweave.routing.faigate_adapter import make_route_decision
+        decision = make_route_decision(
+            correlation_id="sdk-test/attempt-1",
+            requested_alias="deepseek-v4-flash",
+            resolved_provider="faigate",
+            resolved_model="byteplus/deepseek-v4-flash",
+            answering_envelope_identity="deepseek-v4-flash",
+            catalog_revision=proof.catalog_revision,
+            policy_revision=proof.policy_revision,
+            run_id="run-sdk-test",
+            task_id="task-sdk-test",
+            attempt=1,
+            reservation_id="res-sdk-test",
+            attempt_order=["attempt-1"],
+            attribution_status="attributed",
+            outcome="resolved",
+        )
+
+        # --- 4. Append to journal (production persistence path) ---
+        from skillweave.runtime.journal import EventJournal
+        db_path = tmp_path / "test_sdk_validator.db"
+        journal = EventJournal(str(db_path))
+        journal.append(
+            "run-sdk-test",
+            event_type="route_decision",
+            payload=decision.to_journal_dict(),
+            correlation_id="sdk-test/attempt-1",
+        )
+
+        # --- 5. Read back journal events ---
+        events = journal.get_events("run-sdk-test")
+        route_events = [e for e in events if e.event_type == "route_decision"]
+        assert len(route_events) >= 1, "no route_decision events found in journal"
+
+        # --- 6. Validate every route_decision contract with the SDK validator ---
+        import skillweave_sdk.validator as sdk_validator
+
+        # Monkey-patch SCHEMA_FILENAMES so load_registry picks up the new schema
+        original_filenames = sdk_validator.SCHEMA_FILENAMES
+        try:
+            sdk_validator.SCHEMA_FILENAMES = original_filenames + (
+                "route-decision-v1.schema.json",
+            )
+            schema_id = "https://skillweave.dev/schemas/execution/route-decision/v1"
+
+            for event in route_events:
+                contract = event.payload["contract"]
+                errors = sdk_validator.validate(
+                    contract, schema_id, schemas_dir=scratch_schemas,
+                )
+                assert errors == [], (
+                    f"SDK validator rejected route_decision contract: {errors}\n"
+                    f"contract: {json.dumps(contract, indent=2)}"
+                )
+        finally:
+            sdk_validator.SCHEMA_FILENAMES = original_filenames
 
 
 class TestAnsweringModelUpdate:
@@ -2555,6 +2689,8 @@ class TestAnsweringModelUpdate:
             correlation_id="task-answer-1/attempt-1",
             requested_alias="deepseek-v4-flash",
             answering_model="deepseek-v4-flash",
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
             reservation_id="res-answer-1",
             attempt=1,
             attempt_order=1,
@@ -2566,7 +2702,7 @@ class TestAnsweringModelUpdate:
         assert payload["contract"]["answering_model"] == "deepseek-v4-flash"
         assert payload["contract"]["attribution_status"] == "answered"
         assert payload["contract"]["outcome"] == "resolved"
-        assert payload["contract"]["attempt_order"] == [1]
+        assert payload["contract"]["attempt_order"] == ["attempt-1"]
 
     def test_update_answering_model_empty_string(self, svc, db_path):
         """When answering_model is empty, the event records unattributed status."""
@@ -2576,6 +2712,8 @@ class TestAnsweringModelUpdate:
             correlation_id="task-answer-2/attempt-1",
             requested_alias="deepseek-v4-flash",
             answering_model="",
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
             reservation_id="",
             attempt=1,
             attempt_order=1,
@@ -2602,6 +2740,8 @@ class TestAnsweringModelUpdate:
             correlation_id="task-answer-3/attempt-1",
             requested_alias="deepseek-v4-flash",
             answering_model="deepseek-v4-flash",
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
             reservation_id="res-answer-3",
             attempt=1,
             attempt_order=1,
@@ -2627,11 +2767,13 @@ class TestAnsweringModelUpdate:
             requested_alias="deepseek-v4-flash",
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-flash",
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
             run_id="run-full",
             task_id="task-full",
             attempt=1,
             reservation_id="res-full",
-            attempt_order=[0],
+            attempt_order=["attempt-0"],
         )
         svc.journal.append(
             "run-full",
@@ -2649,11 +2791,13 @@ class TestAnsweringModelUpdate:
             resolved_provider="faigate",
             resolved_model="byteplus/deepseek-v4-flash",
             answering_envelope_identity="deepseek-v4-flash",
+            catalog_revision="1.3.11",
+            policy_revision="1.3.11",
             run_id="run-full",
             task_id="task-full",
             attempt=1,
             reservation_id="res-full",
-            attempt_order=[1],
+            attempt_order=["attempt-1"],
             attribution_status="attributed",
             outcome="resolved",
         )
@@ -2670,7 +2814,7 @@ class TestAnsweringModelUpdate:
         route_events = [e for e in events if e.event_type == "route_decision"]
         assert len(route_events) >= 2
         orders = sorted([e.payload["contract"]["attempt_order"] for e in route_events])
-        assert orders == [[0], [1]]
+        assert orders == [["attempt-0"], ["attempt-1"]]
 
     # ------------------------------------------------------------------
     # Egress profile generation (SBPL syntax verification)

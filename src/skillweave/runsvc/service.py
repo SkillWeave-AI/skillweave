@@ -635,6 +635,11 @@ class RunApplicationService:
         # A later route_decision update below carries the answering identity
         # from the response envelope when the provider reports it.
         if reservation_rec is not None:
+            # SW-1510-ROUTE-LOCK: when route_proof is available, fill
+            # catalog_revision and policy_revision from the proof document
+            # so the contract payload satisfies the frozen schema minLength:1.
+            _rd_catalog = getattr(route_proof, "catalog_revision", "") if route_proof is not None else ""
+            _rd_policy = getattr(route_proof, "policy_revision", "") if route_proof is not None else ""
             self._log_route_decision(
                 run_id,
                 task_id=task_id or run_id,
@@ -643,8 +648,8 @@ class RunApplicationService:
                 resolved_provider="faigate",
                 resolved_model=model,
                 answering_envelope_identity=None,
-                catalog_revision="",
-                policy_revision="",
+                catalog_revision=_rd_catalog,
+                policy_revision=_rd_policy,
             )
 
         # Stage 2: launch the worker as a real subprocess. On the protected
@@ -830,12 +835,18 @@ class RunApplicationService:
         # observable from the parent.  Record a null answering model with a
         # reason so the identity chain is honest rather than silently absent.
         if reservation_rec is not None:
+            # SW-1510-ROUTE-LOCK: carry forward catalog/policy revision from
+            # the route proof so the follow-up event also satisfies minLength:1.
+            _rd_catalog = getattr(route_proof, "catalog_revision", "") if route_proof is not None else ""
+            _rd_policy = getattr(route_proof, "policy_revision", "") if route_proof is not None else ""
             self._update_route_decision_answering(
                 run_id,
                 task_id=task_id or run_id,
                 correlation_id=f"{task_id or run_id}/attempt-{attempt}",
                 requested_alias=model or "",
                 answering_model="",
+                catalog_revision=_rd_catalog,
+                policy_revision=_rd_policy,
                 reservation_id=reservation_rec.reservation_id,
                 attempt=int(attempt),
                 attempt_order=1,
@@ -1343,7 +1354,7 @@ class RunApplicationService:
                 task_id=task_id,
                 attempt=attempt,
                 reservation_id=reservation_id,
-                attempt_order=[attempt_order] if isinstance(attempt_order, int) else attempt_order,
+                attempt_order=[f"attempt-{attempt_order}"] if isinstance(attempt_order, int) else attempt_order,
                 attribution_status=attribution_status,
                 outcome=outcome,
             )
@@ -1366,6 +1377,8 @@ class RunApplicationService:
         answering_model: str,
         resolved_provider: str = "faigate",
         resolved_model: str = "",
+        catalog_revision: str = "",
+        policy_revision: str = "",
         reservation_id: str = "",
         attempt: int = 1,
         attempt_order: int = 1,
@@ -1381,6 +1394,10 @@ class RunApplicationService:
         (``AttributedResponse.answering_model``, read from ``envelope['model']``).
         When the provider genuinely does not report a model, ``answering_model``
         is empty and the reason is documented in ``_meta``.
+
+        ``catalog_revision`` and ``policy_revision`` carry forward the values
+        from the initial route decision so the follow-up event also satisfies
+        the frozen schema ``minLength:1`` constraint.
 
         Only call this when the answering model is genuinely observable.  If the
         provider did not report a model, pass an empty string and the event is
@@ -1398,13 +1415,13 @@ class RunApplicationService:
                 resolved_provider=resolved_provider,
                 resolved_model=resolved_model or requested_alias,
                 answering_envelope_identity=answering_model if not is_empty else None,
-                catalog_revision="",
-                policy_revision="",
+                catalog_revision=catalog_revision,
+                policy_revision=policy_revision,
                 run_id=run_id,
                 task_id=task_id,
                 attempt=attempt,
                 reservation_id=reservation_id,
-                attempt_order=[attempt_order] if isinstance(attempt_order, int) else attempt_order,
+                attempt_order=[f"attempt-{attempt_order}"] if isinstance(attempt_order, int) else attempt_order,
                 attribution_status="unattributed" if is_empty else "attributed",
                 outcome="resolved",
             )
@@ -2678,6 +2695,10 @@ class RunApplicationService:
         # wrapper-completion or poll step should carry the answering identity
         # when the provider reports it.
         if reservation_rec is not None and route is not None:
+            # SW-1510-ROUTE-LOCK: when route_proof is available, fill
+            # catalog_revision and policy_revision from the proof document.
+            _rd_catalog = getattr(route_proof, "catalog_revision", "") if route_proof is not None else ""
+            _rd_policy = getattr(route_proof, "policy_revision", "") if route_proof is not None else ""
             self._log_route_decision(
                 rid,
                 task_id=effective_task_id,
@@ -2686,8 +2707,8 @@ class RunApplicationService:
                 resolved_provider="faigate",
                 resolved_model=route,
                 answering_envelope_identity=None,
-                catalog_revision="",
-                policy_revision="",
+                catalog_revision=_rd_catalog,
+                policy_revision=_rd_policy,
             )
 
         # Store initial lifecycle metadata BEFORE launching the child, so the
@@ -3867,6 +3888,10 @@ class RunApplicationService:
         # later route_decision update should carry the answering identity when
         # the provider reports it.
         if reservation_rec is not None:
+            # SW-1510-ROUTE-LOCK: when route_proof is available, fill
+            # catalog_revision and policy_revision from the proof document.
+            _rd_catalog = getattr(route_proof, "catalog_revision", "") if route_proof is not None else ""
+            _rd_policy = getattr(route_proof, "policy_revision", "") if route_proof is not None else ""
             self._log_route_decision(
                 run_id,
                 task_id=task_id or run_id,
@@ -3875,8 +3900,8 @@ class RunApplicationService:
                 resolved_provider="faigate",
                 resolved_model=model,
                 answering_envelope_identity=None,
-                catalog_revision="",
-                policy_revision="",
+                catalog_revision=_rd_catalog,
+                policy_revision=_rd_policy,
             )
 
         # Stage 2: the real protected launch + durable streaming collection.
