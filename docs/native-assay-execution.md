@@ -157,6 +157,31 @@ exposes:
   `allow_remote=True` is passed, and a scope token (`auth_token` or
   `SKILLWEAVE_MCP_HTTP_TOKEN`) is required. A bind that is not scoped refuses;
   nothing is served open.
+* **Per-request scoped HTTP authentication** (`SW-1510-MCP-AUTH`). A scope
+  token checked only at startup does not authenticate a *request*. The scope
+  token is enforced on **every** HTTP request, ahead of any MCP handling, by an
+  ASGI guard installed on the built server's Streamable HTTP app
+  (`control._install_http_request_guard`). The comparison is constant-time
+  (`hmac.compare_digest`); a missing or wrong token is refused with `401` and a
+  `WWW-Authenticate: Bearer` challenge, and neither the presented nor the
+  expected token is ever echoed in the response body, the log line or the
+  refusal reason. When a session authority is bound at serve time the presented
+  token is resolved to its registered principal and that principal is attached
+  to the operation for the call (a `ContextVar`, so concurrent requests never
+  see one another's principal, and reset between requests), so the per-tool
+  gating sees an *authenticated* principal over HTTP exactly as it does over
+  stdio. The authenticated principal's role comes from the server registry,
+  never the wire.
+* **An explicit supervisor identity for local stdio** (`SW-1510-MCP-AUTH`).
+  The local stdio transport runs under a supervised session, so
+  `python -m skillweave.mcp.server` requires the supervising principal to be
+  named in `SKILLWEAVE_MCP_SUPERVISOR` (a real operator/launcher sets it; the
+  value is the supervisor's identity, e.g. `supervisor:ops`). Without it the
+  entry **refuses cleanly**: a one-line actionable message on stderr (naming
+  the environment variable and the word *supervisor*) and the documented
+  non-zero exit code `3` (`server.EXIT_REFUSED`) — never a bare traceback. The
+  same non-zero exit covers the missing-`mcp`-dependency refusal, so a launcher
+  sees one documented failure code for either refusal.
 
 ### Stub vs live transport proof
 

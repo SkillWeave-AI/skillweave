@@ -525,9 +525,17 @@ def test_protected_triple_declared_scope_holds_or_confines(tmp_path):
 # ---------------------------------------------------------------------------
 
 _MCP_DRIVER = r'''
-import asyncio, hashlib, json, os
+import asyncio, base64, hashlib, json, os, sys
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
+
+# The production native ingress the MCP ``create_run`` tool delegates to. The
+# driver is a *separate process* from the stdio server, so it uses this ingress
+# to create the positive-control run host-side and then reads it back over the
+# real MCP transport. Over the transport the authenticated supervisor principal
+# may not supply a command of its own, so the genuine child is launched here.
+sys.path.insert(0, os.environ["SKILLWEAVE_SRC"])
+from skillweave.mcp.control import create_run_payload
 
 here = os.environ["MCP_WORK"]
 
@@ -582,10 +590,29 @@ evidence = json.dumps([art])
 server_env = dict(os.environ)
 server_env["PYTHONPATH"] = os.environ["SKILLWEAVE_SRC"] + os.pathsep + os.environ["SDK_SRC"]
 server_env["PYTHONUNBUFFERED"] = "1"
+# SW-1510-MCP-AUTH: a local stdio session must name its explicit supervisor
+# identity, exactly as a real operator's launcher does. Without it the server
+# refuses to start (nil supervisor) and the handshake never completes.
+server_env["SKILLWEAVE_MCP_SUPERVISOR"] = os.environ["MCP_SUPERVISOR"]
 params = StdioServerParameters(
     command=os.environ["MCP_PY"],
     args=["-B", "-m", "skillweave.mcp.server"],
     env=server_env, cwd=here,
+)
+
+# The host-owned positive-control run: created through the production native
+# ingress (which the MCP tool delegates to), never a client-supplied command
+# crossing the transport. A client cannot name this command, so a genuine assay
+# PASS can only be reached this way.
+created = create_run_payload(
+    tool="opencode", model="m",
+    subject_repo="skillweave", subject_commit=COMMIT,
+    command=sys.executable + " -c \"print('mcp-transport-ok')\"",
+    db_path=".skillweave/store.db", artifacts_path=".skillweave/artifacts",
+    methodology="assay", autonomy_policy="unicorn",
+    task_id="task-transport", attempt=1,
+    stream_root=os.path.join(here, "streams"),
+    artifact_evidence=evidence, source_root=src, analysis_root=ana,
 )
 
 async def main():
@@ -595,34 +622,41 @@ async def main():
             print("INIT", init.serverInfo.name, init.serverInfo.version)
             tools = await session.list_tools()
             print("TOOLS", ",".join(sorted(t.name for t in tools.tools)))
-            call = await session.call_tool("create_run", {
+
+            # (a) Negative over the real transport: a client-supplied command is
+            # refused with an auditable typed error and nothing is executed.
+            bad = await session.call_tool("create_run", {
                 "tool": "opencode", "model": "m",
                 "subject_repo": "skillweave", "subject_commit": COMMIT,
-                "command": os.environ["MCP_PY"] + " -c \"print('mcp-transport-ok')\"",
-                "db_path": os.path.join(here, "run.db"),
-                "artifacts_path": os.path.join(here, "artifacts"),
-                "methodology": "assay", "autonomy_policy": "unicorn",
-                "task_id": "task-transport", "attempt": 1,
-                "stream_root": os.path.join(here, "streams"),
-                "artifact_evidence": evidence,
-                "source_root": src,
-                "analysis_root": ana,
+                "command": os.environ["MCP_PY"] + " -c \"print('should-not-run')\"",
             })
-            payload = json.loads(call.content[0].text)
-            print("CREATE", payload["run_id"], payload["gate_state"], payload["stream"]["durable"])
+            refused = json.loads(bad.content[0].text)
+            print("CMDREFUSE", refused["code"], "run_id" in refused)
+
+            # (b) Positive over the real transport: read a run created
+            # host-side, asserting real CALL output.
             st = await session.call_tool("status_run",
-                {"run_id": payload["run_id"], "db_path": os.path.join(here, "run.db")})
+                {"run_id": created["run_id"], "db_path": ".skillweave/store.db"})
             snap = json.loads(st.content[0].text)
             print("STATUS", snap["methodology"], snap["task_id"], snap["outcome"])
+            ev = await session.call_tool("get_evidence",
+                {"run_id": created["run_id"], "db_path": ".skillweave/store.db"})
+            events = json.loads(ev.content[0].text)["events"]
+            print("EVIDENCE", len(events))
             streams = os.path.join(here, "streams")
             print("FILES", ",".join(sorted(os.listdir(streams))))
-            cursors = []
+            cursors, stdout = [], []
             with open(os.path.join(streams, "frames.jsonl")) as fh:
                 for line in fh:
                     line = line.strip()
-                    if line:
-                        cursors.append(json.loads(line)["cursor"])
+                    if not line:
+                        continue
+                    frame = json.loads(line)
+                    cursors.append(frame["cursor"])
+                    if frame.get("stream") == "stdout" and frame.get("data_b64"):
+                        stdout.append(base64.b64decode(frame["data_b64"]))
             print("CURSORS", ",".join(str(c) for c in cursors))
+            print("STDOUT", b"".join(stdout).decode())
 
 asyncio.run(main())
 '''
@@ -634,9 +668,15 @@ def test_real_mcp_transport_initialize_call_and_status(tmp_path):
 
     This is not an in-process handler call: a subprocess client speaks the MCP
     protocol (``initialize`` handshake, ``tools/list``, ``tools/call``) to a
-    subprocess server launched as ``python -m skillweave.mcp.server``, and the
-    call must persist durable stream evidence whose ordered cursors form a real
-    replay.
+    subprocess server launched as ``python -m skillweave.mcp.server``.
+
+    The authenticated local supervisor principal may not supply a command at
+    the tool boundary, so the driver first asserts the transport *refuses* a
+    client-supplied command (``command_injection_refused``, nothing executed),
+    then exercises the allowed positive path -- reading, over the transport, a
+    genuine assay PASS run created host-side through the production native
+    ingress -- and asserts real ``INIT``/``TOOLS``/``CALL`` output plus durable
+    stream evidence whose ordered cursors form a real replay.
     """
     mcp_py = _mcp_python()
     sdk = _sdk_src()
@@ -654,6 +694,9 @@ def test_real_mcp_transport_initialize_call_and_status(tmp_path):
         "MCP_WORK": str(work),
         "SKILLWEAVE_SRC": str(_SRC),
         "SDK_SRC": str(sdk),
+        # The explicit supervisor identity every real local stdio launcher must
+        # now provide (SW-1510-MCP-AUTH criterion 3).
+        "MCP_SUPERVISOR": "supervisor:ops-harness",
     })
     proc = subprocess.run(
         [mcp_py, "-B", str(driver)],
@@ -669,12 +712,17 @@ def test_real_mcp_transport_initialize_call_and_status(tmp_path):
     assert lines["TOOLS"] == (
         "cancel_run,create_run,get_evidence,resume_run,review_run,status_run"
     )
-    run_id, gate, durable = lines["CREATE"].split(" ")
-    assert gate == "pass" and durable == "True"
+    # (a) A client-supplied command is refused over the real transport; the
+    # ethical refusal carries no run id (nothing was launched).
+    assert lines["CMDREFUSE"] == "command_injection_refused False"
+    # (b) The allowed positive path: the host-owned run is read back over the
+    # transport and reports the genuine assay PASS.
     assert lines["STATUS"] == "assay task-transport pass"
+    assert int(lines["EVIDENCE"]) >= 1
     assert set(lines["FILES"].split(",")) >= {
         "frames.jsonl", "facts.jsonl", "cursor.json", "meta.json",
     }
+    assert lines["STDOUT"] == "mcp-transport-ok"
     cursors = [int(c) for c in lines["CURSORS"].split(",") if c]
     assert len(cursors) >= 4
     assert cursors == sorted(cursors) and len(set(cursors)) == len(cursors)
