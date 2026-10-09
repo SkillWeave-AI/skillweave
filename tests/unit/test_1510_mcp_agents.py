@@ -53,6 +53,7 @@ from skillweave.dispatch.messaging import (  # noqa: E402
     UnsupportedMessageVersion,
     agent_message_contract_digest,
 )
+from skillweave.mcp import control as mcp_control  # noqa: E402
 from skillweave.mcp import server as mcp_server  # noqa: E402
 from skillweave.runtime import handoff as runtime_handoff  # noqa: E402
 from skillweave.runtime.authority import MCPPrincipalAuthority  # noqa: E402
@@ -293,6 +294,64 @@ class TestServerToolsAreScoped:
             kind="status", recipient="w2", body="x",
         ))
         assert denied["code"] == "unauthenticated"
+
+    def test_the_new_tools_are_gated_like_the_legacy_six(self, authority):
+        """Every SW-1510-MCP-AGENTS tool is refused without a resolvable credential.
+
+        The controller required explicit proof that the new tools carry the
+        *same* MCP-AUTH gate as the legacy six: with an authority bound and no
+        token presented, each new tool refuses ``unauthenticated`` before any
+        mailbox is opened (nothing is posted/read/acked).
+        """
+        calls = {
+            "mailbox_post": lambda: mcp_server.mailbox_post(
+                kind="handoff", recipient="worker-1",
+            ),
+            "mailbox_read": lambda: mcp_server.mailbox_read(recipient="worker-1"),
+            "mailbox_replay": lambda: mcp_server.mailbox_replay(recipient="worker-1"),
+            "mailbox_ack": lambda: mcp_server.mailbox_ack("m-1"),
+            "agent_capabilities": lambda: mcp_server.agent_capabilities(),
+        }
+        assert set(calls) == set(mcp_control.MCP_AGENT_TOOLS)
+        for name, call in calls.items():
+            out = json.loads(call())
+            assert out["status"] == "refused", (name, out)
+            assert out["code"] == "unauthenticated", (name, out)
+
+    def test_agent_capabilities_is_admitted_for_an_authenticated_principal(
+        self, authority
+    ):
+        token = authority.issue_session(
+            role="controller", client_id="A", transport="stdio"
+        )
+        out = json.loads(mcp_server.agent_capabilities(session_token=token))
+        assert out["status"] == "ok", out
+        # The attestation reports the frozen contract a client can attest to.
+        assert out["contract"]["artifact"] == AGENT_MESSAGE_ARTIFACT
+        assert out["contract"]["schema_digest"] == AGENT_MESSAGE_SCHEMA_DIGEST
+
+    def test_both_served_transports_register_the_whole_surface(self):
+        """The scoped HTTP transport serves the identical surface as stdio.
+
+        The controller finding: a *real* ``tools/list`` from either transport
+        must equal one authority. This pins the shared enumeration both servers
+        are built from, without needing the real ``mcp`` package.
+        """
+        from skillweave.mcp import server as _server
+
+        # Where the placeholder records its decorated tools (no real ``mcp``),
+        # it captures exactly the served surface -- the same names the scoped
+        # HTTP server registers via ``_build_server``.
+        if not mcp_control.mcp_available():
+            stdio_handlers = {fn.__name__ for fn in _server.mcp.tools}
+            assert stdio_handlers == set(mcp_control.mcp_tool_names())
+        # The scoped HTTP server is built from the same two spec sets, so its
+        # registered surface is the identical sorted tool-name tuple.
+        built = [s.name for s in (
+            *mcp_control.legacy_tool_specs(), *mcp_control.mcp_agent_tool_specs()
+        )]
+        assert set(built) == set(mcp_control.mcp_tool_names())
+        assert sorted(built) == list(mcp_control.mcp_tool_names())
 
 
 # ===========================================================================

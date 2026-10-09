@@ -81,6 +81,32 @@ LEGACY_TOOLS: tuple[str, ...] = (
     "review_run",
 )
 
+#: The SW-1510-MCP-AGENTS tools the durable handoff/mailbox surface registers on
+#: the *same* production stdio server. Like :data:`LEGACY_TOOLS` they are served
+#: only when the real ``mcp`` package is present, so a live ``tools/list``
+#: advertises exactly the union of the two sets. Kept here -- the single place
+#: the served surface is enumerated -- so a transport assertion names the whole
+#: surface from one authority instead of re-listing it per test.
+MCP_AGENT_TOOLS: tuple[str, ...] = (
+    "mailbox_post",
+    "mailbox_read",
+    "mailbox_replay",
+    "mailbox_ack",
+    "agent_capabilities",
+)
+
+
+def mcp_tool_names() -> tuple[str, ...]:
+    """The complete served tool surface, sorted -- legacy six + MCP-AGENTS tools.
+
+    Every exact-tool-list assertion over a *real* transport (stdio or scoped
+    HTTP) should compare against this rather than a hand-maintained literal, so
+    adding a tool to the served surface cannot silently drift from the tests
+    that pin it. The result matches the wire form a client sees:
+    ``','.join(sorted(t.name for t in tools.tools))``.
+    """
+    return tuple(sorted(LEGACY_TOOLS + MCP_AGENT_TOOLS))
+
 #: The explicit diagnostic returned when the ``mcp`` dependency is missing.
 #: Phrased as a durable state, not a stack trace: a host can surface it and an
 #: operator can act on it.
@@ -466,9 +492,17 @@ def _load_fastmcp() -> Any:
 
 
 def _build_server(fastmcp: Any):
-    """Build the real ``FastMCP`` server carrying the six legacy tools."""
+    """Build the real ``FastMCP`` server carrying the complete served surface.
+
+    The scoped HTTP transport registers exactly what the production stdio
+    server (``skillweave.mcp.server``) registers: the six legacy command tools
+    *plus* the SW-1510-MCP-AGENTS durable handoff/mailbox tools. Both are
+    resolved lazily from the same module, so a transport cannot advertise a
+    surface the other lacks -- and every tool carries the module's own
+    ``gate_operation`` authorization gate, over the same host-bound authority.
+    """
     server = fastmcp.FastMCP(SERVER_NAME)
-    for spec in legacy_tool_specs():
+    for spec in (*legacy_tool_specs(), *mcp_agent_tool_specs()):
         server.tool()(spec.handler)
     return server
 
@@ -1328,6 +1362,30 @@ def legacy_tool_specs() -> list[ToolSpec]:
     ]
 
 
+def mcp_agent_tool_specs() -> list[ToolSpec]:
+    """The SW-1510-MCP-AGENTS tools (the same module handlers stdio registers).
+
+    Resolved lazily from ``skillweave.mcp.server`` exactly as
+    :func:`legacy_tool_specs` is, so the scoped HTTP server serves the identical
+    durable handoff/mailbox surface -- gated by each tool's own
+    ``gate_operation`` -- without this module eagerly importing the optional
+    authority subpackage or re-declaring the handlers.
+    """
+    from skillweave.mcp import server as _server
+
+    names = {
+        "mailbox_post": _server.mailbox_post,
+        "mailbox_read": _server.mailbox_read,
+        "mailbox_replay": _server.mailbox_replay,
+        "mailbox_ack": _server.mailbox_ack,
+        "agent_capabilities": _server.agent_capabilities,
+    }
+    return [
+        ToolSpec(name=n, version="agents", description=n, handler=names[n])
+        for n in MCP_AGENT_TOOLS
+    ]
+
+
 __all__ = [
     "CONTROL_NAMESPACE",
     "CONTROL_SURFACE",
@@ -1341,6 +1399,7 @@ __all__ = [
     "HttpRequestUnauthorized",
     "LEGACY_TOOLS",
     "LOOPBACK_HOSTS",
+    "MCP_AGENT_TOOLS",
     "MCP_PROTOCOL_VERSION",
     "McpDependencyUnavailable",
     "RUN_SNAPSHOT_VERSION",
@@ -1370,7 +1429,9 @@ __all__ = [
     "get_run_service",
     "http_authority",
     "legacy_tool_specs",
+    "mcp_agent_tool_specs",
     "mcp_available",
+    "mcp_tool_names",
     "negotiate_capabilities",
     "require_mcp",
     "require_scoped_bind",
