@@ -12,6 +12,10 @@ Modes (argv[1]):
                        compliant server does to the old defect's bare tools/call
     error              tools/call returns a JSON-RPC error object
     unavailable        closes the stream immediately (an outage)
+    auth_required      tools/list returns empty tools (anonymous/ask-only)
+    missing_credential tools/list returns -32001 credential error
+    expired_credential tools/list succeeds but tools/call returns -32001 auth error
+    tool_unavailable   tools/list succeeds but specific tool is missing
 
 The launched command is always a local interpreter + this file: no floating
 ``git+`` or URL install is ever constructed.
@@ -69,10 +73,22 @@ def main():
             if not initialized:
                 _error(rid, -32002, "server not initialized")
                 continue
+            if MODE == "auth_required":
+                _result(rid, {"tools": []})
+                continue
+            if MODE == "missing_credential":
+                _error(rid, -32001, "Missing credential: PERPLEXITY_COOKIES not found")
+                continue
             _result(rid, {"tools": [_TOOL]})
         elif method == "tools/call":
             if MODE == "reject-first-call" and not initialized:
                 _error(rid, -32002, "server not initialized")
+                continue
+            if MODE == "expired_credential":
+                _error(rid, -32001, "Credential expired: PERPLEXITY_COOKIES is no longer valid")
+                continue
+            if MODE == "tool_unavailable":
+                _error(rid, -32602, f"Unknown tool: perplexity_search")
                 continue
             if MODE == "error":
                 _error(rid, -32603, "internal error")
