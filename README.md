@@ -282,6 +282,12 @@ All SkillWeave data lives in `.skillweave/` (git-ignored):
 └── templates/           # Report/doc templates
 ```
 
+The **27 canonical `.skillweave/` areas**, their single owning skill/subsystem,
+lifecycle phase and mutability are specified in
+**[docs/substrate-map.md](docs/substrate-map.md)**; the execution/support matrix
+in [docs/native-execution-support-1510.md](docs/native-execution-support-1510.md)
+summarises the substrate count and the one open deviation it records.
+
 ### Risk Modes
 
 | Mode | Behavior |
@@ -319,20 +325,31 @@ current-release status for it.)
 
 ---
 
-## Free / Studio
+## Support and limits
 
-SkillWeave is **Forever Free** — all 15 skills, all 7 phases, no limits.
+This section states what the shipped engine **does** and the limits it carries;
+it makes no future-capability or always-free promise.
 
-**SkillWeave Studio** (coming soon) adds advanced and team features:
+The **execution/support matrix** — the versioned surface support table
+(`skillweave.support/1`), the shared run-state interpretation
+(`skillweave.run-state/1`), the CLI/MCP/Assay rows, and the explicit bare
+limits, detected-versus-live-tested adapters, unknown-capacity rule, preview
+features and plaintext onboarding storage behaviour — is
+**[docs/native-execution-support-1510.md](docs/native-execution-support-1510.md)**.
+Every number and name there is derived from the release tree and asserted by
+`tests/unit/test_1510_doc_truth.py`.
 
-| Free | Studio |
-|------|--------|
-| 15 skills, 7 phases | Everything in Free |
-| Testing pyramid | Webhook/event hooks |
-| Planning board | Team collaboration |
-| Wizard + meta-commands | Analytics dashboard |
-| Council deliberation | Priority support |
-| Reports + documentation | Custom skill authoring |
+The 15 skills (all 15 skills) and 7 phases above are the ones this repository
+ships — the exact `skills/*/capability.yaml` inventory. The local engine keeps
+its raw events on the machine and works offline; the aggregate telemetry service
+is labelled **`preview/unavailable`** and this release ships **no** production
+service for it (`AGGREGATE_SERVICE_GA` is pinned `False`). Edition contracts
+exist for **Community / Pro / Enterprise**; `EditionGuard` grants only what an
+edition's declared contract allows and refuses an unknown edition. Expected
+limits — a keyless zero-key search default, a source/Capacium-only install (no
+PyPI), a capability handshake where **unknown capacity is never treated as
+unlimited**, and onboarding state written as **plaintext** YAML — are all
+itemised in the matrix above.
 
 ---
 
