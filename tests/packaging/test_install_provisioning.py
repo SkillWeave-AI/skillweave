@@ -37,6 +37,7 @@ explicit setup-hold reason -- never weakened into a semantic false pass.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -60,11 +61,125 @@ _COPY_IGNORE = shutil.ignore_patterns(
 _SEED_PACKAGES = ("setuptools", "wheel", "_distutils_hack", "yaml", "_yaml")
 _SEED_DISTINFOS = ("setuptools", "wheel", "pyyaml")
 
-# The pinned SDK is a *base* dependency and is seeded too when the running
-# interpreter has it, so the runtime-surface sweep can import the modules that
-# genuinely require it.
-_SDK_PACKAGE = "skillweave_sdk"
+# The pinned SDK is a *base* dependency. The runtime-surface sweep needs it in
+# the fresh venv -- ``skillweave.runtime.authority_service`` imports
+# ``skillweave_sdk.validator.AuthenticatedServiceContext`` -- so ``_seed_bare_venv``
+# provides it from a real SDK source: the offline pinned wheel named by
+# ``$SKILLWEAVE_SDK_DIR`` (the private dependency material / preflight dir) when
+# present, else the running interpreter's own install. A stale or absent copy is
+# a setup HOLD at the point of use, never a fabricated pass.
 _SDK_DISTINFOS = ("skillweave_sdk", "skillweave-sdk")
+_SDK_MODULE = "skillweave_sdk"
+_SDK_SENTINEL = "AuthenticatedServiceContext"
+# Prebuilt sdist/wheel normalized names (``skillweave-sdk``) are normalized to the
+# underscore form; accept both spellings when locating a wheel.
+_SDK_WHEEL_GLOBS = ("skillweave_sdk-*.whl", "skillweave-sdk-*.whl")
+# This lane runs from the pinched reproducible scratch; the caller pins read-only
+# inputs. The default is only a courtesy, tested for existence before use.
+_SDK_DIR_ENV = "SKILLWEAVE_SDK_DIR"
+_DEFAULT_SDK_DIR = "/Users/andrelange/Documents/repositories/forgejo/skillweave/skillweave-planning/.skillweave/sequences/2026-10-04-sw1510-controller-recovery/preflight/real-baseline-artifacts-0ef3ead374e24f38b4c95759a8903d3b/wheels"
+
+
+def _imports_sentinel(pkg_dir: Path, module: str, sentinel: str) -> bool:
+    """Whether the source file ``<pkg_dir>/<top_level>.py``-adjacent package
+    actually defines ``sentinel``.
+
+    A cheap, subprocess-free pre-check: a stale SDK reusing the same version
+    string can be detected by scanning source before we trust it.
+    """
+    top = module.split(".")[0]
+    root = pkg_dir / top
+    if not root.is_dir():
+        return False
+    for path in root.rglob("*.py"):
+        try:
+            if re.search(r"\b%s\b" % re.escape(sentinel), path.read_text(errors="ignore")):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _running_sdk_source():
+    """The running interpreter's own SDK install, if it provides the sentinel.
+
+    Returns ``(site_dir, distinfo_dir)`` -- the directory that contains the
+    ``skillweave_sdk`` package (added to the venv as a ``.pth``) and the existing
+    ``.dist-info`` to copy -- or ``None`` when the running interpreter has no
+    qualified SDK (missing, stale, or metadata-only).
+    """
+    import importlib.util
+
+    spec = importlib.util.find_spec(_SDK_MODULE)
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    pkg_dir = Path(next(iter(spec.submodule_search_locations))).parent
+    if not _imports_sentinel(pkg_dir, _SDK_MODULE, _SDK_SENTINEL):
+        return None
+    for info in pkg_dir.glob("*.dist-info"):
+        name = info.name.split("-")[0]
+        if name in _SDK_DISTINFOS or name.lower() == _SDK_MODULE:
+            return pkg_dir, info
+    return None
+
+
+def _sdk_wheel():
+    """The offline pinned SDK wheel to provide, or ``None`` when none exists."""
+    candidates = []
+    env_dir = os.environ.get(_SDK_DIR_ENV)
+    if env_dir:
+        candidates.append(Path(env_dir))
+    candidates.append(Path(_DEFAULT_SDK_DIR))
+    for directory in candidates:
+        if not directory.is_dir():
+            continue
+        for pattern in _SDK_WHEEL_GLOBS:
+            found = sorted(directory.glob(pattern))
+            if found:
+                return found[0]
+    return None
+
+
+def _provide_sdk_source(venv_dir: Path) -> None:
+    """Give a fresh venv a qualified ``skillweave_sdk``, or skip with a reason.
+
+    Order: the offline pinned wheel (installed with pip, no index, no deps) is
+    preferred; otherwise the running interpreter's own qualified install is
+    linked with a ``.pth`` and its ``.dist-info`` copied. Neither path mutates
+    ``site-packages`` globally or installs anything shared.
+    """
+    site = next(venv_dir.glob("lib/python*/site-packages"))
+
+    wheel = _sdk_wheel()
+    if wheel is not None:
+        proc = subprocess.run(
+            [_python(venv_dir), "-m", "pip", "install", "--no-index", "--no-deps",
+             "--ignore-installed", str(wheel)],
+            capture_output=True, text=True,
+            env=_clean_env(venv_dir.parent), cwd=str(venv_dir.parent),
+        )
+        if proc.returncode != 0:
+            pytest.skip(
+                "setup HOLD: could not install the pinned SDK wheel "
+                f"{wheel.name} into the fresh venv: {proc.stderr.strip()[:200]}"
+            )
+        return
+
+    running = _running_sdk_source()
+    if running is not None:
+        pkg_dir, distinfo = running
+        (site / "skillweave_sdk.pth").write_text(str(pkg_dir) + "\n")
+        shutil.copytree(distinfo, site / distinfo.name, dirs_exist_ok=True)
+        return
+
+    pytest.skip(
+        "setup HOLD: no qualified skillweave_sdk source is available. Provide the "
+        f"pinned SDK wheel (set ${_SDK_DIR_ENV} to a dir containing "
+        "skillweave_sdk-*.whl, e.g. the private preflight "
+        "real-baseline-artifacts/*/wheels) or run on an interpreter whose own "
+        "install exposes skillweave_sdk.validator.AuthenticatedServiceContext. "
+        "The runtime-surface sweep needs the pinned SDK and is not run without it."
+    )
 
 # The whole-runtime-surface import sweep (R1). It walks every non-optional
 # module under the installed ``skillweave`` and imports it, skipping the optional
@@ -89,7 +204,7 @@ for info in pkgutil.walk_packages(skillweave.__path__, "skillweave."):
     except Exception as exc:  # noqa: BLE001 - the sweep records every failure
         failures.append([name, type(exc).__name__ + ": " + str(exc)[:200]])
 
-print(json.dumps({"modules": len(modules), "failures": failures}))
+print(json.dumps({"modules": len(modules), "names": modules, "failures": failures}))
 '''
 
 
@@ -156,26 +271,21 @@ def _seed_bare_venv(venv_dir: Path) -> None:
     ``--system-site-packages`` venv would leak ambient packages (including a
     possibly-installed ``mcp``) into the very base install we are proving is
     minimal. Seeding by copy keeps the venv's ``sys.path`` closed. The pinned
-    SDK is copied too when the running interpreter has it (it is a base
-    dependency), so the runtime-surface sweep can import the modules that need
-    it.
+    SDK is provided by ``_provide_sdk_source`` (offline wheel, else the running
+    interpreter's qualified install) because it is a *base* dependency the
+    runtime-surface sweep must import; a missing source is a setup HOLD.
     """
     purelib = Path(sysconfig.get_paths()["purelib"])
     site = next(venv_dir.glob("lib/python*/site-packages"))
-    wanted = list(_SEED_PACKAGES)
-    distinfos = list(_SEED_DISTINFOS)
-    if (purelib / _SDK_PACKAGE).exists():
-        wanted.append(_SDK_PACKAGE)
-        distinfos += list(_SDK_DISTINFOS)
     missing = []
-    for name in wanted:
+    for name in _SEED_PACKAGES:
         src = purelib / name
         if src.exists():
             shutil.copytree(src, site / name, dirs_exist_ok=True)
-        elif name in _SEED_PACKAGES:
+        else:
             missing.append(name)
     for distinfo in purelib.glob("*.dist-info"):
-        if distinfo.name.split("-")[0].lower() in distinfos:
+        if distinfo.name.split("-")[0].lower() in _SEED_DISTINFOS:
             shutil.copytree(distinfo, site / distinfo.name, dirs_exist_ok=True)
     pth = purelib / "distutils-precedence.pth"
     if pth.exists():
@@ -186,6 +296,7 @@ def _seed_bare_venv(venv_dir: Path) -> None:
             f"{missing!r}. PyYAML is a declared base dependency and is required "
             "to prove a real base install. Install it and re-run."
         )
+    _provide_sdk_source(venv_dir)
 
 
 def _make_venv(tmp_path: Path, name: str) -> Path:
@@ -196,18 +307,18 @@ def _make_venv(tmp_path: Path, name: str) -> Path:
     return venv_dir
 
 
-def _qualified_sdk_available() -> bool:
-    """Whether *this* interpreter has a pinned SDK exposing the runtime symbol.
+def _venv_sdk_qualified(venv_dir: Path, tmp_path: Path) -> bool:
+    """Whether the *fresh venv* can import the pinned SDK's runtime symbol.
 
-    The runtime surface imports ``AuthenticatedServiceContext`` from
-    ``skillweave_sdk.validator``. An older/unqualified SDK on the path (the same
-    drift the cold review flagged as R1) cannot satisfy the sweep; that is a
-    setup HOLD, not a product failure, so callers skip with that reason.
+    The runtime sweep imports ``AuthenticatedServiceContext`` from
+    ``skillweave_sdk.validator``; the check must run against the venv that will
+    run the sweep, not the running interpreter (the earlier bug). A stale or
+    missing copy in the venv is a setup HOLD.
     """
-    proc = subprocess.run(
-        [sys.executable, "-c",
+    proc = _run(
+        [_python(venv_dir), "-c",
          "from skillweave_sdk.validator import AuthenticatedServiceContext"],
-        capture_output=True, text=True,
+        cwd=_unrelated_cwd(tmp_path), env=_clean_env(tmp_path),
     )
     return proc.returncode == 0
 
@@ -354,27 +465,35 @@ def test_base_install_whole_runtime_surface_imports_cleanly(tmp_path, wheel):
     The cold review found that a stale base/SDK could hide an import break
     (``skillweave_sdk.validator.AuthenticatedServiceContext``); sweeping the
     whole runtime surface makes such a break fail loudly instead of silently.
-    The pinned SDK is seeded from the running interpreter, so a missing or
-    unqualified local SDK is a setup HOLD, reported as a skip -- not a pass.
+    The pinned SDK is provided to the fresh venv by ``_seed_bare_venv`` (offline
+    wheel, else the running interpreter's install); only when *no* source exists
+    does ``_provide_sdk_source`` skip with an explicit setup-HOLD reason. When a
+    source exists the sweep runs for real -- it is never skipped or narrowed.
     """
     venv_dir = _make_venv(tmp_path, "sweep")
     _install_wheel(venv_dir, wheel, tmp_path)
     env = _clean_env(tmp_path)
     cwd = _unrelated_cwd(tmp_path)
 
-    if not _qualified_sdk_available():
-        pytest.skip(
-            "setup HOLD: the running interpreter has no pinned skillweave_sdk "
-            "exposing validator.AuthenticatedServiceContext (missing or "
-            "unqualified SDK copy). The runtime-surface sweep needs the pinned "
-            "skillweave-sdk==0.2.0; install it and re-run."
-        )
+    # The SDK must actually be importable in THIS venv, not merely on the
+    # running interpreter (the earlier bug let a stale/absent venv SDK through).
+    assert _venv_sdk_qualified(venv_dir, tmp_path), (
+        "the fresh venv cannot import "
+        "skillweave_sdk.validator.AuthenticatedServiceContext; the sweep would "
+        "be meaningless"
+    )
 
     proc = _run([_python(venv_dir), "-c", _SWEEP_PROBE], cwd=cwd, env=env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     report = json.loads(proc.stdout)
     assert report["modules"] > 0, report
     assert report["failures"] == [], report["failures"]
+    # The exact module the cold review flagged must have been swept and clean --
+    # it imports the pinned SDK, so its presence proves the venv SDK is real.
+    assert "skillweave.runtime.authority_service" in report["names"], (
+        "the sweep did not reach skillweave.runtime.authority_service: "
+        + repr(sorted(report["names"]))
+    )
 
 
 # ── criterion 1: installed origins, entrypoint, no PYTHONPATH ───────────────

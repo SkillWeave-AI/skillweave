@@ -230,9 +230,26 @@ case. Criterion 2 is therefore checked by *walking* the installed package:
 `pkgutil.walk_packages` enumerates every non-optional module under
 `skillweave` (the optional `mcp` extra and the packaged `test_*` modules are
 excluded) and imports each. The sweep asserts **zero** import failures, so a
-base-install import break fails loudly rather than silently. Where the running
-interpreter has no *pinned* SDK the sweep is a **setup HOLD** (skip with the
-reason), never a fabricated pass.
+base-install import break fails loudly rather than silently, and it asserts the
+flagged `skillweave.runtime.authority_service` module was among those swept.
+
+The sweep needs the pinned SDK **in the fresh venv**, not merely on the running
+interpreter (a stale copy reusing the same version string, or a metadata-only
+dist-info, can sit on the interpreter's path). `_provide_sdk_source` supplies
+it, preferring, in order:
+
+1. the offline pinned wheel named by `SKILLWEAVE_SDK_DIR` (default: the private
+   `real-baseline-artifacts/*/wheels`), installed with `pip install --no-index
+   --no-deps` — a source file's `AuthenticatedServiceContext` is verified by
+   source scan before it is trusted; else
+2. the running interpreter's own install, linked with a `skillweave_sdk.pth`
+   and its `skillweave_sdk-*.dist-info` copied beside it.
+
+Only when *neither* source exists — no wheel and no qualified interpreter
+install — is the sweep a **setup HOLD** (skip with an explicit reason). A
+source that is present but stale is rejected for the same reason, never
+fabricated into a pass. Neither path installs anything globally or into a
+shared environment.
 
 ## Composed installed gate
 
@@ -326,8 +343,12 @@ preserved `requires-python`/classifier metadata, not by a run.
   disallowed, the base install is a **setup HOLD** — an explicit blocker, not a
   fabricated pass.
 * The runtime-surface sweep needs a *pinned* `skillweave-sdk` exposing
-  `validator.AuthenticatedServiceContext`. An unqualified SDK copy on the path
-  makes the sweep a **setup HOLD** (explicit skip), not a pass.
+  `validator.AuthenticatedServiceContext`, present in the fresh venv. It is
+  supplied from the offline pinned wheel (`SKILLWEAVE_SDK_DIR`) or the running
+  interpreter's qualified install; a stale SDK copy (including one reusing the
+  same `0.2.0` version string) is detected by source scan and rejected, making
+  the sweep a **setup HOLD** (explicit skip), not a pass. For a bare checkout
+  the sweep still needs `PyYAML` seedable in the running interpreter.
 * The composed SW-1510-CLI gate needs a wheel that carries
   `skillweave.cli.support`. On the bare checkout base it is **skipped with a
   reason**; it is only a real pass on the SW-1510-CLI-composed head.
