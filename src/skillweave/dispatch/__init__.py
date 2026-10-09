@@ -53,6 +53,20 @@ from .messaging import (  # noqa: F401
     MessageChannelError,
     DirectMessage,
     MessageChannel,
+    # SW-1510-MCP-AGENTS: the durable, harness-neutral agent mailbox
+    AGENT_MESSAGE_ARTIFACT,
+    AGENT_MESSAGE_SCHEMA_VERSION,
+    AGENT_MESSAGE_NAMESPACE,
+    AGENT_MESSAGE_SCHEMA_DIGEST,
+    AGENT_MESSAGE_CONTRACT,
+    AGENT_MESSAGE_KINDS,
+    agent_message_contract_digest,
+    UnsupportedMessageVersion,
+    MessageMismatchRefused,
+    AgentMessage,
+    MailboxCursor,
+    AgentMailbox,
+    MailboxHandoffBridge,
 )
 
 from .application import (  # noqa: F401
@@ -129,4 +143,18 @@ __all__ = [
     "MessageChannelError",
     "DirectMessage",
     "MessageChannel",
+    # SW-1510-MCP-AGENTS: the durable agent mailbox (agent-message-v1)
+    "AGENT_MESSAGE_ARTIFACT",
+    "AGENT_MESSAGE_SCHEMA_VERSION",
+    "AGENT_MESSAGE_NAMESPACE",
+    "AGENT_MESSAGE_SCHEMA_DIGEST",
+    "AGENT_MESSAGE_CONTRACT",
+    "AGENT_MESSAGE_KINDS",
+    "agent_message_contract_digest",
+    "UnsupportedMessageVersion",
+    "MessageMismatchRefused",
+    "AgentMessage",
+    "MailboxCursor",
+    "AgentMailbox",
+    "MailboxHandoffBridge",
 ]

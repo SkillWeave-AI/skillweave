@@ -660,6 +660,256 @@ def review_run(run_id: str, verdict: str, comment: str, db_path: str = ".skillwe
     })
 
 
+# ---------------------------------------------------------------------------
+# SW-1510-MCP-AGENTS: durable, harness-neutral handoff + agent mailbox tools
+# ---------------------------------------------------------------------------
+#
+# These tools provide *application-level* agent communication over MCP without
+# assuming MCP is a reliable peer-to-peer event bus. Notifications are advisory;
+# the durable mailbox (``skillweave.dispatch.messaging``) is the source of
+# truth, so a client that misses a notification recovers the same durable work
+# by cursor. Every tool resolves a **server-owned scoped principal** (never a
+# caller field) and every message carries run/task/attempt/message IDs.
+
+#: The environment variable naming the durable mailbox file. It defaults beside
+#: the server store so the mailbox path is server-owned -- a caller cannot
+#: point an agent tool at an arbitrary path.
+MAILBOX_PATH_ENV = "SKILLWEAVE_AGENT_MAILBOX"
+
+#: The server's own default mailbox path (a caller may never inject another).
+MAILBOX_DEFAULT_PATH = ".skillweave/agent-mailbox.jsonl"
+
+
+def default_mailbox_path() -> str:
+    """The server-owned durable mailbox path (env override, else the default)."""
+    return os.environ.get(MAILBOX_PATH_ENV, "") or MAILBOX_DEFAULT_PATH
+
+
+def _open_mailbox():
+    """The durable mailbox and its module (imported lazily, GLE-020)."""
+    from skillweave.dispatch import messaging as _messaging
+
+    return _messaging, _messaging.AgentMailbox(default_mailbox_path())
+
+
+def _message_principal(gate_principal, explicit_principal: str) -> str:
+    """Resolve the scoped principal a message is authored/received under.
+
+    Authority is server-owned: when an authority is bound the authenticated
+    principal is authoritative, and an explicit principal that differs is a
+    refusal (exactly as a role mismatch is refused) -- a caller cannot widen or
+    redirect the scope by naming another principal. Only the in-process
+    direct-caller path (no bound authority, the CLI-parity seam) may name its
+    own principal.
+    """
+    if gate_principal is not None:
+        if explicit_principal and explicit_principal != gate_principal.principal:
+            raise _authority_module().MCPAuthError(
+                "principal_mismatch",
+                f"authenticated principal {gate_principal.principal!r} cannot "
+                f"act as {explicit_principal!r}",
+                role=gate_principal.role,
+                action="messaging",
+                extra={
+                    "requested_principal": explicit_principal,
+                    "actual_principal": gate_principal.principal,
+                },
+            )
+        return gate_principal.principal
+    if explicit_principal:
+        return explicit_principal
+    raise _authority_module().UnauthenticatedPrincipal(
+        "agent messaging requires a scoped principal"
+    )
+
+
+@mcp.tool()
+def mailbox_post(kind: str, recipient: str, sender: str = "", body: str = "", run_id: str = "", task_id: str = "", attempt: int = 0, in_reply_to: str = "", correlation_id: str = "", message_id: str = "", principal: str = "", session_token: str = "") -> str:
+    """Post one durable, addressed ``agent-message-v1`` message.
+
+    ``kind`` is one of ``handoff``, ``ack``, ``input_required`` or ``status``.
+    The message is addressed to ``recipient`` under the *authenticated* scoped
+    principal and stamped with ``run_id``/``task_id``/``attempt``/``message_id``.
+
+    SW-1510-MCP-AGENTS: the write is authorized at this boundary (duplicate
+    deliveries are idempotent by ``message_id``); the mailbox path is
+    server-owned, never a caller path.
+    """
+    gate_principal, refusal = gate_operation(
+        "write_run_state", session_token, run_id=run_id, db_path="",
+    )
+    if refusal is not None:
+        return refusal
+    _messaging, mailbox = _open_mailbox()
+    try:
+        scope_principal = _message_principal(gate_principal, principal)
+        try:
+            payload = json.loads(body) if body.strip().startswith(("{", "[")) else body
+        except (json.JSONDecodeError, TypeError):
+            payload = body
+        kwargs = {"message_id": message_id} if message_id else {}
+        message = _messaging.AgentMessage(
+            kind=kind,
+            sender=(sender or scope_principal),
+            recipient=recipient,
+            principal=scope_principal,
+            run_id=run_id,
+            task_id=task_id,
+            attempt=attempt,
+            in_reply_to=in_reply_to,
+            correlation_id=correlation_id,
+            body=payload,
+            **kwargs,
+        )
+        record = mailbox.post(message)
+    except _messaging.MessageChannelError as exc:
+        return json.dumps({"status": "refused", **exc.to_dict()})
+    except _authority_module().MCPAuthError as exc:
+        return _auth_error_payload(exc)
+    return json.dumps({"status": "posted", "message": record})
+
+
+@mcp.tool()
+def mailbox_read(recipient: str = "", resume_token: str = "", after_seq: int = 0, kinds: str = "", run_id: str = "", principal: str = "", session_token: str = "") -> str:
+    """Read durable messages addressed to ``recipient`` from a resume cursor.
+
+    This is the *subscription* read: it is pure (it consumes nothing), it
+    carries a ``resume_token`` the caller persists, and it returns every message
+    it has not yet accepted -- so a *missed* notification loses no durable work
+    and a re-read is idempotent. ``kinds`` is an optional comma-separated filter
+    (for example ``input_required,status``) so a caller may subscribe to just
+    the input/status stream.
+
+    SW-1510-MCP-AGENTS: the read is authorized at this boundary and scoped to
+    the authenticated principal; a message addressed to another principal is
+    never returned.
+    """
+    gate_principal, refusal = gate_operation(
+        "read_run", session_token, run_id=run_id,
+    )
+    if refusal is not None:
+        return refusal
+    _messaging, mailbox = _open_mailbox()
+    try:
+        scope_principal = _message_principal(gate_principal, principal)
+        wanted = [k.strip() for k in kinds.split(",") if k.strip()] or None
+        messages = mailbox.read(
+            recipient=(recipient or scope_principal),
+            principal=scope_principal,
+            resume_token=resume_token,
+            after_seq=after_seq,
+            kinds=wanted,
+        )
+    except _messaging.MessageChannelError as exc:
+        return json.dumps({"status": "refused", **exc.to_dict()})
+    except _authority_module().MCPAuthError as exc:
+        return _auth_error_payload(exc)
+    resume = messages[-1]["resume_token"] if messages else resume_token
+    return json.dumps(
+        {"status": "ok", "recipient": recipient or scope_principal,
+         "messages": messages, "resume_token": resume}
+    )
+
+
+@mcp.tool()
+def mailbox_replay(recipient: str = "", after_seq: int = 0, run_id: str = "", principal: str = "", session_token: str = "") -> str:
+    """Replay the full durable history addressed to ``recipient``.
+
+    The reconnect seam: regardless of which notifications a client observed, the
+    same durable records are returned in append order. Reading never mutates or
+    consumes the mailbox.
+
+    SW-1510-MCP-AGENTS: the replay is authorized at this boundary and scoped to
+    the authenticated principal.
+    """
+    gate_principal, refusal = gate_operation(
+        "read_run", session_token, run_id=run_id,
+    )
+    if refusal is not None:
+        return refusal
+    _messaging, mailbox = _open_mailbox()
+    try:
+        scope_principal = _message_principal(gate_principal, principal)
+        messages = mailbox.replay(
+            recipient=(recipient or scope_principal),
+            principal=scope_principal,
+            after_seq=after_seq,
+        )
+    except _messaging.MessageChannelError as exc:
+        return json.dumps({"status": "refused", **exc.to_dict()})
+    except _authority_module().MCPAuthError as exc:
+        return _auth_error_payload(exc)
+    return json.dumps(
+        {"status": "ok", "recipient": recipient or scope_principal,
+         "messages": messages}
+    )
+
+
+@mcp.tool()
+def mailbox_ack(message_id: str, note: str = "", run_id: str = "", principal: str = "", session_token: str = "") -> str:
+    """Acknowledge a handoff by posting its durable ``ack`` reply.
+
+    Only the message's *addressed recipient under its scoped principal* may
+    acknowledge it; any other caller is refused. A repeated acknowledgement is
+    idempotent (the reply id is derived from the original), so a duplicated
+    delivery never creates a second acknowledgement.
+
+    SW-1510-MCP-AGENTS: the ack is authorized at this boundary.
+    """
+    gate_principal, refusal = gate_operation(
+        "write_run_state", session_token, run_id=run_id,
+    )
+    if refusal is not None:
+        return refusal
+    _messaging, mailbox = _open_mailbox()
+    try:
+        scope_principal = _message_principal(gate_principal, principal)
+        record = mailbox.ack(
+            message_id, recipient=scope_principal, principal=scope_principal,
+            note=note,
+        )
+    except _messaging.MessageChannelError as exc:
+        return json.dumps({"status": "refused", **exc.to_dict()})
+    except _authority_module().MCPAuthError as exc:
+        return _auth_error_payload(exc)
+    return json.dumps({"status": "acked", "message": record})
+
+
+@mcp.tool()
+def agent_capabilities(clients: str = "", session_token: str = "") -> str:
+    """Detect, per client, which transports it supports and the adapter chosen.
+
+    This is the **registration/capability attestation** seam: a client's support
+    for MCP notifications is *explicitly detected* (positive config/skill-root
+    presence or an operator attestation), never assumed. A client without
+    notification support -- including one that was never detected -- is assigned
+    the file/CLI polling adapter, which carries the **same authority contract**.
+    The frozen ``agent-message-v1`` contract version and digest are reported so
+    a client can attest the exact schema it speaks.
+
+    SW-1510-MCP-AGENTS: authorized at this boundary; scoped to the authenticated
+    principal.
+    """
+    _principal, refusal = gate_operation("read_run", session_token)
+    if refusal is not None:
+        return refusal
+    from skillweave.dispatch import messaging as _messaging
+    from skillweave.runtime import handoff as _handoff
+
+    ids = [c.strip() for c in clients.split(",") if c.strip()] or None
+    detected = _handoff.detect_capabilities(ids)
+    return json.dumps({
+        "status": "ok",
+        "contract": {
+            "artifact": _messaging.AGENT_MESSAGE_ARTIFACT,
+            "schema_version": _messaging.AGENT_MESSAGE_SCHEMA_VERSION,
+            "namespace": _messaging.AGENT_MESSAGE_NAMESPACE,
+            "schema_digest": _messaging.AGENT_MESSAGE_SCHEMA_DIGEST,
+        },
+        "clients": {cid: cap.to_dict() for cid, cap in detected.items()},
+    })
+
+
 def startup_and_bind_stdio(
     *,
     authority: "MCPPrincipalAuthority | None" = None,
