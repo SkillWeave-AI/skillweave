@@ -218,3 +218,69 @@ class TestVariableNameMapping:
     def test_brave_api_key_mapping(self):
         names = CredentialResolver._variable_names_for("BRAVE_API_KEY")
         assert "BRAVE_API_KEY" in names
+
+
+class TestCredentialResolverHermetic:
+    """Guard tests: resolver with explicit empty env_overrides is hermetic.
+
+    These tests set PERPLEXITY_COOKIES / TAVILY_API_KEY / PERPLEXITY_API_KEY
+    in os.environ via monkeypatch and then prove that a resolver constructed
+    with an explicit empty ``env_overrides={}`` still sees "missing" --- it
+    does NOT fall through to the real process environment.
+    """
+
+    def test_empty_env_overrides_ignores_os_environ(self, monkeypatch):
+        """Even with env var set in os.environ, empty env_overrides sees missing."""
+        monkeypatch.setenv("PERPLEXITY_COOKIES", "real-cookie-value")
+        resolver = CredentialResolver(env_overrides={})
+        r = resolver.resolve("PERPLEXITY_COOKIES")
+        assert r.available is False, (
+            "empty env_overrides must isolate from os.environ"
+        )
+
+    def test_empty_env_overrides_tavily(self, monkeypatch):
+        """Empty env_overrides isolates TAVILY_API_KEY from os.environ."""
+        monkeypatch.setenv("TAVILY_API_KEY", "sk-real-key")
+        resolver = CredentialResolver(env_overrides={})
+        r = resolver.resolve("TAVILY_API_KEY")
+        assert r.available is False
+
+    def test_empty_env_overrides_perplexity_api_key(self, monkeypatch):
+        """Empty env_overrides isolates PERPLEXITY_API_KEY from os.environ."""
+        monkeypatch.setenv("PERPLEXITY_API_KEY", "pplx-real-key")
+        resolver = CredentialResolver(env_overrides={})
+        r = resolver.resolve("PERPLEXITY_API_KEY")
+        assert r.available is False
+
+    def test_resolver_never_returns_secret_value(self, monkeypatch):
+        """Resolver never returns or prints the credential value."""
+        monkeypatch.setenv("PERPLEXITY_COOKIES", "super-secret-cookie-value")
+        resolver = CredentialResolver(env_overrides={"PERPLEXITY_COOKIES": "override-value"})
+        r = resolver.resolve("PERPLEXITY_COOKIES")
+        assert r.available is True
+        # The resolution object never contains the value
+        d = r.to_dict()
+        for val in d.values():
+            val_str = str(val)
+            assert "super-secret" not in val_str
+            assert "override-value" not in val_str
+
+    def test_child_env_honors_empty_overrides(self, monkeypatch):
+        """child_env() with empty env_overrides does not read os.environ."""
+        monkeypatch.setenv("PATH", "/usr/bin")
+        resolver = CredentialResolver(env_overrides={})
+        child = resolver.child_env(env_allowlist=("PATH",))
+        # PATH should NOT be in child because env_overrides is empty
+        assert "PATH" not in child, (
+            "child_env with empty env_overrides must not leak os.environ"
+        )
+
+    def test_child_env_uses_override_not_os_environ(self, monkeypatch):
+        """child_env() uses env_overrides values, not os.environ."""
+        monkeypatch.setenv("PERPLEXITY_COOKIES", "real-value")
+        resolver = CredentialResolver(
+            env_overrides={"PERPLEXITY_COOKIES": "override-value"}
+        )
+        child = resolver.child_env(env_allowlist=("PERPLEXITY_COOKIES",))
+        assert child.get("PERPLEXITY_COOKIES") == "override-value"
+        assert child.get("PERPLEXITY_COOKIES") != "real-value"

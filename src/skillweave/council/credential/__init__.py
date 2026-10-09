@@ -96,7 +96,7 @@ class CredentialResolver:
             allow_envctl: Whether to attempt envctl resolution when the
                 environment variable is not found.
         """
-        self._env_overrides = dict(env_overrides) if env_overrides else None
+        self._env_overrides = dict(env_overrides) if env_overrides is not None else None
         self._allow_envctl = allow_envctl and resolve_envctl_available()
 
     def resolve(self, reference_id: str) -> CredentialResolution:
