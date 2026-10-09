@@ -255,10 +255,7 @@ class TestRouteDecisionRecord:
         assert jd["_meta"]["catalog_revision"] == "1.3.11"
         assert jd["_meta"]["policy_revision"] == "1.3.11"
         # The contract sub-dict passes schema validation
-        import json
-        from jsonschema import validate
-        schema = TestRouteDecisionContractCompliance._route_decision_schema()
-        validate(instance=jd["contract"], schema=schema)
+        TestRouteDecisionContractCompliance._validate_contract_with_sdk(jd["contract"])
 
     def test_answering_envelope_identity_may_be_none(self):
         """When the envelope does not report a model, the field is None."""
@@ -2368,61 +2365,31 @@ class TestInstalledWheelRouteLock:
 
 
 class TestRouteDecisionContractCompliance:
-    """Every route_decision payload validates against route-decision-v1 schema."""
+    """Every route_decision payload validates against route-decision-v1 schema.
 
-    # Schema reference removed: the SDK owns this contract.
-    # Tests validate against an inline representation of the
-    # route-decision-v1 required field set.
+    Validation uses the installed SDK validator when available
+    (``pytest.importorskip("skillweave_sdk.validator")``); the SDK
+    resolves its own packaged schemas.  No inline schema copy is kept.
+    """
+
+    _ROUTE_DECISION_SCHEMA_ID = (
+        "https://skillweave.dev/schemas/execution/route-decision/v1"
+    )
 
     @staticmethod
-    def _route_decision_schema():
-        """Minimal route-decision-v1 contract schema (SDK-owned, frozen).
-        
-        The full schema lives in the SDK at
-        skillweave_sdk/schemas/execution/route-decision-v1.schema.json.
-        This inline version covers the required fields for unit tests.
-        """
-        return {
-            "type": "object",
-            "required": [
-                "schema_version", "run_id", "task_id", "attempt",
-                "request_id", "parent_request_id", "requested_model",
-                "answering_model", "resolved_provider", "resolved_model",
-                "catalog_revision", "policy_revision", "attribution_status",
-                "reservation_id", "attempt_order", "measured_at", "outcome",
-            ],
-            "properties": {
-                "schema_version": {"type": "string"},
-                "run_id": {"type": "string"},
-                "task_id": {"type": "string"},
-                "attempt": {"type": "integer"},
-                "request_id": {"type": "string"},
-                "parent_request_id": {"type": "string"},
-                "requested_model": {"type": "string"},
-                "answering_model": {"type": "string"},
-                "resolved_provider": {"type": "string"},
-                "resolved_model": {"type": "string"},
-                "catalog_revision": {"type": "string", "minLength": 1},
-                "policy_revision": {"type": "string", "minLength": 1},
-                "attribution_status": {
-                    "type": "string",
-                    "enum": ["answered", "substituted", "unavailable",
-                             "rate_limited", "errored", "unknown"]
-                },
-                "reservation_id": {"type": "string", "minLength": 1},
-                "attempt_order": {"type": "array", "items": {"type": "string"}},
-                "measured_at": {"type": "string"},
-                "outcome": {"type": "string"},
-                "usage": {"type": "object"},
-            },
-            "additionalProperties": False,
-        }
+    def _validate_contract_with_sdk(contract: dict, schema_id: str = None):
+        """Validate *contract* with the SDK validator, or skip if unavailable."""
+        pytest.importorskip("skillweave_sdk.validator")
+        from skillweave_sdk import validator as sdk_validator
+        schema_id = schema_id or TestRouteDecisionContractCompliance._ROUTE_DECISION_SCHEMA_ID
+        errors = sdk_validator.validate(contract, schema_id)
+        assert errors == [], (
+            f"SDK validator rejected contract: {errors}\n"
+            f"contract: {json.dumps(contract, indent=2)}"
+        )
 
     def test_to_dict_validates_against_schema(self):
         """The contract payload from to_dict() validates against the schema."""
-        import json
-        from jsonschema import validate
-        schema = self._route_decision_schema()
         d = RouteDecision(
             correlation_id="schema-corr-1",
             requested_alias="deepseek-v4-flash",
@@ -2439,13 +2406,10 @@ class TestRouteDecisionContractCompliance:
             outcome="resolved",
             measured_at="2026-10-08T12:00:00+00:00",
         )
-        validate(instance=d.to_dict(), schema=schema)
+        self._validate_contract_with_sdk(d.to_dict())
 
     def test_to_journal_dict_contract_validates_against_schema(self):
         """The contract sub-dict in to_journal_dict() validates."""
-        import json
-        from jsonschema import validate
-        schema = self._route_decision_schema()
         d = RouteDecision(
             correlation_id="schema-corr-2",
             requested_alias="deepseek-v4-pro",
@@ -2459,13 +2423,10 @@ class TestRouteDecisionContractCompliance:
             attempt=1,
         )
         jd = d.to_journal_dict()
-        validate(instance=jd["contract"], schema=schema)
+        self._validate_contract_with_sdk(jd["contract"])
 
     def test_pending_decision_validates_against_schema(self):
         """A pending route_decision (no answering model) validates."""
-        import json
-        from jsonschema import validate
-        schema = self._route_decision_schema()
         d = RouteDecision(
             correlation_id="schema-corr-3",
             requested_alias="deepseek-v4-flash",
@@ -2477,13 +2438,10 @@ class TestRouteDecisionContractCompliance:
             task_id="task-schema-3",
             attempt=1,
         )
-        validate(instance=d.to_dict(), schema=schema)
+        self._validate_contract_with_sdk(d.to_dict())
 
     def test_nested_request_validates_against_schema(self):
         """A nested request's contract payload validates with parent_request_id."""
-        import json
-        from jsonschema import validate
-        schema = self._route_decision_schema()
         d = RouteDecision(
             correlation_id="run-001/task-01/nested-01",
             requested_alias="deepseek-v4-flash",
@@ -2498,7 +2456,7 @@ class TestRouteDecisionContractCompliance:
         )
         payload = d.to_dict()
         assert payload["parent_request_id"] == "run-001/task-01"
-        validate(instance=payload, schema=schema)
+        self._validate_contract_with_sdk(payload)
 
     def test_no_disallowed_fields_in_contract(self):
         """The contract payload must NOT contain correlation_id, requested_alias,
@@ -2542,20 +2500,6 @@ class TestRouteDecisionContractCompliance:
         6. Validates every route_decision contract with the SDK validator
         """
         import json
-        import tempfile
-
-        # Path to the scratch schemas dir that includes route-decision-v1.schema.json
-        scratch_schemas = Path(
-            "/Users/andrelange/Documents/repositories/forgejo/skillweave/"
-            "skillweave-planning/.skillweave/sequences/2026-10-04-sw1510-controller-recovery/"
-            "runtime/SW-1510-ROUTE-LOCK-ops-4c9cd968b2f4/tmp/schemas"
-        )
-        assert scratch_schemas.is_dir(), (
-            f"scratch schemas dir not found: {scratch_schemas}"
-        )
-        assert (scratch_schemas / "route-decision-v1.schema.json").is_file(), (
-            "route-decision-v1.schema.json missing from scratch schemas"
-        )
 
         # --- 1. Write route policy and route proof to temp files ---
         policy_data = {
@@ -2626,28 +2570,11 @@ class TestRouteDecisionContractCompliance:
         assert len(route_events) >= 1, "no route_decision events found in journal"
 
         # --- 6. Validate every route_decision contract with the SDK validator ---
-        pytest.importorskip("skillweave_sdk.validator")
-        import skillweave_sdk.validator as sdk_validator
-
-        # Monkey-patch SCHEMA_FILENAMES so load_registry picks up the new schema
-        original_filenames = sdk_validator.SCHEMA_FILENAMES
-        try:
-            sdk_validator.SCHEMA_FILENAMES = original_filenames + (
-                "route-decision-v1.schema.json",
+        # The SDK resolves its own packaged schemas; no path argument needed.
+        for event in route_events:
+            TestRouteDecisionContractCompliance._validate_contract_with_sdk(
+                event.payload["contract"]
             )
-            schema_id = "https://skillweave.dev/schemas/execution/route-decision/v1"
-
-            for event in route_events:
-                contract = event.payload["contract"]
-                errors = sdk_validator.validate(
-                    contract, schema_id, schemas_dir=scratch_schemas,
-                )
-                assert errors == [], (
-                    f"SDK validator rejected route_decision contract: {errors}\n"
-                    f"contract: {json.dumps(contract, indent=2)}"
-                )
-        finally:
-            sdk_validator.SCHEMA_FILENAMES = original_filenames
 
 
 class TestAnsweringModelUpdate:
@@ -2732,9 +2659,6 @@ class TestAnsweringModelUpdate:
 
     def test_update_answering_model_validates_against_schema(self, svc, db_path):
         """The follow-up event payload validates against route-decision-v1."""
-        from jsonschema import validate
-        schema = TestRouteDecisionContractCompliance._route_decision_schema()
-
         svc._update_route_decision_answering(
             run_id="run-answer-3",
             task_id="task-answer-3",
@@ -2750,7 +2674,9 @@ class TestAnsweringModelUpdate:
         events = svc.journal.get_events("run-answer-3")
         route_events = [e for e in events if e.event_type == "route_decision"]
         assert len(route_events) >= 1
-        validate(instance=route_events[0].payload["contract"], schema=schema)
+        TestRouteDecisionContractCompliance._validate_contract_with_sdk(
+            route_events[0].payload["contract"]
+        )
 
     def test_both_initial_and_follow_up_validate(self, svc, db_path):
         """Both the initial decision and the answering model update validate.
@@ -2758,9 +2684,6 @@ class TestAnsweringModelUpdate:
         This simulates the real flow: initial decision (pending), then
         a follow-up with the answering model (attributed).
         """
-        from jsonschema import validate
-        schema = TestRouteDecisionContractCompliance._route_decision_schema()
-
         # 1. Initial decision (pending)
         from skillweave.routing.faigate_adapter import make_route_decision
         initial = make_route_decision(
@@ -2782,7 +2705,9 @@ class TestAnsweringModelUpdate:
             payload=initial.to_journal_dict(),
             correlation_id="task-full/attempt-1",
         )
-        validate(instance=initial.to_dict(), schema=schema)
+        TestRouteDecisionContractCompliance._validate_contract_with_sdk(
+            initial.to_dict()
+        )
 
         # 2. Follow-up with answering model (attributed)
         from skillweave.routing.faigate_adapter import make_route_decision
@@ -2808,7 +2733,9 @@ class TestAnsweringModelUpdate:
             payload=follow_up.to_journal_dict(),
             correlation_id="task-full/attempt-1",
         )
-        validate(instance=follow_up.to_dict(), schema=schema)
+        TestRouteDecisionContractCompliance._validate_contract_with_sdk(
+            follow_up.to_dict()
+        )
 
         # 3. Verify both events are present with correct attempt_order
         events = svc.journal.get_events("run-full")
