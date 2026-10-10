@@ -67,7 +67,7 @@ jobs:
           echo "Tag ${TAG} is on the default branch ${DEFAULT_BRANCH}."
 
       - name: Publish to Capacium
-        uses: Capacium/capacium-action-publish@v1
+        uses: Capacium/capacium-action-publish@7a099697fd3c668bf8737564375b983dc662e118 # v1
         with:
           github_url: ${{ github.event.repository.html_url }}
           # Without this the action reaches `cap publish` with an empty
