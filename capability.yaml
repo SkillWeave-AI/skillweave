@@ -4,9 +4,11 @@ version: 1.5.9
 description: A complete 7-phase AI-assisted development lifecycle ecosystem.
 author: SkillWeave Team
 license: Apache-2.0
-owner: LangeVC
-repository: https://git.langevc.com/skillweave/skillweave
-homepage: https://git.langevc.com/skillweave/skillweave
+owner: SkillWeave-AI
+repository: https://github.com/SkillWeave-AI/skillweave
+homepage: https://github.com/SkillWeave-AI/skillweave
+replaces: ["LangeVC/skillweave"]
+previous_identities: ["LangeVC/skillweave"]
 frameworks:
 - opencode
 - claude-code
