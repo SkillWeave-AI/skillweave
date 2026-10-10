@@ -1,13 +1,13 @@
 #!/bin/bash
 # SkillWeave Online Installer
-# One-line installer: curl -s https://raw.githubusercontent.com/LangeVC/skillweave/main/install.sh | bash
+# One-line installer: curl -s https://raw.githubusercontent.com/SkillWeave-AI/skillweave/main/install.sh | bash
 #
 # This script downloads the latest SkillWeave release and installs it to all detected AI agents.
 # It supports offline installation if the repository is already cloned locally.
 
 set -e
 
-SKILLWEAVE_REPO="https://github.com/LangeVC/skillweave.git"
+SKILLWEAVE_REPO="https://github.com/SkillWeave-AI/skillweave.git"
 TEMP_DIR="/tmp/skillweave-install-$(date +%s)"
 INSTALL_SCRIPT="scripts/install-skills.sh"
 DEFAULT_BRANCH="main"
@@ -129,7 +129,7 @@ main() {
         echo
         log "Note: The SkillWeave repository was cloned to a temporary directory."
         log "To update skills in the future, run:"
-        log "  curl -s https://raw.githubusercontent.com/LangeVC/skillweave/main/install.sh | bash"
+        log "  curl -s https://raw.githubusercontent.com/SkillWeave-AI/skillweave/main/install.sh | bash"
     else
         echo
         log "Note: You're running from a local SkillWeave repository."
@@ -147,7 +147,7 @@ parse_args() {
         case $1 in
             --help|-h)
                 echo "SkillWeave Online Installer"
-                echo "Usage: curl -s https://raw.githubusercontent.com/LangeVC/skillweave/main/install.sh | bash -s -- [options]"
+                echo "Usage: curl -s https://raw.githubusercontent.com/SkillWeave-AI/skillweave/main/install.sh | bash -s -- [options]"
                 echo
                 echo "Options:"
                 echo "  --interactive, -i   Interactive agent selection"
@@ -161,13 +161,13 @@ parse_args() {
                 echo
                 echo "Examples:"
                 echo "  # Interactive installation"
-                echo "  curl -s https://raw.githubusercontent.com/LangeVC/skillweave/main/install.sh | bash -s -- --interactive"
+                echo "  curl -s https://raw.githubusercontent.com/SkillWeave-AI/skillweave/main/install.sh | bash -s -- --interactive"
                 echo
                 echo "  # Dry-run to preview changes"
-                echo "  curl -s https://raw.githubusercontent.com/LangeVC/skillweave/main/install.sh | bash -s -- --dry-run"
+                echo "  curl -s https://raw.githubusercontent.com/SkillWeave-AI/skillweave/main/install.sh | bash -s -- --dry-run"
                 echo
                 echo "  # Initialize Next Level features in current project"
-                echo "  curl -s https://raw.githubusercontent.com/LangeVC/skillweave/main/install.sh | bash -s -- --init"
+                echo "  curl -s https://raw.githubusercontent.com/SkillWeave-AI/skillweave/main/install.sh | bash -s -- --init"
                 exit 0
                 ;;
             *)

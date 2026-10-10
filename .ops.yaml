@@ -14,7 +14,7 @@ destinations:
     role: release
     visibility: public
   - forge: github
-    repo: LangeVC/skillweave
+    repo: SkillWeave-AI/skillweave
     role: release
     visibility: public
 
