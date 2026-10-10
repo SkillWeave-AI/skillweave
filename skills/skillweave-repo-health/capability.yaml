@@ -4,9 +4,9 @@ version: 1.3.11
 description: Assess repository health, classify files, detect duplicates, and produce safe cleanup plans.
 author: SkillWeave Team
 license: Apache-2.0
-owner: LangeVC
-repository: https://git.langevc.com/skillweave/skillweave
-homepage: https://git.langevc.com/skillweave/skillweave
+owner: SkillWeave-AI
+repository: https://github.com/SkillWeave-AI/skillweave
+homepage: https://github.com/SkillWeave-AI/skillweave
 frameworks:
 - opencode
 - claude-code
