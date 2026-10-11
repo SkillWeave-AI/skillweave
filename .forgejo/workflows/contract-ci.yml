@@ -169,6 +169,18 @@ jobs:
               ;;
           esac
 
+      - name: Install the pinned SDK checked out from the published source
+        run: |
+          set -eu
+          # The contract tests import ``skillweave_sdk`` at module level, so
+          # the checked-out package must be installed into the runner's
+          # interpreter before any pytest step runs. The checkout is the
+          # published, qualified source (its origin was verified above).
+          # ``--no-build-isolation`` builds with the ``setuptools>=77`` and
+          # ``wheel`` installed by "Install dependencies", so no download is
+          # needed; ``--no-deps`` keeps the resolved combination pinned.
+          python3 -m pip install --no-build-isolation --no-deps /tmp/skillweave-sdk
+
       - name: Record SDK tag and full commit SHA
         run: |
           set -eu
