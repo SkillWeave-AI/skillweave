@@ -48,6 +48,17 @@ version mentioned elsewhere as history (e.g. "1.4.0 scope") is not a failure.
 What is forbidden is advertising an old version as current, or advertising a
 version AHEAD of the tag (e.g. an unreleased 1.5.10) as released.
 
+Release-prep exception: the release commit must carry the new CHANGELOG section,
+badge and "What's new" heading BEFORE the tag exists, so those positions will
+name the still-unreleased candidate. An explicit, reviewable flat scalar
+``release_prep: "X.Y.Z"`` in ``.version.yaml`` declares that state: when it
+equals the candidate (pyproject == bundle) and is ahead of the released tag,
+the three advertising positions may name the candidate -- provided they all
+agree with it. Any of them naming something else is DRIFT. A ``release_prep``
+that differs from the candidate, or is not ahead of the released tag, is itself
+a named DRIFT. Without the flag nothing changes: a version ahead of the tag in
+an advertising position is DRIFT.
+
 Annotation-aware: the released version is established from the tag's PEELED
 commit (``git rev-parse '<tag>^{}'``) plus the tag's canonical subject, never by
 requiring the tag to equal the current branch HEAD.
@@ -80,6 +91,10 @@ README_SKILLS_BADGE_RE = re.compile(r"badge/skills-(\d+)")
 CHANGELOG_TOP_RE = re.compile(r"^##\s+v(" + SEMVER + r")\b", re.MULTILINE)
 PYPROJECT_VERSION_RE = re.compile(r'^version\s*=\s*"(' + SEMVER + r')"', re.MULTILINE)
 BUNDLE_VERSION_RE = re.compile(r"^version:\s*(" + SEMVER + r")\s*$", re.MULTILINE)
+# The explicit release-prep scalar in .version.yaml (flat top-level key).
+RELEASE_PREP_RE = re.compile(
+    r'^release_prep:\s*"?' + "(" + SEMVER + r')"?\s*$', re.MULTILINE
+)
 
 
 def _die(msg: str) -> NoReturn:
@@ -118,6 +133,23 @@ def _bundle(repo: Path) -> str:
     if not m:
         _die("capability.yaml has no top-level version:")
     return m.group(1)
+
+
+def _release_prep(repo: Path) -> str | None:
+    """The explicit release-prep candidate, or None when the flag is absent.
+
+    ``release_prep`` is a flat scalar in ``.version.yaml``. It is present ONLY
+    on the release commit, where the new CHANGELOG section, README badge and
+    "What's new" heading must name the still-unreleased candidate because the
+    release tag does not yet exist. Its absence -- whether the file or the key
+    is missing -- means the ordinary rule applies: a version ahead of the
+    released tag in a release-advertising position is drift.
+    """
+    path = repo / ".version.yaml"
+    if not path.exists():
+        return None
+    m = RELEASE_PREP_RE.search(path.read_text(encoding="utf-8"))
+    return m.group(1) if m else None
 
 
 def _skills_on_disk(repo: Path) -> list[str]:
@@ -317,6 +349,7 @@ def main() -> int:
     changelog = _read(repo / "CHANGELOG.md")
     tag, peeled, subject = _release_face(repo)
     released = tag.lstrip("v")
+    release_prep = _release_prep(repo)
 
     checks: list[dict] = []
     failed = False
@@ -329,6 +362,45 @@ def main() -> int:
         if not args.json:
             print(f"  {'ok       ' if ok else 'DRIFT    '} {label}: {detail}")
 
+    # The explicit release-prep state (SW-CORE-RFX-001). It is ACTIVE only when
+    # it names the candidate (pyproject == bundle) AND is ahead of the released
+    # tag; then the three advertising positions may name the candidate. A
+    # release_prep that is set but differs from the candidate, or is not ahead
+    # of the released tag, is itself a named drift.
+    prep_active = False
+    if release_prep is not None:
+        if release_prep != candidate:
+            check(
+                False,
+                "release-prep==candidate",
+                f"release_prep {release_prep!r} != candidate {candidate!r}",
+            )
+        elif candidate == bundle and _semver_key(candidate) > _semver_key(released):
+            prep_active = True
+            check(
+                True,
+                "release-prep",
+                f"release-prep {candidate}: advertising positions may name "
+                f"the candidate (ahead of released {released})",
+            )
+        else:
+            check(
+                False,
+                "release-prep-ahead",
+                f"release_prep {release_prep!r} is not ahead of released "
+                f"{released} (or candidate != bundle)",
+            )
+
+    if prep_active:
+        # During an active release-prep, an advertising position may name the
+        # candidate (the fully-prepped release commit) OR the still-released tag
+        # (a position not yet moved in the prep window). Anything else is DRIFT.
+        adv_accepted = (candidate, released)
+        adv_extra = f" (release-prep {candidate})"
+    else:
+        adv_accepted = (released,)
+        adv_extra = ""
+
     # 1. required surfaces agree (candidate == bundle).
     check(
         candidate == bundle,
@@ -336,29 +408,33 @@ def main() -> int:
         f"pyproject {candidate} vs capability.yaml {bundle}",
     )
 
-    # 2. release-facing badge advertises the released tag.
+    # 2. release-facing badge advertises an accepted version (the released tag,
+    #    or -- during an active release-prep -- the candidate too).
     badge = README_BADGE_RE.search(readme)
     check(
-        badge is not None and badge.group(1) == released,
+        badge is not None and badge.group(1) in adv_accepted,
         "badge==released",
-        f"badge {badge.group(1) if badge else None!r} vs released {released}",
+        f"badge {badge.group(1) if badge else None!r} vs accepted "
+        f"{sorted(adv_accepted)}{adv_extra}",
     )
 
-    # 3. changelog top heading names the released version.
+    # 3. changelog top heading names an accepted version.
     top = CHANGELOG_TOP_RE.search(changelog)
     check(
-        top is not None and top.group(1) == released,
+        top is not None and top.group(1) in adv_accepted,
         "changelog-top==released",
-        f"top {top.group(1) if top else None!r} vs released {released}",
+        f"top {top.group(1) if top else None!r} vs accepted "
+        f"{sorted(adv_accepted)}{adv_extra}",
     )
 
-    # 3b. the "What's new" heading (if present) advertises the released version.
+    # 3b. the "What's new" heading (if present) advertises an accepted version.
     whatsnew = README_WHATSNEW_RE.search(readme)
     if whatsnew is not None:
         check(
-            whatsnew.group(1) == released,
+            whatsnew.group(1) in adv_accepted,
             "whats-new==released",
-            f"whats-new {whatsnew.group(1)!r} vs released {released}",
+            f"whats-new {whatsnew.group(1)!r} vs accepted "
+            f"{sorted(adv_accepted)}{adv_extra}",
         )
 
     # 4. installed identity matches the candidate (absence is reported).
@@ -437,6 +513,7 @@ def main() -> int:
         report = {
             "candidate": candidate,
             "bundle": bundle,
+            "release_prep": release_prep,
             "released": {
                 "tag": tag,
                 "version": released,
@@ -455,9 +532,10 @@ def main() -> int:
     if failed:
         print("check-version-truth: FAIL — a release-facing claim drifted")
     else:
+        prep_txt = f", release-prep {candidate}" if prep_active else ""
         print(
             f"check-version-truth: OK — candidate {candidate}, released {tag} "
-            f"(peeled {peeled[:12]}), {n} skills"
+            f"(peeled {peeled[:12]}), {n} skills{prep_txt}"
         )
     return rc
 
