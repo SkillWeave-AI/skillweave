@@ -282,7 +282,13 @@ def test_real_execute_protects_the_authority_store_from_the_worker(tmp_path):
         run_id="run-protected", task_id="task-1", attempt=1, scope=_scope()
     )
 
-    probe = tmp_path / "probe.json"
+    # The host maps one owned writable output root for the attempt, exactly as
+    # production does. The probe is written *there* (the worker's only writable
+    # tree); a probe path outside it is legitimately denied and would crash the
+    # child, which is not what this test measures.
+    output_root = tmp_path / "worker_out"
+    output_root.mkdir()
+    probe = output_root / "probe.json"
     child = (
         "import json, pathlib, sqlite3, sys\n"
         "db = pathlib.Path(sys.argv[1]); out = pathlib.Path(sys.argv[2])\n"
@@ -310,6 +316,7 @@ def test_real_execute_protects_the_authority_store_from_the_worker(tmp_path):
         created_at="2026-10-05T00:00:00Z",
         authority_service=authority,
         worker_token=worker_token,
+        output_root=str(output_root),
     )
     # The run itself completed and passed; the worker was still confined.
     assert result.gate_state == "pass"
@@ -327,6 +334,12 @@ def test_real_child_process_cannot_write_protected_stores(tmp_path):
         pytest.skip("no real store-isolation adapter on this host")
     protected = ProtectedStores({name: tmp_path / name for name in PROTECTED_STORE_NAMES})
     protected.ensure()
+    # A private writable scope, exactly as production gives every worker: a
+    # confinement adapter (Seatbelt) turns it into the profile's only writable
+    # tree, so the protected store roots sit *outside* it and the child is
+    # denied there. Kept separate from the store roots on purpose.
+    scope = tmp_path / "worker_scope"
+    scope.mkdir()
     gate_root = protected.roots["gate_state"]
     (gate_root / "gate.json").write_text("authoritative")
 
@@ -345,8 +358,13 @@ def test_real_child_process_cannot_write_protected_stores(tmp_path):
     )
     with protect_stores(protected, adapter=adapter) as protection:
         assert protection.denies_writes is True
-        proc = subprocess.run(
+        # Launch through the open window so the adapter wraps the child: Seatbelt
+        # confines *at launch* (its seal() is a no-op), so a bare subprocess.run
+        # here would silently defeat the adapter. protection.run is the enforced
+        # path and fails closed if the window is not open.
+        proc = protection.run(
             [sys.executable, "-c", child, str(gate_root)],
+            writable_scope=scope,
             capture_output=True, text=True,
         )
     result = json.loads(proc.stdout.strip())
