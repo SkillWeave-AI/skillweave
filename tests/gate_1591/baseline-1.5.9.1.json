@@ -92,7 +92,7 @@
         "deepcopy: TypeError: AttributedResponse.__new__() missing 2 required keyword-only arguments: 'requested_model' and 'answering_model'",
         "pickle: TypeError: AttributedResponse.__new__() missing 2 required keyword-only arguments: 'requested_model' and 'answering_model'"
       ],
-      "evidence_file": ".skillweave/releases/1.5.9.1/evidence/RC-1-council-attribution.out",
+      "evidence_file": "tests/gate_1591/evidence-RC-1-council-attribution.out",
       "output_sha256": "3c8195a6332fa0c867e88706a4071fa711c499b3374e43435a97c229daf0fc0b",
       "note": "Probe exits 0 by printing the failure; the red condition is that all three reconstruction paths raise. Re-verified during implementation."
     },
@@ -113,7 +113,7 @@
           "observed": "could not find expected ':' in \".forgejo/workflows/contract-ci.yml\", line 44, column 1"
         }
       ],
-      "evidence_file": ".skillweave/releases/1.5.9.1/evidence/RC-2-contract-ci-yaml.out",
+      "evidence_file": "tests/gate_1591/evidence-RC-2-contract-ci-yaml.out",
       "output_sha256": "513f5dd0cbf75f948271c2fbcb077b66a1b8368ca90f2f579ac01c06a3750aae",
       "actionlint_output_sha256": "067ddeaf1b82a82ffde3e49c1fb853fdcec85fd0ce777383f0ffe24f39f8ef58",
       "yaml_safeload_output_sha256": "e7d3570ffa8e37c0739ea990d189df7a79179be7a0ad848c37646522918716bf",
@@ -141,7 +141,7 @@
         "model-provider",
         "search-provider"
       ],
-      "evidence_file": ".skillweave/releases/1.5.9.1/evidence/RC-3-sdk-lifecycle-schemas.out",
+      "evidence_file": "tests/gate_1591/evidence-RC-3-sdk-lifecycle-schemas.out",
       "output_sha256": "b25e67bd934c1368b8cc8bdf464e2bc0f205593131d368b35e78cc942697af91",
       "note": "The second failure is an environmental artifact: the v0.1.0 snapshot is a local archive with no published remote. The canonical green path (Contract CI) clones the SDK from the public mirror, where origin is a published source. The eight missing lifecycle schemas are the substantive red condition and are schema-version independent."
     },
@@ -160,7 +160,7 @@
         "tests/unit/test_version_sync.py::TestRequiredSurfaces::test_required_surfaces_share_the_runtime_version"
       ],
       "additional_failure": "tests/unit/test_version_sync.py::TestRequiredSurfaces::test_same_version_cannot_hide_a_different_inventory",
-      "evidence_file": ".skillweave/releases/1.5.9.1/evidence/RC-4-inventory.out",
+      "evidence_file": "tests/gate_1591/evidence-RC-4-inventory.out",
       "output_sha256": "7d7b285e0d6222b54c8d8bcdc0c23f7224634ba452b9d22e957a534edda180bb",
       "root_cause": "capability.yaml distribution_bundle version is 1.5.8 while the runtime declares 1.5.9, and the `skillweave-entry` pin points at ./skills/skillweave while the on-disk skill directory is `skillweave`.",
       "independence": "Distinct from RC-1: these are catalogue/version topology failures in tests/unit, RC-1 is the Council probe. Running tests/unit never exercises src/skillweave/routing/faigate_adapter.py copy reconstruction."
@@ -173,7 +173,7 @@
       "command": "bash -eo pipefail -c 'python3 -m pytest tests/unit/test_version_sync.py tests/unit/test_doc_arch.py tests/release/test_version_topology.py tests/gate_1312/test_topology_regressions.py -q'",
       "exit_code": 1,
       "observed_summary": "9 failed, 17 passed, 2 skipped",
-      "evidence_file": ".skillweave/releases/1.5.9.1/evidence/RC-5-version-topology-corroboration.out",
+      "evidence_file": "tests/gate_1591/evidence-RC-5-version-topology-corroboration.out",
       "output_sha256": "ea6ba412b5d57ab571253eca73bc475433a245a5036d6edfd30e067c67961a76"
     }
   ],

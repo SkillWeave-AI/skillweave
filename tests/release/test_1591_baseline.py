@@ -2,7 +2,7 @@
 
 This module pins the released multi-repository baseline for the SkillWeave
 1.5.9.1 contract-authority patch and proves the pinned refs have not moved.
-It is the executable half of ``.skillweave/releases/1.5.9.1/baseline.json``:
+It is the executable half of ``tests/gate_1591/baseline-1.5.9.1.json``:
 the JSON is the content-addressed record, this test is the guard that keeps
 that record honest against the live repositories.
 
@@ -36,7 +36,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-BASELINE_PATH = REPO_ROOT / ".skillweave" / "releases" / "1.5.9.1" / "baseline.json"
+BASELINE_PATH = REPO_ROOT / "tests" / "gate_1591" / "baseline-1.5.9.1.json"
 
 # Default location of the SDK checkout. Overridable so the guard can run in
 # CI or a relocated workspace without editing the test.
