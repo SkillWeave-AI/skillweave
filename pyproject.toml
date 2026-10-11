@@ -61,7 +61,7 @@ dev = [
 # matches the project's own `requires-python`; the MCP SDK itself is a
 # pure-Python wheel on the supported range.
 mcp = [
-    "mcp>=1.0; python_version >= '3.9'",
+    "mcp>=1.0,<2; python_version >= '3.9'",
 ]
 
 [project.urls]
