@@ -54,8 +54,8 @@ read from exactly these authorities; none of them re-derives a second set.
 
 ### The two required version surfaces agree
 
-- candidate (product) — `pyproject.toml`: **1.5.9**
-- bundle — `capability.yaml`: **1.5.9**
+- candidate (product) — `pyproject.toml`: **1.5.10**
+- bundle — `capability.yaml`: **1.5.10**
 
 `.version.yaml` declares `release_policy: decoupled_member_pins`: the *runtime
 product* and the *distribution bundle* carry the train version, while every
@@ -67,18 +67,24 @@ consistency.
 
 ### The released fact is peeled, not `HEAD`
 
-| Fact | Value in this checkout |
-|------|------------------------|
-| candidate | `1.5.9` |
-| released tag | `v1.5.9` |
-| released **peeled** commit | `11a6fe72295d02bdb18ad2eaa0ed34837164e803` |
-| tag subject | `SkillWeave v1.5.9` |
-| branch `HEAD` (the in-flight 1.5.10 work) | `0a67a76a71501c94c12ecb257993b77ceecb4ed4` |
+The released fact is **stated by its rule and by the command that derives it**,
+not by a printed hash. It is the latest canonical **annotated** tag, identified
+by its **peeled** commit:
 
-The released identity is the tag's **peeled** commit (`git rev-parse
-'v1.5.9^{}'`), never branch `HEAD`. `1.5.10` is the **candidate-under-work**;
-it is **not released** and is not advertised as released anywhere. The full rule
-is in `docs/version-truth.md`, enforced by `scripts/check-version-truth.py`.
+```sh
+git rev-parse '<latest-annotated-tag>^{}'
+```
+
+The released identity is the tag's **peeled** commit, never branch `HEAD` and
+never the tag object itself; the tag's own subject line is the canonical
+release metadata. Neither a peeled commit nor a `HEAD` hash is printed in this
+page — the value is derived from the repository at read time, so it cannot go
+stale here. The full rule is in `docs/version-truth.md`, enforced by
+`scripts/check-version-truth.py`.
+
+`1.5.10` is this page's **candidate and bundle** version and the **release in
+preparation**: it is **not yet released** — it must not be presented as
+released anywhere until its `v1.5.10` tag exists in the repository.
 
 ---
 
