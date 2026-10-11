@@ -118,13 +118,11 @@ def test_pins_present_and_well_formed() -> None:
 def test_core_pins_match_live_refs() -> None:
     """The pinned Core refs still resolve to the recorded SHAs."""
     baseline = _load_baseline()
-    checked_any = False
     for key, ref in _PINS.items():
         expected = baseline["pins"][key]["sha"]
         actual = _rev_parse(REPO_ROOT, ref)
         if actual is None:
-            continue  # ref not available; skip this pin silently
-        checked_any = True
+            pytest.skip(f"{ref} not available in this clone; cannot verify {key}")
         # The pinned SHA must exist as a valid commit object in this repo.
         assert _git(
             REPO_ROOT, "cat-file", "-e", f"{expected}^{{commit}}"
@@ -135,15 +133,15 @@ def test_core_pins_match_live_refs() -> None:
         # This proves the released baseline is still part of the history
         # without requiring an exact match (HEAD moves with every commit).
         result = _git(REPO_ROOT, "merge-base", "--is-ancestor", expected, actual)
-        if result.returncode not in (0, 1):
-            continue  # cannot compute ancestry; skip this pin silently
+        assert result.returncode in (0, 1), (
+            f"ancestry check for pin {key} ({expected} vs ref {ref} -> {actual}) "
+            f"failed with exit {result.returncode}: {result.stderr.strip()}"
+        )
         assert result.returncode == 0, (
             f"pinned SHA {expected} for {key} is not an ancestor of ref {ref} "
             f"(resolved to {actual}). The released baseline is no longer "
             f"trustworthy."
         )
-    if not checked_any:
-        pytest.skip("no Core refs available in this clone")
 
 
 def test_non_ancestor_pin_is_rejected() -> None:
@@ -163,6 +161,43 @@ def test_non_ancestor_pin_is_rejected() -> None:
     assert result.returncode != 0, (
         f"negative control SHA {non_ancestor} should not be an ancestor of HEAD"
     )
+
+
+def test_ancestry_error_branch_is_rejected() -> None:
+    """A merge-base error (exit 128) is caught by the assertion, never skipped.
+
+    This negative control proves that when git merge-base --is-ancestor exits
+    with a non-0/non-1 code (e.g. a corrupt or absent object), the assertion
+    ``result.returncode in (0, 1)`` fires and fails the test instead of
+    silently continuing.
+    """
+    import os
+    import tempfile
+    tmpdir = tempfile.mkdtemp(dir=os.environ.get("_TMPDIR", None))
+    try:
+        subprocess.run(
+            ["git", "init"], cwd=tmpdir, capture_output=True, check=True
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t",
+             "commit", "--allow-empty", "-m", "root"],
+            cwd=tmpdir, capture_output=True, check=True,
+        )
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmpdir, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        # A non-existent SHA makes merge-base exit 128.
+        bogus = "0000000000000000000000000000000000000000"
+        result = _git(Path(tmpdir), "merge-base", "--is-ancestor", bogus, head)
+        # The result code must be 128 (error), not 0 or 1.
+        assert result.returncode not in (0, 1), (
+            f"expected merge-base to fail with exit !=0/1 for bogus SHA, "
+            f"got {result.returncode}: {result.stderr.strip()}"
+        )
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_skillweave_main_pin_is_the_worktree_ancestor() -> None:
@@ -194,13 +229,11 @@ def test_sdk_pins_match_live_refs_when_sdk_present() -> None:
         "sdk_tag_v0_1_0": "refs/tags/v0.1.0",
         "sdk_local_preview": "ops/SW1312-PROFILE-CONTRACT-001",
     }
-    checked_any = False
     for key, ref in checks.items():
         expected = baseline["pins"][key]["sha"]
         actual = _rev_parse(sdk, ref)
         if actual is None:
-            continue  # ref not available in SDK clone; skip silently
-        checked_any = True
+            pytest.skip(f"{ref} not available in SDK clone; cannot verify {key}")
         # The pinned SHA must exist as a valid commit in the SDK repo.
         assert _git(
             sdk, "cat-file", "-e", f"{expected}^{{commit}}"
@@ -209,14 +242,14 @@ def test_sdk_pins_match_live_refs_when_sdk_present() -> None:
         )
         # The pinned SHA must be an ancestor of (or equal to) the live ref.
         result = _git(sdk, "merge-base", "--is-ancestor", expected, actual)
-        if result.returncode not in (0, 1):
-            continue  # cannot compute SDK ancestry; skip silently
+        assert result.returncode in (0, 1), (
+            f"ancestry check for SDK pin {key} ({expected} vs ref {ref} -> {actual}) "
+            f"failed with exit {result.returncode}: {result.stderr.strip()}"
+        )
         assert result.returncode == 0, (
             f"SDK ref {ref} moved: baseline pinned {expected}, live is {actual}. "
             f"The pinned SHA is not an ancestor of the current ref."
         )
-    if not checked_any:
-        pytest.skip("no SDK refs available in this clone")
 
 
 def test_local_sdk_preview_is_protected_evidence() -> None:

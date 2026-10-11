@@ -74,8 +74,10 @@ def test_map_head_matches_repo(map_data, head_sha):
         capture_output=True, text=True,
         cwd=Path(__file__).resolve().parent.parent,
     )
-    if result.returncode == 128:
-        pytest.skip("cannot compute ancestry in this clone")
+    assert result.returncode in (0, 1), (
+        f"ancestry check for map HEAD {recorded} vs repo HEAD {head_sha} "
+        f"failed with exit {result.returncode}: {result.stderr.strip()}"
+    )
     assert result.returncode == 0, (
         f"Map HEAD {recorded} is not an ancestor of repo HEAD {head_sha}. "
         f"The rebaseline map is no longer part of the current history."
