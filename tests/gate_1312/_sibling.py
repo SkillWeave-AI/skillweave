@@ -81,33 +81,58 @@ def sdk_root() -> Path:
     )
 
 
-def sdk_schemas_dir() -> Path:
-    """Directory holding the SDK schemas, preferring the preview-schema tree.
+#: Filenames that anchor an SDK schema directory. SDK 0.3.0 ships its schemas
+#: inside the package (``src/skillweave_sdk/schemas``) under plain
+#: ``*.schema.json`` names; the pre-0.3.0 PROFILE-CONTRACT lane used a root
+#: ``schemas/`` tree with ``*.preview.schema.json`` names. Either anchors a dir.
+_SDK_SCHEMA_ANCHORS = (
+    "lifecycle-profile.schema.json",
+    "lifecycle-profile.preview.schema.json",
+)
 
-    The canonical preview digest is computed over five preview schemas
-    (``*-.preview.schema.json``). The SDK ``main`` branch carries only the four
-    core schemas; the PROFILE-CONTRACT lane adds the five preview schemas. Both
-    env-var overrides point at a repository root or a schemas dir directly.
+
+def _sdk_schemas_candidate(base: Path) -> Path | None:
+    """Return the schemas dir under ``base``, in-package location first.
+
+    ``base`` may be an SDK repository root, a distribution root, or a schemas
+    directory itself. The in-package location (``src/skillweave_sdk/schemas``)
+    is tried first; the pre-0.3.0 root ``schemas/`` tree is the fallback; a
+    ``base`` that is already a schemas dir is accepted last. Returns ``None``
+    when no candidate anchors on an SDK schema file.
+    """
+    for cand in (base / "src" / "skillweave_sdk" / "schemas", base / "schemas", base):
+        if cand.is_dir() and any((cand / a).is_file() for a in _SDK_SCHEMA_ANCHORS):
+            return cand
+    return None
+
+
+def sdk_schemas_dir() -> Path:
+    """Directory holding the SDK contract schemas.
+
+    Resolves the in-package schema tree first (SDK >= 0.3.0 ships schemas at
+    ``src/skillweave_sdk/schemas``) and falls back to the pre-0.3.0 root
+    ``schemas/`` tree. Both env-var overrides point at a repository root or a
+    schemas dir directly.
     """
     env_schema = os.environ.get("SKILLWEAVE_SCHEMA_DIR")
     if env_schema:
-        cand = Path(env_schema)
-        if (cand / "lifecycle-profile.preview.schema.json").is_file():
+        cand = _sdk_schemas_candidate(Path(env_schema))
+        if cand is not None:
             return cand
     env_sdk = os.environ.get("SKILLWEAVE_SDK_DIR")
     if env_sdk:
-        cand = Path(env_sdk) / "schemas"
-        if (cand / "lifecycle-profile.preview.schema.json").is_file():
+        cand = _sdk_schemas_candidate(Path(env_sdk))
+        if cand is not None:
             return cand
 
-    root = sdk_root()
-    direct = root / "schemas"
-    if (direct / "lifecycle-profile.preview.schema.json").is_file():
-        return direct
+    cand = _sdk_schemas_candidate(sdk_root())
+    if cand is not None:
+        return cand
     raise RepoResolutionError(
-        "could not resolve the SDK preview schemas (lifecycle-profile.preview.schema.json); "
+        "could not resolve the SDK schemas (looked for "
+        "src/skillweave_sdk/schemas/<anchor> and schemas/<anchor>); "
         "set SKILLWEAVE_SCHEMA_DIR (schemas dir) or SKILLWEAVE_SDK_DIR (repo root) "
-        "to a skillweave-sdk tree whose PROFILE-CONTRACT lane preview schemas are committed"
+        "to a skillweave-sdk tree shipping its contract schemas"
     )
 
 
@@ -134,9 +159,15 @@ def sdk_validator_module():
         "skillweave_sdk.validator", validator_file
     )
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Register the module before executing it. SDK 0.3.0's validator defines
+    # ``@dataclass(frozen=True)`` classes with ``from __future__ import
+    # annotations``; the dataclass machinery looks the class up in
+    # ``sys.modules[cls.__module__]`` to resolve its string annotations. If the
+    # module is not yet registered at decoration time that lookup yields None
+    # and the import raises AttributeError.
     sys.modules["skillweave_sdk"] = type("skillweave_sdk", (), {"validator": module})()
     sys.modules["skillweave_sdk.validator"] = module
+    spec.loader.exec_module(module)
     return module
 
 

@@ -5,6 +5,7 @@ Provides:
 - Dispatchability assessments and gates for decomposed units.
 - Fibonacci point validation and dependency cycle detection.
 - Unit eligibility and fail-closed dispatch validation.
+- Authority-aware planning ticket handshake (SW-159-BP-TICKET-001).
 """
 
 from .decomposition import (
@@ -31,6 +32,18 @@ from .dispatchability import (
     validate_dispatchability,
 )
 
+from .planning_handshake import (
+    HandshakeError,
+    HandshakeEvidence,
+    HandshakeResult,
+    HandshakeTerminal,
+    PlanningBoardInfo,
+    create_ticket_on_board,
+    detect_planning_repository,
+    link_ticket,
+    perform_handshake,
+)
+
 __all__ = [
     # Decomposition
     "ComplexityLevel",
@@ -52,4 +65,14 @@ __all__ = [
     "evaluate_dispatchability",
     "get_dispatchable_units",
     "validate_dispatchability",
+    # Planning handshake (SW-159-BP-TICKET-001)
+    "HandshakeError",
+    "HandshakeEvidence",
+    "HandshakeResult",
+    "HandshakeTerminal",
+    "PlanningBoardInfo",
+    "create_ticket_on_board",
+    "detect_planning_repository",
+    "link_ticket",
+    "perform_handshake",
 ]

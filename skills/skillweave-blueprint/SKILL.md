@@ -354,6 +354,9 @@ Based on interview responses, creates a structured PRD with:
 - System architecture diagram
 - Data model overview
 - Integration points
+- Data boundaries: every crossing of storage, process, adapter, telemetry or public-api
+  requires an exact versioned data contract (artifact, versioning, producer,
+  consumer, compatibility). Prose alone is not a contract.
 
 ## 8. Success Metrics (Binary & Testable)
 - [Metric 1]: Target value, measurement method
@@ -424,10 +427,55 @@ Creates a task list in Ralph Loop format for execution:
       "dependsOn": ["ARCH-001"],
       "type": "feature",
       "passes": false
+    },
+    {
+      "id": "DATA-001",
+      "title": "Persist user sessions to the session store",
+      "description": "Crosses the storage boundary: writes session records to the session store and reads them back at request time.",
+      "acceptanceCriteria": [
+        "Session record written on login and read on the next request",
+        "Old session records remain readable after a schema addition"
+      ],
+      "priority": "high",
+      "estimatedEffort": "5",
+      "dependsOn": ["ARCH-001"],
+      "type": "feature",
+      "passes": false,
+      "boundaries": [
+        {
+          "kind": "storage",
+          "data_contract": {
+            "artifact": "session record",
+            "versioning": "schema v2; v1 records remain readable",
+            "producer": "auth service",
+            "consumer": "request middleware",
+            "compatibility": "backward compatible: new optional fields only",
+            "subject_kind": "configuration"
+          }
+        }
+      ]
     }
   ]
 }
 ```
+
+### Data-boundary contract (required for any boundary crossing)
+
+A task that crosses an architectural boundary MUST declare a `boundaries`
+array; a task with no data-boundary change omits it and validates unchanged.
+
+- **Contract-requiring kinds:** `storage`, `process`, `adapter`, `telemetry`,
+  `public-api`. Any other kind is refused — a boundary is never guessed.
+- **Every boundary requires a `data_contract`** carrying all five fields:
+  `artifact`, `versioning`, `producer`, `consumer`, `compatibility`. A missing
+  or blank field is an *undefined required field* and fails with a
+  task-specific diagnostic.
+- **Prose is not a contract.** A boundary whose `data_contract` is a bare
+  string (e.g. `"data_contract": "the session store"`) is refused.
+- `subject_kind` is optional and must use the WorkContract subject vocabulary
+  (`repository`, `content`, `configuration`, `deployment`, `incident`).
+
+Validation: `skillweave.blueprint.data_boundary_contract.validate_prd_data_boundaries(prd)`.
 
 ### Phase 4: Memory System Setup
 Creates memory files for Ralph Loop execution:
@@ -549,8 +597,42 @@ Based on analysis of your PRD tasks, the blueprint provides recommendations for 
 - **Best for**: Major features, system overhauls, new projects
 - **Tools**: Overnight execution with comprehensive verification
 
-### Automatic Recommendation
-The blueprint analyzes your PRD and includes an `execution_recommendation` in the generated `prd.json`:
+### Native Methodology Declaration
+
+The blueprint declares the execution **methodology**, its **autonomy policy** and
+its **session schedule** as three *separate* fields on the PRD's `sequence`
+block — never as one conflated mode string. This is the native surface the
+promptchain-generate, promptchain-validate, promptchain-execute and regen
+producer preserve end to end:
+
+```json
+"sequence": {
+  "sequence_id": "my-project",
+  "sequence_type": "build",
+  "methodology": "assay",
+  "autonomy_policy": "unicorn",
+  "session_schedule": "batch"
+}
+```
+
+- `methodology` is one of `rex`, `ralph`, `gauntlet`, `assay`. **Assay is never
+  silently substituted by Ralph** — the value the blueprint declares is the
+  value every downstream stage preserves.
+- `autonomy_policy` is the methodology's own policy axis (`conservative`,
+  `medium`, `unicorn`), carried separately from the methodology. `unicorn` is
+  Assay's declared default; it is not a methodology.
+- `session_schedule` is separate again from both.
+
+### Automatic Recommendation (explicit legacy compatibility)
+
+The blueprint may additionally include an `execution_recommendation` in the
+generated `prd.json`. This is **legacy compatibility only**: its
+`suggested_workflow` is an *adapter* over the legacy vocabulary, and it must be
+**consistent with the declared methodology or the producer refuses it**. A
+`suggested_workflow` that would route execution to a *different* methodology
+than the sequence declares is a hard error (`suggested_workflow_would_substitute_methodology`)
+— the compatibility path never silently rewrites a different methodology into
+the run.
 
 ```json
 "execution_recommendation": {
@@ -561,6 +643,20 @@ The blueprint analyzes your PRD and includes an `execution_recommendation` in th
   "parallel_opportunities": 2
 }
 ```
+
+The legacy `suggested_workflow` vocabulary and the methodology it denotes:
+
+| `suggested_workflow` | denotes methodology |
+|----------------------|---------------------|
+| `rex-simple`         | `rex`               |
+| `ralph-loop-attended`| `ralph`             |
+| `ralph-loop-overnight`| `ralph`            |
+| `direct-execution`   | `rex`               |
+
+An unrecognised `suggested_workflow` is refused rather than coerced, and a
+workflow denoting a different methodology than the declared one is refused with
+`legacy_would_substitute_methodology`. Omitting `execution_recommendation`
+entirely is valid: compatibility is explicit and never a silent default.
 
 ### REX vs Ralph Loop Decision Guide
 
@@ -574,7 +670,8 @@ The blueprint analyzes your PRD and includes an `execution_recommendation` in th
 | **Setup Overhead** | Minimal | Moderate (memory system) |
 | **Best For** | Quick wins, proofs of concept | Production features, systems |
 
-**Rule of thumb**: When in doubt, start with REX for speed, switch to Ralph Loop when complexity emerges.
+**Rule of thumb**: When in doubt, start with REX for speed, switch to Ralph Loop when complexity emerges. Either way, record the choice as an explicit
+`methodology` declaration — not as a workflow string a producer might re-route.
 
 ## Usage Examples
 

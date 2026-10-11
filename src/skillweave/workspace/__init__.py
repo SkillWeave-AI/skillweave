@@ -25,6 +25,23 @@ from .provider import (
     WorkspaceProviderError,
     GitWorktreeProvider,
 )
+from .repository import (
+    REPOSITORY_TARGET_SCHEMA_VERSION,
+    REPOSITORY_TARGET_SCHEMA_ID,
+    REPOSITORY_TARGET_KEYS,
+    RepositoryTargetError,
+    controller_branch_for,
+    RepositoryTarget,
+    resolve_ref_in_repository,
+    resolve_base,
+    resolve_candidate,
+    provider_for,
+    worktree_path_for,
+    DispatchedLane,
+    lane_branch,
+    plan_lane,
+    acquire_lane,
+)
 
 __all__ = [
     "WorkspaceProvider",
@@ -32,4 +49,19 @@ __all__ = [
     "Attestation",
     "WorkspaceProviderError",
     "GitWorktreeProvider",
+    "REPOSITORY_TARGET_SCHEMA_VERSION",
+    "REPOSITORY_TARGET_SCHEMA_ID",
+    "REPOSITORY_TARGET_KEYS",
+    "RepositoryTargetError",
+    "controller_branch_for",
+    "RepositoryTarget",
+    "resolve_ref_in_repository",
+    "resolve_base",
+    "resolve_candidate",
+    "provider_for",
+    "worktree_path_for",
+    "DispatchedLane",
+    "lane_branch",
+    "plan_lane",
+    "acquire_lane",
 ]

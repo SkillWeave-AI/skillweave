@@ -62,6 +62,7 @@ role_defaults:
 
 contracts:
   - schemas/assessment-receipt.schema.json
+  - schemas/discovery-trace.schema.json
   - schemas/dispatch-handoff.schema.json
   - schemas/dispatch-sequence.schema.json
   - schemas/dispatch-trace.schema.json

@@ -1,0 +1,26 @@
+{
+  "projectName": "Negative proof — a contract-requiring boundary defined only in prose",
+  "version": "1.0",
+  "status": "draft",
+  "tasks": [
+    {
+      "id": "PROSE-001",
+      "title": "Store the upload result",
+      "description": "Crosses the storage boundary but describes the interface in prose instead of defining an exact versioned data contract.",
+      "acceptanceCriteria": [
+        "The upload result is stored somewhere durable"
+      ],
+      "priority": "high",
+      "points": 3,
+      "dependsOn": [],
+      "type": "feature",
+      "passes": false,
+      "boundaries": [
+        {
+          "kind": "storage",
+          "data_contract": "the upload result goes in the object store under the tenant prefix"
+        }
+      ]
+    }
+  ]
+}

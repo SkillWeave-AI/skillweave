@@ -25,6 +25,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, List, Mapping, Optional, Sequence
 
+from skillweave.dispatch.work_contract import (
+    SubjectRef,
+    EvidenceReceipt,
+    subject_ref_from_dict,
+    is_git_subject,
+)
+
 #: The only permitted session boundary. Reused from the post-v1.3.7 promptchain
 #: declaration: a sequence that does not declare ``session_boundary: batch`` is
 #: refused, never defaulted.
@@ -147,6 +154,19 @@ class Lane:
         covered = self.criteria_covered()
         expected = sorted(int(i) for i in criterion_indices)
         return sorted(covered) == expected
+
+    def to_subject_ref(self) -> Optional[SubjectRef]:
+        """Produce a :class:`SubjectRef` from this lane's Git identity.
+
+        A lane that carries both ``repo`` and a full base SHA returns a
+        ``RepositorySubject``. A lane without a repo (a read-only reviewer, for
+        example) returns ``None`` — the lane has no subject identity to carry.
+        """
+        if self.repo and self.base and _is_full_sha(self.base):
+            from skillweave.dispatch.work_contract import RepositorySubject
+
+            return RepositorySubject(repo=self.repo, commit=self.base)
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -530,4 +550,8 @@ __all__ = [
     "validate_mutating_lane",
     "validate_for_dispatch",
     "validate_practice_task",
+    "SubjectRef",
+    "EvidenceReceipt",
+    "subject_ref_from_dict",
+    "is_git_subject",
 ]

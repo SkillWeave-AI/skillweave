@@ -3,7 +3,18 @@
 Provides foundational processing, planning, and system primitives.
 """
 
-from .proc.runner import run_process, redact_secrets, ProcessLimitExceeded
+from .proc.runner import (
+    run_process,
+    run_process_streaming,
+    StreamingResult,
+    StreamLaunchError,
+    redact_secrets,
+    ProcessLimitExceeded,
+    ScopeEnforcement,
+    IsolationAttestation,
+    ScopeEnforcementUnavailable,
+    ScopeViolation,
+)
 from .context import (
     ContextBlock,
     ContextCheckpoint,
@@ -22,8 +33,15 @@ from .context import (
 
 __all__ = [
     "run_process",
+    "run_process_streaming",
+    "StreamingResult",
+    "StreamLaunchError",
     "redact_secrets",
     "ProcessLimitExceeded",
+    "ScopeEnforcement",
+    "IsolationAttestation",
+    "ScopeEnforcementUnavailable",
+    "ScopeViolation",
     "ContextBlock",
     "ContextCheckpoint",
     "ContextLimitAssessment",

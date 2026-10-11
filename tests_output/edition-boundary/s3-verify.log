@@ -1,0 +1,19 @@
+== SW-159-EDITION-001 S3 verification ==
+repo=/Users/andrelange/workspaces/skillweave-temp/.worktrees/sw159/run-1/sw-159-edition-001
+head=2eb87af5647911a8fa6acd13d3240ec48424ac8f
+branch=feature/sw-159-edition-001
+  [default_off] {"fresh_consent_off": true, "granted_without_handle_refused": true, "raw_subjects_refused": true, "schema_version": 1, "sub_floor_cohort_refused": true, "unsupported_version_refused": true}
+  [consent] {"grant_mints_handle": true, "handle_changes_with_time": true, "handle_deterministic": true, "handle_len": 32, "preview_does_not_grant": true, "preview_reports_cohort_refusal": true, "preview_reports_content_refusal": true, "preview_schema_version": 1}
+  [deletion] {"handle_revocable": true, "handle_survives_revoke": true, "unknown_handle_refused": true}
+  [prohibited_content] {"prohibited_values_refused": true, "raw_keys_refused": true, "raw_record_refused_at_boundary": true, "rejection_precedes_cohort_check": true, "secret_subject_refused": true}
+  [cohort_threshold] {"absolute_floor_holds": true, "cohort_is_safe_boundary": {"3": true, "4": false, "5": true}, "default_min_cohort": 5, "undersized_refused": true}
+  [re_identification] {"balanced_smallest_bucket": 4, "floor": 3, "imbalanced_bucket_refused": true}
+  [poisoning] {"clean_cohort_has_no_signal": true, "degenerate_outcome_detected": true, "export_refused_on_signal": true, "max_outcome_share": 0.98, "max_repeat_share": 0.5, "replayed_record_detected": true}
+  [withdrawal] {"contributions_removed": 8, "other_tenant_untouched": true, "withdraw_by_handle": true, "withdraw_by_string_equivalent": true, "withdrawn_tenant_refused": true}
+  [tenant_boundary] {"contribution_without_consent_refused": true, "duplicate_registration_refused": true, "export_while_unavailable_refused": true, "export_without_consent_refused": true, "unknown_subject_refused": true}
+  [edition_bypass] {"aggregate_service_denied_everywhere": true, "community_denies_pro_features": true, "contract_frozen": true, "require_capability_fails_closed": true, "unknown_edition_refused": true}
+  [aggregate_service_label] {"all_gates": "preview", "contradicted_cohort_gate": false, "default": "preview/unavailable", "gates": ["ingestion", "cohort", "quality", "deletion", "tenant_isolation"], "partial": "preview/unavailable", "production_claim": false}
+  [editions] {"all_offline_local_optin_default_off": true, "community": {"aggregate_service_claim": false, "budgeting": false, "capability_mix": false, "coarse_local_recommendations": true, "edition": "community", "export_default_off": true, "export_opt_in": true, "fixture_backed_benchmark": false, "hotspots": false, "local_raw_events": true, "offline": true, "tenant_isolation": false}, "enterprise": {"aggregate_service_claim": false, "budgeting": true, "capability_mix": true, "coarse_local_recommendations": true, "edition": "enterprise", "export_default_off": true, "export_opt_in": true, "fixture_backed_benchmark": true, "hotspots": true, "local_raw_events": true, "offline": true, "tenant_isolation": true}, "pro": {"aggregate_service_claim": false, "budgeting": true, "capability_mix": true, "coarse_local_recommendations": true, "edition": "pro", "export_default_off": true, "export_opt_in": true, "fixture_backed_benchmark": true, "hotspots": true, "local_raw_events": true, "offline": true, "tenant_isolation": false}}
+  [aggregate_artifact] {"cohort_size": 8, "forbidden_key_free": true, "kind": "skillweave.telemetry-export", "network_export": false, "production_claim": false, "raw_events_exported": false, "sample_label": "adequate", "schema_version": 1}
+ALL S3 CASES PASSED
+== S3 harness exit: 0 ==

@@ -1,0 +1,184 @@
+{
+  "schema": {
+    "schema_version": 1,
+    "kind": "skillweave.local-telemetry",
+    "digest_prefix": "06cc496414fc8595",
+    "round_trip": true,
+    "unknown_key_refused": true,
+    "tamper_detected": true
+  },
+  "prohibited_content": {
+    "refused": {
+      "prompt": true,
+      "source": true,
+      "secret_key": true,
+      "pii_email": true,
+      "pii_ssn": true,
+      "pii_ssn_dotted": true,
+      "pii_ip": true,
+      "pii_phone": true,
+      "direct_repo_path": true,
+      "unlisted_head_path": true,
+      "absolute_path": true,
+      "github_pat": true,
+      "aws_access_key": true,
+      "slack_token": true,
+      "jwt": true,
+      "base64_blob": true,
+      "prompt_phrase": true,
+      "shopify_token": true,
+      "sendgrid_token": true,
+      "gitlab_pat": true,
+      "card_number": true,
+      "mid_value_path": true,
+      "single_segment_path": true,
+      "dotenv_path": true,
+      "single_char_path": true,
+      "comma_embedded_path": true,
+      "space_embedded_path": true,
+      "paren_embedded_path": true,
+      "glued_home_path": true,
+      "word_glued_home_path": true,
+      "user_home_path": true,
+      "root_user_home_path": true,
+      "ipv6_compressed": true,
+      "ipv6_full": true,
+      "ipv6_mixed": true,
+      "bearer_secret": true,
+      "value_email": true,
+      "phone_paren": true,
+      "terse_prompt_phrase": true,
+      "inline_source_marker": true,
+      "glued_rooted_path": true,
+      "long_value_cap": true,
+      "blocked_key_secret": true,
+      "blocked_key_pii": true,
+      "blocked_key_prompt": true,
+      "posix_traversal": true,
+      "windows_traversal": true,
+      "bad_freshness": true,
+      "value_level_secret": true,
+      "store_github_pat": true
+    },
+    "all_refused": true,
+    "false_positive_free_on_legit_values": true,
+    "legit_values_checked": 31
+  },
+  "no_consent": {
+    "disabled_by_default": true,
+    "record_while_disabled_refused": true,
+    "export_without_consent_refused": true,
+    "export_with_consent_ok": true
+  },
+  "correlation": {
+    "moderate_n4": {
+      "factor": "starting_budget",
+      "r": 0.8944,
+      "sample_size": 4,
+      "label": "coarse"
+    },
+    "moderate_n10": {
+      "factor": "starting_budget",
+      "r": 0.8704,
+      "sample_size": 10,
+      "label": "adequate"
+    },
+    "conservative_n10": {
+      "factor": "starting_budget",
+      "r": 0.8704,
+      "direction": "positive"
+    },
+    "unicorn_n10": {
+      "factor": "starting_budget",
+      "r": 0.8704,
+      "direction": "positive"
+    }
+  },
+  "confidence": {
+    "by_size": {
+      "n2": {
+        "label": "insufficient",
+        "confidence": 0.25,
+        "sample_size": 2
+      },
+      "n4": {
+        "label": "coarse",
+        "confidence": 0.447,
+        "sample_size": 4
+      },
+      "n16": {
+        "label": "adequate",
+        "confidence": 0.868,
+        "sample_size": 16
+      }
+    },
+    "empty_corpus_is_not_fabricated": true
+  },
+  "dynamic_budget": {
+    "delta": 150,
+    "factor": "starting_budget",
+    "r": 0.8729,
+    "direction": "positive"
+  },
+  "ast_failure": {
+    "min_ast_delta": -7,
+    "factor": "ast_delta",
+    "r": -0.8729,
+    "direction": "negative"
+  },
+  "gate_pass": {
+    "pass_count": 5,
+    "interval_to_pass_sample": 10,
+    "pass_rate": 0.5,
+    "sealed_and_validated": true,
+    "missing_interval_refused": true
+  },
+  "model_identity": {
+    "catalogue_id": "faigate/deepseek-v4-pro",
+    "tier": "pro",
+    "salted_digest_prefix": "d2f9f20b18a6d3b8"
+  },
+  "boundary": {
+    "pairs": {
+      "token_run_min": {
+        "inside": "skillweaveauthx",
+        "outside": "skillweaveauthxx"
+      },
+      "digit_token_run_min": {
+        "inside": "sw159tele01",
+        "outside": "sw159tele001"
+      },
+      "grouped_digit_min": {
+        "inside": "123-456789",
+        "outside": "1234-567890"
+      },
+      "max_words": {
+        "inside": "release candidate",
+        "outside": "one two three"
+      },
+      "hex_opaque_min": {
+        "inside": "abcdefabcdef",
+        "outside": "abcdefabcdefa"
+      }
+    },
+    "hex_admitted_lengths": [
+      7,
+      8,
+      12,
+      40,
+      64
+    ],
+    "hex_refused_lengths": [
+      13,
+      20,
+      39,
+      41,
+      63
+    ],
+    "digit_free_hex_refused": [
+      "bbbbbbbbbbbbb",
+      "bbbbbbbbbbbbbbb"
+    ],
+    "all_thresholds_pinned": true
+  }
+}

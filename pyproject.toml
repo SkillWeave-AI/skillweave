@@ -1,21 +1,28 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "skillweave"
-version = "1.5.8"
+version = "1.5.10"
 description = "Multi-agent AI skill orchestration with Next Level features"
 readme = "README.md"
 authors = [
     {name = "LangeVC.com"},
 ]
-license = {text = "Apache-2.0"}
+# PEP 639: SPDX license expression + explicit license files. The setuptools
+# build-system floor above is raised to >=77.0.0 because a string license and
+# `license-files` are only honoured by PEP 639-compatible backends. The
+# deprecated `License ::` classifier is dropped for the same reason: PEP 639
+# forbids it alongside `license`.
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "License :: OSI Approved :: Apache Software License",
+    # PEP 639: the `License ::` classifier is mutually exclusive with the
+    # SPDX `license` expression above, so it is intentionally not declared.
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -29,7 +36,7 @@ dependencies = [
     # an exact version and consumes the pinned artifact; it never copies the
     # schema authority into its own tree (see docs/architecture.md, "Repository
     # boundary", and tests/contract/test_preview_core_pro_boundary.py).
-    "skillweave-sdk==0.1.0",
+    "skillweave-sdk==0.3.0",
 ]
 
 [project.optional-dependencies]
@@ -44,11 +51,23 @@ dev = [
     "flake8>=6.0",
     "jsonschema>=4.0",
 ]
+# Optional capability: hosting the tool surface over the Model Context Protocol.
+# Deliberately NOT a base dependency. src/skillweave/mcp/server.py imports the
+# SDK inside try/except and degrades to an inert stub, so the base install runs
+# without it; this extra is the one-line way to add the real server. Run
+# `python -m skillweave.scripts.check_optional_capability` for an actionable
+# diagnostic when it is absent (the packaged module; scripts/
+# check-optional-capability.py is a source-tree wrapper over it). Python floor
+# matches the project's own `requires-python`; the MCP SDK itself is a
+# pure-Python wheel on the supported range.
+mcp = [
+    "mcp>=1.0,<2; python_version >= '3.9'",
+]
 
 [project.urls]
-Homepage = "https://github.com/LangeVC/skillweave"
-Repository = "https://github.com/LangeVC/skillweave"
-Issues = "https://github.com/LangeVC/skillweave/issues"
+Homepage = "https://git.langevc.com/skillweave/skillweave"
+Repository = "https://git.langevc.com/skillweave/skillweave"
+Issues = "https://git.langevc.com/skillweave/skillweave/issues"
 
 [project.scripts]
 skillweave-install = "skillweave.installer:main"

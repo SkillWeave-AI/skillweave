@@ -1,56 +1,28 @@
-# unified-mirror.yml — single Mirror to GitHub workflow for every mirrored repo.
-# Decided by ADR-0001 (lvc-ops, OPS-001). Deploy as `.forgejo/workflows/mirror.yml`
-# verbatim in every repo that has one. The GitHub target is resolved from two
-# Actions variables read via the `vars` context (no token, no API):
-#   GH_REPO_OWNER  — org scope, the owning GitHub org/user (e.g. LangeVC)
-#   GH_REPO        — repo scope, the full owner/name destination (e.g. LangeVC/skillweave)
-# A preflight guard in the mirror job enforces the mapping contract in cost
-# order — double match (string), existence (reachability), then permission
-# (ownership) — and exports the vetted destination for the push steps. Nothing
-# is pushed until all three hold.
+# Forgejo (git.langevc.com) is canonical. GitHub (SkillWeave-AI/skillweave) is a
+# read-only mirror. Force-push ONLY the ref that triggered this run (branch or
+# tag). No --prune and no 'refs/heads/*' wildcard: the CI checkout only has this
+# one ref locally, so a pruning wildcard push would try to delete every OTHER
+# branch on the mirror -- including GitHub's default branch (which GitHub
+# refuses, failing the job) and any GitHub-managed branch such as gh-pages.
+# Pushing only ${GITHUB_REF} keeps the mirror in sync and leaves those untouched.
+# Unified pattern (see lvc-ops/docs/release-flow.md).
 #
-# Two entry points:
-#   1. push event  -> exact-ref: force-push ONLY the triggering ref.
-#      This is the default, per-event copy. It never prunes, so it never
-#      deletes the GitHub default branch or GitHub-managed refs.
-#   2. workflow_dispatch -> STATE SYNC (no `ref`) or targeted exact-ref (with
-#      `ref`). No `ref` means: clone --mirror the canonical source and force-push
-#      ALL refs. The clone IS the health gate: if Forgejo cannot be read the step
-#      fails and NO ref is touched. A `ref` narrows the run to a single
-#      break-glass re-push of exactly that ref. Deletion propagation is a
-#      separate, explicit mode below.
+# REL-010 -- this workflow mirrors git refs ONLY. It used to also derive the
+# GitHub release object from the canonical Forgejo release by downloading the
+# four release assets over the network and re-uploading them (REL-004), waiting
+# under a hard bound for the canonical release to appear (REL-009). That release
+# logic is gone: the build in forgejo-release.yml now publishes its four assets
+# to BOTH forges from its own workspace, so there is nothing to wait for and
+# nothing to re-download here. This file keeps exactly the force-push below,
+# unchanged in intent.
 #
-# Visibility gate (OPS-011 / CAP-CI-001): a `needs:`-preceding job that refuses
-# to mirror a push touching planning/contract paths to a PUBLIC mirror. Forgejo
-# Actions has no cross-workflow `needs:`; a separate workflow on the same trigger
-# would race ahead of the gate. The gate is therefore a job INSIDE this workflow
-# and the mirror job depends on it. Only within one workflow is ordering
-# guaranteed. A deliberate release is unblockable via release_override with a
-# mandatory reason; a gate with no way out gets bypassed, which is worse than no
-# gate.
-#
-# Full-state per-ref gate (LVC-216): the visibility-gate job inspects only the
-# dispatch ref, but the full-state push writes every canonical ref, so each ref
-# is re-gated against BLOCKED_PATHS relative to its own merge-base before it
-# may enter the push list. Blocked refs are dropped and reported with a
-# ::warning::; there is deliberately no release_override on this path. The
-# break-glass exact-ref push is NOT re-gated — it is a single manual ref that
-# stays under the normal needs-gate only.
-#
-# Deletion propagation (OPS-005): pass `prune=true` on dispatch to synchronize
-# deletions too. It is opt-in because a healthy-source gate is required before
-# pruning anything from the mirror (ADR D.2 / D.3): the mirror is a recovery copy,
-# so an unverified source must never be allowed to wipe it. Deleted refs are the
-# ones present on GitHub (in the cloned mirror) but absent on the freshly cloned
-# canonical state. These are always excluded from pruning, even under prune=true:
-#   - the GitHub default branch (GitHub refuses to delete it -> job would fail)
-#   - GitHub-managed refs: gh-pages and any 'refs/heads' matching the mirror-only
-#     set declared per repo.
-#
-# Forgejo Actions secrets (org-level):
-#   GH_MIRROR_TOKEN  — required. GitHub PAT with push access to the mirror.
-#                      Name is fixed across orgs to keep mirror.yml identical.
-
+# ADP-009 -- the repository this workflow pushes to is a destination, so it must
+# come from the committed config layer, never from this file as a literal. The
+# GitHub destination is read out of `.ops.yaml` below (stdlib only, REL-006:
+# this job carries neither yaml nor pydantic and installs nothing). The
+# credential stays where it belongs: GH_MIRROR_TOKEN is a secret (a credential,
+# not a destination) and is never copied into `.ops.yaml`, which carries the
+# repository only.
 name: Mirror to GitHub
 
 on:
@@ -98,15 +70,6 @@ on:
 #                               free for public product docs (architecture, roadmap).
 env:
   BLOCKED_PATHS: ".skillweave/**|strategy.md|**/strategy.md|prd*.md|**/prd*.md|prd*.json|**/prd*.json|*.contract*|**/*.contract*|*contract*.md|**/*contract*.md|*proposal*.md|**/*proposal*.md|*.proposal*|**/*.proposal*"
-
-# The GitHub destination comes from TWO Actions variables, read through the
-# `vars` context: GH_REPO_OWNER at org scope and GH_REPO at repo scope. The
-# preflight guard enforces the mapping contract in cost order — double match
-# (string), existence (reachability), then permission (ownership) — and only then
-# exports the vetted destination for the push and dispatch steps. An unset
-# variable, a pair that drifted apart, a nonexistent destination, or a
-# destination the token may not push to all fail at that named preflight step —
-# never as a git exit 128 from inside a push.
 
 jobs:
   # --- Gate: runs BEFORE the mirror. The mirror depends on it via needs:. ---
@@ -287,236 +250,131 @@ jobs:
     needs: [visibility-gate, version-gate]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout the triggering ref (needed for the event-path push)
-        uses: actions/checkout@v4
+      - uses: https://github.com/actions/checkout@v4
         with:
           fetch-depth: 0
-
-      # --- Preflight guard: enforce the mapping contract before any push.
-      # Reads GH_REPO_OWNER (org scope) and GH_REPO (repo scope) through the
-      # `vars` context — no token, no API. Checks, in cost order:
-      #   1. presence  (either unset -> named error naming the variable + scope)
-      #   2. DOUBLE MATCH  (GH_REPO owner prefix == GH_REPO_OWNER, case-sensitive)
-      #      A pure string comparison, runs BEFORE any call to GitHub.
-      #   3. existence (real git ls-remote reachability)
-      #   4. permission (permissions.push for the mirror token — reachability is
-      #      NOT ownership; a public repo someone else owns passes ls-remote).
-      # Each failure exits 1 at this named step, before any push. On success the
-      # vetted destination is exported as GH_REPO for the push/dispatch steps.
-      - name: Preflight — resolve, double-match, verify, and vouch for the destination
+      - name: Push to GitHub mirror
         env:
           GH_MIRROR_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
-          GH_REPO_OWNER: ${{ vars.GH_REPO_OWNER }}
-          GH_REPO: ${{ vars.GH_REPO }}
         run: |
           set -euo pipefail
+          mirror_repo="$(
+            python3 - <<'PY'
+          import sys
 
-          owner="${GH_REPO_OWNER:-}"
-          repo="${GH_REPO:-}"
+          def _clean_scalar(raw):
+              """Strip YAML quoting/inline-comment then flag anything leftover.
 
-          # 1. Presence — either missing is a named error, before any network.
-          if [ -z "${owner}" ]; then
-            echo "::error::preflight: GH_REPO_OWNER is UNSET. Set the ORG-level Actions variable GH_REPO_OWNER to the GitHub org/user that owns the mirror (e.g. LangeVC)."
-            exit 1
-          fi
-          if [ -z "${repo}" ]; then
-            echo "::error::preflight: GH_REPO is UNSET. Set the REPOSITORY-level Actions variable GH_REPO to the full destination (owner/repo, e.g. LangeVC/skillweave)."
-            exit 1
-          fi
-          echo "preflight: GH_REPO_OWNER='${owner}'  GH_REPO='${repo}'"
+              The real loader (config_loader.load_ops_yaml) accepts forms this
+              line-scan cannot parse: a single- or double-quoted scalar, and an
+              inline comment after a value. Rather than pass the raw bytes
+              (quotes, trailing comment) into a push remote that git then
+              rejects with an obscure error, this mirror strips the exact YAML
+              wrapping it understands and, when wrapping it does NOT understand
+              remains, refuses by name instead of guessing.
+              """
+              v = raw.strip()
+              if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                  v = v[1:-1].strip()
+              marker = None
+              if v and v[0] in "\"'":
+                  marker = "an unmatched quote"
+              elif "#" in v:
+                  rest = v.split("#", 1)[1]
+                  if rest.strip():
+                      marker = "an inline comment"
+              if marker:
+                  return "", marker
+              return v, None
 
-          # 2. Double match — pure string comparison, BEFORE any GitHub request.
-          #    Catches the most likely drift: a pair whose prefix has strayed.
-          repo_owner="${repo%%/*}"
-          if [ "${repo_owner}" != "${owner}" ]; then
-            echo "::error::preflight: DOUBLE MATCH failed — GH_REPO '${repo}' has owner prefix '${repo_owner}', but GH_REPO_OWNER is '${owner}' (case-sensitive)."
-            echo "::error::Correct one of the two variables so GH_REPO's owner prefix equals GH_REPO_OWNER exactly. Refusing to push; no GitHub request was made."
-            exit 1
-          fi
-          echo "preflight: double match OK — owner prefix '${repo_owner}' == GH_REPO_OWNER '${owner}'"
-
-          # 3. Existence — first network call: prove the destination reachable.
-          echo "preflight: checking '${repo}' is reachable on github.com..."
-          if ! git ls-remote "https://x-access-token:${GH_MIRROR_TOKEN}@github.com/${repo}.git" HEAD >/dev/null 2>&1; then
-            echo "::error::preflight: destination '${repo}' does not exist (or is not reachable) on github.com."
-            echo "::error::Correct the GH_REPO variable to an existing repository. Refusing to push."
-            exit 1
-          fi
-          echo "preflight: '${repo}' is reachable."
-
-          # 4. Permission — reachability is NOT ownership. A public repository
-          #    someone else owns passes ls-remote but must not be pushed to.
-          push_ok="$(curl -sS -H "Authorization: token ${GH_MIRROR_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("permissions",{}).get("push", False))' 2>/dev/null || echo False)"
-          if [ "${push_ok}" != "True" ]; then
-            echo "::error::preflight: destination '${repo}' exists and is reachable, but the mirror token may NOT push to it (permissions.push != true)."
-            echo "::error::Reachability is not ownership. Grant the mirror token push access to '${repo}', or correct GH_REPO. Refusing to push."
-            exit 1
-          fi
-          echo "preflight: '${repo}' is reachable AND the mirror token may push to it."
-
-          # Export the vetted destination so the push steps push exactly what
-          # this step vouched for.
-          echo "GH_REPO=${repo}" >> "$GITHUB_ENV"
-          echo "GH_REPO_OWNER=${owner}" >> "$GITHUB_ENV"
-
-      - name: Push triggering ref to GitHub mirror (exact-ref, event path)
-        if: github.event_name == 'push'
-        env:
-          GH_MIRROR_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
-          GH_REPO: ${{ env.GH_REPO }}
-          MIRROR_DECISION: ${{ needs.visibility-gate.outputs.decision }}
-        run: |
-          echo "Gate decision: ${MIRROR_DECISION} (OVERRIDE = recorded release)"
-          remote="https://x-access-token:${GH_MIRROR_TOKEN}@github.com/${GH_REPO}.git"
+          # Strict, refusal-first scan of `.ops.yaml` for the github destination.
+          #
+          # This workflow is install-free (REL-010 keeps the mirror a bare force-push,
+          # and REL-006 keeps the bare runner free of yaml/pydantic), so it cannot call
+          # config_loader.load_ops_yaml here. It reads ONLY the rigid `destinations`
+          # list that the committed `.ops.yaml` declares, and REFUSES (never guesses)
+          # the moment the file uses a form this scan does not understand. The forms
+          # it understands and strips are YAML scalar quoting and an inline comment;
+          # any wrapping left over after that is refused by name rather than passed
+          # as raw bytes into a push remote (see _clean_scalar) or guessed at.
+          indent = None
+          git_repos = []
+          with open(".ops.yaml", "r", encoding="utf-8") as fh:
+              in_destinations = False
+              cur = {}
+              cur_indent = None
+              for lineno, raw in enumerate(fh, start=1):
+                  line = raw.rstrip("\n")
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+                  pad = len(line) - len(line.lstrip(" "))
+                  if in_destinations and stripped == "destinations:":
+                      raise LookupError("nested destinations is not supported")
+                  if not in_destinations and stripped == "destinations:":
+                      in_destinations = True
+                      indent = pad
+                      continue
+                  if not in_destinations:
+                      continue
+                  if pad <= indent:
+                      break
+                  if stripped.startswith("- "):
+                      if cur and cur.get("forge") == "github":
+                          git_repos.append(cur["repo"])
+                      cur = {}
+                      cur_indent = pad
+                      field = stripped[2:]
+                      if ":" not in field:
+                          raise LookupError("unexpected destinations sequence entry")
+                      key, _, value = field.partition(":")
+                      if key not in ("forge", "repo", "role", "visibility"):
+                          raise LookupError("unknown destination field: %r" % key)
+                      value, marker = _clean_scalar(value)
+                      if marker:
+                          sys.stderr.write(
+                              "MirrorDestinationBoundaryError: .ops.yaml destination value "
+                              "at line %d carries %s; this mirror does not parse YAML and "
+                              "cannot be sure which repo it pushes to. Refusing to "
+                              "guess a push remote over one a reviewer did not see.\n"
+                              % (lineno, marker)
+                          )
+                          sys.exit(2)
+                      cur[key] = value
+                  else:
+                      if cur_indent is None or pad <= cur_indent:
+                          raise LookupError(
+                              "unexpected destinations indentation at line %d" % lineno
+                          )
+                      key, _, value = stripped.partition(":")
+                      if ":" not in stripped or not value.strip():
+                          raise LookupError(
+                              "destination value must be `key: value` at line %d" % lineno
+                          )
+                      if key not in ("forge", "repo", "role", "visibility"):
+                          raise LookupError("unknown destination field: %r" % key)
+                      value, marker = _clean_scalar(value)
+                      if marker:
+                          sys.stderr.write(
+                              "MirrorDestinationBoundaryError: .ops.yaml destination value "
+                              "at line %d carries %s; this mirror does not parse YAML and "
+                              "cannot be sure which repo it pushes to. Refusing to "
+                              "guess a push remote over one a reviewer did not see.\n"
+                              % (lineno, marker)
+                          )
+                          sys.exit(2)
+                      cur[key] = value
+              if in_destinations and cur and cur.get("forge") == "github":
+                  git_repos.append(cur["repo"])
+          if len(git_repos) != 1:
+              sys.stderr.write(
+                  "MirrorDestinationBoundaryError: .ops.yaml must declare exactly one "
+                  "github destination (the mirror); refusing to push an ambiguous or "
+                  "unconfigured mirror remote rather than silently choosing one.\n"
+              )
+              sys.exit(2)
+          sys.stdout.write(git_repos[0] + "\n")
+          PY
+          )"
+          remote="https://x-access-token:${GH_MIRROR_TOKEN}@github.com/${mirror_repo}.git"
           git push --force "$remote" "+${GITHUB_REF}:${GITHUB_REF}"
-
-      - name: Dispatch — targeted exact-ref (break-glass) or full state sync
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          GH_MIRROR_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
-          FORGEJO_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ env.GH_REPO }}
-          PRUNE: ${{ github.event.inputs.prune }}
-          REF: ${{ github.event.inputs.ref }}
-          MIRROR_DECISION: ${{ needs.visibility-gate.outputs.decision }}
-        run: |
-          set -euo pipefail
-          # LVC-214b: assemble the GitHub remote INSIDE the shell, where
-          # ${GH_REPO}/${GH_MIRROR_TOKEN} resolve from the step env. An
-          # env:-level TARGET literal is NOT re-interpolated, so it baked the
-          # literal "${GH_REPO}" into the URL and every clone/push hit
-          # github.com/${GH_REPO}.git -> Not Found.
-          TARGET="https://x-access-token:${GH_MIRROR_TOKEN}@github.com/${GH_REPO}.git"
-          # A `ref` narrows a dispatch to one break-glass re-push of exactly that
-          # ref (recorded gate decision above). It never prunes: pruning is only
-          # ever the full-state path further down, which is health-gated by the
-          # clone. An empty `ref` falls through to the full state sync below.
-          if [ -n "${REF}" ]; then
-            echo "Gate decision: ${MIRROR_DECISION} (OVERRIDE = recorded release)"
-            git push --force "$TARGET" "+${REF}:${REF}"
-            exit 0
-          fi
-
-          tmp="$(mktemp -d)"
-          # Health gate: if the canonical source is not readable the clone fails
-          # and we touch nothing. The mirror is a recovery copy; we never prune
-          # from an unverified source (ADR D.2/D.3).
-          git clone --mirror "http://x-access-token:${FORGEJO_TOKEN}@forgejo:3000/${{ github.repository }}.git" "$tmp/s.git"
-          git clone --mirror "$TARGET" "$tmp/d.git" 2>/dev/null || true
-
-          # --- FULL-STATE SYNC — per-ref blocked-path gate (LVC-216 / OPS-011).
-          # The clone above is the health gate, but it is NOT a visibility
-          # gate: on a state-sync dispatch the needs: visibility-gate job only
-          # inspected the dispatch ref (usually a clean `main`), while this push
-          # writes EVERY canonical ref — including branches that carry
-          # planning/contract content (e.g. proof/lvc214-blocked-* with
-          # docs/proof-contract*.md). A `needs:` edge orders the runs; it does
-          # not make the inspected object equal to the written one. So each ref
-          # is re-gated here against BLOCKED_PATHS before it may enter the push
-          # list. A blocked ref is DROPPED from the push and reported with a
-          # ::warning:: (never a silent skip). There is deliberately NO
-          # release_override on this path: a bulk state sync must not whitelist
-          # individual refs — the rule is strict, blocked means excluded.
-
-          # Default branch from the mirror clone's HEAD symref (a --mirror clone
-          # sets HEAD to the source's default). Fall back to main/master, then to
-          # a hardcoded "main" (fail closed: a wrong guess only widens what the
-          # merge-base diff reports, never a bypass).
-          default_branch="$(git -C "$tmp/s.git" symbolic-ref --short HEAD 2>/dev/null || true)"
-          if [ -z "${default_branch}" ]; then
-            default_branch="$(git -C "$tmp/s.git" for-each-ref --format='%(refname:short)' refs/heads/main refs/heads/master 2>/dev/null | head -n 1 || true)"
-          fi
-          if [ -z "${default_branch}" ]; then
-            default_branch="main"
-          fi
-          echo "default branch: ${default_branch}"
-
-          IFS='|' read -ra GLOBS <<< "$BLOCKED_PATHS"
-
-          push_specs=()
-          blocked_count=0
-          while IFS= read -r _ref; do
-            [ -z "${_ref}" ] && continue
-
-            # A ref is blocked iff it changes blocked paths RELATIVE TO ITS OWN
-            # base — not against the default branch's whole tree. A branch that
-            # never forked from main would otherwise diff against the wrong
-            # history (or come out empty), and an empty diff would let a blocked
-            # branch through. Base = merge-base(default, ref), root fallback for
-            # orphan/fresh branches — the same logic the visibility-gate job
-            # already runs and has measured to work.
-            commit="$(git -C "$tmp/s.git" rev-parse "${_ref}^{commit}" 2>/dev/null || true)"
-            if [ -z "${commit}" ]; then
-              # Non-commit ref (tag on a blob/tree): no diff to gate, keep it.
-              push_specs+=("+${_ref}:${_ref}")
-              continue
-            fi
-            base="$(git -C "$tmp/s.git" merge-base "refs/heads/${default_branch}" "${commit}" 2>/dev/null || true)"
-            if [ -z "${base}" ]; then
-              base="$(git -C "$tmp/s.git" rev-list --max-parents=0 "${commit}" 2>/dev/null || true)"
-            fi
-
-            # diff-tree against the LOCAL base SHA (no network, no working tree
-            # — the mirror clone is bare). One diff-tree per ref = O(files this
-            # ref changed), not O(refs^2).
-            matches=""
-            while IFS= read -r f; do
-              [ -z "${f}" ] && continue
-              for g in "${GLOBS[@]}"; do
-                case "${f}" in
-                  ${g}) matches="${matches} ${f}" ;;
-                esac
-              done
-            done < <(git -C "$tmp/s.git" diff-tree --no-commit-id --name-only -r "${base}" "${commit}" 2>/dev/null || true)
-
-            if [ -n "${matches}" ]; then
-              blocked_count=$((blocked_count + 1))
-              printf '::warning::state-sync: EXCLUDING %s — blocked path(s):%s\n' "${_ref}" "${matches}"
-              continue
-            fi
-            push_specs+=("+${_ref}:${_ref}")
-          done < <(git -C "$tmp/s.git" for-each-ref --format='%(refname)' refs/heads refs/tags)
-
-          if [ "${blocked_count}" -gt 0 ]; then
-            printf '::warning::state-sync: %d ref(s) dropped by the blocked-path gate; not pushed to the public mirror\n' "${blocked_count}"
-          fi
-
-          # Always push every canonical ref that PASSED the gate (catch-up; no
-          # prune by default). The wildcard is gone by design: the explicit list
-          # is what keeps a blocked ref out of the push.
-          if [ "${#push_specs[@]}" -gt 0 ]; then
-            git -C "$tmp/s.git" push --force "$TARGET" "${push_specs[@]}"
-          else
-            echo "state-sync: no refs passed the gate; nothing pushed"
-          fi
-
-          # Git list of refs to DELETE from the mirror. A ref blocked by the
-          # gate above is still PRESENT on canonical (it was only excluded from
-          # the push, not removed), so the "absent on canonical" check below
-          # leaves it untouched — a blocked-but-alive canonical ref is never
-          # pruned.
-          if [ "${PRUNE:-false}" = "true" ]; then
-            deletes=()
-            while IFS= read -r _ref; do
-              case "$_ref" in
-                # never delete the GitHub default branch, the dev branch, or
-                # GitHub-managed refs (gh-pages). main and dev are both protected
-                # so a faulty source can never wipe the long-lived integration or
-                # release line.
-                refs/heads/main|refs/heads/master|refs/heads/dev|refs/heads/gh-pages) continue ;;
-              esac
-              # delete only refs PRESENT on the mirror but ABSENT on canonical
-              if git -C "$tmp/d.git" rev-parse --verify "$_ref" >/dev/null 2>&1 && \
-                 ! git -C "$tmp/s.git" rev-parse --verify "$_ref" >/dev/null 2>&1; then
-                deletes+=(":$_ref")
-                echo "::notice::prune: ${_ref} deleted on Forgejo, removing from mirror"
-              fi
-            done < <(git -C "$tmp/d.git" for-each-ref --format='%(refname)' refs/heads refs/tags)
-
-            if [ "${#deletes[@]}" -gt 0 ]; then
-              git -C "$tmp/s.git" push --force "$TARGET" "${deletes[@]}"
-            else
-              echo "prune: no refs to delete"
-            fi
-          fi
-          rm -rf "$tmp"

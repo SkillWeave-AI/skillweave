@@ -335,6 +335,12 @@ The following areas under `.skillweave/` represent supplementary runtime artifac
 - **Role**: Declares the model-and-harness catalogue (runtime CLI, harness statuses, model capabilities, role defaults, contract index), the single source of truth for role-to-model resolution and the `!= ops` separation-of-duties guard.
 - **Key Artifacts**: `catalogue.yaml`.
 
+### 5.9 `releases/`
+- **Owner**: `skillweave-releasechain`
+- **Lifecycle**: Release (Phase 5)
+- **Role**: Stores baseline manifests, evidence files, and release artefacts for Contract Authority patch releases. Content is per-release-version subdirectories.
+- **Key Artifacts**: `baseline.json`, `evidence/*.out`.
+
 ---
 
 ## 5a. Durable Input Tier (`skillweave.config/`)

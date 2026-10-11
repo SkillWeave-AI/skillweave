@@ -41,6 +41,7 @@ import time
 from pathlib import Path
 from typing import Optional, Sequence
 
+from skillweave.cli.support import validate_run_id_or_exit
 from skillweave.dispatch.application import generate_run_id
 
 # ---------------------------------------------------------------------------
@@ -185,6 +186,12 @@ def main_dispatch(argv: Optional[Sequence[str]] = None) -> int:
 
     if not command:
         parser.error("A command to run in the background is required.")
+
+    # An explicit execution id obeys the same run-id rule the async lifecycle
+    # surfaces apply (shared support table, SW-1510-CLI criterion 2/3): an
+    # invalid id is a usage error (exit 2), never a filesystem path hazard.
+    if args.execution_id is not None:
+        validate_run_id_or_exit(args.execution_id, parser)
 
     execution_id = args.execution_id or generate_run_id()
     project_root = Path(args.project_root).resolve()

@@ -1,0 +1,209 @@
+{
+  "schema_version": 1,
+  "release": "1.5.9.1",
+  "task": "SW-1591-BASE-001",
+  "role": "OPS",
+  "gate": "CONTRACT_AUTHORITY_PATCH_PASS",
+  "generated_for_prd": "2026-09-29-skillweave-1591-contract-authority-hotfix",
+  "baseline_kind": "content-addressed multi-repository pin",
+  "captured_from": {
+    "core_worktree": "/Users/andrelange/workspaces/skillweave-temp/.worktrees/sw1591/run-1/base",
+    "core_branch": "ops/SW-1591-base",
+    "sdk_checkout": "/Users/andrelange/Documents/repositories/forgejo/skillweave/skillweave-sdk",
+    "sdk_origin": "git@git.langevc.com:skillweave/skillweave-sdk.git"
+  },
+  "pins": {
+    "skillweave_main": {
+      "sha": "067337b0c58a466cc8926e0ff0bc32a279e55848",
+      "ref": "refs/heads/main",
+      "subject": "SkillWeave 1.5.9 release commit",
+      "source": "origin/main after fetch; also this worktree HEAD"
+    },
+    "skillweave_dev": {
+      "sha": "514ed0b763b07a06d1504c478b14e439f66af44a",
+      "ref": "refs/heads/dev",
+      "subject": "SkillWeave dev tip",
+      "source": "origin/dev after fetch"
+    },
+    "council_fix_input": {
+      "sha": "916a37e1d770732c65843946cce673a622bf24ab",
+      "ref": "refs/heads/fix/council-attributed-response-copy",
+      "subject": "fix(council): make AttributedResponse survive copy, asdict and pickle",
+      "also_reflected_at": "refs/remotes/origin/fix/council-attributed-response-copy, refs/remotes/github/fix/council-attributed-response-copy",
+      "note": "reviewed diff input; built on stale dev"
+    },
+    "workflow_fix_input": {
+      "sha": "16e95d555ab9d80c975e5f93638221f6a6709659",
+      "ref": "refs/heads/fix/contract-ci-invalid-yaml",
+      "subject": "fix(ci): make contract-ci.yml valid YAML",
+      "also_reflected_at": "refs/remotes/origin/fix/contract-ci-invalid-yaml, refs/remotes/github/fix/contract-ci-invalid-yaml",
+      "note": "reviewed diff input; built on stale dev"
+    },
+    "sdk_main": {
+      "sha": "b9cd96707ef7ec4804cf51986af462e699a12a26",
+      "ref": "refs/heads/main",
+      "subject": "skillweave-sdk origin/main (lifecycle contract candidate)",
+      "source": "git ls-remote origin refs/heads/main"
+    },
+    "sdk_tag_v0_1_0": {
+      "sha": "ec764279f7f817bba22810847793f423ef8d62f0",
+      "ref": "refs/tags/v0.1.0",
+      "subject": "published skillweave-sdk release consumed by Core (pyproject pin skillweave-sdk==0.1.0)",
+      "source": "git ls-remote origin refs/tags/v0.1.0"
+    },
+    "sdk_local_preview": {
+      "sha": "5db7f44d7a3350d245737dc99e43fbaf386d27cf",
+      "ref": "refs/heads/ops/SW1312-PROFILE-CONTRACT-001",
+      "subject": "GLE-001/SW1312: five preview schemas, standalone validator, canonical digest",
+      "committed": "2026-08-30 14:08:18 +0200"
+    }
+  },
+  "protected_local_evidence": {
+    "sdk_local_preview": {
+      "sha": "5db7f44d7a3350d245737dc99e43fbaf386d27cf",
+      "branch": "ops/SW1312-PROFILE-CONTRACT-001",
+      "repository": "/Users/andrelange/Documents/repositories/forgejo/skillweave/skillweave-sdk",
+      "kind": "unpublished local preview branch",
+      "ancestor_of_sdk_main": false,
+      "motif": "The GLE preview remains protected source evidence; it is read-only for this lane.",
+      "modification_policy": "must_not_touch; recorded, never altered by any SkillWeave 1.5.9.1 lane"
+    },
+    "gate_1312_manifest": {
+      "path": "tests/gate_1312/gate-1312-manifest.json",
+      "schema_version": 1,
+      "modification_policy": "immutable; Gate-1591 gets a successor manifest. must_not_touch for this lane.",
+      "shas_field": "shas",
+      "shas": {
+        "skillweave-sdk": "ec764279f7f817bba22810847793f423ef8d62f0",
+        "skillweave-sdk-profile-contract": "5db7f44d7a3350d245737dc99e43fbaf386d27cf"
+      }
+    }
+  },
+  "red_conditions": [
+    {
+      "id": "RC-1-council-attribution",
+      "criterion": 2,
+      "title": "Council copy/asdict probe is red on released main",
+      "subject": "src/skillweave/routing/faigate_adapter.py::AttributedResponse",
+      "command": "bash -eo pipefail -c 'python3 /tmp/council_probe.py'",
+      "exit_code": 0,
+      "observed": [
+        "copy: TypeError: AttributedResponse.__new__() missing 2 required keyword-only arguments: 'requested_model' and 'answering_model'",
+        "deepcopy: TypeError: AttributedResponse.__new__() missing 2 required keyword-only arguments: 'requested_model' and 'answering_model'",
+        "pickle: TypeError: AttributedResponse.__new__() missing 2 required keyword-only arguments: 'requested_model' and 'answering_model'"
+      ],
+      "evidence_file": "tests/gate_1591/evidence-RC-1-council-attribution.out",
+      "output_sha256": "3c8195a6332fa0c867e88706a4071fa711c499b3374e43435a97c229daf0fc0b",
+      "note": "Probe exits 0 by printing the failure; the red condition is that all three reconstruction paths raise. Re-verified during implementation."
+    },
+    {
+      "id": "RC-2-contract-ci-yaml",
+      "criterion": 3,
+      "title": "YAML/actionlint parsing is red on released contract-ci.yml",
+      "subject": ".forgejo/workflows/contract-ci.yml",
+      "commands": [
+        {
+          "command": "bash -eo pipefail -c 'actionlint .forgejo/workflows/contract-ci.yml'",
+          "exit_code": 1,
+          "observed": ".forgejo/workflows/contract-ci.yml:44:0: could not parse as YAML: could not find expected ':' [syntax-check]"
+        },
+        {
+          "command": "python3 -c \"import yaml; yaml.safe_load(open('.forgejo/workflows/contract-ci.yml'))\"",
+          "exit_code": 1,
+          "observed": "could not find expected ':' in \".forgejo/workflows/contract-ci.yml\", line 44, column 1"
+        }
+      ],
+      "evidence_file": "tests/gate_1591/evidence-RC-2-contract-ci-yaml.out",
+      "output_sha256": "513f5dd0cbf75f948271c2fbcb077b66a1b8368ca90f2f579ac01c06a3750aae",
+      "actionlint_output_sha256": "067ddeaf1b82a82ffde3e49c1fb853fdcec85fd0ce777383f0ffe24f39f8ef58",
+      "yaml_safeload_output_sha256": "e7d3570ffa8e37c0739ea990d189df7a79179be7a0ad848c37646522918716bf",
+      "root_cause": "line 44 is an unindented `import re` inside an inline `python3 -c \"...\"` bash block; the YAML block scalar terminator breaks, so the file never parsed and Contract CI concealed a false-green boundary."
+    },
+    {
+      "id": "RC-3-sdk-lifecycle-schemas",
+      "criterion": 3,
+      "title": "Cross-repo test against SDK v0.1.0 reports missing lifecycle schemas",
+      "subject": "tests/integration/test_cross_repo_contract_ci.py",
+      "command": "bash -eo pipefail -c 'SKILLWEAVE_SDK_DIR=<v0.1.0-snapshot> python3 -m pytest tests/integration/test_cross_repo_contract_ci.py -q'",
+      "exit_code": 1,
+      "observed_summary": "2 failed, 11 passed",
+      "failed_tests": [
+        "TestPositiveFixtureValidation::test_all_fixtures_validate_against_sdk_schemas",
+        "TestNoLocalCheckoutDependency::test_sdk_is_resolved_from_published_source"
+      ],
+      "missing_lifecycle_schemas": [
+        "work-profile",
+        "lifecycle-profile",
+        "deliverable-contract",
+        "evidence-contract",
+        "category-pack",
+        "category-taxonomy",
+        "model-provider",
+        "search-provider"
+      ],
+      "evidence_file": "tests/gate_1591/evidence-RC-3-sdk-lifecycle-schemas.out",
+      "output_sha256": "b25e67bd934c1368b8cc8bdf464e2bc0f205593131d368b35e78cc942697af91",
+      "note": "The second failure is an environmental artifact: the v0.1.0 snapshot is a local archive with no published remote. The canonical green path (Contract CI) clones the SDK from the public mirror, where origin is a published source. The eight missing lifecycle schemas are the substantive red condition and are schema-version independent."
+    },
+    {
+      "id": "RC-4-inventory",
+      "criterion": 4,
+      "title": "Full unit suite reproduces the four inventory failures separately from the Council probe",
+      "subject": "tests/unit",
+      "command": "bash -eo pipefail -c 'python3 -m pytest tests/unit -q -p no:randomly'",
+      "exit_code": 1,
+      "observed_summary": "5 failed, 1317 passed, 2 warnings",
+      "the_four_inventory_failures": [
+        "tests/unit/test_doc_arch.py::test_thirteen_skills_are_named_and_match_disk",
+        "tests/unit/test_version_sync.py::TestBundlePinsMatchOnDiskSkills::test_every_bundle_pin_names_an_on_disk_skill_with_matching_source",
+        "tests/unit/test_version_sync.py::TestBundlePinsMatchOnDiskSkills::test_bundle_pin_version_matches_on_disk_skill_version",
+        "tests/unit/test_version_sync.py::TestRequiredSurfaces::test_required_surfaces_share_the_runtime_version"
+      ],
+      "additional_failure": "tests/unit/test_version_sync.py::TestRequiredSurfaces::test_same_version_cannot_hide_a_different_inventory",
+      "evidence_file": "tests/gate_1591/evidence-RC-4-inventory.out",
+      "output_sha256": "7d7b285e0d6222b54c8d8bcdc0c23f7224634ba452b9d22e957a534edda180bb",
+      "root_cause": "capability.yaml distribution_bundle version is 1.5.8 while the runtime declares 1.5.9, and the `skillweave-entry` pin points at ./skills/skillweave while the on-disk skill directory is `skillweave`.",
+      "independence": "Distinct from RC-1: these are catalogue/version topology failures in tests/unit, RC-1 is the Council probe. Running tests/unit never exercises src/skillweave/routing/faigate_adapter.py copy reconstruction."
+    },
+    {
+      "id": "RC-5-version-topology-corroboration",
+      "criterion": 4,
+      "title": "Corroborating version-topology failures",
+      "subject": "tests/release/test_version_topology.py, tests/gate_1312/test_topology_regressions.py",
+      "command": "bash -eo pipefail -c 'python3 -m pytest tests/unit/test_version_sync.py tests/unit/test_doc_arch.py tests/release/test_version_topology.py tests/gate_1312/test_topology_regressions.py -q'",
+      "exit_code": 1,
+      "observed_summary": "9 failed, 17 passed, 2 skipped",
+      "evidence_file": "tests/gate_1591/evidence-RC-5-version-topology-corroboration.out",
+      "output_sha256": "ea6ba412b5d57ab571253eca73bc475433a245a5036d6edfd30e067c67961a76"
+    }
+  ],
+  "reproduced_on": {
+    "release_commit": "067337b0c58a466cc8926e0ff0bc32a279e55848",
+    "release_ref": "refs/heads/main",
+    "note": "Every red condition reproduces on the released main commit. The controller-created worktree (branch ops/SW-1591-base) is checked out at exactly this commit with no local modifications, so running the probes in it is equivalent to probing main.",
+    "worktree": "/Users/andrelange/workspaces/skillweave-temp/.worktrees/sw1591/run-1/base",
+    "worktree_head": "067337b0c58a466cc8926e0ff0bc32a279e55848",
+    "worktree_clean_at_capture": true,
+    "python": "3.14.7",
+    "pytest": "9.0.2"
+  },
+  "verification_contract": {
+    "describe": "On-disk release artifacts this baseline is pinned to. Their digests must not change without re-pinning, because downstream lanes diff against these exact bytes.",
+    "watched_paths": [
+      ".forgejo/workflows/contract-ci.yml",
+      "src/skillweave/routing/faigate_adapter.py",
+      "tests/integration/test_cross_repo_contract_ci.py",
+      "tests/gate_1312/gate-1312-manifest.json"
+    ],
+    "watched_digests": {
+      ".forgejo/workflows/contract-ci.yml": "fe7a7c9099df5f686fe45622aa3d3d8f5cfab6e4196b160fd906b1e2ed44b052",
+      "tests/gate_1312/gate-1312-manifest.json": "adce0f3eec49e513fda1e5a81b20fcb578872341459391a6b7a3c0f2aa496039"
+    },
+    "digests_note": "tests/release/test_1591_baseline.py::test_watched_artifact_digests_unchanged enforces these digests. SW-1591-CI-001 repaired the YAML and re-pinned contract-ci.yml here, from the known-red bytes 3c059942fe80149fad6473ded3bba926402bb372a7162e046b69dc6006cdb480; the baseline test explicitly anticipates this deliberate re-pin. The gate-1312 manifest digest must never change (immutable historical artifact). SW-1510-SDK-CI subsequently rewrote the same gate (repairing the cross-repository contract contradictions: the schema path, the canonical digest algorithm, the SDK pin and the installed-wheel ownership inventory, per criteria 1-3) and deliberately re-pinned contract-ci.yml here from efc00b540222b1e7cd9ef1e3c60f5f205247f3f3ba19f8fcbdae58b0086c1952 to 68cf32d66d8af7dc8bc2a5ab472dfd700bf0abf8e18afb75c2bf744d0854e366. The guard semantics are unchanged: the digest still pins the exact bytes and still fails on any later silent rewrite; only the recorded value moved with the intentional edit. The gate-1312 manifest digest is still immutable."
+  },
+  "mutation_policy": {
+    "red_conditions_reproduced_before_mutation": true,
+    "files_modified_by_this_lane_outside_scope": [],
+    "never_reset_other_checkouts": true
+  }
+}

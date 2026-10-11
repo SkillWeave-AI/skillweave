@@ -1,0 +1,54 @@
+......F...F..                                                            [100%]
+=================================== FAILURES ===================================
+_ TestPositiveFixtureValidation.test_all_fixtures_validate_against_sdk_schemas _
+
+self = <tests.integration.test_cross_repo_contract_ci.TestPositiveFixtureValidation object at 0x10bd790f0>
+fixtures = {'category-pack': {'category': 'assure', 'contractVersion': '1.0.0', 'id': 'example-pack'}, 'category-taxonomy': {'cat....0.0', 'id': 'example-evidence', 'requirements': [{'id': 'proof', 'kind': 'test-run', 'strength': 'reproduced'}]}, ...}
+sdk_checkout = PosixPath('/tmp/sw1591sdk.oxeKHO')
+
+    def test_all_fixtures_validate_against_sdk_schemas(self, fixtures, sdk_checkout):
+        """Every positive fixture validates against the SDK's schemas."""
+        registry = _sdk_registry(sdk_checkout)
+        failures = []
+        for contract, instance in fixtures.items():
+            # Map contract name to SDK schema filename.
+            schema_name = f"{contract}.preview.schema.json"
+            schema_path = sdk_checkout / "schemas" / schema_name
+            if not schema_path.is_file():
+                # Try without preview suffix.
+                schema_path = sdk_checkout / "schemas" / f"{contract}.schema.json"
+            if not schema_path.is_file():
+                failures.append((contract, f"no SDK schema for {contract}"))
+                continue
+            doc = json.loads(schema_path.read_text(encoding="utf-8"))
+            validator = Draft202012Validator(doc, registry=registry)
+            errors = sorted(validator.iter_errors(instance), key=lambda e: list(e.path))
+            if errors:
+                failures.append((contract, [e.message for e in errors]))
+>       assert not failures, (
+            f"SDK schema validation failures: {failures}"
+        )
+E       AssertionError: SDK schema validation failures: [('work-profile', 'no SDK schema for work-profile'), ('lifecycle-profile', 'no SDK schema for lifecycle-profile'), ('deliverable-contract', 'no SDK schema for deliverable-contract'), ('evidence-contract', 'no SDK schema for evidence-contract'), ('category-pack', 'no SDK schema for category-pack'), ('category-taxonomy', 'no SDK schema for category-taxonomy'), ('model-provider', 'no SDK schema for model-provider'), ('search-provider', 'no SDK schema for search-provider')]
+E       assert not [('work-profile', 'no SDK schema for work-profile'), ('lifecycle-profile', 'no SDK schema for lifecycle-profile'), ('d...'category-pack', 'no SDK schema for category-pack'), ('category-taxonomy', 'no SDK schema for category-taxonomy'), ...]
+
+tests/integration/test_cross_repo_contract_ci.py:348: AssertionError
+___ TestNoLocalCheckoutDependency.test_sdk_is_resolved_from_published_source ___
+
+self = <tests.integration.test_cross_repo_contract_ci.TestNoLocalCheckoutDependency object at 0x10bb29e50>
+sdk_checkout = PosixPath('/tmp/sw1591sdk.oxeKHO')
+
+    def test_sdk_is_resolved_from_published_source(self, sdk_checkout):
+        """The SDK checkout origin must be a published remote, not local."""
+>       assert _is_published_source(sdk_checkout), (
+            f"SDK at {sdk_checkout} must be cloned from a published remote "
+            f"(github.com, forgejo, gitlab.com), not a local path"
+        )
+E       AssertionError: SDK at /tmp/sw1591sdk.oxeKHO must be cloned from a published remote (github.com, forgejo, gitlab.com), not a local path
+E       assert False
+E        +  where False = _is_published_source(PosixPath('/tmp/sw1591sdk.oxeKHO'))
+
+tests/integration/test_cross_repo_contract_ci.py:477: AssertionError
+=========================== short test summary info ============================
+FAILED tests/integration/test_cross_repo_contract_ci.py::TestPositiveFixtureValidation::test_all_fixtures_validate_against_sdk_schemas
+FAILED tests/integration/test_cross_repo_contract_ci.py::TestNoLocalCheckoutDependency::test_sdk_is_resolved_from_published_source
+2 failed, 11 passed in 0.10s

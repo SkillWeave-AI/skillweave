@@ -264,6 +264,60 @@
               }
             },
             "additionalProperties": true
+          },
+          "boundaries": {
+            "type": "array",
+            "description": "Architectural boundaries this task crosses (SW-159-BP-CONTRACT-001). Optional: a task with no data-boundary change omits this and validates exactly as before. Every declared boundary is contract-requiring and must carry a complete data_contract.",
+            "items": {
+              "type": "object",
+              "required": ["kind", "data_contract"],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": ["storage", "process", "adapter", "telemetry", "public-api"],
+                  "description": "The contract-requiring boundary kind: storage (persistence), process (separate executing context), adapter (foreign system), telemetry (observational sink), public-api (published surface)."
+                },
+                "data_contract": {
+                  "type": "object",
+                  "description": "The exact versioned data contract for this crossing. All five fields are required and must be non-blank; a prose-only string is refused by validate_prd_data_boundaries.",
+                  "required": ["artifact", "versioning", "producer", "consumer", "compatibility"],
+                  "properties": {
+                    "artifact": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "What crosses the boundary."
+                    },
+                    "versioning": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "How the artifact is versioned and which version is contracted."
+                    },
+                    "producer": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Who produces the artifact."
+                    },
+                    "consumer": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Who consumes the artifact."
+                    },
+                    "compatibility": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "How the consumer tolerates producer change (e.g. backward/forward compatible, breaking-with-migration)."
+                    },
+                    "subject_kind": {
+                      "type": "string",
+                      "enum": ["repository", "content", "configuration", "deployment", "incident"],
+                      "description": "Optional. The integrated WorkContract subject kind (SW-159-WORK-001) the artifact's subject belongs to, so a boundary speaks the same vocabulary as the work contract that authorizes it."
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
           }
         },
         "additionalProperties": false

@@ -120,6 +120,17 @@ Format: "As a [user], I want to [action] so that [benefit]"
 - Data migration strategy
 - Backup/restore procedures
 
+#### Data Boundaries
+List every crossing of `storage`, `process`, `adapter`, `telemetry` or
+`public-api`. Each crossing requires an exact versioned data contract — a prose
+description is not a contract. State, per boundary:
+
+- Artifact: what crosses
+- Versioning: how it is versioned, and which version is contracted
+- Producer: who produces it
+- Consumer: who consumes it
+- Compatibility: how change is tolerated (compatible / breaking-with-migration)
+
 ### 8. Success Metrics (Binary & Testable)
 **Purpose:** Clear, measurable success criteria
 

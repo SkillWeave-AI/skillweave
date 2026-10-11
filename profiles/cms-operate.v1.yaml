@@ -1,0 +1,169 @@
+# SkillWeave WorkProfile: cms-operate.v1
+#
+# SW-159-CMS-PACK-001. Provider-neutral CMS Ops profile.
+#
+# Provider-neutral: no harness, router, provider, model, Elementeer, or
+# txtHumanizer ID appears in this file. The implementation contract always
+# comes from Blueprint. Discovery, Design, and Council are invoked only when
+# their preconditions are met; their absence is recorded with a skip-reason.
+#
+# This file is DATA, loaded through skillweave.routing.harness.load_profiles_from_location.
+#
+# It carries two field groups validated against their own contracts:
+#
+#   * WorkProfile contract fields -- contractVersion, id, category,
+#     kernelStages, topology, humanCoupling, changeSurfaces, deliverables,
+#     evidence -- validated against schemas/lifecycle-contracts/work-profile.schema.json.
+#   * RoutingProfile fields -- name, tier, limits, roles -- loaded by
+#     skillweave.routing.profile.RoutingProfile.from_dict.
+#
+# The roles below are GENERIC (no model, tool, or pin). A harness that
+# references this profile supplies the concrete provider binding.
+
+# ── WorkProfile contract fields ────────────────────────────────────────
+contractVersion: "1.0.0"
+id: cms-operate.v1
+title: "CMS Operate V1"
+category: operate
+kernelStages:
+  - K0
+  - K1
+  - K2
+  - K3
+  - K4
+  - K5
+  - K6
+topology: reactive
+humanCoupling: supervised
+changeSurfaces:
+  - code
+  - configuration
+  - data
+  - documents
+deliverables:
+  - prd
+  - implementation
+  - tests
+  - release-notes
+evidence:
+  - test-results
+  - review-attestation
+  - build-artifact
+  - rollback-verification
+
+# ── RoutingProfile fields (GENERIC — no model, tool, or pin) ──────────
+name: cms-operate-v1
+tier: balanced
+limits:
+  timeout: 120.0
+  max_retries: 2
+  min_models_required: 2
+  on_model_failure: skip
+roles:
+  observer:
+    observer: true
+    capabilities:
+      can_observe_run: true
+  producer:
+    capabilities:
+      can_mutate_run_state: true
+  reviewer:
+    capabilities:
+      can_approve_gate: true
+  approver:
+    capabilities:
+      can_approve_gate: true
+  transaction-owner:
+    capabilities:
+      can_observe_run: true
+
+# ── Metadata: evidence, deliverable and review contracts ───────────────
+metadata:
+  evidence_contract:
+    contractVersion: "1.0.0"
+    id: cms-operate.evidence
+    title: "CMS operate evidence"
+    category: operate
+    requirements:
+      - id: test-results
+        kind: test-run
+        strength: reproduced
+        kernelStage: K3
+        required: true
+      - id: review-attestation
+        kind: independent-review
+        strength: independently_verified
+        kernelStage: K4
+        required: true
+      - id: build-artifact
+        kind: build-output
+        strength: reproduced
+        kernelStage: K3
+        required: true
+      - id: rollback-verification
+        kind: rollback-test
+        strength: reproduced
+        kernelStage: K4
+        required: true
+  deliverable_contract:
+    contractVersion: "1.0.0"
+    id: cms-operate.deliverables
+    title: "CMS operate deliverables"
+    category: operate
+    changeSurfaces:
+      - code
+      - configuration
+      - data
+      - documents
+    entrypoints:
+      - id: prd
+        surface: documents
+        acceptance: "PRD is produced by Blueprint and contains executable task contracts"
+        kernelStage: K1
+      - id: implementation
+        surface: code
+        acceptance: "implementation satisfies all PRD task contracts"
+        kernelStage: K3
+      - id: tests
+        surface: code
+        acceptance: "tests pass and cover acceptance criteria"
+        kernelStage: K3
+      - id: release-notes
+        surface: documents
+        acceptance: "release notes describe changes and rollback procedure"
+        kernelStage: K4
+  review_requirement:
+    id: cms-review
+    strength: independently_verified
+    reviewer_role: reviewer
+    subject: code
+    basis: "an independent reviewer attests that the implementation meets the PRD contracts"
+
+  # ── Lifecycle choices: why optional phases are selected or skipped ────
+  # Each optional phase (Discovery, Design, Council) records its skip reason
+  # or invocation condition. This proves a no-ceremony counterexample:
+  # the phases are absent by informed decision, not by oversight.
+  lifecycle_choices:
+    discovery:
+      skip_reason: "framing is resolved and evidence is complete; no unresolved
+        stakeholder needs, competing claims, or knowledge gaps remain.
+        Invoke Discovery only when framing or evidence is unresolved."
+      phase_type: optional
+    blueprint:
+      invoked: true
+      phase_type: recommended
+      note: "Blueprint always produces the executable PRD and task contract
+        that every implementation run starts from."
+    design:
+      skip_reason: "no competing architecture decisions, no UX uncertainty,
+        and no material design evidence gaps. Invoke Design or Council only
+        for evidenced UX/design, competing architecture, material uncertainty,
+        or explicit decision gates."
+      phase_type: optional
+    council:
+      skip_reason: "no material uncertainty and no competing architecture
+        requires multi-model deliberation; the architecture is settled and
+        the design space has unanimous evidence. Invoke Council only when
+        material uncertainty, competing architecture, or explicit decision
+        gates are present."
+      phase_type: optional

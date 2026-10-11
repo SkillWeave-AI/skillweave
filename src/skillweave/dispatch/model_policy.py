@@ -48,9 +48,13 @@ criteria:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
+
+from skillweave.routing.route_proof import RouteProof
 
 
 # ── Capability tiers ───────────────────────────────────────────────────────
@@ -536,6 +540,371 @@ def apply_transfer_observation(
     return declaration
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SW-1510-ROUTE-LOCK: Retry attribution.
+# ═══════════════════════════════════════════════════════════════════════════
+@dataclass(frozen=True)
+class AttemptAttribution:
+    """Retry/escalation attempt attribution (criterion 4).
+
+    Each retry or escalation carries its own new ``attempt`` number
+    (strictly increasing from the parent), the ``requested_route`` the
+    attempt is bound to, and the ``reserved_budget`` (in abstract cost
+    units) allocated for this attempt.  An attempt with ``attempt < 1``
+    or without an explicit route is invalid and must be refused before
+    any launch.
+
+    When ``allowed_routes`` is set, the requested route must be within
+    that set — raw upstream names or global environment keys cannot
+    override the approved route set.
+    """
+
+    attempt: int = 1
+    requested_route: str = ""
+    reserved_budget: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.attempt, int) or isinstance(self.attempt, bool):
+            raise AllocationError(
+                f"attempt must be a positive integer, got {self.attempt!r}"
+            )
+        if self.attempt < 1:
+            raise AllocationError(
+                f"attempt must be >= 1, got {self.attempt}"
+            )
+        if not self.requested_route:
+            raise AllocationError(
+                "an attempt attribution requires a non-empty requested_route"
+            )
+
+
+def check_attempt_route(
+    attribution: AttemptAttribution,
+    allowed_routes: Optional[frozenset[str]] = None,
+) -> None:
+    """Verify that an attempt's route is within the allowed set (criterion 4).
+
+    Raises ``AllocationError`` when the route is not permitted.  When
+    ``allowed_routes`` is ``None``, the check is skipped (caller has not
+    declared a route restriction).
+    """
+    if allowed_routes is not None and attribution.requested_route not in allowed_routes:
+        raise AllocationError(
+            f"attempt {attribution.attempt} requests route "
+            f"{attribution.requested_route!r} which is not in allowed routes "
+            f"{sorted(allowed_routes)}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SW-1510-ADAPTIVE: Role-based flash/pro eligibility (criterion 2).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Criterion 2: "V4 Flash and V4.1 Flash are eligible only for their attested
+# workload capabilities; Pro is bounded to complex/special analysis or a fresh
+# independent re-review."
+#
+# A route family is the ``model`` half of an approved ``provider/model`` pair
+# (the provider prefix is adapter/profile data and is never interpreted here).
+# Which families are Flash-eligible and which are Pro only comes from the
+# owner's route-to-tier binding, not from a literal list.  Which a task may use
+# is decided from an *attested* workload capability and an explicit Pro basis —
+# never from a hand-written per-task flag.
+
+#: The Flash-eligible route families and the Pro-only route families, derived
+#: from the owner's route-to-tier binding rather than hand-written literals.
+#:
+#: The binding is the ``tier_routes`` block of a ``route-proof-v1`` document
+#: (the accepted SW-1510-ROUTE-LOCK pin, exposed by
+#: ``skillweave.routing.route_proof.RouteProof``).  The accepted binding is
+#: inclusive: ``tier_routes.pro`` contains the Pro routes *and* the Flash routes
+#: (a Pro allocation may still pick an attested Flash route), while
+#: ``tier_routes.flash`` contains only the Flash routes.  The Pro-only families
+#: are therefore ``pro - flash``.  No product/model name is written here: the
+#: family strings are the ``model`` halves of the approved ``provider/model``
+#: pairs in the owner's route-proof document.
+#:
+#: Like every other route authority in Core (``route_policy``/``route_proof``),
+#: this fails closed.  ``_ROUTE_PROOF_ENV`` names an environment variable
+#: pointing at the operator's own route-proof document; when set, the families
+#: are derived from it.  When it is unset the families are empty and every route
+#: is refused as unknown — a missing owner binding never silently admits a
+#: route.  Callers holding a loaded proof may instead build the families with
+#: :func:`route_families_from_tier_routes` and pass them to
+#: :func:`evaluate_route_eligibility`.
+_ROUTE_PROOF_ENV = "SKILLWEAVE_ROUTE_PROOF"
+
+
+def _model_half(route: str) -> str:
+    """Return the ``model`` half of a ``provider/model`` route (adapter data)."""
+    return route.split("/", 1)[1]
+
+
+def route_families_from_tier_routes(
+    tier_routes: Mapping[str, Sequence[str]],
+) -> dict[str, frozenset[str]]:
+    """Derive the flash/pro route families from a ``tier_routes`` binding.
+
+    ``flash`` maps to the model halves of the Flash-tier routes; ``pro`` maps to
+    the model halves of the Pro-tier routes that are *not* also Flash-tier
+    (``pro - flash``) — the Pro-only families a Flash allocation must never
+    reach.  This is data in, data out: it names no product.
+    """
+    flash = frozenset(_model_half(r) for r in tier_routes.get(ModelTier.FLASH.value, ()))
+    pro_all = frozenset(_model_half(r) for r in tier_routes.get(ModelTier.PRO.value, ()))
+    return {"flash": flash, "pro": pro_all - flash}
+
+
+def _load_route_families() -> dict[str, frozenset[str]]:
+    """Resolve the flash/pro families from the operator's route-proof document.
+
+    Fails closed: with no ``SKILLWEAVE_ROUTE_PROOF`` document the families are
+    empty, so no route is admitted.  The document is the same owner authority
+    ROUTE-LOCK already pins; no product name lives in this module.
+    """
+    proof_path = os.environ.get(_ROUTE_PROOF_ENV, "")
+    if not proof_path:
+        return {"flash": frozenset(), "pro": frozenset()}
+    proof = RouteProof.load(proof_path)
+    return route_families_from_tier_routes(proof.tier_routes)
+
+
+_ROUTE_FAMILIES: dict[str, frozenset[str]] = _load_route_families()
+
+#: The Flash-eligible route families (model halves), admissible only for a
+#: workload capability that is *attested* (proved by a real run) — never for an
+#: unattested/declared-only workload.  Empty unless an owner route-proof is
+#: configured (fail closed).
+FLASH_ROUTE_FAMILY: frozenset[str] = _ROUTE_FAMILIES["flash"]
+
+#: The Pro-only route families.  A Pro route is bounded to complex/special
+#: analysis or a fresh independent re-review; it is never admitted on a Flash
+#: allocation and never without one of those two reasons.  Empty unless an owner
+#: route-proof is configured (fail closed).
+PRO_ROUTE_FAMILY: frozenset[str] = _ROUTE_FAMILIES["pro"]
+
+#: Route family keyed by the capability tier it belongs to.
+ROUTE_FAMILY_BY_TIER: dict[ModelTier, frozenset[str]] = {
+    ModelTier.FLASH: FLASH_ROUTE_FAMILY,
+    ModelTier.PRO: PRO_ROUTE_FAMILY,
+}
+
+
+class EligibilityError(AllocationError):
+    """A route-eligibility evaluation was asked for a shape it cannot decide."""
+
+
+@dataclass(frozen=True)
+class WorkloadCapabilityGrant:
+    """The workload capability a route is (or is not) attested for (criterion 2).
+
+    ``workload`` names the workload (a task type / capability label) and
+    ``attested`` is true only when an independent run *proved* that workload on
+    the route — the runtime-attested axis of
+    ``work_contract.CapabilityResolution``.  A merely declared or detected
+    capability is not attested and does not make a Flash route eligible.
+    """
+
+    workload: str
+    attested: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.workload:
+            raise EligibilityError(
+                "a workload capability grant requires a non-empty workload"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"workload": self.workload, "attested": self.attested}
+
+
+@dataclass(frozen=True)
+class ProBasis:
+    """Why a Pro allocation is permitted (criterion 2).
+
+    Exactly one of the two admitted reasons must hold: ``complexity`` (complex
+    or special analysis) or ``fresh_independent_re_review`` (a brand-new,
+    independent re-review).  A Pro route with neither reason is refused, never
+    defaulted.
+    """
+
+    complexity: bool = False
+    fresh_independent_re_review: bool = False
+    note: str = ""
+
+    def permits_pro(self) -> bool:
+        """True when at least one of the two admitted Pro reasons holds."""
+        return self.complexity or self.fresh_independent_re_review
+
+    def reasons(self) -> list[str]:
+        """The admitted reasons, in a stable order."""
+        out: list[str] = []
+        if self.complexity:
+            out.append("complex_or_special_analysis")
+        if self.fresh_independent_re_review:
+            out.append("fresh_independent_re_review")
+        return out
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "complexity": self.complexity,
+            "fresh_independent_re_review": self.fresh_independent_re_review,
+            "note": self.note,
+        }
+
+
+def pro_basis_from_strategy(review_strategy: Any) -> ProBasis:
+    """Derive a Pro basis from an execution strategy (criterion 2).
+
+    A strategy that is a fresh independent re-review
+    (``ExecutionStrategy.is_fresh_independent_re_review``: FRESH_CONTEXT |
+    INDEPENDENT_REVIEWER) permits Pro.  Any other strategy confers no reason, so
+    the basis is empty and Pro routes stay refused.
+
+    This is the wiring that makes "a fresh independent re-review" mean the
+    composable capability pair from :mod:`skillweave.runtime.strategy`, not a
+    hand-written flag.
+    """
+    is_re_review = bool(
+        getattr(review_strategy, "is_fresh_independent_re_review", False)
+    )
+    return ProBasis(fresh_independent_re_review=is_re_review)
+
+
+def pro_basis_from_signals(
+    signals: "AllocationSignals",
+    *,
+    review_strategy: Any = None,
+) -> ProBasis:
+    """Derive a Pro basis from allocation signals (criterion 2).
+
+    The seven forcing dimensions map onto the two admitted Pro reasons: a
+    critical review is an independent re-review; every other forcing dimension
+    (architecture, high blast radius, migration, security, causal verification,
+    ambiguous rework) is complex/special analysis.  A ``review_strategy`` that
+    is a fresh independent re-review also confers the re-review reason.
+    """
+    forcing = set(signals.forcing())
+    re_review = "critical_review" in forcing
+    if review_strategy is not None and bool(
+        getattr(review_strategy, "is_fresh_independent_re_review", False)
+    ):
+        re_review = True
+    complexity = bool(forcing - {"critical_review"})
+    return ProBasis(
+        complexity=complexity,
+        fresh_independent_re_review=re_review,
+        note="derived from allocation signals",
+    )
+
+
+@dataclass(frozen=True)
+class RouteEligibility:
+    """The outcome of a role-based route eligibility evaluation (criterion 2).
+
+    ``eligible`` is the set of candidate routes admitted for the workload.
+    ``rejected`` maps every refused route to the reason it was refused, so a
+    selection/escalation record can name both the candidate set and the rejected
+    routes with their causes (criterion 3).  ``tier`` is the allocation the
+    decision was made under and ``reasons`` lists the admitted Pro reasons (empty
+    for a Flash allocation).
+    """
+
+    tier: ModelTier
+    eligible: frozenset[str]
+    rejected: Mapping[str, str]
+    reasons: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tier": self.tier.value,
+            "eligible": sorted(self.eligible),
+            "rejected": dict(sorted(self.rejected.items())),
+            "reasons": list(self.reasons),
+        }
+
+
+def _route_family(route: str) -> Optional[str]:
+    """Return the route family (``v4-flash`` etc.), or ``None`` when it is not
+    a ``provider/model`` pair.  The provider prefix is opaque adapter data."""
+    if not isinstance(route, str) or "/" not in route:
+        return None
+    family = route.split("/", 1)[1]
+    return family or None
+
+
+#: Stable refusal reasons, so a consumer reads a code rather than prose.
+REASON_FLASH_UNATTESTED = "flash-route requires an attested workload capability"
+REASON_PRO_NO_BASIS = (
+    "pro-route requires complex/special analysis or a fresh independent re-review"
+)
+REASON_PRO_ROUTE_ON_FLASH = "pro-route is not admitted on a flash allocation"
+REASON_UNKNOWN_ROUTE = "route is not a recognized flash/pro route family"
+
+
+def evaluate_route_eligibility(
+    allocated: AllocationResult,
+    candidate_routes: Sequence[str],
+    *,
+    workload: WorkloadCapabilityGrant,
+    pro_basis: Optional[ProBasis] = None,
+    route_families: Optional[Mapping[str, frozenset[str]]] = None,
+) -> RouteEligibility:
+    """Admit which candidate routes a role may use (criterion 2).
+
+    * A Flash route family is admitted only for an *attested* workload
+      capability — never for an unattested/declared-only workload.  This holds
+      on a Pro allocation too: the accepted ``tier_routes.pro`` set includes the
+      Flash routes, so a Pro allocation may still pick a Flash route *when the
+      workload is attested*.
+    * A Pro route family is admitted only when the allocation is Pro *and* a
+      :class:`ProBasis` permits it — bounded to complex/special analysis or a
+      fresh independent re-review.
+    * A route outside both families, or a bare model name, is refused.
+
+    ``route_families`` overrides the owner-policy families (a mapping with
+    ``flash``/``pro`` keys, e.g. from :func:`route_families_from_tier_routes`);
+    when omitted the configured :data:`FLASH_ROUTE_FAMILY`/:data:`PRO_ROUTE_FAMILY`
+    are used.  Every refusal carries a stable reason code so the caller can
+    record the rejected routes and their causes.  Nothing is defaulted: a route
+    is present in ``eligible`` only when it positively qualifies.
+    """
+    if route_families is None:
+        flash_family, pro_family = FLASH_ROUTE_FAMILY, PRO_ROUTE_FAMILY
+    else:
+        flash_family = route_families.get(ModelTier.FLASH.value, frozenset())
+        pro_family = route_families.get(ModelTier.PRO.value, frozenset())
+
+    rejected: dict[str, str] = {}
+    eligible: list[str] = []
+    pro_ok = pro_basis is not None and pro_basis.permits_pro()
+    is_pro_allocation = allocated.tier is ModelTier.PRO
+
+    for route in candidate_routes:
+        family = _route_family(route)
+        if family in flash_family:
+            if not workload.attested:
+                rejected[route] = REASON_FLASH_UNATTESTED
+            else:
+                eligible.append(route)
+        elif family in pro_family:
+            if not is_pro_allocation:
+                rejected[route] = REASON_PRO_ROUTE_ON_FLASH
+            elif not pro_ok:
+                rejected[route] = REASON_PRO_NO_BASIS
+            else:
+                eligible.append(route)
+        else:
+            rejected[route] = REASON_UNKNOWN_ROUTE
+
+    return RouteEligibility(
+        tier=allocated.tier,
+        eligible=frozenset(eligible),
+        rejected=rejected,
+        reasons=tuple(pro_basis.reasons()) if pro_ok and pro_basis else (),
+    )
+
+
 __all__ = [
     "ModelTier",
     "AllocationError",
@@ -558,4 +927,22 @@ __all__ = [
     "ModelReceipt",
     "TransferObservation",
     "apply_transfer_observation",
+    "AttemptAttribution",
+    "check_attempt_route",
+    # SW-1510-ADAPTIVE role-based eligibility.
+    "FLASH_ROUTE_FAMILY",
+    "PRO_ROUTE_FAMILY",
+    "ROUTE_FAMILY_BY_TIER",
+    "route_families_from_tier_routes",
+    "EligibilityError",
+    "WorkloadCapabilityGrant",
+    "ProBasis",
+    "pro_basis_from_strategy",
+    "pro_basis_from_signals",
+    "RouteEligibility",
+    "evaluate_route_eligibility",
+    "REASON_FLASH_UNATTESTED",
+    "REASON_PRO_NO_BASIS",
+    "REASON_PRO_ROUTE_ON_FLASH",
+    "REASON_UNKNOWN_ROUTE",
 ]

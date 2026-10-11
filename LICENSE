@@ -46,19 +46,18 @@
       the Work and Derivative Works thereof.
 
       "Contribution" shall mean any work of authorship, including
-      the original version of the Work and any Derivative Works or
-      other additions or changes to the Work that intentionally
-      submitted to Licensor for inclusion in the Work by the copyright
-      owner or by an individual or Legal Entity authorized to submit
-      on behalf of the copyright owner. For the purposes of this definition,
-      "submitted" means any form of electronic, verbal, or written
-      communication sent to the Licensor or its representatives, including
-      but not limited to communication on electronic mailing lists,
-      source code control systems, and issue tracking systems that are
-      managed by, or on behalf of, the Licensor for the purpose of
-      discussing and improving the Work, but excluding communication
-      that is clearly marked or otherwise designated in writing by the
-      copyright owner as "Not a Contribution."
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
 
       "Contributor" shall mean Licensor and any individual or Legal Entity
       on behalf of whom a Contribution has been received by Licensor and
@@ -117,7 +116,7 @@
           of the NOTICE file are for informational purposes only and
           do not modify the License. You may add Your own attribution
           notices within Derivative Works that You distribute, alongside
-          or as an annex to the NOTICE text from the Work, provided
+          or as an addendum to the NOTICE text from the Work, provided
           that such additional attribution notices cannot be construed
           as modifying the License.
 
@@ -125,7 +124,7 @@
       may provide additional or different license terms and conditions
       for use, reproduction, or distribution of Your modifications, or
       for any such Derivative Works as a whole, provided Your use,
-      reproduction, and distribution of the work otherwise complies with
+      reproduction, and distribution of the Work otherwise complies with
       the conditions stated in this License.
 
    5. Submission of Contributions. Unless You explicitly state otherwise,
@@ -153,11 +152,12 @@
 
    8. Limitation of Liability. In no event and under no legal theory,
       whether in tort (including negligence), contract, or otherwise,
-      unless required by applicable law or agreed to in writing, shall
-      any Contributor be liable to You for damages, including any direct,
-      indirect, special, incidental, or consequential damages of any character
-      arising as a result of this License or out of the use or inability to
-      use the Work (including but not limited to damages for loss of goodwill,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
       work stoppage, computer failure or malfunction, or any and all
       other commercial damages or losses), even if such Contributor
       has been advised of the possibility of such damages.
@@ -169,7 +169,7 @@
       License. However, in accepting such obligations, You may act only
       on Your own behalf and on Your sole responsibility, not on behalf
       of any other Contributor, and only if You agree to indemnify,
-      defend, and hold harmless each Contributor for any liability
+      defend, and hold each Contributor harmless for any liability
       incurred by, or claims asserted against, such Contributor by reason
       of your accepting any such warranty or additional liability.
 

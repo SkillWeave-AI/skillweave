@@ -1,34 +1,41 @@
 import json
 import pytest
+from skillweave.mcp.control import mcp_tool_names
 from skillweave.mcp.server import mcp, cancel_run, resume_run
+
+
+def _assert_registry_matches(registered):
+    """Assert that *registered* (sorted list of tool names) equals the authorized set."""
+    assert registered == list(mcp_tool_names()), (
+        f"registered tools {registered} do not match authorized set "
+        f"{list(mcp_tool_names())}"
+    )
+
+
+def _collect_registered():
+    """Return sorted tool names from the server, regardless of FastMCP or degraded stub."""
+    if hasattr(mcp, "_tool_manager"):
+        tools = mcp._tool_manager.list_tools()
+        return sorted(t.name for t in tools)
+    if hasattr(mcp, "tools"):
+        # Degraded stub: each entry is the raw function object
+        return sorted(f.__name__ for f in mcp.tools)
+    return []
+
 
 def test_mcp_tools_list_only_commands():
     """Ensure that only authorized command tools are registered."""
-    # mcp._tools might be a dict or list depending on FastMCP version
-    # Let's inspect tools
-    if hasattr(mcp, "_tools"):
-        tools = mcp._tools
-    elif hasattr(mcp, "tools"):
-        tools = mcp.tools
-    else:
-        # Fallback to check functions via attributes
-        tools = []
-    
-    # Actually, we can just verify the tools list
-    tool_names = [tool.name for tool in mcp.list_tools()] if hasattr(mcp, "list_tools") else []
-    
-    # In FastMCP, list_tools() is typically async or returns a list of Tool objects
-    # But if we just look at the registered functions:
-    assert getattr(mcp, "name") == "SkillWeave"
+    _assert_registry_matches(_collect_registered())
 
-def test_authority_negative_no_raw_mutations():
-    """Ensure authority negative tests are covered (no raw state mutations)."""
-    # Verify that no tool allows raw state injection
-    for tool_name in ["create_run", "status_run", "cancel_run", "resume_run", "get_evidence", "review_run"]:
-        tool_func = getattr(mcp, "_tool_dict", {}).get(tool_name)
-        if tool_func:
-            assert "state" not in tool_func.__code__.co_varnames, "Raw state mutation parameter found!"
-            assert "query" not in tool_func.__code__.co_varnames, "Raw SQL query parameter found!"
+
+def test_mcp_tools_rejects_raw_mutation():
+    """Negative control: an extra raw state-mutation tool would be caught."""
+    # Build a contaminated registry that includes a synthetic raw-mutation tool.
+    # _assert_registry_matches MUST raise AssertionError; if it were weakened
+    # to a no-op the pytest.raises block would fail (no exception raised).
+    contaminated = list(mcp_tool_names()) + ["raw_mutate_db"]
+    with pytest.raises(AssertionError):
+        _assert_registry_matches(contaminated)
 
 def test_cancel_run_not_found():
     res = cancel_run("invalid-run", "test", db_path=":memory:")

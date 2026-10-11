@@ -21,6 +21,20 @@ release_policy: decoupled_member_pins
 # version the release tag is bound to.
 source_of_truth: pyproject.toml
 
+# release_prep is an explicit, reviewable release-preparation state (SW-CORE-
+# RFX-001). It is a flat top-level scalar — the version-sync parser accepts only
+# flat scalar keys and the `locations` list — so the automatic bump never
+# rewrites it. Set it to the candidate version ONLY on the release commit, where
+# the new CHANGELOG section, README badge and "What's new" heading must name the
+# still-unreleased candidate because the release tag does not yet exist. While
+# it equals the candidate (pyproject == bundle) and is ahead of the latest
+# annotated tag, scripts/check-version-truth.py accepts those three positions
+# naming the candidate, provided they all agree with it. Without it nothing
+# changes: a version ahead of the tag in an advertising position is DRIFT. A
+# value that differs from the candidate, or is not ahead of the released tag,
+# is a named drift. Remove it (or it stops being ahead) once the tag exists.
+release_prep: "1.5.10"
+
 # Prose release history is NOT a version surface. CHANGELOG.md carries a prose
 # heading per release and is written by hand; it is deliberately kept out of
 # `locations` so an automatic bump can never rewrite history. Maintaining the
@@ -35,16 +49,19 @@ source_of_truth: pyproject.toml
 # title reads this pattern; the product name is NOT hardcoded in skill text.
 # Missing or malformed policy must fail closed before any release object is
 # created.
-release_title_policy:
-  # The product name for release titles. This MUST match pyproject.toml's
-  # [project].name, title-cased (first letter uppercase, rest lowercase).
-  # To rebrand, change only this value — no skill edits required.
-  product_name: SkillWeave
-  # Full regex that every release title must match. {product} is replaced
-  # at consumption time with product_name above. The version comes from the
-  # release tag (vX.Y.Z, optionally with -rcN prerelease suffix).
-  pattern: '^{product} v[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?$'
-  description: "Release titles must be exactly '<product> vX.Y.Z' with no extra text. Prerelease suffixes (-rcN) are accepted."
+#
+# product_name MUST match pyproject.toml's [project].name, title-cased (first
+# letter uppercase, rest lowercase); to rebrand, change only this value — no
+# skill edits required. pattern is the full regex every release title must
+# match; {product} is replaced at consumption time with product_name above, and
+# the version comes from the release tag (vX.Y.Z, optionally -rcN).
+#
+# Layout note (SW-CORE-ZR-001): the canonical version-sync parser accepts ONLY
+# flat top-level scalars and the `locations` list — a nested block map makes it
+# exit 2 before any comparison. The policy is therefore a single-line FLOW
+# mapping: one unindented scalar line to that parser, a mapping
+# ({product_name, pattern}) to YAML readers and the release-title consumers.
+release_title_policy: {product_name: SkillWeave, pattern: '^{product} v[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?$'}
 
 changelog_path: CHANGELOG.md
 changelog_managed: false
@@ -84,7 +101,7 @@ locations:
   # the two stay consistent and both may lag the bundle version (OPS decision
   # 2026-09-02). version-sync must NOT force a skill file equal to
   # source_of_truth; its own version surface is its capability.yaml.
-  - path: skills/skillweave/capability.yaml
+  - path: skills/skillweave-entry/capability.yaml
     role: skill_capability
     pattern: '^version:\s*(\S+)'
     required: false
@@ -144,3 +161,9 @@ locations:
     role: skill_capability
     pattern: '^version:\s*(\S+)'
     required: false
+
+# Flat top-level scalars consumed by .forgejo/workflows/forgejo-release.yml
+# (regex search with re.MULTILINE).  Keep identical to release_title_policy.
+product_name: SkillWeave
+pattern: '^{product} v[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?$'
+

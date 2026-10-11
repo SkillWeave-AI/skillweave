@@ -40,6 +40,22 @@
       "items": {
         "$ref": "#/$defs/lane"
       }
+    },
+    "methodology": {
+      "type": "string",
+      "enum": ["rex", "ralph", "gauntlet", "assay"],
+      "description": "The execution methodology, named separately from its autonomy policy and session schedule (SW-1510-SKILLS). The legacy execution_model vocabulary is an explicit adapter and never a silent substitution."
+    },
+    "autonomy_policy": {
+      "type": "string",
+      "enum": ["conservative", "medium", "unicorn", ""]
+    },
+    "session_schedule": {
+      "type": "string",
+      "minLength": 1
+    },
+    "execution_envelope": {
+      "$ref": "#/$defs/executionEnvelope"
     }
   },
   "additionalProperties": false,
@@ -311,6 +327,46 @@
         }
       },
       "additionalProperties": true
+    },
+    "executionEnvelope": {
+      "type": "object",
+      "title": "execution-envelope-v1",
+      "description": "The namespaced execution-envelope-v1 block (SW-1510-SKILLS): methodology, autonomy_policy and session_schedule as three separate fields, plus the explicit legacy adapter provenance.",
+      "required": ["version", "methodology", "autonomy_policy", "session_schedule"],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "methodology": {
+          "type": "string",
+          "enum": ["rex", "ralph", "gauntlet", "assay"]
+        },
+        "autonomy_policy": {
+          "type": "string",
+          "enum": ["conservative", "medium", "unicorn", ""]
+        },
+        "session_schedule": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "enum": ["declared", "legacy"]
+        },
+        "legacy_fields": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "subject_kind": {
+          "type": "string",
+          "enum": ["configuration"]
+        },
+        "schema_digest": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

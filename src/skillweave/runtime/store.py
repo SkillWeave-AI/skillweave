@@ -78,6 +78,45 @@ class RunStateModel(str, Enum):
         from_state = cls(from_state) if isinstance(from_state, str) else from_state
         return transition_map.get(from_state, [])
 
+    @classmethod
+    def canonical_path_to_terminal(cls, from_state, target_state: str = "advance_or_stop"):
+        """Return forward-only lane states to advance through so that
+        *target_state* becomes a legal outgoing transition.
+
+        Returns an empty list when *target_state* is already legal from
+        *from_state*, or ``None`` when no forward path reaches it.  The path is
+        resolved from the state machine rather than a hand-maintained table, so
+        it cannot drift from :meth:`legal_transitions`.
+        """
+        def _values(states):
+            return [s.value if isinstance(s, RunStateModel) else s for s in states]
+
+        start = from_state.value if isinstance(from_state, RunStateModel) else from_state
+        if target_state in _values(cls.legal_transitions(start)):
+            return []
+        prev: dict = {start: None}
+        queue = [start]
+        found = None
+        while queue:
+            node = queue.pop(0)
+            if target_state in _values(cls.legal_transitions(node)):
+                found = node
+                break
+            for nxt in cls.legal_transitions(node):
+                nv = nxt.value if isinstance(nxt, RunStateModel) else nxt
+                if nv not in prev:
+                    prev[nv] = node
+                    queue.append(nv)
+        if found is None:
+            return None
+        path = []
+        node = found
+        while node is not None and node != start:
+            path.append(node)
+            node = prev.get(node)
+        path.reverse()
+        return path
+
 
 #: Persistent stop reasons (recorded in ``metadata["stop_reason"]``, never as
 #: a dedicated state) that explain why a run entered a terminal state.
@@ -143,6 +182,12 @@ class RunStore(ABC):
 class SQLiteRunStore(RunStore):
     def __init__(self, db_path: str = ":memory:"):
         self.db_path = db_path
+        #: The live host authority service this store is bound to for protected
+        #: writes (SW-1510-IDENTITY). ``None`` means the protected boundaries
+        #: (:meth:`save_protected_evidence`,
+        #: :meth:`transition_with_gate_admission`) fail closed — a store reached
+        #: by a delegated worker is never bound to the service.
+        self._authority_service: Any = None
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -252,6 +297,28 @@ class SQLiteRunStore(RunStore):
             );
             CREATE INDEX IF NOT EXISTS idx_outbox_run
                 ON outbox(run_id, id);
+            -- The journal event table lives in the same SQLite database so a
+            -- terminal state, its outbox intent, and its logical journal event
+            -- can commit in ONE transaction (see ``_transition_impl``).  The
+            -- DDL is identical to ``EventJournal._init_schema``; both use
+            -- CREATE TABLE IF NOT EXISTS so the shared table is defined once.
+            CREATE TABLE IF NOT EXISTS events (
+                sequence INTEGER NOT NULL,
+                run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                correlation_id TEXT,
+                causation_id TEXT,
+                idempotency_key TEXT,
+                timestamp TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (run_id, sequence)
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_run
+                ON events(run_id, sequence);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency
+                ON events(run_id, idempotency_key)
+                WHERE idempotency_key IS NOT NULL;
         """)
         self._conn.commit()
         self._migrate_legacy_states()
@@ -334,6 +401,11 @@ class SQLiteRunStore(RunStore):
         #   means the persisted version no longer equals the writer's snapshot,
         #   so exactly one of N concurrent same-snapshot writers wins and the
         #   other N-1 raise VersionConflictError.
+        # Read the existing row BEFORE BEGIN IMMEDIATE so we can check
+        # terminal state.  The version CAS inside the transaction is still
+        # the real authority; the terminal check is an additional guard.
+        existing = self.get_run(record.run_id)
+
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             if record.version <= 1:
@@ -360,6 +432,14 @@ class SQLiteRunStore(RunStore):
                     raise VersionConflictError(record.run_id, 1, actual)
                 new_version = 1
             else:
+                # Terminal records cannot be resurrected by any caller,
+                # even one holding the matching version.
+                if existing is not None and RunStateModel.is_terminal(existing.state):
+                    self._conn.rollback()
+                    raise InvalidTransitionError(
+                        existing.state, record.state, record.run_id,
+                        extra={"reason": "terminal record cannot be resurrected"},
+                    )
                 new_version = record.version + 1
                 cur = self._conn.execute(
                     """UPDATE runs SET
@@ -400,6 +480,7 @@ class SQLiteRunStore(RunStore):
         reason: str = "",
         role: Optional[str] = None,
         stop_reason: Optional[str] = None,
+        metadata_update: Optional[dict] = None,
     ) -> RunRecord:
         return self._transition_impl(
             run_id=run_id,
@@ -409,6 +490,7 @@ class SQLiteRunStore(RunStore):
             reason=reason,
             role=role,
             stop_reason=stop_reason,
+            metadata_update=metadata_update,
             event_type=None,
             event_payload=None,
             idempotency_key=None,
@@ -426,6 +508,8 @@ class SQLiteRunStore(RunStore):
         role: Optional[str] = None,
         stop_reason: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        metadata_update: Optional[dict] = None,
+        journal_event: bool = False,
     ) -> RunRecord:
         """Atomically transition a run AND enqueue one journal outbox event.
 
@@ -434,6 +518,17 @@ class SQLiteRunStore(RunStore):
         ``BEGIN IMMEDIATE`` transaction. A crash before commit rolls back all
         three; after commit all three are durably present. This is the
         unit-of-work/outbox contract: state and event never diverge.
+
+        When *metadata_update* is provided, its key-value pairs are merged
+        into the run's metadata inside the same transaction (deep-merged for
+        the ``runlifecycle`` key). This allows lifecycle state changes and
+        the terminal transition to commit atomically.
+
+        When *journal_event* is true the logical event is ALSO inserted into
+        the shared ``events`` journal table in the same transaction, so the
+        terminal state, its outbox intent, and its logical journal record all
+        commit atomically.  It defaults to ``False`` so existing
+        outbox-only callers keep their exact behaviour.
         """
         return self._transition_impl(
             run_id=run_id,
@@ -446,6 +541,8 @@ class SQLiteRunStore(RunStore):
             event_type=event_type,
             event_payload=event_payload,
             idempotency_key=idempotency_key,
+            metadata_update=metadata_update,
+            journal_event=journal_event,
         )
 
     def _transition_impl(
@@ -460,6 +557,8 @@ class SQLiteRunStore(RunStore):
         event_type: Optional[str] = None,
         event_payload: Optional[dict] = None,
         idempotency_key: Optional[str] = None,
+        metadata_update: Optional[dict] = None,
+        journal_event: bool = False,
     ) -> RunRecord:
         existing = self.get_run(run_id)
         if existing is None:
@@ -506,10 +605,20 @@ class SQLiteRunStore(RunStore):
 
         # A terminal transition may carry a persistent stop reason. Record it
         # in metadata (the vocabulary itself stays flat; the reason is data).
+        # When *metadata_update* is provided, merge its values into metadata
+        # inside the same transaction (deep-merge runlifecycle).
         import json
         merged_metadata = dict(existing.metadata or {})
         if stop_reason is not None:
             merged_metadata["stop_reason"] = stop_reason
+        if metadata_update is not None:
+            for k, v in metadata_update.items():
+                if k == "runlifecycle" and isinstance(v, dict):
+                    existing_lifecycle = dict(merged_metadata.get("runlifecycle", {}))
+                    existing_lifecycle.update(v)
+                    merged_metadata["runlifecycle"] = existing_lifecycle
+                else:
+                    merged_metadata[k] = v
 
         # One transaction: the run-state UPDATE, its transitions_log row, and
         # (when requested) a pending outbox event commit together. A crash at
@@ -542,6 +651,29 @@ class SQLiteRunStore(RunStore):
                        (run_id, event_type, payload, idempotency_key, created_at, delivered_at)
                        VALUES (?, ?, ?, ?, ?, NULL)""",
                     (run_id, event_type, json.dumps(event_payload or {}), idempotency_key, now),
+                )
+
+            # When requested, also write the logical journal event into the
+            # shared ``events`` table INSIDE this same transaction.  Previously
+            # the wrapper appended the terminal journal event separately AFTER
+            # the atomic transition, which is not crash-atomic: a crash between
+            # the committed state and the journal append could leave a terminal
+            # state with no logical record (and a reader could observe the
+            # state/event divergence).  Co-committing both removes that window.
+            # Sequence allocation is MAX(sequence)+1 under the same write lock,
+            # so it cannot race a concurrent journal append.
+            if journal_event and event_type is not None:
+                seq = self._conn.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+                self._conn.execute(
+                    """INSERT INTO events
+                       (sequence, run_id, event_type, payload, correlation_id,
+                        causation_id, idempotency_key, timestamp, version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (seq, run_id, event_type, json.dumps(event_payload or {}),
+                     None, None, idempotency_key, now, new_version),
                 )
 
             self._conn.commit()
@@ -1038,6 +1170,139 @@ class SQLiteRunStore(RunStore):
     def ensure_storage(self):
         pass
 
+    def with_authority_service(self, authority_service: Any) -> "SQLiteRunStore":
+        """Bind this store to the live host authority service (protected writes).
+
+        Only the host process that owns the :class:`HostAuthorityService` binds
+        it, and only a genuine service (one that answers :meth:`serve_live`) is
+        accepted. The store object reachable by a delegated worker is never
+        bound, so its protected boundaries fail closed.
+        """
+        if authority_service is None or not callable(
+            getattr(authority_service, "serve_live", None)
+        ):
+            from .authority_service import IdentityBoundaryError
+
+            raise IdentityBoundaryError(
+                "with_authority_service requires a live HostAuthorityService"
+            )
+        self._authority_service = authority_service
+        return self
+
+    # ---- Protected receipt / gate mutation boundary (SW-1510-IDENTITY) ----
+    #
+    # These are the *actual* persistence boundaries for a protected receipt and
+    # a gate transition. They are separate from ``save_evidence``/``transition``
+    # (which stay as general-purpose legacy APIs) so that a worker-shaped call
+    # cannot reach a protected write: the boundary requires an
+    # ``IngestedReceipt`` that only ``HostAuthorityService`` can produce, and a
+    # ``GateAdmission`` that only a controller/integrator credential can obtain.
+
+    def save_protected_evidence(
+        self,
+        receipt: ArtifactReceipt,
+        ingested: Any,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> ArtifactReceipt:
+        """Persist a receipt that passed the host identity boundary.
+
+        A typed ``IngestedReceipt`` is only a *claim*: the class is importable,
+        so a caller can construct one. Authorization is a live, one-shot
+        capability that the genuine :class:`HostAuthorityService` mints at
+        ingestion and that this boundary *consumes through that same service*
+        against the exact attempt and artifact digest. A forged/copied
+        ``IngestedReceipt`` (no issued token), a replayed token, a token minted
+        for a different attempt/artifact, or a look-alike service object is
+        refused before any mutation.
+        """
+        from .authority_service import IdentityBoundaryError, IngestedReceipt
+
+        if not isinstance(ingested, IngestedReceipt):
+            raise IdentityBoundaryError(
+                "save_protected_evidence requires an IngestedReceipt produced by "
+                "HostAuthorityService.ingest_evidence_receipt"
+            )
+        service = self._authority_service
+        if service is None or not callable(getattr(service, "serve_live", None)):
+            raise IdentityBoundaryError(
+                "save_protected_evidence requires the store to be bound to the "
+                "live authority service; bind with with_authority_service(...)"
+            )
+        if receipt.sha256 != ingested.artifact_digest:
+            raise IdentityBoundaryError(
+                "receipt digest does not match the authenticated artifact digest"
+            )
+        if not service.registry.consume_receipt_ingestion(
+            ingested.ingestion_token,
+            attempt_key=ingested.attempt_key,
+            artifact_digest=ingested.artifact_digest,
+        ):
+            raise IdentityBoundaryError(
+                "ingestion capability was not issued by the live authority service "
+                "for this attempt/artifact (forged, replayed or mismatched)"
+            )
+        return self.save_evidence(receipt, idempotency_key=idempotency_key)
+
+    def transition_with_gate_admission(
+        self,
+        run_id: str,
+        target_state: str,
+        expected_state: str,
+        expected_version: int,
+        admission: Any,
+        reason: str = "",
+        stop_reason: Optional[str] = None,
+    ) -> RunRecord:
+        """Transition a run to a gate state, admitted by a live controller decision.
+
+        A typed ``GateAdmission`` is again only a claim. This boundary consumes
+        the live, one-shot capability the authority service minted at
+        :func:`admit_gate`, bound to the exact run and admitted receipt bytes and
+        to a decision the service actually issued. A copied/forged
+        ``GateAdmission``, a replay, a token for a different run/receipt, or a
+        withdrawn authority decision is refused before any run state changes.
+        The admitted principal is recorded as ``role``, so the persisted state
+        carries who actually admitted it.
+        """
+        from .authority_service import GateAdmission, IdentityBoundaryError
+
+        if not isinstance(admission, GateAdmission):
+            raise IdentityBoundaryError(
+                "transition_with_gate_admission requires a GateAdmission from a "
+                "controller/integrator credential"
+            )
+        service = admission.authority_service
+        if service is None or not callable(getattr(service, "serve_live", None)):
+            raise IdentityBoundaryError(
+                "gate admission is not bound to a live authority service"
+            )
+        if admission.run_id != run_id:
+            raise IdentityBoundaryError("gate admission is for a different run")
+        active = service.registry.consume_gate_admission(
+            admission.admission_token,
+            run_id=run_id,
+            receipt_artifact_digest=admission.receipt_artifact_digest,
+        )
+        if active is None:
+            raise IdentityBoundaryError(
+                "gate admission capability was not issued by the live authority "
+                "service for this run/target/receipt (forged, replayed, expired or "
+                "mismatched)"
+            )
+        return self._transition_impl(
+            run_id=run_id,
+            target_state=target_state,
+            expected_state=expected_state,
+            expected_version=expected_version,
+            reason=reason,
+            role=active["admitted_by"],
+            stop_reason=stop_reason,
+            event_type=None,
+            event_payload=None,
+            idempotency_key=None,
+        )
+
     def create_run(self, run_id: str, **kwargs) -> RunRecord:
         from datetime import datetime, timezone
         import uuid
@@ -1056,5 +1321,568 @@ class SQLiteRunStore(RunStore):
         )
         return self.save_run(record)
 
+    def update_metadata(
+        self,
+        run_id: str,
+        expected_version: Optional[int] = None,
+        **changes: Any,
+    ) -> RunRecord:
+        """Atomic CAS metadata update.
+
+        When *expected_version* is provided, the update succeeds only if the
+        persisted version matches (``WHERE version = ?``).  When omitted, the
+        update is still an atomic current-row operation — never an unlocked
+        read-modify-write.
+
+        Raises
+        ------
+        VersionConflictError
+            When *expected_version* is provided but does not match the
+            persisted version.
+        InvalidTransitionError
+            When the run does not exist or is in a terminal state (terminal
+            records cannot be resurrected).
+        """
+        import json
+        from datetime import datetime, timezone
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                self._conn.rollback()
+                raise InvalidTransitionError(
+                    "nonexistent", "update", run_id,
+                    extra={"reason": "run does not exist"},
+                )
+
+            if expected_version is not None and row["version"] != expected_version:
+                self._conn.rollback()
+                raise VersionConflictError(run_id, expected_version, row["version"])
+
+            # Terminal records cannot be resurrected by any caller.
+            if RunStateModel.is_terminal(row["state"]):
+                self._conn.rollback()
+                raise InvalidTransitionError(
+                    row["state"], "update", run_id,
+                    extra={"reason": "terminal record cannot be resurrected"},
+                )
+
+            # Merge changes.  Recognised top-level fields are set directly;
+            # everything else is stored in metadata.
+            now = datetime.now(timezone.utc).isoformat()
+            new_state = changes.pop("state", row["state"])
+            new_role = changes.pop("role", row["role"])
+            new_ended_at = changes.pop("ended_at", row["ended_at"])
+            merged_meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            for k, v in changes.items():
+                if k == "metadata" and isinstance(v, dict):
+                    merged_meta.update(v)
+                else:
+                    merged_meta[k] = v
+
+            # Determine the version to guard on: the caller's expected_version
+            # if given, otherwise the current persisted version (atomic).
+            guard_version = expected_version if expected_version is not None else row["version"]
+            new_version = row["version"] + 1
+
+            cur = self._conn.execute(
+                """UPDATE runs SET state = ?, version = ?, updated_at = ?,
+                   ended_at = ?, role = ?, metadata = ?
+                   WHERE run_id = ? AND version = ?""",
+                (new_state, new_version, now, new_ended_at, new_role,
+                 json.dumps(merged_meta), run_id, guard_version),
+            )
+            if cur.rowcount == 0:
+                self._conn.rollback()
+                persisted = self._conn.execute(
+                    "SELECT version FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                actual = persisted["version"] if persisted else row["version"]
+                raise VersionConflictError(run_id, guard_version, actual)
+
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+        return self.get_run(run_id)
+
+    def reconcile_terminal(
+        self,
+        run_id: str,
+        *,
+        target_state: str,
+        lifecycle_update: Optional[dict] = None,
+        event_type: Optional[str] = None,
+        event_payload: Optional[dict] = None,
+        idempotency_key: Optional[str] = None,
+        reason: str = "",
+        stop_reason: Optional[str] = None,
+        extra_metadata: Optional[dict] = None,
+    ) -> RunRecord:
+        """Durably commit a terminal outcome for *run_id*, retrying past conflicts.
+
+        Unlike :meth:`transition_with_event`, this is the **durable
+        reconciliation** primitive for out-of-band writers (the detached
+        completion wrapper): a finite sequence of uncoordinated-but-legal
+        writers must not be able to discard a real terminal outcome.  A single
+        CAS attempt is insufficient because each competing metadata write bumps
+        the run version, so any fixed retry budget can be exhausted and lose a
+        completed child.
+
+        Semantics
+        ---------
+        A genuine terminal winner is never overturned:
+
+        * If the run already holds a terminal state, it is returned unchanged
+          and nothing is written (the cancelled/terminal winner is preserved).
+        * If the run does not exist, ``InvalidTransitionError`` is raised.
+
+        Otherwise this method loops: re-read the current non-terminal snapshot,
+        walk the legal lane transitions to a state from which *target_state* is
+        reachable, then commit the terminal transition, the lifecycle metadata
+        merge, and (when requested) exactly one idempotent outbox event together
+        in a single ``BEGIN IMMEDIATE`` transaction.  On ``VersionConflictError``
+        it re-reads and tries again, without a finite bound, so a completed
+        child is never dropped.  A non-CAS storage error (e.g. a SQLite I/O
+        failure) propagates, so an I/O failure is never swallowed and reported
+        as an apparent success.
+
+        Idempotency: because a committed terminal state ends the loop on the
+        next pass, exactly one terminal event with *idempotency_key* is ever
+        written, however many conflicting writers appear.
+        """
+        while True:
+            existing = self.get_run(run_id)
+            if existing is None:
+                raise InvalidTransitionError(
+                    "nonexistent", target_state, run_id,
+                    extra={"reason": "run does not exist"},
+                )
+            if RunStateModel.is_terminal(existing.state):
+                # A genuine terminal winner (cancellation or a committed
+                # completion) is preserved as-is.
+                return existing
+
+            current = existing
+            try:
+                # Walk to a state from which target_state is a legal outgoing
+                # transition.  Each intermediate step is its own transaction
+                # and only ever moves forward.
+                guard = 0
+                while (target_state not in [
+                    s.value if isinstance(s, RunStateModel) else s
+                    for s in RunStateModel.legal_transitions(current.state)
+                ]):
+                    guard += 1
+                    if guard > len(RunStateModel):
+                        raise InvalidTransitionError(
+                            current.state, target_state, run_id,
+                            extra={"reason": "no legal path to target state"},
+                        )
+                    next_states = [
+                        s.value if isinstance(s, RunStateModel) else s
+                        for s in RunStateModel.legal_transitions(current.state)
+                    ]
+                    # Prefer the canonical forward lane when a choice exists.
+                    prefer = ["batch_selection", "lane_plan", "implement",
+                              "verify", "fix_retry", "review_gate", "integrate"]
+                    step = next(
+                        (p for p in prefer if p in next_states),
+                        next_states[0] if next_states else None,
+                    )
+                    if step is None:
+                        raise InvalidTransitionError(
+                            current.state, target_state, run_id,
+                            extra={"reason": "no legal path to target state"},
+                        )
+                    self.transition(
+                        run_id, step,
+                        expected_state=current.state,
+                        expected_version=current.version,
+                        reason=reason or "reconcile: advance",
+                    )
+                    current = self.get_run(run_id)
+
+                merged: dict = dict(lifecycle_update or {})
+                if extra_metadata:
+                    merged.update(extra_metadata)
+                metadata_update = {"runlifecycle": merged} if merged else None
+                return self.transition_with_event(
+                    run_id, target_state,
+                    expected_state=current.state,
+                    expected_version=current.version,
+                    event_type=event_type,
+                    event_payload=event_payload,
+                    idempotency_key=idempotency_key,
+                    reason=reason or "reconcile: terminal",
+                    stop_reason=stop_reason,
+                    metadata_update=metadata_update,
+                    journal_event=True,
+                )
+            except VersionConflictError:
+                # A legal unrelated writer moved the run.  Re-read and retry;
+                # a completed child's outcome must not be lost.
+                continue
+
+    def reconcile_terminal_intent(
+        self,
+        run_id: str,
+        *,
+        target_state: str,
+        lifecycle_update: Optional[dict] = None,
+        event_type: Optional[str] = None,
+        event_payload: Optional[dict] = None,
+        idempotency_key: Optional[str] = None,
+        reason: str = "",
+        stop_reason: Optional[str] = None,
+        intent_metadata_key: str = "_pending_completion",
+    ) -> "CompletionReconciler":
+        """Return a reconciler that first durably records the completion intent.
+
+        The intent (the terminal outcome plus its one logical event) is written
+        as run metadata **before** the terminal commit.  A crash after the
+        intent and before commit leaves the intent readable, so a later
+        reconciliation pass can finish the outcome rather than lose it.
+        """
+        return CompletionReconciler(
+            self,
+            run_id,
+            target_state=target_state,
+            lifecycle_update=lifecycle_update,
+            event_type=event_type,
+            event_payload=event_payload,
+            idempotency_key=idempotency_key,
+            reason=reason,
+            stop_reason=stop_reason,
+            intent_metadata_key=intent_metadata_key,
+        )
+
+    def reconcile_cancellation_intent(
+        self,
+        run_id: str,
+        *,
+        pid: Optional[int] = None,
+        result: str = "unknown",
+        event_type: str = "process_killed",
+        event_payload: Optional[dict] = None,
+        idempotency_key: Optional[str] = None,
+        stop_reason: str = "operator_halt",
+        reason: str = "service: kill",
+        intent_metadata_key: str = "_pending_cancellation",
+    ) -> "CancellationReconciler":
+        """Return a reconciler that durably records a cancellation intent.
+
+        The intent (the terminal outcome plus its one logical event) is stored
+        in run metadata, so if the process crashes between the intent and the
+        terminal commit a later pass can still finish the cancellation instead
+        of leaving a non-terminal ``running`` run behind.
+        """
+        return CancellationReconciler(
+            self,
+            run_id,
+            pid=pid,
+            result=result,
+            event_type=event_type,
+            event_payload=event_payload,
+            idempotency_key=idempotency_key,
+            stop_reason=stop_reason,
+            reason=reason,
+            intent_metadata_key=intent_metadata_key,
+        )
+
+    def import_legacy(
+        self,
+        run_id: str,
+        source_bytes: bytes,
+        source_path: Optional[str] = None,
+    ) -> RunRecord:
+        """Import a legacy JSON run record as historical data.
+
+        The imported record is assigned state ``unknown`` and metadata
+        ``{"historical": true, "provenance": ...}``.  The exact source bytes
+        are preserved in metadata.  This method never infers execution,
+        success, review approval, or live PID ownership from the old bytes.
+
+        Idempotent: a second call with the same *run_id* returns the existing
+        row unchanged.  Existing SQLite rows always win — if *run_id* already
+        exists in the store, this method returns the existing row without
+        modifying it.
+
+        Parameters
+        ----------
+        run_id:
+            The run ID to import as.
+        source_bytes:
+            The raw bytes of the legacy JSON file.
+        source_path:
+            Optional path to the source file (recorded in provenance).
+
+        Returns
+        -------
+        RunRecord
+            The imported or existing record.
+        """
+        import json
+        from datetime import datetime, timezone
+
+        existing = self.get_run(run_id)
+        if existing is not None:
+            return existing
+
+        provenance: dict[str, Any] = {
+            "source": "legacy_import",
+            "byte_length": len(source_bytes),
+            "sha256": __import__("hashlib").sha256(source_bytes).hexdigest(),
+        }
+        if source_path:
+            provenance["source_path"] = source_path
+
+        now = datetime.now(timezone.utc).isoformat()
+        record = RunRecord(
+            run_id=run_id,
+            root_run_id=run_id,
+            parent_run_id=None,
+            state="unknown",
+            version=1,
+            created_at=now,
+            updated_at=now,
+            ended_at=None,
+            role="ops",
+            metadata={
+                "historical": True,
+                "provenance": provenance,
+                "raw_bytes_b64": __import__("base64").b64encode(source_bytes).decode("ascii"),
+            },
+        )
+        return self.save_run(record)
+
     def close(self):
         self._conn.close()
+
+
+class CompletionReconciler:
+    """Durable completion-intent recorder and reconciler.
+
+    Wraps :meth:`SQLiteRunStore.reconcile_terminal` with an explicit intent
+    record.  The intent is stored in run metadata (keyed by
+    ``intent_metadata_key``) inside a single recoverable write, then the
+    terminal outcome is reconciled.  If the process crashes between the intent
+    and the commit, :meth:`resume_pending` finishes the recorded outcome on a
+    later pass, so a completed child is never silently lost across a restart.
+    """
+
+    def __init__(
+        self,
+        store: "SQLiteRunStore",
+        run_id: str,
+        *,
+        target_state: str,
+        lifecycle_update: Optional[dict] = None,
+        event_type: Optional[str] = None,
+        event_payload: Optional[dict] = None,
+        idempotency_key: Optional[str] = None,
+        reason: str = "",
+        stop_reason: Optional[str] = None,
+        intent_metadata_key: str = "_pending_completion",
+    ) -> None:
+        self._store = store
+        self.run_id = run_id
+        self.target_state = target_state
+        self.lifecycle_update = dict(lifecycle_update or {})
+        self.event_type = event_type
+        self.event_payload = event_payload
+        self.idempotency_key = idempotency_key
+        self.reason = reason
+        self.stop_reason = stop_reason
+        self.intent_metadata_key = intent_metadata_key
+
+    def _intent(self) -> dict:
+        return {
+            "target_state": self.target_state,
+            "lifecycle_update": self.lifecycle_update,
+            "event_type": self.event_type,
+            "event_payload": self.event_payload,
+            "idempotency_key": self.idempotency_key,
+            "reason": self.reason,
+            "stop_reason": self.stop_reason,
+        }
+
+    def record_intent(self) -> None:
+        """Durably write the completion intent, retrying past CAS conflicts.
+
+        A genuine terminal winner is left untouched and no intent is written
+        (the winner already stands).
+        """
+        RunStateModel = globals()["RunStateModel"]
+        intent = self._intent()
+        while True:
+            current = self._store.get_run(self.run_id)
+            if current is None or RunStateModel.is_terminal(current.state):
+                return
+            try:
+                self._store.update_metadata(
+                    self.run_id,
+                    expected_version=current.version,
+                    metadata={self.intent_metadata_key: intent},
+                )
+                return
+            except VersionConflictError:
+                continue
+            except InvalidTransitionError:
+                # Terminal winner appeared between read and write.
+                return
+
+    def reconcile(self) -> RunRecord:
+        self.record_intent()
+        return self._store.reconcile_terminal(
+            self.run_id,
+            target_state=self.target_state,
+            lifecycle_update=self.lifecycle_update,
+            event_type=self.event_type,
+            event_payload=self.event_payload,
+            idempotency_key=self.idempotency_key,
+            reason=self.reason,
+            stop_reason=self.stop_reason,
+        )
+
+    @classmethod
+    def resume_pending(
+        cls,
+        store: "SQLiteRunStore",
+        run_id: str,
+        *,
+        intent_metadata_key: str = "_pending_completion",
+    ) -> Optional[RunRecord]:
+        """Finish a recorded-but-uncommitted completion intent, if any."""
+        RunStateModel = globals()["RunStateModel"]
+        current = store.get_run(run_id)
+        if current is None or RunStateModel.is_terminal(current.state):
+            return None
+        intent = (current.metadata or {}).get(intent_metadata_key)
+        if not isinstance(intent, dict):
+            return None
+        return store.reconcile_terminal(
+            run_id,
+            target_state=intent["target_state"],
+            lifecycle_update=intent.get("lifecycle_update"),
+            event_type=intent.get("event_type"),
+            event_payload=intent.get("event_payload"),
+            idempotency_key=intent.get("idempotency_key"),
+            reason=intent.get("reason", ""),
+            stop_reason=intent.get("stop_reason"),
+        )
+
+
+class CancellationReconciler:
+    """Durable cancellation-intent recorder and reconciler.
+
+    Mirrors :class:`CompletionReconciler` for the kill path.  A cancellation
+    request must leave one durable terminal outcome, or surface a typed error —
+    never a successful-looking ``already_dead``/``running`` result with the
+    exception swallowed.  A genuine pre-existing terminal winner is preserved
+    and never overwritten.
+    """
+
+    def __init__(
+        self,
+        store: "SQLiteRunStore",
+        run_id: str,
+        *,
+        pid: Optional[int] = None,
+        result: str = "unknown",
+        event_type: str = "process_killed",
+        event_payload: Optional[dict] = None,
+        idempotency_key: Optional[str] = None,
+        stop_reason: str = "operator_halt",
+        reason: str = "service: kill",
+        intent_metadata_key: str = "_pending_cancellation",
+    ) -> None:
+        self._store = store
+        self.run_id = run_id
+        self.pid = pid
+        self.result = result
+        self.event_type = event_type
+        self.event_payload = dict(event_payload or {})
+        self.idempotency_key = idempotency_key
+        self.stop_reason = stop_reason
+        self.reason = reason
+        self.intent_metadata_key = intent_metadata_key
+
+    def _intent(self) -> dict:
+        return {
+            "pid": self.pid,
+            "result": self.result,
+            "event_type": self.event_type,
+            "event_payload": self.event_payload,
+            "idempotency_key": self.idempotency_key,
+            "stop_reason": self.stop_reason,
+            "reason": self.reason,
+        }
+
+    def record_intent(self) -> None:
+        """Durably write the cancellation intent, retrying past CAS conflicts.
+
+        A genuine terminal winner is left untouched and no intent is written.
+        """
+        RunStateModel = globals()["RunStateModel"]
+        intent = self._intent()
+        while True:
+            current = self._store.get_run(self.run_id)
+            if current is None or RunStateModel.is_terminal(current.state):
+                return
+            try:
+                self._store.update_metadata(
+                    self.run_id,
+                    expected_version=current.version,
+                    metadata={self.intent_metadata_key: intent},
+                )
+                return
+            except VersionConflictError:
+                continue
+            except InvalidTransitionError:
+                # Terminal winner appeared between read and write.
+                return
+
+    def reconcile(self) -> RunRecord:
+        self.record_intent()
+        return self._store.reconcile_terminal(
+            self.run_id,
+            target_state="advance_or_stop",
+            lifecycle_update={"lifecycle_state": "killed"},
+            event_type=self.event_type,
+            event_payload=self.event_payload,
+            idempotency_key=self.idempotency_key,
+            reason=self.reason,
+            stop_reason=self.stop_reason,
+        )
+
+    @classmethod
+    def resume_pending(
+        cls,
+        store: "SQLiteRunStore",
+        run_id: str,
+        *,
+        intent_metadata_key: str = "_pending_cancellation",
+    ) -> Optional[RunRecord]:
+        """Finish a recorded-but-uncommitted cancellation intent, if any."""
+        RunStateModel = globals()["RunStateModel"]
+        current = store.get_run(run_id)
+        if current is None or RunStateModel.is_terminal(current.state):
+            return None
+        intent = (current.metadata or {}).get(intent_metadata_key)
+        if not isinstance(intent, dict):
+            return None
+        return store.reconcile_terminal(
+            run_id,
+            target_state="advance_or_stop",
+            lifecycle_update={"lifecycle_state": "killed"},
+            event_type=intent.get("event_type", "process_killed"),
+            event_payload=intent.get("event_payload"),
+            idempotency_key=intent.get("idempotency_key"),
+            reason=intent.get("reason", "service: kill"),
+            stop_reason=intent.get("stop_reason", "operator_halt"),
+        )

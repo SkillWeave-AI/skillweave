@@ -294,6 +294,37 @@ TEST-001 (after API-001), TEST-002 (after API-002)
 }
 ```
 
+## Data-Boundary Contracts
+
+A task that crosses an architectural boundary must declare `boundaries`; a task
+with no data-boundary change omits it and validates unchanged. The
+contract-requiring kinds are `storage`, `process`, `adapter`, `telemetry` and
+`public-api`; any other kind is refused. Each boundary requires a
+`data_contract` with all five fields `artifact`, `versioning`, `producer`,
+`consumer` and `compatibility` — all non-blank. A prose-only `data_contract`
+(a bare string) is refused with a task-specific diagnostic, because a described
+crossing is not a defined interface.
+
+```json
+"boundaries": [
+  {
+    "kind": "adapter",
+    "data_contract": {
+      "artifact": "payment authorization response",
+      "versioning": "provider API v2023-10-16",
+      "producer": "payment provider",
+      "consumer": "checkout service",
+      "compatibility": "pinned version; upgrade is a separate migration"
+    }
+  }
+]
+```
+
+The optional `subject_kind` names the artifact's subject in the integrated
+WorkContract vocabulary (`repository`, `content`, `configuration`,
+`deployment`, `incident`), so a boundary speaks the same language as the work
+contract that authorizes it.
+
 ## Verification Strategy
 
 ### Automated Verification

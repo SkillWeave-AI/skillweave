@@ -99,28 +99,36 @@ def _service(tmp_db=":memory:"):
     return RunApplicationService(store, journal, raw), store, journal, raw
 
 
-def _contract_registry() -> Registry:
-    """Every lifecycle contract registered by its own ``$id``.
+import skillweave_sdk.validator as _sdk_validator
 
-    The profile's contract blocks are validated against the same bytes an
-    external consumer reads — cross-schema ``$ref`` resolution comes from the
-    contract directory alone, with no private Core copy.
+
+def _sdk_schema(contract: str) -> dict:
+    """Return the SDK schema dict for a lifecycle contract name."""
+    reg = _sdk_validator.load_registry()
+    for sid, schema in reg.items():
+        if f"lifecycle/{contract}" in sid:
+            return schema
+    raise ValueError(f"SDK schema not found for lifecycle contract {contract!r}")
+
+
+def _contract_registry() -> Registry:
+    """Every lifecycle contract registered by its own ``$id`` from the installed SDK.
+
+    The profile's contract blocks are validated against the SDK schemas —
+    the SDK is contract authority.
     """
+    reg = _sdk_validator.load_registry()
     resources = []
-    for schema_file in _CONTRACTS_DIR.glob("*.schema.json"):
-        doc = json.loads(schema_file.read_text(encoding="utf-8"))
-        resources.append(
-            (doc["$id"], Resource.from_contents(doc, default_specification=DRAFT202012))
-        )
+    for sid, schema in reg.items():
+        if "lifecycle" in sid:
+            resources.append(
+                (schema["$id"], Resource.from_contents(schema, default_specification=DRAFT202012))
+            )
     return Registry().with_resources(resources)
 
 
 def _validate_contract(contract: str, instance: dict) -> None:
-    lock = json.loads((_CONTRACTS_DIR / "contract-lock.json").read_text(encoding="utf-8"))
-    schema = json.loads(
-        (_CONTRACTS_DIR / lock["contracts"][contract]["schema"]).read_text(encoding="utf-8")
-    )
-    validator = Draft202012Validator(schema, registry=_contract_registry())
+    validator = Draft202012Validator(_sdk_schema(contract), registry=_contract_registry())
     errors = sorted(validator.iter_errors(instance), key=lambda e: list(e.path))
     assert errors == [], f"{contract}: {[e.message for e in errors]}"
 

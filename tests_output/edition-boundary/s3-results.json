@@ -1,0 +1,145 @@
+{
+  "default_off": {
+    "fresh_consent_off": true,
+    "granted_without_handle_refused": true,
+    "unsupported_version_refused": true,
+    "sub_floor_cohort_refused": true,
+    "raw_subjects_refused": true,
+    "schema_version": 1
+  },
+  "consent": {
+    "grant_mints_handle": true,
+    "handle_len": 32,
+    "handle_deterministic": true,
+    "handle_changes_with_time": true,
+    "preview_does_not_grant": true,
+    "preview_schema_version": 1,
+    "preview_reports_cohort_refusal": true,
+    "preview_reports_content_refusal": true
+  },
+  "deletion": {
+    "handle_revocable": true,
+    "handle_survives_revoke": true,
+    "unknown_handle_refused": true
+  },
+  "prohibited_content": {
+    "raw_keys_refused": true,
+    "prohibited_values_refused": true,
+    "secret_subject_refused": true,
+    "rejection_precedes_cohort_check": true,
+    "raw_record_refused_at_boundary": true
+  },
+  "cohort_threshold": {
+    "undersized_refused": true,
+    "absolute_floor_holds": true,
+    "default_min_cohort": 5,
+    "cohort_is_safe_boundary": {
+      "5": true,
+      "4": false,
+      "3": true
+    }
+  },
+  "re_identification": {
+    "imbalanced_bucket_refused": true,
+    "balanced_smallest_bucket": 4,
+    "floor": 3
+  },
+  "poisoning": {
+    "replayed_record_detected": true,
+    "degenerate_outcome_detected": true,
+    "clean_cohort_has_no_signal": true,
+    "export_refused_on_signal": true,
+    "max_repeat_share": 0.5,
+    "max_outcome_share": 0.98
+  },
+  "withdrawal": {
+    "withdraw_by_handle": true,
+    "contributions_removed": 8,
+    "withdrawn_tenant_refused": true,
+    "other_tenant_untouched": true,
+    "withdraw_by_string_equivalent": true
+  },
+  "tenant_boundary": {
+    "unknown_subject_refused": true,
+    "duplicate_registration_refused": true,
+    "contribution_without_consent_refused": true,
+    "export_without_consent_refused": true,
+    "export_while_unavailable_refused": true
+  },
+  "edition_bypass": {
+    "community_denies_pro_features": true,
+    "unknown_edition_refused": true,
+    "contract_frozen": true,
+    "aggregate_service_denied_everywhere": true,
+    "require_capability_fails_closed": true
+  },
+  "aggregate_service_label": {
+    "default": "preview/unavailable",
+    "partial": "preview/unavailable",
+    "all_gates": "preview",
+    "contradicted_cohort_gate": false,
+    "production_claim": false,
+    "gates": [
+      "ingestion",
+      "cohort",
+      "quality",
+      "deletion",
+      "tenant_isolation"
+    ]
+  },
+  "editions": {
+    "community": {
+      "edition": "community",
+      "local_raw_events": true,
+      "offline": true,
+      "export_opt_in": true,
+      "export_default_off": true,
+      "coarse_local_recommendations": true,
+      "fixture_backed_benchmark": false,
+      "budgeting": false,
+      "capability_mix": false,
+      "hotspots": false,
+      "tenant_isolation": false,
+      "aggregate_service_claim": false
+    },
+    "pro": {
+      "edition": "pro",
+      "local_raw_events": true,
+      "offline": true,
+      "export_opt_in": true,
+      "export_default_off": true,
+      "coarse_local_recommendations": true,
+      "fixture_backed_benchmark": true,
+      "budgeting": true,
+      "capability_mix": true,
+      "hotspots": true,
+      "tenant_isolation": false,
+      "aggregate_service_claim": false
+    },
+    "enterprise": {
+      "edition": "enterprise",
+      "local_raw_events": true,
+      "offline": true,
+      "export_opt_in": true,
+      "export_default_off": true,
+      "coarse_local_recommendations": true,
+      "fixture_backed_benchmark": true,
+      "budgeting": true,
+      "capability_mix": true,
+      "hotspots": true,
+      "tenant_isolation": true,
+      "aggregate_service_claim": false
+    },
+    "all_offline_local_optin_default_off": true
+  },
+  "aggregate_artifact": {
+    "kind": "skillweave.telemetry-export",
+    "schema_version": 1,
+    "raw_events_exported": false,
+    "network_export": false,
+    "production_claim": false,
+    "cohort_size": 8,
+    "sample_label": "adequate",
+    "forbidden_key_free": true
+  }
+}

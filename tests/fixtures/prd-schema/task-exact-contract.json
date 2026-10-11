@@ -1,0 +1,71 @@
+{
+  "projectName": "Positive proof — tasks that cross boundaries with exact contracts",
+  "version": "1.0",
+  "status": "draft",
+  "tasks": [
+    {
+      "id": "BOUND-STORAGE-001",
+      "title": "Persist session records",
+      "description": "Crosses the storage boundary: writes session records to the session store and reads them back.",
+      "acceptanceCriteria": [
+        "Session record written on login and read on the next request",
+        "v1 session records remain readable after the v2 addition"
+      ],
+      "priority": "high",
+      "points": 3,
+      "dependsOn": [],
+      "type": "feature",
+      "passes": false,
+      "boundaries": [
+        {
+          "kind": "storage",
+          "data_contract": {
+            "artifact": "session record",
+            "versioning": "schema v2; v1 records remain readable",
+            "producer": "auth service",
+            "consumer": "request middleware",
+            "compatibility": "backward compatible: new optional fields only",
+            "subject_kind": "configuration"
+          }
+        }
+      ]
+    },
+    {
+      "id": "BOUND-MULTI-001",
+      "title": "Call the payment adapter and emit telemetry",
+      "description": "Crosses two boundaries: an adapter to a foreign payment system and a telemetry sink.",
+      "acceptanceCriteria": [
+        "The provider version is pinned and recorded",
+        "A telemetry event is emitted for every authorization"
+      ],
+      "priority": "high",
+      "points": 5,
+      "dependsOn": [],
+      "type": "task",
+      "passes": false,
+      "boundaries": [
+        {
+          "kind": "adapter",
+          "data_contract": {
+            "artifact": "payment authorization response",
+            "versioning": "provider API v2023-10-16",
+            "producer": "payment provider",
+            "consumer": "checkout service",
+            "compatibility": "pinned version; upgrade is a separate migration",
+            "subject_kind": "deployment"
+          }
+        },
+        {
+          "kind": "public-api",
+          "data_contract": {
+            "artifact": "authorization status event",
+            "versioning": "event schema v1",
+            "producer": "checkout service",
+            "consumer": "observability pipeline",
+            "compatibility": "additive only; consumers ignore unknown fields"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -36,11 +36,28 @@ from .harness import (  # noqa: F401
 # The Faigate adapter is the shared model-routing surface. It lives here (not
 # under council/) so both the council and the RunnerAdapter import the same
 # module. The ``council.faigate_adapter`` path remains as a back-compat shim.
+from .route_proof import (  # noqa: F401
+    RouteProof,
+    RouteProofError,
+)
+
+# The owner-controlled route policy document (SW-1510-ROUTE-LOCK criterion 3):
+# the policy is the owner pin that every observed route proof must be a subset
+# of.  No provider literals, no port constant and no revision literal live in
+# generic Core source.
+from .route_policy import (  # noqa: F401
+    RoutePolicy,
+    RoutePolicyError,
+    resolve_route_policy,
+    _ENV_ROUTE_POLICY,
+)
+
 from .faigate_adapter import (  # noqa: F401
     CouncilProvider,
     FaigateProvider,
     ModelInfo,
     ModelResolution,
+    EgressGatewayError,
     ROUTER_PROFILES,
     detect_providers,
     get_best_provider,
@@ -107,6 +124,36 @@ from .harness_adapter import (  # noqa: F401
     RouterSeam,
     register_plugins,
     tier_for_complexity,
+    # Headless transport vocabulary + helpers (SW-1510-OPENCLAUDE)
+    HEADLESS_PRINT_ARGV,
+    HEADLESS_INPUT_FORMAT_STREAM_JSON,
+    HEADLESS_OUTPUT_FORMAT_STREAM_JSON,
+    HEADLESS_ENV_ALLOWLIST,
+    HEADLESS_PERMISSION_MODES,
+    PERMISSION_MODE_DEFAULT,
+    PERMISSION_MODE_DONT_ASK,
+    AMBIENT_PROVIDER_ENV_KEYS,
+    HEADLESS_EVENT_PERMISSION_DENIED,
+    HEADLESS_EVENT_INPUT_REQUIRED,
+    HEADLESS_EVENT_WORKER_EXIT,
+    HEADLESS_EVENT_RESULT_ERROR,
+    HEADLESS_EVENT_RAW,
+    HEADLESS_INPUT_REQUIRED_MARKER,
+    HEADLESS_PERMISSION_DENIED_MARKER,
+    DEFAULT_MAX_PROMPT_BYTES,
+    OBSERVER_OWNED_FILENAMES,
+    clean_launch_environment,
+    classify_headless_event,
+    parse_headless_events,
+    headless_terminal_status,
+    check_prompt_size,
+    check_surface,
+    assert_not_observer_owned,
+    write_worker_scratch,
+    HeadlessEventRecord,
+    HeadlessStreamIngest,
+    ingest_headless_stream,
+    HeadlessResult,
 )
 
 __all__ = [
@@ -130,6 +177,13 @@ __all__ = [
     "tier_to_router",
     "tier_to_mode",
     "ResolutionRecord",
+    "RouteProof",
+    "RouteProofError",
+    "EgressGatewayError",
+    "RoutePolicy",
+    "RoutePolicyError",
+    "resolve_route_policy",
+    "_ENV_ROUTE_POLICY",
     "HarnessSource",
     "HarnessError",
     "HarnessDetermination",
@@ -182,4 +236,33 @@ __all__ = [
     "HarnessAdapterRegistry",
     "register_plugins",
     "OpenClaudeAdapter",
+    "HEADLESS_PRINT_ARGV",
+    "HEADLESS_INPUT_FORMAT_STREAM_JSON",
+    "HEADLESS_OUTPUT_FORMAT_STREAM_JSON",
+    "HEADLESS_ENV_ALLOWLIST",
+    "HEADLESS_PERMISSION_MODES",
+    "PERMISSION_MODE_DEFAULT",
+    "PERMISSION_MODE_DONT_ASK",
+    "AMBIENT_PROVIDER_ENV_KEYS",
+    "HEADLESS_EVENT_PERMISSION_DENIED",
+    "HEADLESS_EVENT_INPUT_REQUIRED",
+    "HEADLESS_EVENT_WORKER_EXIT",
+    "HEADLESS_EVENT_RESULT_ERROR",
+    "HEADLESS_EVENT_RAW",
+    "HEADLESS_INPUT_REQUIRED_MARKER",
+    "HEADLESS_PERMISSION_DENIED_MARKER",
+    "DEFAULT_MAX_PROMPT_BYTES",
+    "OBSERVER_OWNED_FILENAMES",
+    "clean_launch_environment",
+    "classify_headless_event",
+    "parse_headless_events",
+    "headless_terminal_status",
+    "check_prompt_size",
+    "check_surface",
+    "assert_not_observer_owned",
+    "write_worker_scratch",
+    "HeadlessEventRecord",
+    "HeadlessStreamIngest",
+    "ingest_headless_stream",
+    "HeadlessResult",
 ]

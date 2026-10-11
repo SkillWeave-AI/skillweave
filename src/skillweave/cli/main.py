@@ -48,6 +48,8 @@ from skillweave.dispatch import cli as dispatch
 from skillweave.cli import observe as observe_mod
 from skillweave.cli import planning_sync as planning_sync_mod
 from skillweave.cli import assess as assess_mod
+from skillweave.cli import support as support_mod
+from skillweave.runlifecycle import cli as runlifecycle_cli
 
 # ── Entry exit semantics (SW-156-ENTRY-003) ─────────────────────────────────
 
@@ -163,6 +165,55 @@ def _build_parser(prog: str = "skillweave") -> argparse.ArgumentParser:
         add_help=False,
     )
 
+    # `start` subcommand -- async run lifecycle
+    subparsers.add_parser(
+        "start",
+        help="Start a command, optionally as a durable async run",
+        parents=[runlifecycle_cli.build_start_parser()],
+        add_help=False,
+    )
+
+    # `inspect` subcommand -- async run state/events inspection
+    subparsers.add_parser(
+        "inspect",
+        help="Inspect a run's state and events (snapshot or follow)",
+        parents=[runlifecycle_cli.build_inspect_parser()],
+        add_help=False,
+    )
+
+    # `kill` subcommand -- async run kill
+    subparsers.add_parser(
+        "kill",
+        help="Kill a run by its ID and recorded PID",
+        parents=[runlifecycle_cli.build_kill_parser()],
+        add_help=False,
+    )
+
+    # `cancel` subcommand -- identity-verified native cancellation
+    subparsers.add_parser(
+        "cancel",
+        help="Cancel an owned run after verifying its process identity",
+        parents=[runlifecycle_cli.build_cancel_parser()],
+        add_help=False,
+    )
+
+    # `resume` subcommand -- launch a new identified attempt
+    subparsers.add_parser(
+        "resume",
+        help="Resume a run by launching a new identified attempt",
+        parents=[runlifecycle_cli.build_resume_parser()],
+        add_help=False,
+    )
+
+    # `support` subcommand -- the versioned support table + shared state
+    # interpretation (SW-1510-CLI criterion 2). Read-only.
+    subparsers.add_parser(
+        "support",
+        help="Print the versioned surface support table and shared state interpretation",
+        parents=[support_mod.build_parser()],
+        add_help=False,
+    )
+
     return parser
 
 
@@ -208,6 +259,18 @@ def main(
         return planning_sync_mod.main(subcommand_argv(args_list))
     elif args.command == "assess":
         return assess_mod.main(subcommand_argv(args_list))
+    elif args.command == "start":
+        return runlifecycle_cli.main_start(subcommand_argv(args_list))
+    elif args.command == "inspect":
+        return runlifecycle_cli.main_inspect(subcommand_argv(args_list))
+    elif args.command == "kill":
+        return runlifecycle_cli.main_kill(subcommand_argv(args_list))
+    elif args.command == "cancel":
+        return runlifecycle_cli.main_cancel(subcommand_argv(args_list))
+    elif args.command == "resume":
+        return runlifecycle_cli.main_resume(subcommand_argv(args_list))
+    elif args.command == "support":
+        return support_mod.main(subcommand_argv(args_list))
     else:
         parser.print_help()
         return 1
@@ -221,7 +284,7 @@ def subcommand_argv(args_list: Sequence[str]) -> list:
     from the subcommand's own index is correct for both call styles.
     """
     for index, token in enumerate(args_list):
-        if token in ("onboard", "entry", "dispatch", "run", "rework", "planning-sync", "assess"):
+        if token in ("onboard", "entry", "dispatch", "run", "rework", "planning-sync", "assess", "start", "inspect", "kill", "cancel", "resume", "support"):
             return list(args_list[index + 1:])
     return []
 

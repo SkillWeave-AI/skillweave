@@ -1,0 +1,21 @@
+{
+  "projectName": "Compatibility proof — a task with no data-boundary change",
+  "version": "1.0",
+  "status": "draft",
+  "tasks": [
+    {
+      "id": "COMP-001",
+      "title": "Pure refactor with no boundary crossing",
+      "description": "Renames a local helper and adds unit tests. It crosses no storage, process, adapter, telemetry or public-api boundary, so it declares no boundaries block and must validate exactly as before.",
+      "acceptanceCriteria": [
+        "The helper is renamed and all call sites updated",
+        "Existing unit tests still pass unchanged"
+      ],
+      "priority": "medium",
+      "points": 2,
+      "dependsOn": [],
+      "type": "refactor",
+      "passes": false
+    }
+  ]
+}

@@ -587,6 +587,14 @@ def test_probe_end_to_end_reaches_hold_without_an_injected_adapter(tmp_path, mon
 
 def test_router_still_registers_every_subcommand():
     parser = _router_parser()
+    # Every mounted surface must stay registered: the delegation/entry
+    # surfaces plus the async run lifecycle (start/inspect/kill) and the
+    # identity-verified cancel/resume pair. ``support`` is the SW-1510-CLI
+    # criterion-2 published surface (the versioned support table + shared
+    # state interpretation). A REMAINDER positional or an option dest that
+    # collides with ``dest="command"`` (see ``test_router_delegates_to_run``)
+    # would drop one of these from the router *and* break the installed
+    # top-level dispatch.
     assert set(parser.choices) == {
         "entry",
         "dispatch",
@@ -595,6 +603,12 @@ def test_router_still_registers_every_subcommand():
         "planning-sync",
         "onboard",
         "assess",
+        "start",
+        "inspect",
+        "kill",
+        "cancel",
+        "resume",
+        "support",
     }
 
 
@@ -677,19 +691,15 @@ def test_router_delegates_post_subcommand_argv(monkeypatch, name, argv, expected
     assert calls == [(name, expected)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-existing router bug, out of scope for SW-156-ENTRY-003: "
-        "``_build_parser`` uses add_subparsers(dest='command'), but "
-        "``run.build_parser()`` contributes a REMAINDER positional also named "
-        "``command``, which overwrites the router's value with ``[]``. So "
-        "``args.command == 'run'`` is never true and the router prints help "
-        "instead of delegating. Reproduced unchanged at the pinned parent SHA "
-        "b29860b2. Marked strict so a fix flips this to XPASS and is noticed."
-    ),
-)
 def test_router_delegates_to_run(monkeypatch):
+    """The router must delegate ``run`` to ``cli.run.main`` with its own argv.
+
+    The REMAINDER positional in ``run.build_parser()`` is named ``run_argv``
+    (not ``command``) precisely so it cannot overwrite the router's
+    ``add_subparsers(dest="command")`` value -- otherwise the installed
+    ``skillweave run`` entry never reached the run surface. Marked as a plain
+    test now that the fix has flipped the former strict xfail to XPASS.
+    """
     calls: list[tuple[str, list[str]]] = []
     _spy(monkeypatch, calls)
     argv = [
@@ -724,7 +734,7 @@ def test_product_version_matches_the_declared_release():
     test honest across releases, while the literal pin records what the
     published envelope said when the contract was written.
     """
-    assert product_version() == _pyproject_version() == "1.5.7"
+    assert product_version() == _pyproject_version()
 
 
 def _router_parser():

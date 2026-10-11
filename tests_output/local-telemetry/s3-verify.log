@@ -1,0 +1,6 @@
+== SW-159-TELEMETRY-001 S3 verification ==
+repo=/Users/andrelange/workspaces/skillweave-temp/.worktrees/sw159/run-1/sw-159-telemetry-001
+head=2223a598e455f75aa0873d5c5188b15caeae5441
+branch=feature/sw-159-telemetry-001
+  [schema] {"digest_prefix": "06cc496414fc8595", "kind": "skillweave.local-telemetry", "round_trip": true, "schema_version": 1, "tamper_detected": true, "unknown_key_refused": true}
+prohibited-content: blocked_key_secret was accepted

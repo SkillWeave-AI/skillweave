@@ -50,6 +50,20 @@ class ModelNamespaceError(ValueError):
         self.reason = reason
 
 
+class EgressGatewayError(ValueError):
+    """An egress gateway check failed (criterion 2).
+
+    Raised when a URL does not route through the approved enforcing gateway.
+    This is distinct from a model namespace error: the check names the failing
+    check (``egress_gateway``) so a caller can produce a clear HOLD reason.
+    """
+
+    def __init__(self, url: str, reason: str):
+        super().__init__(f"egress_gateway check failed for {url!r}: {reason}")
+        self.url = url
+        self.reason = reason
+
+
 class UnavailableModelError(RuntimeError):
     """The provider confirmed it cannot serve the requested model id."""
 
@@ -490,6 +504,22 @@ class AttributedResponse(str):
         obj.substituted = flag
         return obj
 
+    def __getnewargs_ex__(self) -> tuple[tuple[str], dict[str, Any]]:
+        """Hand ``copy`` and ``pickle`` the keyword-only arguments ``__new__`` needs.
+
+        Both rebuild a ``str`` subclass by calling ``__new__``. Without this they
+        pass the text alone, and ``dataclasses.asdict()`` or ``copy.deepcopy()``
+        on a council result raises ``TypeError``. The recorded substitution
+        verdict is handed over as recorded, never recomputed.
+        """
+        return (str(self),), {
+            "requested_model": self.requested_model,
+            "answering_model": self.answering_model,
+            "provider": self.provider,
+            "served_by": self.served_by,
+            "is_substituted": self.is_substituted,
+        }
+
 
 def _extract_answer(envelope: dict, requested_model: str, provider: str = "unknown") -> AttributedResponse:
     """Read the answer content, actual answering model, and served_by from a response.
@@ -771,7 +801,7 @@ FAIGATE_DEFAULT_PORT = "8090"
 
 
 class FaigateProvider(CouncilProvider):
-    def __init__(self, base_url: str | None = None, api_key: str | None = None, cache_ttl: float | None = None):
+    def __init__(self, base_url: str | None = None, api_key: str | None = None, cache_ttl: float | None = None, *, enforce_egress: bool = False):
         super().__init__()
         self.base_url = (base_url or os.environ.get(
             "FAIGATE_BASE_URL",
@@ -781,6 +811,16 @@ class FaigateProvider(CouncilProvider):
         self.api_key = api_key or os.environ.get("FAIGATE_API_KEY")
         if cache_ttl is not None:
             self._cache_ttl = cache_ttl
+        # SW-1510-ROUTE-LOCK: when egress enforcement is active, verify the
+        # resolved base_url routes through the approved gateway.  This catches
+        # alternative loopback routers and direct upstream URLs before any
+        # network call — even when the env-var config points elsewhere.
+        if enforce_egress:
+            check_egress_gateway(
+                self.base_url,
+                approved_host=os.environ.get("FAIGATE_HOST", FAIGATE_DEFAULT_HOST),
+                approved_port=int(os.environ.get("FAIGATE_PORT", FAIGATE_DEFAULT_PORT)),
+            )
         # If no explicit key, try reading from ~/.config/faigate/tokens.json
         if not self.api_key:
             token_file = os.path.expanduser("~/.config/faigate/tokens.json")
@@ -1455,3 +1495,370 @@ def _profile_pin(profile: "RoutingProfile") -> Optional[str]:
     if len(pins) == 1:
         return next(iter(pins))
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SW-1510-ROUTE-LOCK: Route decision records, gateway enforcement, and
+# BytePlus V4 Flash / V4.1 Flash / Pro route enforcement.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# No provider literals, port constant or revision literal live in generic
+# Core source — the owner ``RoutePolicy`` document supplies them all.
+# Functions that need the approved route set, gateway address, or policy
+# revision accept an optional ``RoutePolicy`` parameter; when none is
+# provided they use safe defaults or raise ``RoutePolicyError``.
+
+
+@dataclass
+class RouteDecision:
+    """Full record of a route decision (SW-1510-ROUTE-LOCK criterion 1).
+
+    Every request — parent or nested — retains its full identity chain so a
+    later reader can reconstruct the request → resolution → answer path
+    without guessing.  When answering envelope identity is not observable it
+    is left as ``None``, never fabricated.
+
+    The ``to_dict()`` output conforms to the ``route-decision-v1`` contract
+    schema (``https://skillweave.dev/schemas/execution/route-decision/v1``).
+    The contract fields are:
+
+    * ``request_id`` — maps from ``correlation_id`` (the unique request
+      identifier linking parent and nested requests).
+    * ``parent_request_id`` — the parent correlation, empty for root requests.
+    * ``requested_model`` — maps from ``requested_alias``.
+    * ``answering_model`` — maps from ``answering_envelope_identity``;
+      empty string when not yet known or not reported by the provider.
+
+    Extra routing, catalog, and policy revision data that is not part of the
+    contract schema is kept in ``_journal_meta`` and emitted as a separate
+    ``_meta`` field in the journal event payload (outside the contract payload).
+    """
+
+    correlation_id: str
+    requested_alias: str
+    resolved_provider: str
+    resolved_model: str
+    answering_envelope_identity: Optional[str] = None
+    catalog_revision: str = ""
+    policy_revision: str = ""
+    # Contract fields for route-decision-v1 compliance
+    run_id: str = ""
+    task_id: str = ""
+    attempt: int = 0
+    reservation_id: str = ""
+    attempt_order: list[str] = field(default_factory=list)
+    attribution_status: str = "unknown"
+    outcome: str = "pending"
+    measured_at: str = ""
+
+    def _compute_parent_request_id(self) -> str:
+        """Derive parent_request_id from correlation_id.
+
+        A correlation_id like ``run-001/task-01/nested-01`` has a parent of
+        ``run-001/task-01``.  A root request (no ``/nested`` segment beyond
+        the first) returns empty string.
+        """
+        parts = self.correlation_id.split("/")
+        if len(parts) >= 3:
+            return "/".join(parts[:-1])
+        return ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a dict conforming to route-decision-v1 contract schema.
+
+        The payload carries the contract fields including ``resolved_provider``,
+        ``resolved_model``, ``catalog_revision`` and ``policy_revision`` as
+        required by the frozen SDK route-decision-v1 schema.  Extra routing
+        metadata (``correlation_id``, ``requested_alias``,
+        ``answering_envelope_identity``) is kept in the ``_meta`` key for
+        journal use only — never in the contract payload.
+        """
+        from datetime import datetime, timezone
+
+        measured = self.measured_at if self.measured_at else datetime.now(timezone.utc).isoformat()
+        answering = self.answering_envelope_identity if self.answering_envelope_identity is not None else ""
+
+        # SDK route-decision-v1 attribution_status enum:
+        # answered, substituted, unavailable, rate_limited, errored, unknown
+        _ATTR_MAP: dict[str, str] = {
+            "pending": "unknown",
+            "attributed": "answered",
+            "unattributed": "unavailable",
+            "substituted": "substituted",
+            "answered": "answered",
+            "unavailable": "unavailable",
+            "rate_limited": "rate_limited",
+            "errored": "errored",
+            "unknown": "unknown",
+        }
+        attr_status = _ATTR_MAP.get(self.attribution_status, "unknown")
+        # Derive outcome from answering state when still pending
+        outcome = self.outcome
+        if not outcome or outcome == "pending":
+            outcome = "resolved" if answering else "pending"
+
+        contract_payload = {
+            "schema_version": "1.0.0",
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "attempt": self.attempt,
+            "request_id": self.correlation_id,
+            "parent_request_id": self._compute_parent_request_id(),
+            "requested_model": self.requested_alias,
+            "answering_model": answering,
+            "resolved_provider": self.resolved_provider,
+            "resolved_model": self.resolved_model,
+            "catalog_revision": self.catalog_revision,
+            "policy_revision": self.policy_revision,
+            "attribution_status": attr_status,
+            "reservation_id": self.reservation_id or "none",
+            "attempt_order": self.attempt_order,
+            "measured_at": measured,
+            "outcome": outcome,
+            "usage": {},
+        }
+        return contract_payload
+
+    def to_journal_dict(self) -> dict[str, Any]:
+        """Full journal payload: contract payload plus extra metadata.
+
+        The ``_meta`` sub-dict carries routing, catalog, and policy data
+        that is outside the contract schema.  This is the dict persisted
+        to the event journal; the contract payload is ``contract``.
+        """
+        return {
+            "contract": self.to_dict(),
+            "_meta": {
+                "correlation_id": self.correlation_id,
+                "requested_alias": self.requested_alias,
+                "resolved_provider": self.resolved_provider,
+                "resolved_model": self.resolved_model,
+                "answering_envelope_identity": self.answering_envelope_identity,
+                "catalog_revision": self.catalog_revision,
+                "policy_revision": self.policy_revision,
+            },
+        }
+
+
+def make_route_decision(
+    correlation_id: str,
+    requested_alias: str,
+    resolved_provider: str,
+    resolved_model: str,
+    answering_envelope_identity: Optional[str] = None,
+    catalog_revision: str = "",
+    policy_revision: str = "",
+    *,
+    run_id: str = "",
+    task_id: str = "",
+    attempt: int = 0,
+    reservation_id: str = "",
+    attempt_order: Optional[list[str]] = None,
+    attribution_status: str = "unknown",
+    outcome: str = "pending",
+    measured_at: str = "",
+    route_policy: Any = None,
+) -> RouteDecision:
+    """Build a ``RouteDecision`` with the given identity chain.
+
+    ``catalog_revision`` and ``policy_revision`` can be supplied explicitly or
+    sourced from *route_policy* when provided.  If neither is available the
+    values remain empty strings.
+
+    The keyword-only contract fields (``run_id``, ``task_id``, ``attempt``,
+    ``reservation_id``, etc.) are passed through to the route-decision-v1
+    conformant ``to_dict()``.
+
+    *route_policy*: when given, its ``policy_revision`` is used as the default
+    for ``catalog_revision`` and ``policy_revision`` if not explicitly set.
+    """
+    from datetime import datetime, timezone
+
+    measured = measured_at or datetime.now(timezone.utc).isoformat()
+    if route_policy is not None:
+        rev = route_policy.policy_revision or ""
+        catalog_revision = catalog_revision or rev
+        policy_revision = policy_revision or rev
+    return RouteDecision(
+        correlation_id=correlation_id,
+        requested_alias=requested_alias,
+        resolved_provider=resolved_provider,
+        resolved_model=resolved_model,
+        answering_envelope_identity=answering_envelope_identity,
+        catalog_revision=catalog_revision,
+        policy_revision=policy_revision,
+        run_id=run_id,
+        task_id=task_id,
+        attempt=attempt,
+        reservation_id=reservation_id,
+        attempt_order=attempt_order if attempt_order is not None else [],
+        attribution_status=attribution_status,
+        outcome=outcome,
+        measured_at=measured,
+    )
+
+
+def is_byteplus_route(resolved_model: str, route_policy: Any = None) -> bool:
+    """Whether ``resolved_model`` is an approved BytePlus route (criterion 3).
+
+    An approved route is one whose provider prefix and model name match
+    the approved route set from the owner ``RoutePolicy``.  Unknown routes,
+    wrong versions, or direct-provider bypasses (no ``byteplus/`` prefix)
+    return ``False``, causing the caller to HOLD.
+
+    When *route_policy* is provided its ``approved_routes`` set is used.
+    When absent the function attempts to resolve from the environment via
+    :func:`resolve_route_policy`.  If no policy is configured no route is
+    approved (fail closed).
+    """
+    approved: frozenset[str]
+    if route_policy is not None:
+        approved = route_policy.approved_routes
+    else:
+        try:
+            from skillweave.routing.route_policy import resolve_route_policy
+            policy = resolve_route_policy()
+            approved = policy.approved_routes if policy is not None else frozenset()
+        except Exception:
+            approved = frozenset()
+    return resolved_model in approved
+
+
+def verify_approved_route(resolved_model: str, provider: str = "faigate",
+                          route_policy: Any = None) -> None:
+    """Verify that ``resolved_model`` is an approved BytePlus route.
+
+    Raises ``ModelNamespaceError`` (HOLD) when the route is not approved.
+    This is the fail-closed check: a model that does not match the approved
+    route set is refused before any provider call, not silently routed to an
+    unapproved provider.
+
+    The provider itself must be the approved gateway (``faigate``).  A
+    direct-provider bypass (e.g. ``openrouter``, ``single_model``) or an
+    alternative router is also refused here — before any paid admission.
+
+    When *route_policy* is provided its ``approved_routes`` set is used.
+    When absent the function attempts to resolve from the environment.
+    """
+    if provider not in ("faigate",):
+        raise ModelNamespaceError(
+            resolved_model,
+            f"provider {provider!r} is not the approved gateway; "
+            "direct-provider bypass is not allowed",
+        )
+    if not is_byteplus_route(resolved_model, route_policy=route_policy):
+        approved_routes: frozenset[str] = frozenset()
+        if route_policy is not None:
+            approved_routes = route_policy.approved_routes
+        raise ModelNamespaceError(
+            resolved_model,
+            f"model {resolved_model!r} is not an approved BytePlus route; "
+            f"approved routes: {sorted(approved_routes)}",
+        )
+
+
+def check_egress_gateway(
+    url: str,
+    *,
+    approved_host: str = "127.0.0.1",
+    approved_port: int = 8090,
+) -> None:
+    """Verify that ``url`` routes through the approved Faigate gateway.
+
+    Criterion 2: worker and child egress is restricted to the approved
+    enforcing gateway.  Alternative loopback routers (different ports,
+    different hosts), suffix/subdomain attacks
+    (``127.0.0.1:8090.evil.com``), userinfo tricks, trailing-dot hosts,
+    IPv6/IPv4 aliases that are not the approved host:port, and direct
+    upstream URLs are detected and refused using exact URL parsing
+    (scheme, hostname, port).  When enforcement is absent the check
+    raises before any paid admission.
+
+    ``approved_host`` and ``approved_port`` default to the fixture policy
+    values but are overridable from a loaded :class:`RoutePolicy` so no
+    provider literals live in generic Core source.
+
+    Raises ``EgressGatewayError`` with a description of the disallowed
+    egress path (not ``ModelNamespaceError``, so the error message names
+    ``egress_gateway`` instead of ``invalid model namespace``).
+    """
+    from urllib.parse import urlparse
+
+    if not url:
+        raise EgressGatewayError(
+            url,
+            f"egress URL is empty; approved gateway is "
+            f"http://{approved_host}:{approved_port}",
+        )
+
+    parsed = urlparse(url)
+
+    # Reject non-HTTP schemes (e.g. https, ftp, file)
+    if parsed.scheme != "http":
+        raise EgressGatewayError(
+            url,
+            f"egress URL uses scheme {parsed.scheme!r}; "
+            f"only http is allowed through the approved gateway "
+            f"at http://{approved_host}:{approved_port}",
+        )
+
+    # Reject userinfo (e.g. http://user:pass@127.0.0.1:8090)
+    if parsed.username is not None or parsed.password is not None:
+        raise EgressGatewayError(
+            url,
+            f"egress URL contains userinfo; "
+            f"approved gateway http://{approved_host}:{approved_port} "
+            f"must not have credentials",
+        )
+
+    # Exact hostname and port comparison
+    if parsed.hostname != approved_host:
+        raise EgressGatewayError(
+            url,
+            f"egress URL resolves to host {parsed.hostname!r}; "
+            f"only {approved_host!r} is the approved gateway host; "
+            "alternative loopback routers and direct upstream URLs are "
+            "not allowed",
+        )
+
+    # parsed.port returns None when no explicit port (defaults to scheme default)
+    # and raises ValueError when the port portion is non-numeric (e.g.
+    # "8090.evil.com" in a suffix-attack URL like 127.0.0.1:8090.evil.com).
+    try:
+        actual_port = parsed.port
+    except ValueError:
+        actual_port = None
+    if actual_port is None or actual_port != approved_port:
+        raise EgressGatewayError(
+            url,
+            f"egress URL uses port {actual_port!r}; "
+            f"only port {approved_port} is the approved "
+            f"gateway port; alternative loopback routers on different "
+            f"ports are not allowed",
+        )
+
+
+def check_retry_attribution(
+    attempt: int,
+    requested_route: str,
+    allowed_routes: Optional[set[str]] = None,
+) -> None:
+    """Verify a retry/escalation has proper attempt attribution (criterion 4).
+
+    Each retry must carry its own new attempt attribution (``attempt >= 1``)
+    and the requested route must be within the approved route set.  When
+    ``allowed_routes`` is set and the requested route is not in it, the
+    retry is refused — raw upstream names or global environment keys cannot
+    override the approved route set.
+
+    Raises ``ValueError`` when the retry attribution is invalid.
+    """
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise ValueError(
+            f"retry attempt must be a positive integer, got {attempt!r}"
+        )
+    if allowed_routes is not None and requested_route not in allowed_routes:
+        raise ValueError(
+            f"retry route {requested_route!r} is not in allowed routes "
+            f"{sorted(allowed_routes)}"
+        )
