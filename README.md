@@ -1,7 +1,7 @@
 # SkillWeave
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.5.9-blue)](https://github.com/SkillWeave-AI/skillweave/releases/tag/v1.5.9)
+[![Version](https://img.shields.io/badge/version-1.5.10-blue)](https://github.com/SkillWeave-AI/skillweave/releases/tag/v1.5.10)
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![Skills](https://img.shields.io/badge/skills-15-blue)](skills/)
 [![Status](https://img.shields.io/badge/status-production--stable-green)](https://github.com/SkillWeave-AI/skillweave)
@@ -13,21 +13,21 @@ SkillWeave orchestrates AI-assisted product development from idea to post-releas
 
 ---
 
-## What's new in 1.5.9
+## What's new in 1.5.10
 
-- **Contract Authority**: Core validates against the published `skillweave-sdk`
-  0.2.0 contract set, with cross-repo contract CI and a drift counterproof.
-- **Work Contracts & Methodology Registry**: discriminated `SubjectRef`
-  variants and a versioned registry for the REX, Ralph, Gauntlet and Assay
-  methodologies.
-- **Assay methodology**: an append-only
-  PIN → HYPOTHESIS → PROBE → MEASURE → CLASSIFY → REMEDIATE → PASS/HOLD state
-  machine with conservative, moderate and unicorn autonomy policies.
-- **Durable async run lifecycle**: `start`/`inspect`/`kill` with durable state.
+- **Native execution surfaces**: an identity-verified lifecycle store and
+  durable execution stream, native Assay, and Scope, Skills, Verify, Cancel and
+  Budget enforcement through the authoritative run path.
+- **Route-lock and MCP control/authority**: the `route-decision-v1` payload with
+  egress confinement, a server-owned MCP authority that gates every tool, and a
+  durable harness-neutral agent mailbox served over both transports.
+- **Trustworthy publishing**: one honest publish identity carried to both
+  forges, with the Core/SDK contracts qualified against the installed wheel.
 
-See the [1.5.9 changelog](CHANGELOG.md#v159-2026-09-30--contract-authority-work-contracts--methodology-registry)
-for the full release contract. Earlier release notes remain in the
-[changelog](CHANGELOG.md) as history.
+See the [1.5.10 changelog](CHANGELOG.md#v1510-2026-10-11--native-execution-route-lock-mcp-control--trustworthy-publishing)
+for the full release contract. `1.5.10` is the release in preparation — **not
+yet released** until its `v1.5.10` tag exists. Earlier release notes remain in
+the [changelog](CHANGELOG.md) as history.
 
 ---
 
@@ -101,7 +101,7 @@ cap install skillweave
 ### From a built wheel
 
 ```bash
-python -m pip install ./skillweave-1.5.9-py3-none-any.whl
+python -m pip install ./skillweave-1.5.10-py3-none-any.whl
 ```
 
 `skillweave` declares `requires-python >=3.9`; Python 3.9 is the supported
@@ -362,13 +362,15 @@ number. The declared, machine-checked inventory is
 
 | Fact | Meaning | Current value |
 |------|---------|---------------|
-| **candidate** | `[project].version` in `pyproject.toml` (the source of truth) and the bundle `capability.yaml` | `1.5.9` |
-| **released** | the latest canonical annotated product tag, by its **peeled commit** | `v1.5.9` → `11a6fe7…` |
-| **installed** | the distribution metadata of a local install (`importlib.metadata`) | `1.5.9` (may be absent) |
-| **advertised early** | a version named but not yet released | `1.5.10` (work in progress; **not** released) |
+| **candidate** | `[project].version` in `pyproject.toml` (the source of truth) and the bundle `capability.yaml` | `1.5.10` |
+| **released** | the latest canonical **annotated** product tag, by its **peeled commit** (`git rev-parse '<tag>^{}'`) | the tag rule above, printed in full by [docs/version-truth.md](docs/version-truth.md) |
+| **installed** | the distribution metadata of a local install (`importlib.metadata`) | `1.5.10` (may be absent) |
+| **advertised early** | a version named but not yet released | `1.5.10` (the release in preparation; **not yet released** until its tag exists) |
 
-The version badge above advertises the **released** fact. Candidate `1.5.10` is
-in progress and is deliberately **not** presented as released. Historical
+The version badge above advertises the candidate `1.5.10`, the release **in
+preparation** — it is deliberately **not** presented as released until its
+`v1.5.10` tag exists. The released fact, whenever it is needed, is derived by
+the peeled-tag rule from the repository rather than printed here. Historical
 versions (for example the `1.4.0` note in *Host-Neutral Scope*) appear only as
 explicitly historical statements. See
 [docs/version-truth.md](docs/version-truth.md) for the full rule, the
