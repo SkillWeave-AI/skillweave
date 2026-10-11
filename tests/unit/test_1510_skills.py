@@ -96,7 +96,7 @@ _spec.loader.exec_module(rs)  # type: ignore[union-attr]
 
 FIXTURES = _REPO_ROOT / "tests" / "fixtures" / "sw-1510-skills"
 DISCOVERY_DIR = FIXTURES / "discovery"
-PRD_JSON = FIXTURES / "prd.json"
+PRD_JSON = FIXTURES / "work-plan.json"
 DISPATCH_PROFILE = _REPO_ROOT / "tests" / "fixtures" / "dispatch-profile.yaml"
 PROMPT_SEQUENCE_SCHEMA = _REPO_ROOT / "schemas" / "prompt-sequence.schema.json"
 DISPATCH_SEQUENCE_SCHEMA = _REPO_ROOT / "schemas" / "dispatch-sequence.schema.json"
