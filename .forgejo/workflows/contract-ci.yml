@@ -23,23 +23,34 @@
 # The authoritative gate is now ``tests/unit/test_1510_sdk_ci.py``, which runs
 # against the *installed wheel* built from the pinned SDK.
 #
+# Original SW-160-CONTRACT-003 guarantees retained across the reconciliation:
+#   * The SDK and Core pin a full tested SHA / exact version, and Contract CI
+#     does not depend on an unpublished local checkout: the SDK is resolved
+#     from its pin and cloned from the published Forgejo (contract authority)
+#     or GitHub (read-only mirror) source, never from a sibling checkout or an
+#     unpublished path.
+#   * Every SDK schema and every Core fixture is actually validated, and an
+#     intentional one-byte SDK schema drift makes the consumer gate red.
+#   * The tested-combination manifest checks the exact Core SHA, SDK SHA, SDK
+#     version and canonical digest — not only non-null values.
+#
 # SW-1591-CI-001: the "Resolve pinned SDK version" inline Python is indented to
 # the block scalar's own indentation. Commit 16e95d5 fixed exactly these six
 # lines; without them YAML parsing stops at the `import re` line and the whole
 # workflow never runs (a false-green boundary).
 #
-# Publication hold: the published SDK tag ``v0.2.0`` predates the frozen
-# execution/adapter contract set, so the gate pins the *qualified commit*
-# (SDK_QUALIFIED_SHA) rather than the tag. The pin MUST be a commit whose wheel
-# ships the ownership payload INSIDE the installed package: the wheel at
-# ``a663a947`` carries no ``skillweave_sdk/_authority`` files at all, and the
-# wheel at ``bc86910`` ships them as a ``.data/data`` payload that a real
-# ``pip install`` lands at ``<sys.prefix>/skillweave_sdk/_authority`` (and drops
-# under ``--target``), so ``importlib.resources.files("skillweave_sdk") /
-# "_authority"`` finds nothing and the gate is RED at that pin. The pin is
-# therefore the SDK head that ships the inventory as installed package data.
-# When an authorized publisher cuts a tag that carries the frozen set,
-# SDK_QUALIFIED_SHA may be replaced by that tag. This lane cannot publish; it
+# Publication state: an authorized publisher has now cut SDK tag ``v0.3.0``
+# and its qualified commit (SDK_QUALIFIED_SHA / ``2a4e2caa``) carries the
+# frozen execution/adapter contract set. SDK_QUALIFIED_SHA remains the exact
+# commit the gate checks out — the tag is distribution provenance and may lag
+# the pinned commit, so the pin is the commit. The pin MUST be a commit whose
+# wheel ships the ownership payload INSIDE the installed package: an earlier
+# wheel carried no ``skillweave_sdk/_authority`` files at all, and another
+# shipped them as a ``.data/data`` payload that a real ``pip install`` lands at
+# ``<sys.prefix>/skillweave_sdk/_authority`` (and drops under ``--target``), so
+# ``importlib.resources.files("skillweave_sdk") / "_authority"`` finds nothing
+# and the gate is RED at those pins. The pin is therefore the SDK head that
+# ships the inventory as installed package data. This lane cannot publish; it
 # can only name the qualified combination.
 
 name: Contract CI — Cross-Repo Contract Validation
@@ -60,7 +71,7 @@ env:
   # the installed package. a663a947 ships no payload; bc86910 ships it as a
   # .data/data payload that a real pip install places outside the package, so
   # the gate would be red at either pin.
-  SDK_QUALIFIED_SHA: "7688f665669fc1be35ae40c70ecf3870518a9d23"
+  SDK_QUALIFIED_SHA: "2a4e2caa420d7578e29b0ad9ba584d676c89fb7b"
   # The frozen canonical digest of the full schema set (flat + execution +
   # adapter), computed with the SDK's own algorithm over the installed wheel.
   QUALIFIED_DIGEST: "3dd247f604017bac4ff37ff4f3e9b46c5d1bc48fc8ef225de88ec4b6d14d2e64"
@@ -103,7 +114,7 @@ jobs:
           echo "SDK pin: ${SDK_PIN}"
           echo "version=${SDK_PIN}" >> "$GITHUB_OUTPUT"
 
-      - name: Check out the qualified SDK from a published source
+      - name: Check out pinned SDK from a published source
         env:
           SDK_VERSION: ${{ steps.sdk-pin.outputs.version }}
         run: |
@@ -158,6 +169,18 @@ jobs:
               ;;
           esac
 
+      - name: Record SDK tag and full commit SHA
+        run: |
+          set -eu
+          echo "### Contract CI — pinned SDK" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| field | value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| tag | ${SKILLWEAVE_SDK_TAG} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| commit | ${SKILLWEAVE_SDK_SHA} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| remote | ${SKILLWEAVE_SDK_REMOTE} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| core | $(git rev-parse HEAD) |" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Record dependency origins and declared compatibility
         run: |
           set -eu
@@ -190,6 +213,13 @@ jobs:
           echo "Tool origins:" >> "$GITHUB_STEP_SUMMARY"
           pip show pytest jsonschema referencing PyYAML \
             | awk '/^Name:|^Version:|^Location:/ {print "- " $0}' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run cross-repo contract CI tests
+        env:
+          SKILLWEAVE_SDK_DIR: /tmp/skillweave-sdk
+        run: |
+          python3 -m pytest tests/integration/test_cross_repo_contract_ci.py \
+            -v --tb=short 2>&1
 
       - name: Run the cross-repo contract gate
         run: |
@@ -248,7 +278,7 @@ jobs:
         run: |
           pip install pytest PyYAML jsonschema referencing build "setuptools>=77" wheel
 
-      - name: Check out the qualified SDK from a published source
+      - name: Check out pinned SDK from a published source
         run: |
           set -eu
           SOURCES="git@git.langevc.com:skillweave/skillweave-sdk.git https://github.com/LangeVC/skillweave-sdk.git"
@@ -267,7 +297,7 @@ jobs:
           fi
           echo "SKILLWEAVE_SDK_DIR=/tmp/skillweave-sdk" >> "$GITHUB_ENV"
 
-      - name: Inject one declared drift into a frozen SDK schema
+      - name: Inject one-byte drift into a published SDK schema
         run: |
           set -eu
           TARGET="/tmp/skillweave-sdk/src/skillweave_sdk/schemas/run-state.schema.json"
@@ -290,7 +320,7 @@ jobs:
           PY
           echo "After:  $(sha256sum "${TARGET}" | cut -d' ' -f1)"
 
-      - name: Assert the drifted consumer run is red on the specific digest assertion
+      - name: Assert the drifted consumer run is red
         run: |
           set -eu
           export SKILLWEAVE_SDK_DIR=/tmp/skillweave-sdk
