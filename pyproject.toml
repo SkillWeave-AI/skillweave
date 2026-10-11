@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skillweave"
-version = "1.5.9"
+version = "1.5.10"
 description = "Multi-agent AI skill orchestration with Next Level features"
 readme = "README.md"
 authors = [
@@ -36,7 +36,7 @@ dependencies = [
     # an exact version and consumes the pinned artifact; it never copies the
     # schema authority into its own tree (see docs/architecture.md, "Repository
     # boundary", and tests/contract/test_preview_core_pro_boundary.py).
-    "skillweave-sdk==0.2.0",
+    "skillweave-sdk==0.3.0",
 ]
 
 [project.optional-dependencies]

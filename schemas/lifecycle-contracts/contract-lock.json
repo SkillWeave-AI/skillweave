@@ -4,7 +4,7 @@
     "version": "1.0.0"
   },
   "consumerReceipt": {
-    "sdkVersion": "0.2.0",
+    "sdkVersion": "0.3.0",
     "sdkCanonicalDigest": "f2ec1b0218dd380341cffb8bce80fc8d272d07ba244287f8af1ec6feb0db18d6",
     "consumedAt": "2026-09-29",
     "consumer": "skillweave-core"
