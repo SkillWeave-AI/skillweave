@@ -10,19 +10,19 @@
   "tested_combination": {
     "core_sha": "e04212860560111359c758a544207ac1cb8b1c96",
     "core_ref": "refs/heads/fix/SW-1591-core-sdk-contracts-run8",
-    "core_subject": "Merge SW-1591-CORE-001: migrate Core to published SDK 0.2.0 contract set",
-    "sdk_sha": "0cff095eedb40adaa583c02b5d6d4e7829927947",
-    "sdk_tag": "v0.2.0",
-    "sdk_version": "0.2.0",
+    "core_subject": "Merge SW-1591-CORE-001: migrate Core to published SDK 0.3.0 contract set",
+    "sdk_sha": "2a4e2caa420d7578e29b0ad9ba584d676c89fb7b",
+    "sdk_tag": "v0.3.0",
+    "sdk_version": "0.3.0",
     "sdk_source": "published (Forgejo canonical git@git.langevc.com:skillweave/skillweave-sdk.git; GitHub mirror https://github.com/LangeVC/skillweave-sdk.git)",
-    "sdk_pin_origin": "pyproject.toml declares skillweave-sdk==0.2.0; the installed SDK carries 13 schemas (4 core + 9 lifecycle) and is contract authority for all lifecycle contract bytes.",
-    "sdk_schema_count": 13,
+    "sdk_pin_origin": "pyproject.toml declares skillweave-sdk==0.3.0 (tag v0.3.0, qualified commit 2a4e2caa420d7578e29b0ad9ba584d676c89fb7b); the installed SDK carries 27 schema files (13 flat core/lifecycle + 11 execution + 3 adapter) and is contract authority for all lifecycle contract bytes.",
+    "sdk_schema_count": 27,
     "canonical_digest_algorithm": "sha256 of the sorted '<filename>\\x00<canonical_json>\\x00' concatenation of every SDK schemas/*.schema.json entry",
     "canonical_digest": "f2ec1b0218dd380341cffb8bce80fc8d272d07ba244287f8af1ec6feb0db18d6"
   },
   "shas": {
     "skillweave": "e04212860560111359c758a544207ac1cb8b1c96",
-    "skillweave-sdk": "0cff095eedb40adaa583c02b5d6d4e7829927947"
+    "skillweave-sdk": "2a4e2caa420d7578e29b0ad9ba584d676c89fb7b"
   },
   "digests": {
     "sdk-canonical": "f2ec1b0218dd380341cffb8bce80fc8d272d07ba244287f8af1ec6feb0db18d6",
