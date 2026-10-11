@@ -20,15 +20,21 @@ inventory to maintain by hand.
 | **installed** | `importlib.metadata.version("skillweave")` in the running interpreter | the version of the distribution that is actually present locally (may be *absent*) |
 | **advertised early** | a version named in docs/README before it ships | work in progress; must never be shown as *released* |
 
-Current values (verified by the check; a manual copy of this table is a
-snapshot, not the authority):
+Current values are **derived, never written here**: the check prints the
+candidate, the released tag and its peeled commit, the installed identity and
+the discovered observation on every run, and the `--json` output carries the
+same values. No literal version or commit hash for the *released* fact is
+recorded in this document — a copy here would be a snapshot that silently rots,
+and a hard-coded hash would contradict the policy that the released fact is
+*resolved* from the tag. Read the checker's output, or the table it prints, for
+the numbers that hold right now.
 
-| Fact | Value | Provenance |
-|------|-------|------------|
-| candidate | `1.5.9` | `pyproject.toml` `[project].version`; bundle `capability.yaml` `version:` |
-| released | `v1.5.9` → `11a6fe72295d02bdb18ad2eaa0ed34837164e803` | tag object `6ab653d3c61dec4b0f6b313720e8c7c3b7e89c84` peeled with `git rev-parse 'v1.5.9^{}'` |
-| installed | `1.5.9` (in this qualification venv); may be **not installed** | `importlib.metadata` |
-| advertised early | `1.5.10` (**not released**) | the in-flight addendum target release |
+| Fact | Where it is derived from | What it means |
+|------|--------------------------|---------------|
+| candidate | `pyproject.toml` `[project].version`; bundle `capability.yaml` `version:` | the version the checked-out tree would build |
+| released | `git tag --list 'v*'` → highest semver → `git rev-parse '<tag>^{}'` | what the canonical tag's peeled commit declares |
+| installed | `importlib.metadata` in the running interpreter | what is present locally (may be **not installed**) |
+| advertised early | the badge / "What's new" heading / CHANGELOG top | a candidate named before it ships; never shown as *released* |
 
 ## Released is a peeled commit, never "equals HEAD"
 
@@ -40,35 +46,19 @@ obtained with `git rev-parse '<tag>^{}'`. A release check must therefore:
 2. bind the released version to **canonical release metadata** (the tag's own
    subject line) rather than to `branch HEAD`.
 
-These are different statements on purpose. In this checkout the peeled commit
-of `v1.5.9` (`11a6fe7…`) is **not** the current branch tip (`5ccfb9d…`), and it
-is not an ancestor of it either: later commits were composed on top of the
-released tag. Requiring `tag == HEAD` would make every one of those legitimate
-later commits look like a broken release. The peeled-tag policy says instead:
-*the released version is whatever the canonical tag's subject declares, at the
-commit the tag peels to.*
+These are different statements on purpose. The latest release tag's peeled
+commit is generally **not** the current branch tip, and need not be an ancestor
+of it: later commits are legitimately composed on top of the released tag.
+Requiring `tag == HEAD` would make every one of those later commits look like a
+broken release. The peeled-tag policy says instead: *the released version is
+whatever the canonical tag's subject declares, at the commit the tag peels to.*
+The canonical tag subject is the release-metadata line (e.g. `SkillWeave
+vX.Y.Z`); the peeled commit is where that release actually lives. Both are
+*resolved at check time*, never copied into this document.
 
-The hash IDs above match the canonical `v1.5.9` subject `SkillWeave v1.5.9`. The
-tag subject is the canonical release-metadata line; the peeled commit is where
-that release actually lives.
-
-### Historical peel evidence
-
-Peeling is how each released version was established, not a head comparison.
-Recorded for the recent train (each row is `git rev-parse '<tag>^{}'` plus the
-`[project].version` at that commit):
-
-| Tag | Tag object | Peeled commit | `[project].version` at peel |
-|-----|-----------|---------------|-----------------------------|
-| `v1.5.6` | `ed12a3926b4841eccb9faae57d4f404d2430564a` | `2f60f3c403f925fe5317a2a53fd91c5bf8ec914d` | `1.5.5` |
-| `v1.5.7` | `1f14f5aa757ba60c09bd45e21669ffb0fa8ae060` | `6d877a24fe77dda79c2396c0ab1ea1ec79636bba` | `1.5.7` |
-| `v1.5.8` | `b94f7191bc6d6685729a0fc0417d4000bfd2608e` | `ba58f8960efedea53e4a4392c04a82677db09038` | `1.5.8` |
-| `v1.5.9` | `6ab653d3c61dec4b0f6b313720e8c7c3b7e89c84` | `11a6fe72295d02bdb18ad2eaa0ed34837164e803` | `1.5.9` |
-
-`v1.5.6` peeled to a commit whose `pyproject.toml` still read `1.5.5` — the
-declared runtime version can lag the tag by a packaging step. That is exactly
-why the *released* fact is the tag/subject, not `pyproject.toml`, and why the
-check treats the tag subject as release metadata.
+The current candidate, released tag and peeled commit are printed by
+`scripts/check-version-truth.py` (and exposed in `--json`); this document
+deliberately holds no literal of them.
 
 ## Discovered vs installed (registry / index)
 
@@ -86,7 +76,7 @@ origin path and how it was installed (`site-packages`, `editable-checkout`
 (`direct_url.json` `dir_info.editable`), `local-vcs`, or `unknown`). This is the
 same identity `skillweave.cli.support.product_version()` consumes. When the
 distribution is absent the check reports **not installed** — it never
-substitutes the candidate or a registry value (no fabricated `1.5.9`).
+substitutes the candidate or a registry value (no fabricated version).
 
 **Discovered observation** (an explicit registry/index observation, supplied by
 the operator):
@@ -135,8 +125,8 @@ zero or duplicate Forgejo release objects.
    `skills/*/capability.yaml` are informational and may lag
    (`release_policy: decoupled_member_pins`).
 2. **release-facing badge** — the README version badge must advertise the
-   **released** fact, not the candidate and not an old value.
-3. **changelog** — the CHANGELOG's top heading must name the current version.
+   **released** fact, not an old value and not an unaccepted candidate.
+3. **changelog** — the CHANGELOG's top heading must name an accepted version.
 4. **installed identity** — when a distribution is importable, its metadata must
    match the candidate the tree builds; a mismatch is a named
    `installed-version-drift` failure. Absence is reported as `not installed`,
@@ -147,20 +137,52 @@ zero or duplicate Forgejo release objects.
 In addition to those checks, the tool **reports** (it does not gate on) the
 `installed` identity and the operator-supplied `discovered` observation as
 separate lines, each with its provenance and freshness, and mirrors all of the
-above in its `--json` output (`candidate`, `bundle`, `released`, `installed`,
-`discovered`, `skills`, `checks`, `ok`). Absence is reported honestly: a missing
-install prints `not installed`, a missing observation prints
-`no discovered observation supplied` — neither is a drift, and neither is ever
-fabricated.
+above in its `--json` output (`candidate`, `bundle`, `release_prep`,
+`released`, `installed`, `discovered`, `skills`, `checks`, `ok`). Absence is
+reported honestly: a missing install prints `not installed`, a missing
+observation prints `no discovered observation supplied` — neither is a drift,
+and neither is ever fabricated.
 
 **Historical references are allowed** when they are explicitly historical. A
 version token is *historical* when it is not presented as the current release —
 for example the wording "1.4.0 scope" in README *Host-Neutral Scope*. The check
 does not demand that an old version vanish; it demands that an old version is
-not **advertised as current** and that candidate `1.5.10` is not advertised as
-**released**. Concretely, the check fails if a version ahead of the tag (e.g.
-`1.5.10`) appears in a release-advertising position (badge, "What's new"
-heading, changelog top) before it is released.
+not **advertised as current**.
+
+## The release-prep exception
+
+A release commit must carry the new CHANGELOG section, README badge and
+"What's new in X" heading **before the release tag exists** — at that instant
+the only version those positions can name is the still-*unreleased* candidate.
+Under the plain rule that is exactly the drift the check exists to catch, so an
+**explicit, reviewable release-preparation state** is declared instead:
+
+- a flat scalar `release_prep: "X.Y.Z"` in `.version.yaml`. It is a flat
+  top-level key on purpose: the ops-engine version-sync parser accepts only
+  flat scalar keys and the `locations` list, so the automatic bump never
+  rewrites it and the declaration stays representable (a nested map would be
+  unparseable).
+
+The rule the checker applies:
+
+- The release-prep state is **active** only when `release_prep` equals the
+  **candidate** (`pyproject.toml` == bundle `capability.yaml`) **and** the
+  candidate is **ahead of** the released tag. When active, the badge, the
+  "What's new" heading and the CHANGELOG top may name the candidate — provided
+  they all agree with it. The tool reports a named `release-prep` line and
+  exits 0.
+- With the state active, any of those positions naming something **other than
+  the candidate or the still-released version** is **DRIFT**.
+- A `release_prep` that **differs from the candidate** is a named
+  `release-prep==candidate` **DRIFT**.
+- A `release_prep` that is **not ahead of the released tag** is a named
+  `release-prep-ahead` **DRIFT**.
+- **Without** `release_prep`, nothing changes: a version ahead of the released
+  tag appearing in a release-advertising position (badge, "What's new" heading,
+  changelog top) is **DRIFT**.
+
+The flag is removed (or stops being ahead) once the tag exists, at which point
+the ordinary rule resumes and the released version becomes the released fact.
 
 ## Distribution note
 
