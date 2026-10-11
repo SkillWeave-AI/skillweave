@@ -1,6 +1,6 @@
 """Generic Lifecycle Extension — standalone lifecycle contracts (SW-160).
 
-These contracts are validated against the installed SDK (skillweave-sdk==0.2.0),
+These contracts are validated against the installed SDK (skillweave-sdk==0.3.0),
 which is the contract authority. Core is a consumer: it loads contract IDs,
 validation and digest from the installed SDK API rather than from hard-coded
 unpublished bytes.

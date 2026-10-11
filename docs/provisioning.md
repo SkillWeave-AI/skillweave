@@ -26,11 +26,11 @@ truth; `importlib.metadata` reports the installed copy):
 | Distribution | `skillweave` |
 | Version | `1.5.9` |
 | `requires-python` | `>=3.9` |
-| Base dependencies | `PyYAML>=6.0`, `skillweave-sdk==0.2.0` (pinned exact) |
+| Base dependencies | `PyYAML>=6.0`, `skillweave-sdk==0.3.0` (pinned exact) |
 | Optional extras | `dev`, `mcp` |
 | Console scripts | `skillweave`, `skillweave-install`, `skillweave-risk-mode`, `skillweave-interactive-mode` |
 
-`skillweave-sdk` is pinned **exactly** (`==0.2.0`). It owns the contract bytes
+`skillweave-sdk` is pinned **exactly** (`==0.3.0`). It owns the contract bytes
 (JSON Schemas + taxonomy); Core consumes the pinned artifact and never copies the
 schema authority into its own tree (see `docs/architecture.md`, "Repository
 boundary"). Do not float it.
@@ -43,7 +43,7 @@ Base dependencies are the ones `import skillweave` genuinely needs:
   `templates.py`, `capability.py` and others. `skillweave/__init__.py` imports
   `persistence`, so PyYAML is on the *unconditional* core import path. It cannot
   be moved to an extra without breaking `import skillweave`.
-* **`skillweave-sdk==0.2.0`** — the pinned contract authority.
+* **`skillweave-sdk==0.3.0`** — the pinned contract authority.
 
 Optional capabilities are **never** base dependencies:
 
@@ -113,16 +113,16 @@ python -c "import sys; print(sys.prefix)"
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install /path/to/skillweave-1.5.9-py3-none-any.whl
+python -m pip install /path/to/skillweave-1.5.10-py3-none-any.whl
 ```
 
-This pulls the base dependencies (`PyYAML`, `skillweave-sdk==0.2.0`) from the
+This pulls the base dependencies (`PyYAML`, `skillweave-sdk==0.3.0`) from the
 configured index. For an offline/hermetic install, point pip at a directory of
 wheels instead of the network:
 
 ```bash
 python -m pip install --no-index --find-links /path/to/wheelhouse \
-    skillweave-1.5.9-py3-none-any.whl PyYAML>=6.0 skillweave-sdk==0.2.0
+    skillweave-1.5.10-py3-none-any.whl PyYAML>=6.0 skillweave-sdk==0.3.0
 ```
 
 ### Editable dev install (checkout)
@@ -172,7 +172,7 @@ pip. Each also has a module equivalent that needs no console-script wrapper.
 
 ```bash
 uv venv
-uv pip install /path/to/skillweave-1.5.9-py3-none-any.whl
+uv pip install /path/to/skillweave-1.5.10-py3-none-any.whl
 uv run skillweave --help
 ```
 
@@ -180,7 +180,7 @@ uv run skillweave --help
 environment (no global symlink into a shared Desktop install):
 
 ```bash
-pipx install /path/to/skillweave-1.5.9-py3-none-any.whl
+pipx install /path/to/skillweave-1.5.10-py3-none-any.whl
 skillweave --help
 ```
 
@@ -209,7 +209,7 @@ env -u PYTHONPATH python -m skillweave.scripts.check_optional_capability mcp  # 
 The `tests/packaging/test_install_provisioning.py` suite automates exactly this
 against a freshly built wheel and a freshly created editable install, asserting:
 
-1. the base distribution's `Requires-Dist` is `PyYAML>=6.0` + `skillweave-sdk==0.2.0`;
+1. the base distribution's `Requires-Dist` is `PyYAML>=6.0` + `skillweave-sdk==0.3.0`;
 2. all four console-script targets import and expose a callable `main`;
 3. `skillweave.<module>` resolves under the *installed* location, not `src/`;
 4. the base install imports and runs with no MCP SDK present;
@@ -346,7 +346,7 @@ preserved `requires-python`/classifier metadata, not by a run.
   `validator.AuthenticatedServiceContext`, present in the fresh venv. It is
   supplied from the offline pinned wheel (`SKILLWEAVE_SDK_DIR`) or the running
   interpreter's qualified install; a stale SDK copy (including one reusing the
-  same `0.2.0` version string) is detected by source scan and rejected, making
+  same `0.3.0` version string) is detected by source scan and rejected, making
   the sweep a **setup HOLD** (explicit skip), not a pass. For a bare checkout
   the sweep still needs `PyYAML` seedable in the running interpreter.
 * The composed SW-1510-CLI gate needs a wheel that carries

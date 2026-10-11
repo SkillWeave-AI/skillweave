@@ -10,7 +10,7 @@ removed. What they prove could not be proven from the source tree:
   ``src``), expose the ``skillweave`` console entrypoint, and run with
   ``PYTHONPATH`` unset.
 * criterion 2 -- the base distribution's declared requirements are exactly
-  ``PyYAML>=6.0`` + ``skillweave-sdk==0.2.0``; ``jsonschema`` (dev) and ``mcp``
+  ``PyYAML>=6.0`` + ``skillweave-sdk==0.3.0``; ``jsonschema`` (dev) and ``mcp``
   (optional) are absent from the base install; a missing optional capability
   yields an actionable ``pip install 'skillweave[mcp]'`` diagnostic (exit 1),
   **through the packaged ``python -m skillweave.scripts.check_optional_capability``
@@ -411,7 +411,7 @@ def test_declared_wheel_metadata_scopes_deps_and_keeps_python_support(wheel):
     requires = [line[len("Requires-Dist: "):] for line in metadata.splitlines()
                 if line.startswith("Requires-Dist: ")]
     base = sorted(r for r in requires if "extra ==" not in r)
-    assert base == ["PyYAML>=6.0", "skillweave-sdk==0.2.0"], base
+    assert base == ["PyYAML>=6.0", "skillweave-sdk==0.3.0"], base
     assert "Requires-Python: >=3.9" in metadata
 
     extras = {line[len("Provides-Extra: "):] for line in metadata.splitlines()
@@ -521,7 +521,7 @@ def test_wheel_install_runs_from_installed_location_without_pythonpath(tmp_path,
                      cwd=_unrelated_cwd(tmp_path), env=_clean_env(tmp_path))
     assert meta_proc.returncode == 0, meta_proc.stderr
     base = {line for line in meta_proc.stdout.splitlines() if "extra ==" not in line}
-    assert base == {"PyYAML>=6.0", "skillweave-sdk==0.2.0"}, base
+    assert base == {"PyYAML>=6.0", "skillweave-sdk==0.3.0"}, base
 
 
 def test_editable_install_resolves_back_to_its_source_tree(tmp_path, source_copy):
