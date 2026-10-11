@@ -33,7 +33,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 #: The protected store families a worker must never write.
 PROTECTED_STORE_NAMES: tuple[str, ...] = (
@@ -509,6 +509,48 @@ class StoreProtection:
                 allowed_egress_port=allowed_egress_port,
             )
         return [str(c) for c in command]
+
+    def run(self, command: Sequence[str], *,
+            writable_scope: Optional[Path] = None,
+            cwd: Optional[str] = None,
+            env: Optional[Mapping[str, str]] = None,
+            **popen_kwargs: Any) -> "subprocess.CompletedProcess":
+        """Launch a real protected child inside this open window (the enforced path).
+
+        This is the one correct way to spawn a worker while the window is open:
+
+        * A confinement adapter (Seatbelt) confines per launch, so the child is
+          always wrapped through :meth:`wrap_command`: writes outside the
+          window's ``writable_scope`` fail at the OS boundary for the child's
+          lifetime. Its ``seal()`` is intentionally a no-op — it confines at
+          launch, never by mutating filesystem state — so spawning a *bare*
+          ``subprocess`` under an open window silently defeats it (the child then
+          writes freely into the protected stores).
+        * A seal-only adapter (the immutable flag) already sealed the protected
+          stores in :meth:`__enter__`; the child runs against those sealed
+          stores.
+
+        Raises :class:`IsolationUnavailableError` when the window is not open, or
+        when a confinement adapter is in force but no writable scope is known, so
+        a bare/unsandboxed child can never be launched by mistake.
+        """
+        if not self.sealed:
+            raise IsolationUnavailableError(
+                "protection window is not open; enter it before launching a "
+                "protected child (fail closed)"
+            )
+        if self.confines_to_scope:
+            scope = writable_scope if writable_scope is not None else self.writable_scope
+            if scope is None:
+                raise IsolationUnavailableError(
+                    f"adapter {self.adapter.name!r} confines at launch but no "
+                    "writable scope was set on the window; refusing to launch an "
+                    "unconfined child (fail closed)"
+                )
+            argv = self.wrap_command(command, writable_scope=scope)
+        else:
+            argv = [str(c) for c in command]
+        return subprocess.run(argv, cwd=cwd, env=env, **popen_kwargs)
 
 
 def protect_stores(

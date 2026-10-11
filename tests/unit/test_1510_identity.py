@@ -619,6 +619,10 @@ def test_real_worker_child_cannot_write_protected_stores(tmp_path):
     if not adapter.available():
         pytest.skip("no real store-isolation adapter on this host")
     protected = _protected_stores(tmp_path)
+    # A private writable scope, exactly as production gives every worker: a
+    # confinement adapter (Seatbelt) turns it into the profile's only writable
+    # tree, so the protected store roots sit *outside* it and the child is
+    # denied there. Kept separate from the store roots on purpose.
     scope = tmp_path / "worker_scope"
     scope.mkdir()
     gate_root = protected.roots["gate_state"]
@@ -640,8 +644,13 @@ def test_real_worker_child_cannot_write_protected_stores(tmp_path):
     from skillweave.runtime.worker_launcher import protect_stores
 
     with protect_stores(protected, adapter=adapter) as protection:
-        proc = subprocess.run(
+        # Launch through the open window so the adapter wraps the child: Seatbelt
+        # confines *at launch* (its seal() is a no-op), so a bare subprocess.run
+        # here would silently defeat the adapter. protection.run is the enforced
+        # path and fails closed if the window is not open.
+        proc = protection.run(
             [sys.executable, "-c", child, str(gate_root)],
+            writable_scope=scope,
             capture_output=True, text=True,
         )
         assert protection.denies_writes is True
