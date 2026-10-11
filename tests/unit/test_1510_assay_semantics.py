@@ -772,16 +772,21 @@ def test_installed_wheel_native_consumer_enforces_semantics(tmp_path):
     write_source_tree(wording_src, wording_files)
     wording_analysis = write_analysis_tree(tmp_path / "wording-analysis", wording_files)
     wording_analysis_text = {k: v.decode() for k, v in wording_analysis.items()}
-    for name, path, justification in (
-        ("wording-overview", "OVERVIEW.md", "Project overview text for readers"),
-        ("wording-licence", "LICENSE", "release notes for humans, non-code narrative"),
+    # A proof must account for *every* source file: the code file is analyzed
+    # and *each* narrative file carries its own justified exclusion. Each case
+    # exercises one non-keyword phrasing; naming only one of the two narrative
+    # files would leave the other genuinely uncovered and is refused below.
+    for name, justification in (
+        ("wording-overview", "Project overview text for readers"),
+        ("wording-licence", "release notes for humans, non-code narrative"),
     ):
         wording_proof = {
             "version": VERSION,
             "analyzed": True,
             "coverage": [coverage_entry("pkg/util.py", wording_files, wording_analysis)],
             "exclusions": [
-                {"path": path, "justification": justification, "bounded": path},
+                {"path": rel, "justification": justification, "bounded": rel}
+                for rel in ("OVERVIEW.md", "LICENSE")
             ],
         }
         admitted = _run_installed(venv_dir, tmp_path, name, {
@@ -793,6 +798,30 @@ def test_installed_wheel_native_consumer_enforces_semantics(tmp_path):
         assert admitted["admitted"] is True, (name, admitted["reasons"])
         assert admitted["outcome"] == "pass"
         assert admitted["reasons"] == []
+
+    # -- control: the same wording-independence proof that omits one narrative
+    #    file from both coverage and exclusions still leaves that file genuinely
+    #    uncovered, so the installed consumer refuses with the raw coverage
+    #    reason -- the enforcement this fixture fix must not weaken.
+    uncovered_proof = {
+        "version": VERSION,
+        "analyzed": True,
+        "coverage": [coverage_entry("pkg/util.py", wording_files, wording_analysis)],
+        "exclusions": [
+            {"path": "OVERVIEW.md",
+             "justification": "Project overview text for readers",
+             "bounded": "OVERVIEW.md"},
+        ],
+    }
+    uncovered = _run_installed(venv_dir, tmp_path, "wording-uncovered", {
+        "artifacts": [artifact(uncovered_proof, commit=COMMIT)],
+        "analysis": wording_analysis_text,
+        "source_root": str(wording_src),
+        "commit": COMMIT,
+    })
+    assert uncovered["admitted"] is False and uncovered["outcome"] == "hold"
+    assert any("neither analyzed nor justified" in r
+               for r in uncovered["reasons"]), uncovered["reasons"]
 
     # -- negative: a doc-suffix file whose *bytes* are an executable script, and
     #    code without a recognised code suffix, are both refuted from the real
