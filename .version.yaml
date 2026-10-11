@@ -49,12 +49,19 @@ release_prep: "1.5.10"
 # title reads this pattern; the product name is NOT hardcoded in skill text.
 # Missing or malformed policy must fail closed before any release object is
 # created.
-  # The product name for release titles. This MUST match pyproject.toml's
-  # [project].name, title-cased (first letter uppercase, rest lowercase).
-  # To rebrand, change only this value — no skill edits required.
-  # Full regex that every release title must match. {product} is replaced
-  # at consumption time with product_name above. The version comes from the
-  # release tag (vX.Y.Z, optionally with -rcN prerelease suffix).
+#
+# product_name MUST match pyproject.toml's [project].name, title-cased (first
+# letter uppercase, rest lowercase); to rebrand, change only this value — no
+# skill edits required. pattern is the full regex every release title must
+# match; {product} is replaced at consumption time with product_name above, and
+# the version comes from the release tag (vX.Y.Z, optionally -rcN).
+#
+# Layout note (SW-CORE-ZR-001): the canonical version-sync parser accepts ONLY
+# flat top-level scalars and the `locations` list — a nested block map makes it
+# exit 2 before any comparison. The policy is therefore a single-line FLOW
+# mapping: one unindented scalar line to that parser, a mapping
+# ({product_name, pattern}) to YAML readers and the release-title consumers.
+release_title_policy: {product_name: SkillWeave, pattern: '^{product} v[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?$'}
 
 changelog_path: CHANGELOG.md
 changelog_managed: false
@@ -154,6 +161,4 @@ locations:
     role: skill_capability
     pattern: '^version:\s*(\S+)'
     required: false
-product_name: SkillWeave
-pattern: '^{product} v[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?$'
 
