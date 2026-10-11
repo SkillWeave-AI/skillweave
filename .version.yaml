@@ -21,6 +21,20 @@ release_policy: decoupled_member_pins
 # version the release tag is bound to.
 source_of_truth: pyproject.toml
 
+# release_prep is an explicit, reviewable release-preparation state (SW-CORE-
+# RFX-001). It is a flat top-level scalar — the version-sync parser accepts only
+# flat scalar keys and the `locations` list — so the automatic bump never
+# rewrites it. Set it to the candidate version ONLY on the release commit, where
+# the new CHANGELOG section, README badge and "What's new" heading must name the
+# still-unreleased candidate because the release tag does not yet exist. While
+# it equals the candidate (pyproject == bundle) and is ahead of the latest
+# annotated tag, scripts/check-version-truth.py accepts those three positions
+# naming the candidate, provided they all agree with it. Without it nothing
+# changes: a version ahead of the tag in an advertising position is DRIFT. A
+# value that differs from the candidate, or is not ahead of the released tag,
+# is a named drift. Remove it (or it stops being ahead) once the tag exists.
+release_prep: "1.5.10"
+
 # Prose release history is NOT a version surface. CHANGELOG.md carries a prose
 # heading per release and is written by hand; it is deliberately kept out of
 # `locations` so an automatic bump can never rewrite history. Maintaining the
