@@ -180,7 +180,7 @@ def test_version_truth_doc_distinguishes_the_four_facts():
         assert fact in doc, f"docs/version-truth.md does not distinguish {fact!r}"
 
 
-def test_candidate_and_bundle_agree_and_candidate_is_not_the_released_fact():
+def test_candidate_and_bundle_agree_and_candidate_relates_to_the_released_fact():
     # The two required surfaces carry the same candidate version.
     pyproject = re.search(r'^version\s*=\s*"(\d+\.\d+\.\d+)"', _read("pyproject.toml"), re.M)
     bundle = re.search(r"^version:\s*(\d+\.\d+\.\d+)\s*$", _read("capability.yaml"), re.M)
@@ -188,13 +188,28 @@ def test_candidate_and_bundle_agree_and_candidate_is_not_the_released_fact():
     assert pyproject.group(1) == bundle.group(1), (
         f"candidate drift: pyproject {pyproject.group(1)} vs bundle {bundle.group(1)}"
     )
-    # The candidate is the *candidate*, not the released fact: it is not named
-    # by the latest annotated tag (derived, never a literal in the docs).
+    # State-aware relation to the released fact (the latest annotated tag,
+    # derived, never a literal): while the explicit release_prep state is set
+    # the candidate is strictly AHEAD of the released tag (pre-tag); once the
+    # release_prep line is removed the candidate equals the released fact (the
+    # normal post-release state). A candidate BEHIND the released fact is drift
+    # in either state. Never asserts a literal version or hash, so the check
+    # passes both before and after the owner creates the release tag.
     candidate = pyproject.group(1)
-    assert candidate != _released_version(), (
-        f"candidate {candidate} must not equal the released fact "
-        f"{_released_version()}"
-    )
+    released = _released_version()
+    prep = _release_prep()
+    candidate_key = _semver_key(candidate)
+    released_key = _semver_key(released)
+    if prep is not None:
+        assert candidate_key > released_key, (
+            f"release_prep {prep!r} is set: candidate {candidate} must be "
+            f"strictly ahead of the released fact {released}"
+        )
+    else:
+        assert candidate_key >= released_key, (
+            f"no release_prep: candidate {candidate} must not be behind the "
+            f"released fact {released}"
+        )
 
 
 def test_release_facing_material_is_release_aware_not_advertising_as_released():
@@ -669,7 +684,7 @@ def test_consistency_check_installed_identity_negative(tmp_path):
 def _run_all() -> int:
     tests = [
         test_version_truth_doc_distinguishes_the_four_facts,
-        test_candidate_and_bundle_agree_and_candidate_is_not_the_released_fact,
+        test_candidate_and_bundle_agree_and_candidate_relates_to_the_released_fact,
         test_release_facing_material_is_release_aware_not_advertising_as_released,
         test_released_face_is_peeled_and_not_branch_head,
         test_discovered_and_installed_are_shown_separately,
