@@ -6,8 +6,11 @@ criteria, asserted rather than claimed:
 
 * criterion 1 — a consistency check (`scripts/check-version-truth.py`) compares
   the candidate package/manifest version, the release-facing badge/changelog and
-  the installed package identity; historical references are allowed, and
-  candidate `1.5.10` is never advertised as **released**.
+  the installed package identity; historical references are allowed, and a
+  version ahead of the released tag is never advertised as **released** — unless
+  the explicit `release_prep` state names the candidate (pyproject == bundle)
+  ahead of the released tag, in which case the badge / "What's new" heading /
+  CHANGELOG top may name the candidate, provided they all agree with it.
 * criterion 2 — the released version is established from the tag's **peeled**
   commit and canonical tag subject, never by requiring the tag to equal branch
   HEAD; discovered and installed versions are shown separately with
@@ -80,6 +83,19 @@ def _skills_on_disk() -> list[str]:
     )
 
 
+def _candidate() -> str:
+    return re.search(
+        r'^version\s*=\s*"(\d+\.\d+\.\d+)"', _read("pyproject.toml"), re.M
+    ).group(1)
+
+
+def _release_prep() -> str | None:
+    m = re.search(
+        r'^release_prep:\s*"?(\d+\.\d+\.\d+)"?\s*$', _read(".version.yaml"), re.M
+    )
+    return m.group(1) if m else None
+
+
 def _peeled(tag: str) -> str:
     return subprocess.run(
         ["git", "-C", str(_REPO), "rev-parse", f"{tag}^{{}}"],
@@ -87,11 +103,22 @@ def _peeled(tag: str) -> str:
     ).stdout.strip()
 
 
-def _head() -> str:
-    return subprocess.run(
-        ["git", "-C", str(_REPO), "rev-parse", "HEAD"],
+def _latest_release_tag() -> str:
+    """The released fact: the highest semver ``vX.Y.Z`` tag -- never a literal."""
+    out = subprocess.run(
+        ["git", "-C", str(_REPO), "tag", "--list", "v*"],
         capture_output=True, text=True, check=True,
-    ).stdout.strip()
+    ).stdout.split()
+    tags = [t for t in out if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
+    return max(tags, key=lambda t: tuple(int(p) for p in t[1:].split(".")))
+
+
+def _released_version() -> str:
+    return _latest_release_tag().lstrip("v")
+
+
+def _semver_key(version: str) -> tuple[int, int, int]:
+    return tuple(int(p) for p in version.split("."))  # type: ignore[return-value]
 
 
 def _run_check(
@@ -120,13 +147,17 @@ def _write_observation(
     tmp_path: Path,
     name: str,
     *,
-    version: str = "1.5.9",
+    version: str | None = None,
     source: str = "forgejo-index",
     index_url: str | None = "https://forgejo.example/api/packages/skillweave/pypi/simple/",
     observed_at: str | None = None,
 ) -> Path:
     obs = tmp_path / name
-    payload = {"source": source, "name": "skillweave", "version": version}
+    payload = {
+        "source": source,
+        "name": "skillweave",
+        "version": version if version is not None else _released_version(),
+    }
     if index_url is not None:
         payload["index_url"] = index_url
     if observed_at is not None:
@@ -157,35 +188,65 @@ def test_candidate_and_bundle_agree_and_candidate_is_not_the_released_fact():
     assert pyproject.group(1) == bundle.group(1), (
         f"candidate drift: pyproject {pyproject.group(1)} vs bundle {bundle.group(1)}"
     )
-    # That candidate is the *candidate*; docs must not call it released, and the
-    # in-flight 1.5.10 must be declared NOT released.
-    doc = _read("docs/version-truth.md")
-    assert "1.5.10" in doc and "not released" in doc.lower(), (
-        "docs/version-truth.md must flag candidate 1.5.10 as not released"
+    # The candidate is the *candidate*, not the released fact: it is not named
+    # by the latest annotated tag (derived, never a literal in the docs).
+    candidate = pyproject.group(1)
+    assert candidate != _released_version(), (
+        f"candidate {candidate} must not equal the released fact "
+        f"{_released_version()}"
     )
 
 
-def test_release_facing_material_does_not_advertise_1510_as_released():
-    # No release-advertising position (badge, What's-new heading, changelog top)
-    # may name 1.5.10 while the released tag is 1.5.9.
-    badge = re.search(r"badge/version-(\d+\.\d+\.\d+)", _read("README.md"))
-    assert badge and badge.group(1) != "1.5.10"
-    whatsnew = re.search(r"^##\s+What's new in\s+(\d+\.\d+\.\d+)", _read("README.md"), re.M)
+def test_release_facing_material_is_release_aware_not_advertising_as_released():
+    # Release-aware: the released fact is the latest annotated tag, derived, not
+    # a literal. A release-advertising position (badge, What's-new heading,
+    # changelog top) may name the candidate ONLY because the explicit
+    # release_prep state is active (prep == candidate, ahead of the released
+    # tag); otherwise every such position must name the released version.
+    released = _released_version()
+    candidate = _candidate()
+    prep = _release_prep()
+    prep_active = prep is not None and prep == candidate and (
+        _semver_key(candidate) > _semver_key(released)
+    )
+    expected = candidate if prep_active else released
+    positions = {
+        "badge": re.search(r"badge/version-(\d+\.\d+\.\d+)", _read("README.md")),
+        "changelog-top": re.search(
+            r"^##\s+v(\d+\.\d+\.\d+)", _read("CHANGELOG.md"), re.M
+        ),
+    }
+    whatsnew = re.search(
+        r"^##\s+What's new in\s+(\d+\.\d+\.\d+)", _read("README.md"), re.M
+    )
     if whatsnew is not None:
-        assert whatsnew.group(1) != "1.5.10"
-    top = re.search(r"^##\s+v(\d+\.\d+\.\d+)", _read("CHANGELOG.md"), re.M)
-    assert top and top.group(1) != "1.5.10"
+        positions["whats-new"] = whatsnew
+    for name, m in positions.items():
+        assert m is not None, f"{name} position missing"
+        if prep_active:
+            assert m.group(1) in (candidate, released), (
+                f"{name} names {m.group(1)!r}; an active release-prep "
+                f"({candidate} ahead of {released}) allows only the candidate "
+                f"or the still-released version"
+            )
+        else:
+            assert m.group(1) == expected, (
+                f"{name} names {m.group(1)!r}; with no release-prep it must "
+                f"name the released fact {released!r}"
+            )
 
 
 # ── criterion 2: peeled identity + discovered/installed separation ──────────
 
 
 def test_released_face_is_peeled_and_not_branch_head():
-    tag = re.search(r"badge/version-(\d+\.\d+\.\d+)", _read("README.md")).group(1)
-    peeled = _peeled(f"v{tag}")
+    # The released fact is the latest annotated tag, derived -- not the badge
+    # (which under an active release-prep may name the candidate).
+    tag = _latest_release_tag()
+    peeled = _peeled(tag)
     assert re.fullmatch(r"[0-9a-f]{40}", peeled), peeled
     # The released identity is the peeled commit; it need not equal HEAD.
-    assert peeled == _peeled(f"v{tag}")
+    assert peeled == _peeled(tag)
     # The check is annotation-aware: it resolves ^{}. Assert the behaviour is
     # real by exercising a tag whose peeled commit is NOT HEAD.
     doc = _read("docs/version-truth.md")
@@ -206,11 +267,12 @@ def test_discovered_and_installed_are_shown_separately():
 def test_check_actually_computes_the_discovered_fact(tmp_path):
     # The tool -- not just the prose -- must produce the discovered version,
     # from an operator observation, with its source and observation timestamp.
-    obs = _write_observation(tmp_path, "obs.json", version="1.5.9")
+    released = _released_version()
+    obs = _write_observation(tmp_path, "obs.json", version=released)
     proc = _run_check(_REPO, extra_args=["--discovered-observation", str(obs)])
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     assert "discovered" in proc.stdout
-    assert "forgejo-index" in proc.stdout and "1.5.9" in proc.stdout
+    assert "forgejo-index" in proc.stdout and released in proc.stdout
     assert "freshness" in proc.stdout
     # It is an explicit observation, never a live registry query.
     doc = _read("docs/version-truth.md")
@@ -220,16 +282,21 @@ def test_check_actually_computes_the_discovered_fact(tmp_path):
 
 
 def test_check_json_exposes_installed_and_discovered_separately(tmp_path):
+    # A discovered observation that is ahead of the released tag -- the exact
+    # "what a registry might see" the doc describes -- must never be promoted to
+    # the released fact (which stays derived from the tag, not this input).
+    candidate = _candidate()
     obs = _write_observation(
-        tmp_path, "obs.json", version="1.5.10", index_url=None, observed_at=_now_iso()
+        tmp_path, "obs.json", version=candidate, index_url=None, observed_at=_now_iso()
     )
     report = _run_check_json(_REPO, "--discovered-observation", str(obs))
-    assert report["discovered"]["version"] == "1.5.10"
+    assert report["discovered"]["version"] == candidate
     assert report["discovered"]["source"] == "forgejo-index"
     # Never merged: they are two distinct top-level facts.
     assert "installed" in report and "discovered" in report
-    # The discovered 1.5.10 is not the released fact (released stays 1.5.9).
-    assert report["released"]["version"] == "1.5.9"
+    # The discovered candidate is not the released fact (released stays the tag).
+    assert report["released"]["version"] == _released_version()
+    assert report["released"]["tag"] == _latest_release_tag()
     # Any mismatch between discovered and installed is shown, not hidden.
     if report["installed"] is not None:
         assert report["installed"]["version"] != report["discovered"]["version"]
@@ -273,7 +340,7 @@ def test_check_fails_closed_on_malformed_observation(tmp_path):
 
 def test_check_fails_closed_on_observation_missing_a_field(tmp_path):
     bad = tmp_path / "missing.json"
-    bad.write_text(json.dumps({"source": "x", "version": "1.5.9"}), encoding="utf-8")
+    bad.write_text(json.dumps({"source": "x", "version": "9.9.9"}), encoding="utf-8")
     proc = _run_check(_REPO, extra_args=["--discovered-observation", str(bad)])
     assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
     assert "missing required field" in proc.stderr
@@ -292,8 +359,17 @@ def test_check_fails_closed_on_absent_observation_file(tmp_path):
 
 def test_readme_advertises_the_released_version_and_inventory():
     readme = _read("README.md")
-    released = _peeled_badge()
-    assert f"badge/version-{released}" in readme
+    released = _released_version()
+    candidate = _candidate()
+    prep = _release_prep()
+    # Release-aware: the badge advertises the released tag, or the candidate
+    # when the explicit release-prep state is active (prep == candidate, ahead
+    # of the released tag). The released fact is derived, never a literal.
+    badge = re.search(r"badge/version-(\d+\.\d+\.\d+)", readme).group(1)
+    expected = {released}
+    if prep is not None and prep == candidate and _semver_key(candidate) > _semver_key(released):
+        expected.add(candidate)
+    assert badge in expected, f"badge {badge!r} not in accepted {sorted(expected)}"
     n = len(_skills_on_disk())
     assert f"badge/skills-{n}" in readme, f"skills badge != on-disk {n}"
     assert f"all {n} skills" in readme
@@ -380,37 +456,67 @@ def test_doc_truth_and_mirror_config_results_are_declared_pending():
 # ── the checker itself: positive + fail-closed negative controls ────────────
 
 
-def _peeled_badge() -> str:
-    return re.search(r"badge/version-(\d+\.\d+\.\d+)", _read("README.md")).group(1)
-
-
 def test_consistency_check_passes_on_the_tree():
     proc = _run_check(_REPO)
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     assert "check-version-truth: OK" in proc.stdout, proc.stdout
 
 
-def _fixture_repo(tmp_path: Path) -> Path:
-    """A minimal, self-contained repo the checker can fail closed on."""
-    repo = tmp_path / "fixture"
+def _init_repo(repo: Path, released: str) -> None:
+    """git-init a fixture repo and lay down one annotated ``vX.Y.Z`` tag."""
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", f"SkillWeave v{released}"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "tag", "-a", f"v{released}",
+         "-m", f"SkillWeave v{released}"],
+        check=True,
+    )
+
+
+def _write_repo(
+    repo: Path,
+    *,
+    version: str,
+    released: str,
+    prep: str | None = None,
+    badge: str | None = None,
+    changelog_top: str | None = None,
+    whatsnew: str | None = None,
+) -> None:
+    """Write a fixture repo whose advertising positions are explicit.
+
+    ``version`` is the candidate (pyproject + bundle); ``released`` is the
+    annotated tag the fixture is initialized with; ``prep`` writes the
+    ``release_prep`` scalar. ``badge``/``changelog_top``/``whatsnew`` default to
+    the released version, so a plain fixture behaves as the pre-release-prep one.
+    """
     repo.mkdir()
     names = ["skillweave-alpha", "skillweave-beta"]
     (repo / "pyproject.toml").write_text(
         textwrap.dedent(
-            """\
+            f"""\
             [project]
             name = "skillweave"
-            version = "1.5.9"
+            version = "{version}"
             """
         )
     )
-    (repo / "capability.yaml").write_text("kind: bundle\nversion: 1.5.9\n")
-    (repo / "CHANGELOG.md").write_text("## v1.5.9 (2026-09-30) — test\n\nbody\n")
+    (repo / "capability.yaml").write_text(f"kind: bundle\nversion: {version}\n")
+    top = released if changelog_top is None else changelog_top
+    (repo / "CHANGELOG.md").write_text(f"## v{top} (2026-09-30) — test\n\nbody\n")
+    badge_v = released if badge is None else badge
+    whatsnew_v = released if whatsnew is None else whatsnew
     (repo / "README.md").write_text(
         "# SkillWeave\n\n"
-        "[![Version](https://img.shields.io/badge/version-1.5.9-blue)](x)\n"
+        f"[![Version](https://img.shields.io/badge/version-{badge_v}-blue)](x)\n"
         "[![Skills](https://img.shields.io/badge/skills-2-blue)](skills/)\n\n"
-        "## What's new in 1.5.9\n\nbody\n\n"
+        f"## What's new in {whatsnew_v}\n\nbody\n\n"
         "## Setup\n\nDuckDuckGo is a zero-key default that fails closed.\n\n"
         "`pip install 'skillweave[mcp]'` is the optional MCP extra. No PyPI here.\n\n"
         f"{names[0]} and {names[1]} are the skills; all 2 skills, 7 phases.\n"
@@ -419,23 +525,29 @@ def _fixture_repo(tmp_path: Path) -> Path:
         d = repo / "skills" / n
         d.mkdir(parents=True)
         (d / "capability.yaml").write_text(f"kind: skill\nname: {n}\nversion: 1.3.11\n")
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
-    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "v1.5.9"], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "tag", "-a", "v1.5.9", "-m", "SkillWeave v1.5.9"],
-        check=True,
-    )
+    if prep is not None:
+        (repo / ".version.yaml").write_text(
+            "schema: 1\n"
+            "source_of_truth: pyproject.toml\n"
+            f'release_prep: "{prep}"\n'
+            "locations:\n"
+            "  - path: pyproject.toml\n"
+            "    pattern: '^version\\s*=\\s*\"(\\d+\\.\\d+\\.\\d+)\"'\n"
+            "    required: true\n"
+        )
+    _init_repo(repo, released)
+
+
+def _fixture_repo(tmp_path: Path) -> Path:
+    """A minimal, self-contained repo the checker can fail closed on."""
+    repo = tmp_path / "fixture"
+    _write_repo(repo, version="9.9.1", released="9.9.1")
     return repo
 
 
 def test_consistency_check_fails_closed_on_badge_drift(tmp_path):
-    repo = _fixture_repo(tmp_path)
-    assert _run_check(repo).returncode == 0
-    readme = (repo / "README.md").read_text()
-    (repo / "README.md").write_text(readme.replace("badge/version-1.5.9", "badge/version-1.5.5"))
+    repo = tmp_path / "drift"
+    _write_repo(repo, version="9.9.1", released="9.9.1", badge="9.9.0")
     proc = _run_check(repo)
     assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr)
     assert "badge==released" in proc.stdout and "DRIFT" in proc.stdout
@@ -443,22 +555,68 @@ def test_consistency_check_fails_closed_on_badge_drift(tmp_path):
 
 def test_consistency_check_fails_closed_on_candidate_drift(tmp_path):
     repo = _fixture_repo(tmp_path)
-    (repo / "capability.yaml").write_text("kind: bundle\nversion: 1.5.8\n")
+    (repo / "capability.yaml").write_text("kind: bundle\nversion: 9.9.0\n")
     proc = _run_check(repo)
     assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr)
     assert "candidate==bundle" in proc.stdout and "DRIFT" in proc.stdout
 
 
 def test_consistency_check_fails_closed_on_early_advertised_version(tmp_path):
-    # A badge naming 1.5.10 while only v1.5.9 exists must not pass.
-    repo = _fixture_repo(tmp_path)
-    readme = (repo / "README.md").read_text()
-    (repo / "README.md").write_text(
-        readme.replace("badge/version-1.5.9", "badge/version-1.5.10")
-        .replace("What's new in 1.5.9", "What's new in 1.5.10")
-    )
+    # Without a release_prep, a badge/heading naming the candidate ahead of the
+    # released tag (9.9.2 while only v9.9.1 exists) must not pass: advertising
+    # ahead is drift.
+    repo = tmp_path / "early"
+    _write_repo(repo, version="9.9.1", released="9.9.1", badge="9.9.2",
+                whatsnew="9.9.2")
     proc = _run_check(repo)
     assert proc.returncode != 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert "DRIFT" in proc.stdout
+
+
+def test_consistency_check_release_prep_accepts_candidate_positions(tmp_path):
+    # POSITIVE control: release_prep == candidate (pyproject == bundle) ahead of
+    # the released tag, and the CHANGELOG top, badge and What's-new heading all
+    # name the candidate -> exit 0 with a named release-prep line.
+    repo = tmp_path / "prepped"
+    _write_repo(repo, version="9.9.2", released="9.9.1", prep="9.9.2",
+                badge="9.9.2", changelog_top="9.9.2", whatsnew="9.9.2")
+    proc = _run_check(repo)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert "release-prep" in proc.stdout, proc.stdout
+    report = _run_check_json(repo)
+    assert report["release_prep"] == "9.9.2"
+    assert report["ok"] is True
+
+
+def test_consistency_check_release_prep_rejects_a_position_naming_another(tmp_path):
+    # NEGATIVE control: with an active release-prep, a position naming a version
+    # that is neither the candidate nor the still-released tag is DRIFT.
+    repo = tmp_path / "prep_other"
+    _write_repo(repo, version="9.9.2", released="9.9.1", prep="9.9.2",
+                badge="9.9.3", changelog_top="9.9.2", whatsnew="9.9.2")
+    proc = _run_check(repo)
+    assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr)
+    assert "badge==released" in proc.stdout and "DRIFT" in proc.stdout
+
+
+def test_consistency_check_release_prep_must_equal_the_candidate(tmp_path):
+    # NEGATIVE control: a release_prep that differs from the candidate is DRIFT.
+    repo = tmp_path / "prep_mismatch"
+    _write_repo(repo, version="9.9.2", released="9.9.1", prep="9.9.3",
+                badge="9.9.2", changelog_top="9.9.2", whatsnew="9.9.2")
+    proc = _run_check(repo)
+    assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr)
+    assert "release-prep==candidate" in proc.stdout and "DRIFT" in proc.stdout
+
+
+def test_consistency_check_release_prep_must_be_ahead_of_the_released_tag(tmp_path):
+    # NEGATIVE control: a release_prep that is not ahead of the released tag is
+    # a named DRIFT, even when it equals the candidate.
+    repo = tmp_path / "prep_not_ahead"
+    _write_repo(repo, version="9.9.1", released="9.9.1", prep="9.9.1")
+    proc = _run_check(repo)
+    assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr)
+    assert "release-prep-ahead" in proc.stdout and "DRIFT" in proc.stdout
 
 
 def _plant_installed(
@@ -482,7 +640,7 @@ def test_consistency_check_installed_identity_positive(tmp_path):
     # criterion 1: a real (on-disk) installed distribution whose metadata
     # matches the candidate is accepted, end to end via the check's own
     # importlib.metadata consumption -- not a helper.
-    site = _plant_installed(tmp_path, _peeled_badge())
+    site = _plant_installed(tmp_path, _candidate())
     proc = _run_check(_REPO, extra_env={"PYTHONPATH": str(site)})
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert "installed==candidate" in proc.stdout and "ok" in proc.stdout
@@ -492,7 +650,7 @@ def test_consistency_check_reports_installed_origin(tmp_path):
     # installed identity carries provenance (dist name, version, origin path
     # and how it was installed), not just a bare number.
     site = _plant_installed(
-        tmp_path, _peeled_badge(), editable_dir="/repo/skillweave"
+        tmp_path, _candidate(), editable_dir="/repo/skillweave"
     )
     proc = _run_check(_REPO, extra_env={"PYTHONPATH": str(site)})
     assert "installed identity" in proc.stdout, proc.stdout
@@ -512,7 +670,7 @@ def _run_all() -> int:
     tests = [
         test_version_truth_doc_distinguishes_the_four_facts,
         test_candidate_and_bundle_agree_and_candidate_is_not_the_released_fact,
-        test_release_facing_material_does_not_advertise_1510_as_released,
+        test_release_facing_material_is_release_aware_not_advertising_as_released,
         test_released_face_is_peeled_and_not_branch_head,
         test_discovered_and_installed_are_shown_separately,
         test_check_reports_no_discovered_observation_when_absent,
@@ -525,13 +683,24 @@ def _run_all() -> int:
         test_support_matrix_retains_repository_names_and_mirror_destination,
         test_doc_truth_and_mirror_config_results_are_declared_pending,
         test_consistency_check_passes_on_the_tree,
+        test_consistency_check_release_prep_accepts_candidate_positions,
+        test_consistency_check_release_prep_rejects_a_position_naming_another,
+        test_consistency_check_release_prep_must_equal_the_candidate,
+        test_consistency_check_release_prep_must_be_ahead_of_the_released_tag,
     ]
+    import inspect
     import tempfile
 
     failed = 0
     for t in tests:
         try:
-            t()
+            tmp = Path(tempfile.mkdtemp())
+            # Tests declaring a `tmp_path` fixture get a fresh directory; the
+            # rest are called with no arguments.
+            if "tmp_path" in inspect.signature(t).parameters:
+                t(tmp)
+            else:
+                t()
             print(f"PASS {t.__name__}")
         except Exception as e:  # noqa: BLE001
             failed += 1
