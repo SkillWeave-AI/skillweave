@@ -289,10 +289,16 @@ def _reference_now(now: Optional[str]) -> datetime:
 # git: read-only invocations only
 # --------------------------------------------------------------------------- #
 def _git_read(cwd: str, *args: str) -> Optional[subprocess.CompletedProcess]:
-    """Run a read-only git command; ``None`` when git itself is unavailable."""
+    """Run a read-only git command; ``None`` when git itself is unavailable.
+
+    Every git subprocess runs with ``LC_ALL=C`` and ``LANGUAGE=C`` so that
+    parsing of git messages never depends on the user's locale.
+    """
     env = dict(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_TERMINAL_PROMPT"] = "0"
+    env["LC_ALL"] = "C"
+    env["LANGUAGE"] = "C"
     try:
         return subprocess.run(
             ["git", "--no-optional-locks", *args],
@@ -357,15 +363,43 @@ def _head_state(path: str) -> HeadState:
 
 
 def _upstream_state(path: str) -> UpstreamState:
+    """Determine upstream state using machine-readable signals first.
+
+    1. If the branch has no configured remote/merge → NO_UPSTREAM.
+    2. If configured but ``rev-list @{upstream}...HEAD`` fails → UNKNOWN
+       (genuinely unavailable).
+    3. Otherwise parse behind/ahead from ``rev-list`` output.
+    """
+    # Machine-readable: does the branch have an upstream configured?
+    branch_result = _git_read(path, "rev-parse", "--abbrev-ref", "HEAD")
+    if branch_result is None or branch_result.returncode != 0:
+        return UpstreamState.UNKNOWN
+    branch = branch_result.stdout.strip()
+    if not branch or branch == "HEAD":
+        # Detached HEAD has no upstream concept.
+        return UpstreamState.NO_UPSTREAM
+
+    remote_result = _git_read(
+        path, "config", "--local", f"branch.{branch}.remote"
+    )
+    merge_result = _git_read(
+        path, "config", "--local", f"branch.{branch}.merge"
+    )
+    if (
+        remote_result is None
+        or remote_result.returncode != 0
+        or not remote_result.stdout.strip()
+        or merge_result is None
+        or merge_result.returncode != 0
+        or not merge_result.stdout.strip()
+    ):
+        return UpstreamState.NO_UPSTREAM
+
+    # Upstream is configured.  Run rev-list to determine ahead/behind.
     result = _git_read(
         path, "rev-list", "--left-right", "--count", "@{upstream}...HEAD"
     )
-    if result is None:
-        return UpstreamState.UNKNOWN
-    if result.returncode != 0:
-        stderr = (result.stderr or "").lower()
-        if "no upstream" in stderr or "does not have an upstream" in stderr:
-            return UpstreamState.NO_UPSTREAM
+    if result is None or result.returncode != 0:
         return UpstreamState.UNKNOWN
     parts = result.stdout.split()
     if len(parts) != 2:

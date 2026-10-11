@@ -312,6 +312,83 @@ def test_unparseable_lease_is_unknown_not_absent():
         assert row.classification is Classification.UNKNOWN
 
 
+def test_clean_worktree_with_unavailable_upstream_is_unknown():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        collection = tmp / "collection"
+        primary = collection / "repo"
+        head = _init_repo(primary)
+        wt = collection / ".worktrees" / "repo" / "run1" / "lane1"
+        _git(primary, "worktree", "add", "-q", "-b", "feat", str(wt))
+
+        # Configure upstream to a non-existent remote ref so that @{upstream}
+        # resolves as a symbolic name but the tracking ref does not exist,
+        # making upstream evidence genuinely unavailable.
+        _git(wt, "remote", "add", "origin", "http://nonexistent/repo.git")
+        _git(wt, "config", "branch.feat.remote", "origin")
+        _git(wt, "config", "branch.feat.merge", "refs/heads/feat")
+
+        row = _inventory(
+            collection,
+            manifests={str(wt): _manifest(head, head)},
+            processes={str(wt): [os.getpid()]},
+        ).row_for(str(wt))
+
+        # Clean tree -> no DIRTY finding; genuinely unavailable upstream
+        # evidence -> UNKNOWN classification.
+        assert row.dirtiness is DirtyState.CLEAN
+        assert row.upstream is UpstreamState.UNKNOWN
+        assert row.classification is Classification.UNKNOWN
+        assert "upstream" in row.reason
+
+
+# --------------------------------------------------------------------------- #
+# locale regression: git messages must be locale-independent
+# --------------------------------------------------------------------------- #
+def test_german_locale_upstream_is_no_upstream_not_unknown():
+    """Regression: _git_read forces LC_ALL=C so git messages never depend on
+    the user's locale.  Running under German locale must still detect
+    NO_UPSTREAM correctly (not fall through to UNKNOWN)."""
+    old_lc = os.environ.get("LC_ALL")
+    old_lang = os.environ.get("LANGUAGE")
+    os.environ["LC_ALL"] = "de_DE.UTF-8"
+    os.environ["LANGUAGE"] = "de"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            collection = tmp / "collection"
+            primary = collection / "repo"
+            head = _init_repo(primary)
+
+            wt = collection / ".worktrees" / "repo" / "run1" / "lane1"
+            _git(primary, "worktree", "add", "-q", "-b", "feat", str(wt))
+
+            row = _inventory(
+                collection,
+                manifests={str(wt): _manifest(head, head)},
+                processes={str(wt): [os.getpid()]},
+            ).row_for(str(wt))
+
+            # Even with German locale in the process environment, the git
+            # subprocess inside _git_read forces LC_ALL=C, so upstream
+            # detection works correctly.
+            assert row.upstream is UpstreamState.NO_UPSTREAM, (
+                f"expected NO_UPSTREAM, got {row.upstream}"
+            )
+            assert row.classification is Classification.HEALTHY, (
+                f"expected HEALTHY, got {row.classification}: {row.reason}"
+            )
+    finally:
+        if old_lc is not None:
+            os.environ["LC_ALL"] = old_lc
+        else:
+            os.environ.pop("LC_ALL", None)
+        if old_lang is not None:
+            os.environ["LANGUAGE"] = old_lang
+        else:
+            os.environ.pop("LANGUAGE", None)
+
+
 def test_stale_session_evidence_is_stale_not_healthy():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
