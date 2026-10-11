@@ -4,38 +4,38 @@ from skillweave.mcp.control import mcp_tool_names
 from skillweave.mcp.server import mcp, cancel_run, resume_run
 
 
-def test_mcp_tools_list_only_commands():
-    """Ensure that only authorized command tools are registered."""
-    # Real FastMCP 1.x has _tool_manager.list_tools() (synchronous).
-    # The degraded stub (no mcp package) stores decorated functions in mcp.tools.
-    if hasattr(mcp, "_tool_manager"):
-        tools = mcp._tool_manager.list_tools()
-        registered = sorted(t.name for t in tools)
-    elif hasattr(mcp, "tools"):
-        # Degraded stub: each entry is the raw function object
-        registered = sorted(f.__name__ for f in mcp.tools)
-    else:
-        registered = []
+def _assert_registry_matches(registered):
+    """Assert that *registered* (sorted list of tool names) equals the authorized set."""
     assert registered == list(mcp_tool_names()), (
         f"registered tools {registered} do not match authorized set "
         f"{list(mcp_tool_names())}"
     )
 
 
-def test_mcp_tools_rejects_raw_mutation():
-    """Negative control: an extra raw state-mutation tool would be caught."""
-    # Demonstrate the assertion has teeth: if a raw mutation tool appeared
-    # in the registered set, it would NOT match the canonical set.
+def _collect_registered():
+    """Return sorted tool names from the server, regardless of FastMCP or degraded stub."""
     if hasattr(mcp, "_tool_manager"):
         tools = mcp._tool_manager.list_tools()
-        registered = sorted(t.name for t in tools)
-    elif hasattr(mcp, "tools"):
-        registered = sorted(f.__name__ for f in mcp.tools)
-    else:
-        registered = []
-    assert "raw_mutate_db" not in registered
-    # Prove the comparison would fail if one were added
-    assert registered != sorted(registered + ["raw_mutate_db"])
+        return sorted(t.name for t in tools)
+    if hasattr(mcp, "tools"):
+        # Degraded stub: each entry is the raw function object
+        return sorted(f.__name__ for f in mcp.tools)
+    return []
+
+
+def test_mcp_tools_list_only_commands():
+    """Ensure that only authorized command tools are registered."""
+    _assert_registry_matches(_collect_registered())
+
+
+def test_mcp_tools_rejects_raw_mutation():
+    """Negative control: an extra raw state-mutation tool would be caught."""
+    # Build a contaminated registry that includes a synthetic raw-mutation tool.
+    # _assert_registry_matches MUST raise AssertionError; if it were weakened
+    # to a no-op the pytest.raises block would fail (no exception raised).
+    contaminated = list(mcp_tool_names()) + ["raw_mutate_db"]
+    with pytest.raises(AssertionError):
+        _assert_registry_matches(contaminated)
 
 def test_cancel_run_not_found():
     res = cancel_run("invalid-run", "test", db_path=":memory:")
