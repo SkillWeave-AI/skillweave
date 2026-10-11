@@ -32,6 +32,7 @@ Self-contained ``sys.path`` handling, following the sibling-test convention
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import os
@@ -102,6 +103,50 @@ def _cli_support_json() -> dict:
     )
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     return json.loads(proc.stdout)
+
+
+def _live_mcp_tool_names(mcp) -> list[str]:
+    """Return the registered MCP tool names for either server object.
+
+    ``skillweave.mcp.server`` binds ``mcp`` to the real ``FastMCP`` when the
+    optional ``mcp`` package is importable, and to ``_DegradedFastMCP`` when it
+    is not. The two surfaces differ:
+
+    * ``_DegradedFastMCP`` records the decorated functions on ``.tools``.
+    * real ``FastMCP`` exposes no ``.tools``; its tools live on the async
+      ``list_tools()`` (``mcp.server.fastmcp.FastMCP.list_tools``) backed by the
+      private ``_tool_manager`` (``mcp.server.fastmcp.tools.base.ToolManager``),
+      whose ``_tools`` mapping is keyed by the public tool name.
+
+    This helper reads whichever surface is present so the doc-row comparison
+    below stays identical on both paths.
+    """
+    listed = getattr(mcp, "list_tools", None)
+    if callable(listed):
+        # Real FastMCP: the async ``list_tools`` yields ``MCPTool`` objects.
+        manager = getattr(mcp, "_tool_manager", None)
+        if manager is not None and hasattr(manager, "_tools"):
+            return list(manager._tools)
+        # Fall back to the async API when driven from a non-async context.
+        tools = asyncio.run(listed())
+        return [t.name for t in tools]
+    # Stub server: decorated callables recorded on ``.tools``.
+    return [f.__name__ for f in getattr(mcp, "tools", [])]
+
+
+def _documented_mcp_tool_names(doc: str) -> list[str]:
+    """The MCP tool rows the doc lists after the live-registry sentence.
+
+    Reads the backticked tool names in the doc paragraph that immediately
+    follows the sentence introducing the enumerated tool set. The live names
+    must still appear in the doc (the original direction); reading the rows the
+    doc actually binds additionally catches a documented row that is not in the
+    live registry, which is the negative control for this test.
+    """
+    marker = "exposes exactly these"
+    assert marker in doc, "doc no longer lists the MCP tool set"
+    paragraph = doc.partition(marker)[2].split("\n\n")[1]
+    return sorted(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", paragraph))
 
 
 def _skills_on_disk() -> list[str]:
@@ -300,10 +345,14 @@ def test_doc_mcp_and_assay_support_rows_match_the_live_registry():
         sys.path.insert(0, src)
     importlib.invalidate_caches()
     server = importlib.import_module("skillweave.mcp.server")
-    tools = sorted(f.__name__ for f in getattr(server.mcp, "tools", []))
+    tools = sorted(_live_mcp_tool_names(server.mcp))
     assert "create_run" in tools and "agent_capabilities" in tools
     for tool in tools:
         assert tool in doc, f"MCP tool {tool!r} not in the doc"
+    documented = _documented_mcp_tool_names(doc)
+    for tool in documented:
+        assert tool in tools, f"documented MCP tool {tool!r} not in the registry"
+    assert documented == tools, (documented, tools)
     methodology = importlib.import_module("skillweave.runtime.methodology")
     for entry in methodology.DEFAULT_REGISTRY._entries:
         assert entry.value in doc, f"methodology {entry.value!r} not in the doc"
