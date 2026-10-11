@@ -556,6 +556,21 @@ def _classify(row: WorkspaceRow) -> Tuple[Classification, str]:
             "no workspace manifest: lease and session ownership are unrecorded",
         )
 
+    # Definite adverse findings outrank unavailable evidence (see docstring).
+    # Check dirtiness, detached HEAD and upstream divergence before the
+    # UNKNOWN check so that a dirty / detached / stale tree is reported as
+    # such even when a non-determinant dimension (e.g. upstream) is genuinely
+    # unavailable.
+    if row.dirtiness is DirtyState.DIRTY:
+        return Classification.DIRTY, "working tree has uncommitted changes (dirty)"
+    if row.head is HeadState.DETACHED:
+        return Classification.DETACHED, "HEAD is detached; no branch is checked out"
+    if row.upstream in (UpstreamState.BEHIND, UpstreamState.DIVERGED):
+        return (
+            Classification.STALE,
+            f"branch is {row.upstream.value} relative to its upstream",
+        )
+
     unknown = [
         name
         for name, state in (
@@ -578,15 +593,6 @@ def _classify(row: WorkspaceRow) -> Tuple[Classification, str]:
             "unknown/unavailable evidence: " + ", ".join(unknown),
         )
 
-    if row.dirtiness is DirtyState.DIRTY:
-        return Classification.DIRTY, "working tree has uncommitted changes (dirty)"
-    if row.head is HeadState.DETACHED:
-        return Classification.DETACHED, "HEAD is detached; no branch is checked out"
-    if row.upstream in (UpstreamState.BEHIND, UpstreamState.DIVERGED):
-        return (
-            Classification.STALE,
-            f"branch is {row.upstream.value} relative to its upstream",
-        )
     if row.session is EvidenceState.ABSENT:
         return Classification.STALE, "session heartbeat is stale; no live owner evidence"
     return (

@@ -312,6 +312,36 @@ def test_unparseable_lease_is_unknown_not_absent():
         assert row.classification is Classification.UNKNOWN
 
 
+def test_clean_worktree_with_unavailable_upstream_is_unknown():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        collection = tmp / "collection"
+        primary = collection / "repo"
+        head = _init_repo(primary)
+        wt = collection / ".worktrees" / "repo" / "run1" / "lane1"
+        _git(primary, "worktree", "add", "-q", "-b", "feat", str(wt))
+
+        # Configure upstream to a non-existent remote ref so that @{upstream}
+        # resolves as a symbolic name but the tracking ref does not exist,
+        # making upstream evidence genuinely unavailable.
+        _git(wt, "remote", "add", "origin", "http://nonexistent/repo.git")
+        _git(wt, "config", "branch.feat.remote", "origin")
+        _git(wt, "config", "branch.feat.merge", "refs/heads/feat")
+
+        row = _inventory(
+            collection,
+            manifests={str(wt): _manifest(head, head)},
+            processes={str(wt): [os.getpid()]},
+        ).row_for(str(wt))
+
+        # Clean tree -> no DIRTY finding; genuinely unavailable upstream
+        # evidence -> UNKNOWN classification.
+        assert row.dirtiness is DirtyState.CLEAN
+        assert row.upstream is UpstreamState.UNKNOWN
+        assert row.classification is Classification.UNKNOWN
+        assert "upstream" in row.reason
+
+
 def test_stale_session_evidence_is_stale_not_healthy():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
