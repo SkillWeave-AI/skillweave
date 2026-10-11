@@ -370,34 +370,88 @@ def test_envctl_where_mentioned_is_optional():
 # ── the release-consistency consumer, run as a real subprocess ──────────────
 
 
-def _scratch_repo_with_candidate_tag(dest: Path) -> Path:
-    """A scratch clone of this checkout with a local annotated ``v<candidate>``.
+def _candidate() -> str:
+    pyproject = re.search(
+        r'^version\s*=\s*"(\d+\.\d+\.\d+)"', _read("pyproject.toml"), re.M
+    )
+    assert pyproject, "pyproject.toml has no [project].version"
+    return pyproject.group(1)
 
-    The read-only ``check-version-truth.py`` compares the release-advertising
-    positions (badge, ``What's new`` heading, CHANGELOG top) against the
-    **latest tag in the repository**. In the working tree the latest tag still
-    predates the release in preparation, so the check correctly reports drift
-    there. This helper materialises the release-in-preparation fact without
-    mutating the tree: an annotated tag named for the candidate is created on
-    the tree's HEAD in a scratch clone, so the check is exercised against the
-    exact tree the diff ships -- never against a re-implementation of it.
+
+def _scratch_repo(dest: Path) -> Path:
+    """A scratch clone of this checkout with the shipped README materialised.
+
+    The clone materialises HEAD, but the release face under test is the
+    working-tree material this diff ships; overwrite the clone's README with
+    the shipped one so the check evaluates the release-in-preparation face
+    exactly as it will be tagged, independent of commit state. The real tree is
+    never mutated.
     """
     repo = dest / "skillweave"
     subprocess.run(
         ["git", "clone", "-q", "--no-hardlinks", str(_REPO), str(repo)],
         check=True, capture_output=True, text=True,
     )
-    # The clone materialises HEAD, but the release face under test is the
-    # working-tree material this diff ships; overwrite the clone's README with
-    # the shipped one so the check evaluates the release-in-preparation face
-    # exactly as it will be tagged, independent of commit state.
     (repo / "README.md").write_text(_read("README.md"), encoding="utf-8")
-    pyproject = re.search(
-        r'^version\s*=\s*"(\d+\.\d+\.\d+)"', _read("pyproject.toml"), re.M
+    return repo
+
+
+def _drop_release_prep(repo: Path) -> None:
+    """Remove the ``release_prep`` scalar from a scratch clone's .version.yaml.
+
+    SW-CORE-RFX-001 introduces ``release_prep: "<candidate>"`` while a release
+    is being prepared: the flag marks the candidate as *ahead* of the released
+    tag. Once the candidate's tag exists the flag is no longer ahead, so
+    ``check-version-truth.py`` correctly reports ``release-prep-ahead`` drift by
+    design -- the owner removes the flag at tagging. This models that post-tag
+    state in the scratch clone (tolerating absence, so the lane is exercised
+    both with and without the RFX-001 key). The real tree is never touched.
+    """
+    vf = repo / ".version.yaml"
+    if not vf.is_file():
+        return
+    kept = [
+        ln for ln in vf.read_text(encoding="utf-8").splitlines(keepends=True)
+        if not re.match(r"\s*release_prep\s*:", ln)
+    ]
+    vf.write_text("".join(kept), encoding="utf-8")
+
+
+def _set_release_prep(repo: Path, candidate: str) -> None:
+    """Ensure a top-level ``release_prep: "<candidate>"`` scalar is present.
+
+    Models SW-CORE-RFX-001's pre-tag release-prep flag: the candidate is named
+    as the release in preparation, ahead of the latest released tag.
+    """
+    vf = repo / ".version.yaml"
+    lines = (
+        vf.read_text(encoding="utf-8").splitlines(keepends=True)
+        if vf.is_file() else []
     )
-    assert pyproject, "pyproject.toml has no [project].version"
-    candidate = pyproject.group(1)
-    tag = "v" + candidate
+    lines = [ln for ln in lines if not re.match(r"\s*release_prep\s*:", ln)]
+    out: list[str] = []
+    inserted = False
+    for ln in lines:
+        out.append(ln)
+        if not inserted and re.match(r"source_of_truth\s*:", ln):
+            out.append(f'release_prep: "{candidate}"\n')
+            inserted = True
+    if not inserted:
+        out.append(f'release_prep: "{candidate}"\n')
+    vf.write_text("".join(out), encoding="utf-8")
+
+
+def _scratch_repo_with_candidate_tag(dest: Path) -> Path:
+    """A scratch clone of this checkout in the POST-tag state.
+
+    An annotated tag named for the candidate is created on the tree's HEAD and
+    the release-prep flag is removed, exactly as the owner will after tagging,
+    so ``check-version-truth.py`` -- which compares the release-advertising
+    positions against the **latest tag in the repository** -- passes. The real
+    tree is never mutated or tagged.
+    """
+    repo = _scratch_repo(dest)
+    tag = "v" + _candidate()
     existing = subprocess.run(
         ["git", "-C", str(repo), "tag", "--list", tag],
         capture_output=True, text=True, check=True,
@@ -405,19 +459,43 @@ def _scratch_repo_with_candidate_tag(dest: Path) -> Path:
     if not existing:
         subprocess.run(
             ["git", "-C", str(repo), "tag", "-a", tag, "-m",
-             f"SkillWeave {candidate}"],
+             f"SkillWeave {_candidate()}"],
             check=True, capture_output=True, text=True,
         )
+    _drop_release_prep(repo)
     return repo
+
+
+def _scratch_repo_pre_release(dest: Path) -> Path:
+    """A scratch clone in the PRE-tag state: no candidate tag, release_prep set.
+
+    Models the tree while 1.5.10 is the release in preparation but before its
+    ``v1.5.10`` tag exists: the release-facing positions name the candidate and
+    ``.version.yaml`` carries ``release_prep: "<candidate>"`` (SW-CORE-RFX-001).
+    """
+    repo = _scratch_repo(dest)
+    candidate = _candidate()
+    subprocess.run(
+        ["git", "-C", str(repo), "tag", "-d", "v" + candidate],
+        capture_output=True, text=True,
+    )
+    _set_release_prep(repo, candidate)
+    return repo
+
+
+def _check_knows_release_prep() -> bool:
+    """True when the composed check implements SW-CORE-RFX-001's release-prep rule."""
+    return "release_prep" in _CHECK.read_text(encoding="utf-8")
 
 
 def test_release_consistency_check_passes_on_the_tree(tmp_path):
     # The diff advertises the release IN PREPARATION (the candidate) at every
     # release-facing position, so the read-only check must pass once that
-    # candidate's tag exists. In the tree as it is the latest tag still
-    # predates the candidate, so the check correctly drifts there -- this test
-    # binds the shipped release face to the tag its release would carry,
-    # without mutating the tree's own tags.
+    # candidate's tag exists and the release-prep flag is cleared, as the owner
+    # does at tagging. In the tree as it is the latest tag still predates the
+    # candidate, so the check correctly drifts there -- this test binds the
+    # shipped release face to the tag its release would carry, without mutating
+    # the tree's own tags.
     repo = _scratch_repo_with_candidate_tag(tmp_path)
     proc = subprocess.run(
         [sys.executable, "-B", str(_CHECK), "--repo", str(repo)],
@@ -425,6 +503,29 @@ def test_release_consistency_check_passes_on_the_tree(tmp_path):
     )
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     assert "check-version-truth: OK" in proc.stdout
+
+
+def test_release_consistency_check_accepts_release_prep_before_tag(tmp_path):
+    # The PRE-tag state: 1.5.10 is the release in preparation, its tag does not
+    # exist yet and .version.yaml carries release_prep: "1.5.10". SW-CORE-RFX-001
+    # makes the release-prep flag license the candidate's release face ahead of
+    # the latest released tag, so the composed check passes; without RFX-001 the
+    # candidate's release face is simply ahead of the tag and correctly drifts.
+    # The test asserts the behaviour of whichever check is present, so the file
+    # is green both in this lane and on the RFX-001 composition.
+    repo = _scratch_repo_pre_release(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-B", str(_CHECK), "--repo", str(repo)],
+        capture_output=True, text=True,
+    )
+    if _check_knows_release_prep():
+        assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+        assert "check-version-truth: OK" in proc.stdout
+    else:
+        # The release-prep rule is not composed here, so the candidate's
+        # release face is ahead of the latest tag and the check drifts.
+        assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr)
+        assert "DRIFT" in proc.stdout
 
 
 def _plant_installed(tmp_path: Path, version: str, editable_dir: str) -> Path:
