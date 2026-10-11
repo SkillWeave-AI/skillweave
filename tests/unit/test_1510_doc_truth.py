@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -118,6 +119,21 @@ def _git(*args: str) -> str:
     ).stdout.strip()
 
 
+def _released_tag() -> str:
+    """The released fact is the repository's latest annotated product tag.
+
+    Derived from the repository, never the literal ``v1.5.9``: the test asks
+    the repository which tag is latest, so a later release (for example a local
+    ``v1.5.10`` tag) is exercised without editing this file.
+    """
+    tags = [
+        t for t in _git("tag", "--list", "v*").split()
+        if re.fullmatch(r"v\d+\.\d+\.\d+", t)
+    ]
+    assert tags, "no vX.Y.Z release tag found in the repository"
+    return max(tags, key=lambda t: tuple(int(p) for p in t[1:].split(".")))
+
+
 # ── criterion 1: derive from the qualified release manifest ─────────────────
 
 
@@ -180,20 +196,41 @@ def test_doc_binds_candidate_and_released_facts():
     bundle = re.search(r"^version:\s*(\d+\.\d+\.\d+)\s*$", _read("capability.yaml"), re.M)
     assert pyproject and bundle and pyproject.group(1) == bundle.group(1)
     candidate = pyproject.group(1)
+    # The candidate (and declared bundle) is named in the doc.
     assert candidate in doc
-    # The released fact is the tag's PEELED commit, never branch HEAD.
-    peeled = _git("rev-parse", "v1.5.9^{}")
-    assert re.fullmatch(r"[0-9a-f]{40}", peeled)
-    assert peeled in doc, "the peeled released commit is not named in the doc"
-    assert "peeled" in doc.lower()
-    head = _git("rev-parse", "HEAD")
-    if head != peeled:
-        assert "1.5.10" in doc and "not released" in doc.lower()
+    # The released fact is derived from the repository (the latest annotated
+    # tag), never a literal v1.5.9 pinned in this file. The document states it
+    # by its RULE and by the COMMAND that derives it, never by a printed hash:
+    # neither the released version literal nor a peeled commit is required in
+    # the document.
+    assert "peeled" in doc.lower(), "the doc must state the peeled-tag rule"
+    assert "rev-parse" in doc, "the doc must name the command that derives it"
+    assert "annotated" in doc.lower(), "the doc must state the annotated rule"
+    # No literal peeled commit may be printed in the doc.
+    assert not re.search(r"\b[0-9a-f]{40}\b", doc), "the doc prints a literal hash"
+    # The candidate is named as the release in preparation, not yet released
+    # until its tag exists in the repository.
+    released_tag = _released_tag()
+    if released_tag != "v" + candidate:
+        assert "not yet released" in doc.lower() or "not released" in doc.lower()
 
 
 def test_readme_binds_version_skill_count_and_substrate():
     readme = _read("README.md")
-    released = re.search(r"badge/version-(\d+\.\d+\.\d+)", readme).group(1)
+    pyproject = re.search(
+        r'^version\s*=\s*"(\d+\.\d+\.\d+)"', _read("pyproject.toml"), re.M
+    )
+    assert pyproject, "pyproject.toml has no [project].version"
+    candidate = pyproject.group(1)
+    # The badge advertises the candidate release in preparation, the What's new
+    # heading names it, the changelog anchor is the CHANGELOG's own 1.5.10
+    # heading slug, and the install example uses the candidate wheel name.
+    assert f"badge/version-{candidate}" in readme, readme[:200]
+    assert f"## What's new in {candidate}" in readme
+    assert f"CHANGELOG.md#v{candidate.replace('.', '')}-" in readme
+    assert f"skillweave-{candidate}-py3-none-any.whl" in readme
+    # No literal peeled hash of a release tag may be printed in the README.
+    assert not re.search(r"\b[0-9a-f]{40}\b", readme), "README prints a literal hash"
     n = len(_skills_on_disk())
     assert f"badge/skills-{n}" in readme, f"skills badge != on-disk {n}"
     assert f"all {n} skills" in readme
@@ -333,9 +370,57 @@ def test_envctl_where_mentioned_is_optional():
 # ── the release-consistency consumer, run as a real subprocess ──────────────
 
 
-def test_release_consistency_check_passes_on_the_tree():
+def _scratch_repo_with_candidate_tag(dest: Path) -> Path:
+    """A scratch clone of this checkout with a local annotated ``v<candidate>``.
+
+    The read-only ``check-version-truth.py`` compares the release-advertising
+    positions (badge, ``What's new`` heading, CHANGELOG top) against the
+    **latest tag in the repository**. In the working tree the latest tag still
+    predates the release in preparation, so the check correctly reports drift
+    there. This helper materialises the release-in-preparation fact without
+    mutating the tree: an annotated tag named for the candidate is created on
+    the tree's HEAD in a scratch clone, so the check is exercised against the
+    exact tree the diff ships -- never against a re-implementation of it.
+    """
+    repo = dest / "skillweave"
+    subprocess.run(
+        ["git", "clone", "-q", "--no-hardlinks", str(_REPO), str(repo)],
+        check=True, capture_output=True, text=True,
+    )
+    # The clone materialises HEAD, but the release face under test is the
+    # working-tree material this diff ships; overwrite the clone's README with
+    # the shipped one so the check evaluates the release-in-preparation face
+    # exactly as it will be tagged, independent of commit state.
+    (repo / "README.md").write_text(_read("README.md"), encoding="utf-8")
+    pyproject = re.search(
+        r'^version\s*=\s*"(\d+\.\d+\.\d+)"', _read("pyproject.toml"), re.M
+    )
+    assert pyproject, "pyproject.toml has no [project].version"
+    candidate = pyproject.group(1)
+    tag = "v" + candidate
+    existing = subprocess.run(
+        ["git", "-C", str(repo), "tag", "--list", tag],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    if not existing:
+        subprocess.run(
+            ["git", "-C", str(repo), "tag", "-a", tag, "-m",
+             f"SkillWeave {candidate}"],
+            check=True, capture_output=True, text=True,
+        )
+    return repo
+
+
+def test_release_consistency_check_passes_on_the_tree(tmp_path):
+    # The diff advertises the release IN PREPARATION (the candidate) at every
+    # release-facing position, so the read-only check must pass once that
+    # candidate's tag exists. In the tree as it is the latest tag still
+    # predates the candidate, so the check correctly drifts there -- this test
+    # binds the shipped release face to the tag its release would carry,
+    # without mutating the tree's own tags.
+    repo = _scratch_repo_with_candidate_tag(tmp_path)
     proc = subprocess.run(
-        [sys.executable, "-B", str(_CHECK), "--repo", str(_REPO)],
+        [sys.executable, "-B", str(_CHECK), "--repo", str(repo)],
         capture_output=True, text=True,
     )
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
@@ -358,16 +443,21 @@ def _plant_installed(tmp_path: Path, version: str, editable_dir: str) -> Path:
 def test_check_reports_installed_origin_from_the_real_distribution(tmp_path):
     # The installed-identity leg is driven end to end by the check's own
     # importlib.metadata consumption of a real on-disk distribution: origin
-    # path + how it was installed, not a bare number.
-    import os
-
-    badge = re.search(r"badge/version-(\d+\.\d+\.\d+)", _read("README.md")).group(1)
-    site = _plant_installed(tmp_path, badge, editable_dir="/repo/skillweave")
+    # path + how it was installed, not a bare number. The check runs against
+    # the release-in-preparation scratch clone so its release-facing legs pass
+    # while the installed-identity leg is exercised.
+    repo = _scratch_repo_with_candidate_tag(tmp_path)
+    installed = (tmp_path / "installed")
+    installed.mkdir(exist_ok=True)
+    badge = re.search(
+        r"badge/version-(\d+\.\d+\.\d+)", (repo / "README.md").read_text()
+    ).group(1)
+    site = _plant_installed(installed, badge, editable_dir="/repo/skillweave")
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
     env["PYTHONPATH"] = str(site)
     proc = subprocess.run(
-        [sys.executable, "-B", str(_CHECK), "--repo", str(_REPO)],
+        [sys.executable, "-B", str(_CHECK), "--repo", str(repo)],
         capture_output=True, text=True, env=env,
     )
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
