@@ -655,7 +655,18 @@ class TestCriterion1PublishedWheel:
             (package_authority / "execution-catalog.json").read_text(encoding="utf-8")
         )
         assert set(catalog["owners"]) == EXPECTED_OWNER_KEYS
-        assert catalog["sdk_version"] == "0.2.0"
+        # The wheel's own version, read from the pinned artifact, must equal the
+        # version Core pins in pyproject.toml -- never a frozen literal. A dead
+        # literal (0.2.0) turns this red once Core re-pins to the 0.3.0 wheel,
+        # exactly the stale-pin class this gate exists to catch.
+        _text = _PYPROJECT.read_text(encoding="utf-8")
+        _m = re.search(r'"skillweave-sdk==([^"]+)"', _text)
+        assert _m, "Core pyproject must pin skillweave-sdk==<version>"
+        assert _m.group(1) != "latest"
+        assert catalog["sdk_version"] == _m.group(1), (
+            f"pinned SDK wheel reports sdk_version {catalog['sdk_version']!r} "
+            f"but Core pins skillweave-sdk=={_m.group(1)}; the pin is stale"
+        )
         # A data-files payload would also leave a ``_authority`` directory at
         # the install root (or, under --target, nowhere). The payload must be in
         # exactly one place: inside the package.
