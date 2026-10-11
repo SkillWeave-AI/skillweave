@@ -1,3 +1,45 @@
+## v1.5.10 (2026-10-11) — Native Execution, Route-Lock, MCP Control & Trustworthy Publishing
+
+SkillWeave v1.5.10 delivers the native execution surfaces of the SW-1510 recovery work visible in the history since v1.5.9: an identity-verified lifecycle store and durable execution stream, native Assay, Scope, Skills, Verify, Cancel and Budget enforcement through the authoritative run path, the route-lock and MCP control/authority surfaces, and a release-publishing path that carries one honest identity to both forges. Every entry below is derived from that history; each cites the commit or task id it comes from.
+
+### Features
+- **Native Lifecycle Store**: unified native lifecycle state with transactional run persistence, CAS kill and legal lane transitions; durable completion and cancellation intent reconciled on resume, with atomic lifecycle/event co-commit (SW-1510-STORE; 07f9c0d, d3fdca0, 8ef1d28, b219c84).
+- **Execution Identity Boundary**: host-owned execution identity with a sealed authority store and live one-shot capabilities for protected writes (SW-1510-IDENTITY; aa60644, 71db98e).
+- **Execution Write-Scope**: WorkContract execution write-scope enforced with real isolation at the launch boundary (SW-1510-SCOPE; 5726d4e).
+- **Native Assay Execution**: methodology execution through the authoritative run path (SW-1510-ASSAY; 2baff64).
+- **Durable Stream Evidence**: disk-backed stream evidence with immutable facts and cursor replay (SW-1510-STREAM; cb7c1b1, d95b3c2).
+- **Cancel/Resume Lifecycle**: native identity-verified process lifecycle for cancel and resume, with durable cancellation reconciliation before the signal boundary (SW-1510-CANCEL; 05e5470, 3122520).
+- **Artifact Semantics Verification**: mandatory verification of artifact-specific semantics before an Assay PASS (SW-1510-VERIFY; b03832f, d2987e0).
+- **Native Execution Envelope**: three-field native execution envelope with no silent Ralph substitution, failing closed at the executor/generator/receipt seams (SW-1510-SKILLS; 74ffd37).
+- **Bounded Adaptive Scheduling**: bounded adaptive scheduling with a role-based model policy (SW-1510-ADAPTIVE; 802e6ca).
+- **Scoped Headless Adapter**: scoped headless OpenClaude adapter that composes typed headless events into execute and guards the launch seam (SW-1510-OPENCLAUDE; 11df945, 00b5e3a).
+- **Bounded Repair**: classified bounded repair bound to the Assay controller, failing closed on provider quota and unclassifiable failures (SW-1510-REPAIR; e235924, 04f0df6).
+- **Adapter Facade**: common adapter facade with an interchangeable search/tool registry, a format-reader API and the adapter guide (SW-ADAPT-001; a77bdc5, ea9d24e).
+- **MCP Agents & Mailbox**: durable harness-neutral handoff and agent mailbox, with the full tool surface served over both transports and atomic, idempotent mailbox posts under races (SW-1510-MCP-AGENTS; a7b6f5c, 700e671).
+- **MCP Control Surface**: control surface delegating to the shared run service, structured refusals, first-run store creation and a scoped Streamable HTTP serving path (SW-1510-MCP-CONTROL; 559ac08, 912287d).
+- **Installed CLI/MCP Entries**: installed CLI and MCP entries wired to the durable native streaming collector, with entry dispatch and publish command semantics repaired (SW-1510-CLI; 02db9fa).
+- **Budget Reservation Enforcement**: `QuotaRefused`, `allowed_routes`, nested-scope budget and task aggregate, with the reservation guard wired into async/restart and installed ingress paths (SW-1510-BUDGET; 6a863b4, 011e0db).
+- **Route-Lock**: route-decision-v1 contract payload, pinned-policy verification, egress confinement composed with worker/scope wrap, and route-proof enforcement through the CLI, MCP and reservation entrypoints (SW-1510-ROUTE-LOCK; ff72f05, f36a3ea, 6ae7b87).
+- **MCP Authority**: MCP authority made server-owned in the middleware, every tool gated, the start scope bound and the SDK envelope consumed (SW-1510-MCP-AUTH; 548a15e, 0900a20, fc891ae).
+- **SDK Contract CI**: Core/SDK contracts qualified against the installed wheel, with the gate pinned to the SDK head that ships `_authority` (SW-1510-SDK-CI; 66cab70, 3b73d86).
+- **Version & Support Truth**: the versioned execution/support matrix published, with version, search and setup claims computed from evidence (SW-1510-DOC-TRUTH, SW-DOC-004; c2e4679, 5484a7a, 9aa6c02).
+
+### Fixes
+- **Council Search**: DuckDuckGo Lite parser, error states, fallback gating and formatted context repaired against cold-review findings (SW-COUNCIL-004; baf6d10, 648429e).
+- **Council Launcher**: Perplexity MCP search lifecycle and result normalization repaired, forwarded credentials redacted from server-originated text, and a refused launcher refused at the consumer boundary (SW-COUNCIL-003; 5ded7c1, 43db148, dff8e34).
+- **Credential Resolver**: credential resolver hermetic isolation fixed with guard tests (SW-MCP-001; c61e9a7).
+
+### Infrastructure
+- **Publish Identity**: skill manifests point at the authorized SkillWeave-AI publish identity (SW-CORE-PUB-002; 416f167).
+- **Publish Manifest**: publish manifest owner/repo and identity aliases resolved (SW-CORE-PUB-001; 9ac4ea5).
+- **Capacium Action Pin**: Capacium publish action pinned to commit SHA `7a09969`, audited v1 (SW-CORE-PUB-004; e1ae85c).
+- **Publish-Manifest Contract Test**: contract test added for the Capacium target state (SW-CORE-PUB-003; f2ae58c).
+- **Install-Free Mirror**: mirror resolves its destination from `.ops.yaml` without requiring an install (SW-MPC-002; 3c73871).
+- **Mirror Configuration**: mirrors bound to SkillWeave-AI, with pinned ops-engine v3.4.2 provisioned before dependency checks (SW-1510-MIRROR-CONFIG; 7aabc1b, 9b245c8).
+- **Reproducible Provisioning**: reproducible Core provisioning with a base/optional boundary and an entrypoint smoke (SW-ENV-001; 47fbc5d).
+- **License Metadata**: Apache license metadata qualified for PEP 639 (SW-LIC-001; c095001).
+
+
 ## v1.5.9 (2026-09-30) — Contract Authority, Work Contracts & Methodology Registry
 
 SkillWeave v1.5.9 delivers the Contract Authority framework, cross-repo contract CI, work contracts, methodology registry, bounded repair, assay methodology, and infrastructure fixes for the release pipeline.
