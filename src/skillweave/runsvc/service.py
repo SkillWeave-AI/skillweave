@@ -148,38 +148,150 @@ def _work_contract_bound_base(work_contract: Any) -> Optional[str]:
     return commit if isinstance(commit, str) and commit else None
 
 
+#: SW-CORE-ZR-012: The measured worst-case delay from a fork of Homebrew
+#: framework Python (stub image) to the observed re-``exec`` of the settled
+#: framework binary.  Measured on the owner host under 10 busy loops over 24
+#: samples: min 164 ms, median 889 ms, max 4448 ms.  The capture waits at most
+#: this long for a *stub* image to be replaced by a different one before it
+#: falls back to a conservative refusal.  It is not an unbounded wait.
+_STUB_EXEC_REPLACEMENT_TIMEOUT_S = 6.0
+
+
+def _native_launcher_stub_images() -> set:
+    """The on-disk images that a thin interpreter launcher stub can present.
+
+    A launcher stub is a distinct on-disk image from the interpreter it
+    re-``exec``s into: Homebrew framework Python's ``.../Versions/3.14/bin/
+    python3.14`` is a small Mach-O that immediately re-``exec``s the framework
+    bundle ``.../Resources/Python.app/Contents/MacOS/Python``.  The stub names
+    the interpreter that will run through ``sys.executable`` *now*, so the
+    images derived from ``sys.executable`` (verbatim, resolved through
+    symlinks, and the ``python`` / ``python3.x`` siblings in its directory) are
+    exactly the images that must not be recorded.  On a Python whose
+    ``sys.executable`` already names the settled binary (Linux, a venv over a
+    non-stub interpreter) those candidates *are* the live image; this process's
+    own live image is dropped from the set, so the guard is inert off the stub
+    layout.  No provider or host path literal is baked in.
+
+    The set is learned from the *current* interpreter rather than from a live
+    probe child, because a probe child is precisely the transient state we are
+    trying to recognise: it may already have settled (yielding an empty set)
+    or still be starting (yielding a false image).
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    exe = getattr(sys, "executable", "") or ""
+    if not exe:
+        return set()
+    images = {exe}
+    try:
+        images.add(_os.path.realpath(exe))
+    except Exception:  # noqa: BLE001
+        pass
+    parent = _Path(exe).resolve().parent
+    for name in ("python", _Path(exe).name):
+        candidate = parent / name
+        images.add(str(candidate))
+        try:
+            images.add(_os.path.realpath(candidate))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # This process is already settled (it is running this code), so its own
+    # live image is by definition *not* a transient stub.  Drop it from the
+    # candidate set: on an interpreter that does not re-exec (e.g. Linux,
+    # where the live image equals ``realpath(sys.executable)``) this keeps the
+    # guard inert and prevents a 6 s stub-wait on every launch.  A genuine
+    # stub image is a *different* on-disk file, so it survives this removal.
+    try:
+        settled = _runtime_attr("process_identity", "capture")(_os.getpid())
+        if settled is not None and settled.exec_path:
+            images.discard(settled.exec_path)
+    except Exception:  # noqa: BLE001
+        pass
+    return {p for p in images if p}
+
+
 def _capture_settled_identity(
-    capture, pid: int, *, timeout: float = 0.3, interval: float = 0.01
+    capture, pid: int, *, timeout: float = 0.3, interval: float = 0.01,
+    launcher_images=None,
 ):
     """Observe *pid* until its exec image is stable, then return the identity.
 
     A freshly launched child can briefly still be the interpreter's thin
     launcher stub: Homebrew's ``bin/python3.14`` is a small Mach-O that
-    immediately re-``exec``s the framework bundle (``Python.app``), so an
-    immediate capture records the *pre-exec* image while a later cancellation
-    observes the *post-exec* one.  Recording the transient image would make the
-    identity verification refuse a legitimately-owned worker, so we wait until
-    two consecutive observations agree on ``(start_time, exec_path, argv)``
-    before recording.  Returns ``None`` only when *pid* is never observable
-    (it already exited); otherwise the last observed identity is returned so a
-    bounded wait can never lose a live process.
+    immediately re-``exec``s the framework bundle (``Python.app``).  The
+    launcher fork and that re-``exec`` are separated by the stub's own start-up
+    cost, so under load both observations taken by a short settle window can
+    still be the *pre-exec* stub image.  "Two consecutive observations agree"
+    therefore does not prove "the exec happened", and the recorded identity is
+    the transient launcher image -- which a later cancellation, seeing the
+    settled image, refuses with ``foreign_worker``.
+
+    Two guards make recording a transient image impossible:
+
+    * **Stub guard.**  An image that is one of the known launcher stubs
+      (:func:`_native_launcher_stub_images`) is *never* recorded.  We keep
+      observing until the image differs from the stub, or until the bounded
+      stub-replacement window (:data:`_STUB_EXEC_REPLACEMENT_TIMEOUT_S`, 6 s on
+      the owner host, above the measured 4.45 s worst case) elapses.
+    * **Stability guard.**  For a process whose image is not a known stub (its
+      exec is done when the observation begins, as on the settled framework
+      binary and on Linux), two consecutive observations must still agree on
+      ``(start_time, exec_path, argv)`` before recording -- the original
+      behaviour, unchanged.
+
+    Both guards run inside one bounded ``timeout``.  The wait can never be
+    unbounded.  When the window elapses without a settled, non-stub image the
+    truth cannot be established: this returns ``None`` rather than record an
+    image a live process no longer has (which would refuse a legitimate
+    worker), unless the only thing ever observed was the *same* non-stub image
+    (then the last observation is returned, so a live worker is never lost when
+    there is nothing transient about it).  ``None`` also means *pid* was never
+    observable (it already exited).
     """
     deadline = time.monotonic() + max(0.0, timeout)
+    if launcher_images is None:
+        launcher_images = _native_launcher_stub_images()
+    stub_seen = False
     previous_key = None
     last = None
+    stub_deadline = None
     while True:
         current = capture(pid)
         if current is not None:
-            last = current
-            key = (
-                current.start_time,
-                current.exec_path,
-                tuple(current.argv or ()),
-            )
-            if previous_key is not None and key == previous_key:
-                return current
-            previous_key = key
-        if time.monotonic() >= deadline:
+            if (current.exec_path or "") in launcher_images:
+                # Pre-exec launcher image: never record it.  Start the
+                # (bounded) replacement window the first time we see it.
+                stub_seen = True
+                if stub_deadline is None:
+                    stub_deadline = time.monotonic() + _STUB_EXEC_REPLACEMENT_TIMEOUT_S
+                previous_key = None
+                current = None
+            else:
+                last = current
+                key = (
+                    current.start_time,
+                    current.exec_path,
+                    tuple(current.argv or ()),
+                )
+                if previous_key is not None and key == previous_key:
+                    return current
+                previous_key = key
+        # A stub image means the exec has not happened yet: keep observing
+        # until the bounded replacement window closes rather than the short
+        # base settle timeout, so a loaded host has time to re-exec.  The wait
+        # is still bounded (by ``stub_deadline``).
+        effective_deadline = deadline
+        if stub_deadline is not None and stub_deadline > effective_deadline:
+            effective_deadline = stub_deadline
+        if time.monotonic() >= effective_deadline:
+            if stub_seen:
+                # Only a transient launcher image was ever observed; the true
+                # settled image could not be established, so record nothing
+                # rather than an image the live process no longer has.
+                return None
             return last
         time.sleep(interval)
 
