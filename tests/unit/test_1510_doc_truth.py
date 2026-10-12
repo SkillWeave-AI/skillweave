@@ -253,10 +253,20 @@ def test_doc_binds_candidate_and_released_facts():
     assert "annotated" in doc.lower(), "the doc must state the annotated rule"
     # No literal peeled commit may be printed in the doc.
     assert not re.search(r"\b[0-9a-f]{40}\b", doc), "the doc prints a literal hash"
-    # The candidate is named as the release in preparation, not yet released
-    # until its tag exists in the repository.
+    # The candidate's release state in the doc follows the repository: once the
+    # candidate's own tag exists (released_tag == "v" + candidate) the doc must
+    # name it as released, not as a release still in preparation; while the tag
+    # is absent the doc must say it is not yet released. Derived from the tag
+    # list, never a literal, so the same assertion holds before and after the
+    # tag exists.
     released_tag = _released_tag()
-    if released_tag != "v" + candidate:
+    if released_tag == "v" + candidate:
+        assert "released" in doc.lower(), (
+            "the doc must name the candidate as released once its tag exists"
+        )
+        assert "not yet released" not in doc.lower()
+        assert "not released" not in doc.lower()
+    else:
         assert "not yet released" in doc.lower() or "not released" in doc.lower()
 
 
