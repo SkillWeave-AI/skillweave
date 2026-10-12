@@ -33,7 +33,7 @@ from skillweave.dispatch.work_contract import SUBJECT_KINDS as DISPATCH_SUBJECT_
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SCHEMA = _REPO_ROOT / "skills" / "skillweave-blueprint" / "assets" / "prd.schema.json"
-_FIXTURE_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "prd-schema"
+_FIXTURE_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 
 
 def _load_schema():
@@ -49,7 +49,7 @@ def _errors(doc):
 
 
 def _fixture(name):
-    return json.loads((_FIXTURE_DIR / name).read_text())
+    return json.loads((_FIXTURE_DIR / f"blueprint-schema-{name}").read_text())
 
 
 def _task(**overrides):

@@ -15,7 +15,8 @@ were measured stale (SW-SKILL-001):
   ``gate_pass_requires``/``session_boundary``.
 
 The two named production PRDs (ops-002 mirror-rollout, Forgejo-first) are
-treated as fixtures under ``tests/fixtures/prd-schema/``. They are real
+treated as fixtures under ``tests/fixtures/`` as flat
+``blueprint-schema-*.json`` files. They are real
 production artifacts with their structure preserved intact and their prose
 redacted; do not simplify them to make tests pass — flattening that structure
 destroys the only check that catches a stale schema.
@@ -27,7 +28,7 @@ import jsonschema
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SCHEMA = _REPO_ROOT / "skills" / "skillweave-blueprint" / "assets" / "prd.schema.json"
-_FIXTURE_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "prd-schema"
+_FIXTURE_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 
 # regen-sequence.py reads at most this many acceptance criteria per dispatch.
 # See planning/scripts/regen-sequence.py (MAX_CRITERIA_PER_DISPATCH).
@@ -53,7 +54,7 @@ def _errors(doc):
 def _fixture(name):
     import json
 
-    return json.loads((_FIXTURE_DIR / name).read_text())
+    return json.loads((_FIXTURE_DIR / f"blueprint-schema-{name}").read_text())
 
 
 # Keys regen-sequence.py's ``_sequence`` and ``_briefs`` read unconditionally
