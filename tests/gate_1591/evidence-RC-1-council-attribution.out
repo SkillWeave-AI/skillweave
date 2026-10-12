@@ -1,0 +1,3 @@
+copy: TypeError: AttributedResponse.__new__() missing 2 required keyword-only arguments: 'requested_model' and 'answering_model'
+deepcopy: TypeError: AttributedResponse.__new__() missing 2 required keyword-only arguments: 'requested_model' and 'answering_model'
+pickle: TypeError: AttributedResponse.__new__() missing 2 required keyword-only arguments: 'requested_model' and 'answering_model'

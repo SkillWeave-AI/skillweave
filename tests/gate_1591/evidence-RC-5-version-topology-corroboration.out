@@ -1,0 +1,248 @@
+........FF.FF.F..F.F...sFsF.                                             [100%]
+=================================== FAILURES ===================================
+_ TestBundlePinsMatchOnDiskSkills.test_every_bundle_pin_names_an_on_disk_skill_with_matching_source _
+
+self = <test_version_sync.TestBundlePinsMatchOnDiskSkills object at 0x1075d42d0>
+
+    def test_every_bundle_pin_names_an_on_disk_skill_with_matching_source(self):
+        skills = self._skill_by_name()
+        for entry in self._bundle_capabilities():
+            name = entry["name"]
+            assert name in skills, f"bundle pin {name} has no on-disk skill"
+            expected_source = f"./skills/{name}"
+>           assert entry["source"] == expected_source, (
+                f"bundle pin {name} source {entry['source']!r} != on-disk {expected_source!r}"
+            )
+E           AssertionError: bundle pin skillweave-entry source './skills/skillweave' != on-disk './skills/skillweave-entry'
+E           assert './skills/skillweave' == './skills/skillweave-entry'
+E             
+E             - ./skills/skillweave-entry
+E             ?                    ------
+E             + ./skills/skillweave
+
+tests/unit/test_version_sync.py:146: AssertionError
+_ TestBundlePinsMatchOnDiskSkills.test_bundle_pin_version_matches_on_disk_skill_version _
+
+self = <test_version_sync.TestBundlePinsMatchOnDiskSkills object at 0x1075d4410>
+
+    def test_bundle_pin_version_matches_on_disk_skill_version(self):
+        skills = self._skill_by_name()
+        for entry in self._bundle_capabilities():
+            name = entry["name"]
+            on_disk = skills[name]["version"]
+>           assert entry["version"] == on_disk, (
+                f"bundle pin {name} version {entry['version']!r} != on-disk skill {on_disk!r}"
+            )
+E           AssertionError: bundle pin skillweave-entry version '1.5.8' != on-disk skill '1.3.11'
+E           assert '1.5.8' == '1.3.11'
+E             
+E             - 1.3.11
+E             + 1.5.8
+
+tests/unit/test_version_sync.py:155: AssertionError
+____ TestRequiredSurfaces.test_required_surfaces_share_the_runtime_version _____
+
+self = <test_version_sync.TestRequiredSurfaces object at 0x1075d4690>
+
+    def test_required_surfaces_share_the_runtime_version(self):
+        runtime = _read_first_match(
+            "pyproject.toml", r'^version\s*=\s*"(\d+\.\d+\.\d+)"'
+        )
+        assert runtime is not None, "pyproject.toml has no version"
+        assert re.fullmatch(r"\d+\.\d+\.\d+", runtime), f"not semver: {runtime!r}"
+    
+        for loc in _locations():
+            value = _read_first_match(loc["path"], loc["pattern"])
+            assert value is not None, f"no match for {loc['role']} at {loc['path']}"
+            if not loc.get("required", True):
+                # Informational (member pins + member files) may legitimately lag.
+                continue
+>           assert value == runtime, (
+                f"{loc['role']} at {loc['path']} is {value!r}, not runtime {runtime!r} "
+                f"(a required surface drifted from the runtime version)"
+            )
+E           AssertionError: distribution_bundle at capability.yaml is '1.5.8', not runtime '1.5.9' (a required surface drifted from the runtime version)
+E           assert '1.5.8' == '1.5.9'
+E             
+E             - 1.5.9
+E             ?     ^
+E             + 1.5.8
+E             ?     ^
+
+tests/unit/test_version_sync.py:188: AssertionError
+___ TestRequiredSurfaces.test_same_version_cannot_hide_a_different_inventory ___
+
+self = <test_version_sync.TestRequiredSurfaces object at 0x107589220>
+
+    def test_same_version_cannot_hide_a_different_inventory(self):
+        # The lockstep version matches, but two inventories must still agree on
+        # their member set. Same version with a different skill list is a real
+        # failure state, detected here as same-version-different-inventory.
+        bundle_members = {
+            e["name"] for e in self._bundle_capabilities()
+        }
+        declared_skills = {
+            loc["path"].split("/")[1]
+            for loc in _skill_entries()
+            if loc["path"].startswith("skills/")
+        }
+>       assert bundle_members == declared_skills, (
+            f"same-version-different-inventory: bundle members "
+            f"{sorted(bundle_members)} != declared skills {sorted(declared_skills)}"
+        )
+E       AssertionError: same-version-different-inventory: bundle members ['skillweave-blueprint', 'skillweave-council', 'skillweave-design', 'skillweave-discovery', 'skillweave-entry', 'skillweave-launch', 'skillweave-lifecycle', 'skillweave-observe', 'skillweave-onboarding', 'skillweave-post-release', 'skillweave-promptchain-execute', 'skillweave-promptchain-generate', 'skillweave-promptchain-validate', 'skillweave-releasechain', 'skillweave-repo-health'] != declared skills ['skillweave', 'skillweave-blueprint', 'skillweave-council', 'skillweave-design', 'skillweave-discovery', 'skillweave-launch', 'skillweave-lifecycle', 'skillweave-observe', 'skillweave-onboarding', 'skillweave-post-release', 'skillweave-promptchain-execute', 'skillweave-promptchain-generate', 'skillweave-promptchain-validate', 'skillweave-releasechain', 'skillweave-repo-health']
+E       assert {'skillweave-...-launch', ...} == {'skillweave'...-launch', ...}
+E         
+E         Extra items in the left set:
+E         'skillweave-entry'
+E         Extra items in the right set:
+E         'skillweave'
+E         Use -v to get more diff
+
+tests/unit/test_version_sync.py:205: AssertionError
+________________ test_thirteen_skills_are_named_and_match_disk _________________
+
+    def test_thirteen_skills_are_named_and_match_disk():
+        text = _doc.read_text()
+        on_disk = _skills_on_disk()
+>       assert len(on_disk) == 13, f"expected 13 skillweave-* skills, found {len(on_disk)}"
+E       AssertionError: expected 13 skillweave-* skills, found 14
+E       assert 14 == 13
+E        +  where 14 = len(['skillweave-blueprint', 'skillweave-council', 'skillweave-design', 'skillweave-discovery', 'skillweave-launch', 'skillweave-lifecycle', ...])
+
+tests/unit/test_doc_arch.py:75: AssertionError
+___________ TestTagBinding.test_product_tag_binds_to_runtime_source ____________
+
+self = <test_version_topology.TestTagBinding object at 0x106ee7d90>
+
+    def test_product_tag_binds_to_runtime_source(self):
+        topo = _load_topology()
+        # The tag is derived from the runtime source, which is the declared
+        # source_of_truth and the runtime_product location.
+        assert topo["source_of_truth"] == "pyproject.toml"
+        runtime = None
+        for loc in topo["locations"]:
+            if loc["role"] == "runtime_product":
+                runtime = _read(REPO_ROOT / loc["path"], loc["pattern"])
+        assert runtime is not None
+        assert re.fullmatch(r"\d+\.\d+\.\d+", runtime), f"runtime not semver: {runtime!r}"
+    
+        # A product tag must equal the runtime version: no required surface may
+        # carry a version that would produce a divergent tag under lockstep.
+        # Informational locations (bundle member pins) may legitimately diverge.
+        for loc in topo["locations"]:
+            if not loc.get("required", True):
+                continue  # informational (bundle member pins) may lag on purpose
+            v = _read(REPO_ROOT / loc["path"], loc["pattern"])
+>           assert v == runtime, (
+                f"tag-binding failure: {loc['role']} at {loc['path']} is {v!r}, "
+                f"runtime is {runtime!r}"
+            )
+E           AssertionError: tag-binding failure: distribution_bundle at capability.yaml is '1.5.8', runtime is '1.5.9'
+E           assert '1.5.8' == '1.5.9'
+E             
+E             - 1.5.9
+E             ?     ^
+E             + 1.5.8
+E             ?     ^
+
+tests/release/test_version_topology.py:70: AssertionError
+_____ TestTagBinding.test_bundle_manifest_version_matches_the_product_tag ______
+
+self = <test_version_topology.TestTagBinding object at 0x1075896e0>
+
+    def test_bundle_manifest_version_matches_the_product_tag(self):
+        topo = _load_topology()
+        runtime = None
+        bundle = None
+        for loc in topo["locations"]:
+            if loc["role"] == "runtime_product":
+                runtime = _read(REPO_ROOT / loc["path"], loc["pattern"])
+            elif loc["role"] == "distribution_bundle":
+                bundle = _read(REPO_ROOT / loc["path"], loc["pattern"])
+>       assert bundle == runtime, (
+            f"bundle manifest version {bundle!r} diverges from product tag {runtime!r}"
+        )
+E       AssertionError: bundle manifest version '1.5.8' diverges from product tag '1.5.9'
+E       assert '1.5.8' == '1.5.9'
+E         
+E         - 1.5.9
+E         ?     ^
+E         + 1.5.8
+E         ?     ^
+
+tests/release/test_version_topology.py:101: AssertionError
+________ TestRehearsal.test_expanded_declaration_finishes_synchronized _________
+
+self = <test_version_topology.TestRehearsal object at 0x1075d4f50>
+tmp_path = PosixPath('/private/var/folders/jv/b3szkbf546nfx6gblvmg633c0000gn/T/pytest-of-andrelange/pytest-3270/test_expanded_declaration_fini0')
+
+    def test_expanded_declaration_finishes_synchronized(self, tmp_path):
+        repo = _copy_tree(tmp_path)
+        # Snapshots of the copied tree's actual pre-bump state, not literals.
+        # A committed tree may already be decoupled (members lagging together
+        # behind the runtime from a prior real release); every required surface
+        # still agrees with the runtime, and every informational surface carries
+        # whatever the tree shipped. The rehearsal must hold in that steady state
+        # exactly as it holds in the fully-synchronized one.
+        runtime = _read(
+            repo / "pyproject.toml", r'^version\s*=\s*"(\d+\.\d+\.\d+)"'
+        )
+        assert runtime is not None, "pyproject runtime unreadable"
+        new = _patch_bump(runtime)
+        prior_bundle = _read(repo / "capability.yaml", r"^version:\s*(\S+)")
+>       assert prior_bundle == runtime, (
+            f"bundled runtime source {prior_bundle!r} != runtime {runtime!r} "
+            f"in the pre-bump tree"
+        )
+E       AssertionError: bundled runtime source '1.5.8' != runtime '1.5.9' in the pre-bump tree
+E       assert '1.5.8' == '1.5.9'
+E         
+E         - 1.5.9
+E         ?     ^
+E         + 1.5.8
+E         ?     ^
+
+tests/release/test_version_topology.py:275: AssertionError
+__________ test_criterion_05_version_topology_foreign_cwd_dual_review __________
+
+    def test_criterion_05_version_topology_foreign_cwd_dual_review():
+        """Runtime/bundle/skill-capability version topology, foreign-cwd package-root
+        discovery, and strict dual-review-attestation regressions.
+        """
+        # --- Version topology ------------------------------------------------------
+        core = _core_root()
+        pyproject = tomllib.loads((core / "pyproject.toml").read_text(encoding="utf-8"))
+        bundle_version = pyproject["project"]["version"]
+    
+        version_toml = yaml.safe_load((core / ".version.yaml").read_text(encoding="utf-8"))
+        assert version_toml["source_of_truth"] == "pyproject.toml"
+        locations = version_toml["locations"]
+        loc_paths = {loc["path"] for loc in locations}
+        assert {"pyproject.toml", "capability.yaml"} <= loc_paths
+    
+        capability = _load_yaml(core / "capability.yaml")
+        assert capability["kind"] == "bundle"
+        # The bundle manifest's own version tracks pyproject.toml (the bundle is the
+        # versioned object). Decoupled member pins are normal; only the bundle's own
+        # head version is expected to match the source of truth.
+>       assert capability["version"] == bundle_version
+E       AssertionError: assert '1.5.8' == '1.5.9'
+E         
+E         - 1.5.9
+E         ?     ^
+E         + 1.5.8
+E         ?     ^
+
+tests/gate_1312/test_topology_regressions.py:63: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_version_sync.py::TestBundlePinsMatchOnDiskSkills::test_every_bundle_pin_names_an_on_disk_skill_with_matching_source
+FAILED tests/unit/test_version_sync.py::TestBundlePinsMatchOnDiskSkills::test_bundle_pin_version_matches_on_disk_skill_version
+FAILED tests/unit/test_version_sync.py::TestRequiredSurfaces::test_required_surfaces_share_the_runtime_version
+FAILED tests/unit/test_version_sync.py::TestRequiredSurfaces::test_same_version_cannot_hide_a_different_inventory
+FAILED tests/unit/test_doc_arch.py::test_thirteen_skills_are_named_and_match_disk
+FAILED tests/release/test_version_topology.py::TestTagBinding::test_product_tag_binds_to_runtime_source
+FAILED tests/release/test_version_topology.py::TestTagBinding::test_bundle_manifest_version_matches_the_product_tag
+FAILED tests/release/test_version_topology.py::TestRehearsal::test_expanded_declaration_finishes_synchronized
+FAILED tests/gate_1312/test_topology_regressions.py::test_criterion_05_version_topology_foreign_cwd_dual_review
+9 failed, 17 passed, 2 skipped in 0.29s

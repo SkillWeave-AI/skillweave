@@ -56,6 +56,15 @@ SDK_OWNED_SCHEMA_FILENAMES = (
 # The Core schemas this release ships: runtime/dispatch contracts, not the
 # lifecycle contract. Their presence is the legitimate Core set; anything in
 # SDK_OWNED_SCHEMA_FILENAMES appearing under Core schemas/ is drift.
+#
+# ``work-contract.schema.json`` (SW-159, commit aae6424) is a Core runtime/
+# dispatch contract, not an SDK contract. docs/architecture.md §"Repository
+# boundary" scopes the SDK to the lifecycle/work-profile/deliverable/evidence/
+# subject schemas and pack schemas only, and docs/execution-write-scope.md
+# places WorkContract inside Core's execution/write-scope boundary (realised by
+# src/skillweave/dispatch/work_contract.py). The pinned SDK 0.3.0 ships no
+# work-contract schema -- absent from schema_version.toml, contract-lock.json
+# and its history. It therefore belongs in the Core set, not the SDK set.
 CORE_OWNED_SCHEMA_FILENAMES = (
     "assessment-receipt.schema.json",
     "discovery-trace.schema.json",
@@ -70,6 +79,7 @@ CORE_OWNED_SCHEMA_FILENAMES = (
     "prompt-sequence.schema.json",
     "run-state.schema.json",
     "transfer-entry.schema.json",
+    "work-contract.schema.json",
     "workflow-context.schema.json",
     "workspace-manifest.schema.json",
 )

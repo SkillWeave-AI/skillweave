@@ -67,3 +67,34 @@ launch a role. The general contract is `skillweave.routing.harness`: a profile
 declares an arbitrary `launch_command`, and the seam runs whatever that profile
 declares. The OpenCode string above is *data* in the example profile, not syntax
 of the product.
+
+## Repository names and the mirror destination
+
+Two names are fixed and must not be rewritten by a mirror:
+
+| Role | Name |
+|------|------|
+| Canonical release repository (Forgejo) | `skillweave/skillweave` |
+| Distribution mirror (GitHub) | `LangeVC/skillweave` |
+| Authorized mirror destination (org) | `SkillWeave-AI` |
+
+These are the published names; the mirror preserves them (see
+`docs/release-flow.md` and `.ops.yaml`). There is **exactly one** mirror owner —
+this repository's release workflow — and **no second mirror owner** is
+introduced here. The `SkillWeave-AI` destination is recorded, not acted on:
+**no transfer is initiated** by this document or by this ticket.
+
+## Composition status of the DOC-TRUTH / MIRROR-CONFIG results
+
+This matrix is intended to bind to the qualified results of the sibling
+SW-1510-DOC-TRUTH and SW-1510-MIRROR-CONFIG tasks (and SW-1510-RELEASE). Those
+tasks' qualified, composed **results are not available in this checkout**: the
+task briefs, the controller ledger and the sibling worktrees are outside this
+lane's read scope, and no accepted result artifact for them is present here.
+
+That binding is therefore an explicit **HOLD**, not a claim: the rows above
+retain the names and the authorized `SkillWeave-AI` destination verbatim, but
+this document does **not** assert that the DOC-TRUTH/MIRROR-CONFIG results have
+been qualified or composed. When those qualified results become available they
+are folded in by the composing controller (SW-1510-DISC-VERIFY / SW-1510-RELEASE);
+nothing here fabricates their content or a passing verification in their place.

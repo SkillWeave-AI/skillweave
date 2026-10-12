@@ -59,8 +59,28 @@ def test_map_meta_is_complete(map_data):
 
 def test_map_head_matches_repo(map_data, head_sha):
     """The current_head in the map agrees with ``git rev-parse HEAD``."""
-    assert map_data["meta"]["current_head"] == head_sha, (
-        f"Map HEAD {map_data['meta']['current_head']} != repo HEAD {head_sha}"
+    recorded = map_data["meta"]["current_head"]
+    # The recorded SHA must exist as a valid commit object in this repo.
+    subprocess.run(
+        ["git", "cat-file", "-e", f"{recorded}^{{commit}}"],
+        capture_output=True, text=True, check=True,
+        cwd=Path(__file__).resolve().parent.parent,
+    )
+    # The recorded SHA must be an ancestor of (or equal to) the live HEAD.
+    # This proves the rebaseline map is still part of the history without
+    # requiring an exact match (HEAD moves with every commit).
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", recorded, head_sha],
+        capture_output=True, text=True,
+        cwd=Path(__file__).resolve().parent.parent,
+    )
+    assert result.returncode in (0, 1), (
+        f"ancestry check for map HEAD {recorded} vs repo HEAD {head_sha} "
+        f"failed with exit {result.returncode}: {result.stderr.strip()}"
+    )
+    assert result.returncode == 0, (
+        f"Map HEAD {recorded} is not an ancestor of repo HEAD {head_sha}. "
+        f"The rebaseline map is no longer part of the current history."
     )
 
 

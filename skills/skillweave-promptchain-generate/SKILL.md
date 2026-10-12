@@ -62,7 +62,10 @@ skillweave-promptchain-generate inputs='{"topic": "Wellness business evaluation"
 **Parameters:**
 - `inputs` (required): JSON containing either PRD path (`prd`) or topic/domain/goal
 - `sequence_type` (optional): Type of sequence - plan (conceptual/strategy), build (development/implementation), mixed (combination) (default: auto-detect)
-- `execution_mode` (optional): Execution profile - rex (simple, fast, attended), ralph_attended (full loop with human checkpoints), ralph_overnight (autonomous overnight execution) (default: auto based on complexity)
+- `methodology` (optional): Native execution methodology - `rex`, `ralph`, `gauntlet`, `assay`. Declared separately from autonomy policy and session schedule; Assay is never silently substituted by Ralph.
+- `autonomy_policy` (optional): The methodology's own autonomy axis - `conservative`, `medium`, `unicorn` (`unicorn` is Assay's declared default). Separate from `methodology`.
+- `session_schedule` (optional): Session scheduling, separate again from both. Defaults to the declared `session_boundary` (or `batch`).
+- `execution_mode` (optional, **legacy adapter**): Legacy execution profile - rex (simple, fast, attended), ralph_attended (full loop with human checkpoints), ralph_overnight (autonomous overnight execution). Accepted only when it agrees with the declared `methodology`; it is refused (never silently substituted) when it would route execution to a different methodology.
 - `target` (optional): Target audience - humanize (human readable), machinize (machine optimized), mixed (default: mixed)
 - `risk_mode` (optional): `conservative`, `medium`, `unicorn` - overrides environment variable and config files
 - `quality` (optional): Quality level (basic, standard, premium)
@@ -82,11 +85,23 @@ skillweave-promptchain-generate inputs='{"topic": "Wellness business evaluation"
 | **mixed** | **ralph_attended** | Full product development • 6-15 tasks • 2-8 hours • Phased execution | End-to-end product development, startup launch, product redesign |
 | **mixed** | **ralph_overnight** | Enterprise-scale development • 15+ tasks • >8 hours • Autonomous pipeline | Large-scale projects, platform development, organizational transformation |
 
-**Backward Compatibility:** The `mode` parameter is still supported as an alias:
-- `mode="simple"` → `execution_mode="rex"`
-- `mode="standard"` → `execution_mode="ralph_attended"` 
-- `mode="complex"` → `execution_mode="ralph_overnight"`
+**Backward Compatibility:** The `mode` parameter is still supported as an alias
+for the **legacy** `execution_mode` adapter, and the `execution_mode` /
+`suggested_workflow` vocabularies are explicit adapters over the native
+`methodology`:
+
+- `mode="simple"` → `execution_mode="rex"` → methodology `rex`
+- `mode="standard"` → `execution_mode="ralph_attended"` → methodology `ralph`
+- `mode="complex"` → `execution_mode="ralph_overnight"` → methodology `ralph`
 - `mode="auto"` → Auto-detect both sequence_type and execution_mode
+
+The adapter **fails closed**: an unknown value, or a legacy
+`execution_mode`/`suggested_workflow` that denotes a *different* methodology
+than the sequence declares, is refused with
+`legacy_would_substitute_methodology` / `unknown_legacy_*` — execution is never
+silently re-routed to Ralph. A legacy `mode`/`execution_mode` alias is therefore
+only usable where it agrees with the declared `methodology`; new work declares
+`methodology` directly.
 
 **PRD Input Example:**
 ```
@@ -119,9 +134,18 @@ When generating from topic/domain, creates standard prompt sequence:
 
 ### Complexity-Aware Workflow Selection (Two-Axis Model)
 
-PromptChain analyzes the PRD's `execution_recommendation` and tasks using a two-axis model:
+PromptChain analyzes the PRD's declared `sequence.methodology` / `autonomy_policy`
+/ `session_schedule` (preserving all three separately) and its tasks using a
+two-axis model:
 - **Sequence Type**: `plan` (conceptual/strategy), `build` (development/implementation), or `mixed`
-- **Execution Mode**: `rex` (simple/fast), `ralph_attended` (human-checkpointed), `ralph_overnight` (autonomous)
+- **Execution Mode** (legacy adapter): `rex` (simple/fast), `ralph_attended` (human-checkpointed), `ralph_overnight` (autonomous)
+
+A PRD that carries a native `methodology` declaration keeps it: the generated
+sequence emits `methodology`, `autonomy_policy` and `session_schedule` as three
+separate fields (plus the `execution_envelope` block). The legacy
+`execution_recommendation.suggested_workflow` is consulted only as an explicit
+compatibility adapter — it is refused if it disagrees with the declared
+methodology.
 
 Based on complexity analysis, generates optimal execution sequences:
 

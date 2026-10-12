@@ -10,22 +10,22 @@
   "tested_combination": {
     "core_sha": "e04212860560111359c758a544207ac1cb8b1c96",
     "core_ref": "refs/heads/fix/SW-1591-core-sdk-contracts-run8",
-    "core_subject": "Merge SW-1591-CORE-001: migrate Core to published SDK 0.2.0 contract set",
-    "sdk_sha": "0cff095eedb40adaa583c02b5d6d4e7829927947",
-    "sdk_tag": "v0.2.0",
-    "sdk_version": "0.2.0",
+    "core_subject": "Merge SW-1591-CORE-001: migrate Core to published SDK 0.3.0 contract set",
+    "sdk_sha": "2a4e2caa420d7578e29b0ad9ba584d676c89fb7b",
+    "sdk_tag": "v0.3.0",
+    "sdk_version": "0.3.0",
     "sdk_source": "published (Forgejo canonical git@git.langevc.com:skillweave/skillweave-sdk.git; GitHub mirror https://github.com/LangeVC/skillweave-sdk.git)",
-    "sdk_pin_origin": "pyproject.toml declares skillweave-sdk==0.2.0; the installed SDK carries 13 schemas (4 core + 9 lifecycle) and is contract authority for all lifecycle contract bytes.",
-    "sdk_schema_count": 13,
-    "canonical_digest_algorithm": "sha256 of the sorted '<filename>\\x00<canonical_json>\\x00' concatenation of every SDK schemas/*.schema.json entry",
-    "canonical_digest": "f2ec1b0218dd380341cffb8bce80fc8d272d07ba244287f8af1ec6feb0db18d6"
+    "sdk_pin_origin": "pyproject.toml declares skillweave-sdk==0.3.0 (tag v0.3.0, qualified commit 2a4e2caa420d7578e29b0ad9ba584d676c89fb7b); the installed SDK carries 27 schema files (13 flat core/lifecycle + 11 execution + 3 adapter) and is contract authority for all lifecycle contract bytes.",
+    "sdk_schema_count": 27,
+    "canonical_digest_algorithm": "sha256 of the sorted '<key>\\x00<canonical_json>\\x00' concatenation of every *.schema.json entry in the SDK schema directory (SDK 0.3.0: src/skillweave_sdk/schemas, 27 files = 13 flat + 11 execution + 3 adapter); key is the schema path relative to that directory, canonical_json is json.dumps(schema, sort_keys=True, separators=(',', ':'))",
+    "canonical_digest": "3dd247f604017bac4ff37ff4f3e9b46c5d1bc48fc8ef225de88ec4b6d14d2e64"
   },
   "shas": {
     "skillweave": "e04212860560111359c758a544207ac1cb8b1c96",
-    "skillweave-sdk": "0cff095eedb40adaa583c02b5d6d4e7829927947"
+    "skillweave-sdk": "2a4e2caa420d7578e29b0ad9ba584d676c89fb7b"
   },
   "digests": {
-    "sdk-canonical": "f2ec1b0218dd380341cffb8bce80fc8d272d07ba244287f8af1ec6feb0db18d6",
+    "sdk-canonical": "3dd247f604017bac4ff37ff4f3e9b46c5d1bc48fc8ef225de88ec4b6d14d2e64",
     "skillweave-sdk:category-pack.schema.json": "77bafee2d1bfbec6918242f3156d308f658ae94ad066d64bb95373fa7def9194",
     "skillweave-sdk:category-taxonomy.schema.json": "d83cd2b520281c9216063ac19101a0423f02dc7e990913ffa1432fbfc53aec06",
     "skillweave-sdk:deliverable-contract.schema.json": "b5ad2f19f18ed4c55217d87526a698dc9384cd065e4355b4d1de1986914838fb",
@@ -41,12 +41,20 @@
     "skillweave-sdk:workflow-context.schema.json": "b0fc2dace5f6c352b09127d82885444023745c0e2af81305b83c27a63bb5803c"
   },
   "commands": [
+    {"command": "python3 -m pytest tests/contract/test_lifecycle_contracts.py tests/integration/test_effective_profile_snapshot.py tests/contract/test_cms_operate_profile.py tests/contract/test_lifecycle_support_matrix.py tests/e2e/test_research_synthesis_vertical.py tests/integration/test_cross_repo_contract_ci.py -x -q", "exit": 0}
+  ],
+  "evidence": [
     {
-      "command": "python3 -m pytest tests/contract/test_lifecycle_contracts.py tests/integration/test_effective_profile_snapshot.py tests/contract/test_cms_operate_profile.py tests/contract/test_lifecycle_support_matrix.py tests/e2e/test_research_synthesis_vertical.py tests/integration/test_cross_repo_contract_ci.py -x -q",
-      "exit": 0
+      "path": "tests/gate_1591/evidence-RC-3-sdk-lifecycle-schemas.out",
+      "sha256": "b25e67bd934c1368b8cc8bdf464e2bc0f205593131d368b35e78cc942697af91",
+      "meaning": "The SDK at the Core contract pin (skillweave-sdk==0.1.0, tag v0.1.0) carries four schemas, not the nine lifecycle contracts; the eight fixture contracts have no SDK schema and the cross-repo suite fails."
+    },
+    {
+      "path": "tests/gate_1591/evidence-SW-1591-CI-001-drift-counterproof.out",
+      "sha256": "e130489c4338bd37c8290e2ec45c583c06c0e6d45385edfd55900e5a4a6dc2ea",
+      "meaning": "AC5 local reproduction: the canonical-digest check passes on the pristine published SDK clone at the Core contract pin (tag v0.1.0, pytest exit 0) and fails once a single byte is appended to schemas/run-state.schema.json (pytest exit 1); the full suite against the drifted SDK is 3 failed, 12 passed (exit 1)."
     }
   ],
-  "evidence": [],
   "resolved_criteria": [
     {
       "criterion": 3,

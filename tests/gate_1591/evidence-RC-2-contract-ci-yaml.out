@@ -1,0 +1,62 @@
+.forgejo/workflows/contract-ci.yml:44:0: could not parse as YAML: could not find expected ':' [syntax-check]
+   |
+44 | import re
+   | 
+
+--- python yaml.safe_load transcript (exit 1) ---
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import yaml; yaml.safe_load(open(chr(46)+chr(102)+chr(111)+chr(114)+chr(103)+chr(101)+chr(106)+chr(111)+chr(47)+chr(119)+chr(111)+chr(114)+chr(107)+chr(102)+chr(108)+chr(111)+chr(119)+chr(115)+chr(47)+chr(99)+chr(111)+chr(110)+chr(116)+chr(114)+chr(97)+chr(99)+chr(116)+chr(45)+chr(99)+chr(105)+chr(46)+chr(121)+chr(109)+chr(108)))
+                 ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/__init__.py", line 125, in safe_load
+    return load(stream, SafeLoader)
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/__init__.py", line 81, in load
+    return loader.get_single_data()
+           ~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/constructor.py", line 49, in get_single_data
+    node = self.get_single_node()
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 36, in get_single_node
+    document = self.compose_document()
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 55, in compose_document
+    node = self.compose_node(None, None)
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 84, in compose_node
+    node = self.compose_mapping_node(anchor)
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 133, in compose_mapping_node
+    item_value = self.compose_node(node, item_key)
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 84, in compose_node
+    node = self.compose_mapping_node(anchor)
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 133, in compose_mapping_node
+    item_value = self.compose_node(node, item_key)
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 84, in compose_node
+    node = self.compose_mapping_node(anchor)
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 133, in compose_mapping_node
+    item_value = self.compose_node(node, item_key)
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 82, in compose_node
+    node = self.compose_sequence_node(anchor)
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 111, in compose_sequence_node
+    node.value.append(self.compose_node(node, index))
+                      ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 84, in compose_node
+    node = self.compose_mapping_node(anchor)
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/composer.py", line 127, in compose_mapping_node
+    while not self.check_event(MappingEndEvent):
+              ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/parser.py", line 98, in check_event
+    self.current_event = self.state()
+                         ~~~~~~~~~~^^
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/parser.py", line 428, in parse_block_mapping_key
+    if self.check_token(KeyToken):
+       ~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/scanner.py", line 115, in check_token
+    while self.need_more_tokens():
+          ~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/scanner.py", line 152, in need_more_tokens
+    self.stale_possible_simple_keys()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/lib/python3.14/site-packages/yaml/scanner.py", line 291, in stale_possible_simple_keys
+    raise ScannerError("while scanning a simple key", key.mark,
+            "could not find expected ':'", self.get_mark())
+yaml.scanner.ScannerError: while scanning a simple key
+  in ".forgejo/workflows/contract-ci.yml", line 44, column 1
+could not find expected ':'
+  in ".forgejo/workflows/contract-ci.yml", line 45, column 1

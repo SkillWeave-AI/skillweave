@@ -193,7 +193,17 @@ This is the **build format**: the `execution-sequences.yaml` that
 It is what the SkillWeave ecosystem produces today. Validate these keys, not
 the twelve sections:
 
-- `sequence_id`, `sequence_type` (build/plan/mixed), `execution_mode`
+- `sequence_id`, `sequence_type` (build/plan/mixed)
+- `methodology` (`rex`|`ralph`|`gauntlet`|`assay`), `autonomy_policy`
+  (`conservative`|`medium`|`unicorn`) and `session_schedule` — three **separate**
+  fields. `execution_mode` is retained as an **explicit legacy adapter**: a
+  value that would route execution to a different methodology than
+  `methodology` declares must be refused (`legacy_would_substitute_methodology`),
+  never silently substituted. Assay is preserved, never rewritten to Ralph.
+- `execution_envelope:` — the namespaced `execution-envelope-v1` block carrying
+  `version`, `methodology`, `autonomy_policy`, `session_schedule`, the adapter
+  `source` (`declared`|`legacy`) and the consumed `legacy_fields`. A consumer
+  refuses a `version` it does not know.
 - `phases:` — one per dependency level, each with `level`, `session:
   separate`, `depends_on_phase`, `dispatches_total`, and lanes split into
   `parallel_lanes` (subagent per lane, disjoint scope) and

@@ -1,8 +1,9 @@
 """Async run lifecycle: start, inspect, and kill durable background runs.
 
-Reuses the existing ``subprocess`` and process-group patterns from
-``runner_adapter`` but writes structured state to
-``.skillweave/runs/<run-id>/`` instead of a bare tracking-log.
+Routes through ``RunApplicationService`` and the kernel SQLite store so that
+start, completion, cancellation and resume share one SQLite/CAS authority.
+The public API (``RunHandle``, ``start_async``, ``kill_run``, ``inspect_run``)
+is preserved as a compatibility facade.
 """
 
 from __future__ import annotations
@@ -50,6 +51,8 @@ class RunHandle:
     state: str = "running"
     created_at: str = ""
     version: int = 1
+    process_identity: Optional[dict[str, Any]] = None
+    lineage: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -69,56 +72,46 @@ class InspectMode:
 
 
 # ---------------------------------------------------------------------------
-# Detached wrapper script (similar to observe.py's wrapper but more robust)
+# Detached wrapper script — writes completion through the kernel store
 # ---------------------------------------------------------------------------
 
 _WRAPPER_SRC = (
     "import subprocess, sys, json, os, signal\n"
     "run_id = sys.argv[1]\n"
-    "store_path = sys.argv[2]\n"
-    "start_seq = int(sys.argv[3])\n"
-    "cmd = sys.argv[4:]\n"
-    "from pathlib import Path\n"
-    "store_dir = Path(store_path)\n"
-    "store_dir.mkdir(parents=True, exist_ok=True)\n"
-    "events = store_dir / 'events.jsonl'\n"
-    "meta = store_dir / 'run.json'\n"
-    "\n"
-    "def _write_event(ev):\n"
-    "    with open(events, 'a') as f:\n"
-    "        f.write(json.dumps(ev, sort_keys=True) + '\\n')\n"
-    "        f.flush()\n"
-    "\n"
-    "seq = start_seq\n"
-    "def _next_seq():\n"
-    "    global seq\n"
-    "    seq += 1\n"
-    "    return seq\n"
-    "\n"
-    "_write_event({'event': 'started', 'sequence': _next_seq(), 'command': list(cmd), 'run_id': run_id})\n"
+    "db_path = sys.argv[2]\n"
+    "cmd = sys.argv[3:]\n"
+    "from skillweave.runtime.store import SQLiteRunStore, RunStateModel, CompletionReconciler\n"
+    "from skillweave.runtime.journal import EventJournal\n"
+    "store = SQLiteRunStore(db_path)\n"
+    "journal = EventJournal(db_path)\n"
+    "journal.append(run_id, event_type='started',\n"
+    "    payload={'command': cmd})\n"
+    "def _complete(lifecycle, event_type, payload, key, reason):\n"
+    "    CompletionReconciler(\n"
+    "        store, run_id,\n"
+    "        target_state='advance_or_stop',\n"
+    "        lifecycle_update=lifecycle,\n"
+    "        event_type=event_type,\n"
+    "        event_payload=payload,\n"
+    "        idempotency_key=key,\n"
+    "        reason=reason,\n"
+    "    ).reconcile()\n"
     "try:\n"
     "    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n"
     "    rc = proc.returncode\n"
     "    stdout_text = proc.stdout.decode('utf-8', errors='replace') if proc.stdout else ''\n"
-    "    _write_event({'event': 'finished', 'sequence': _next_seq(), 'returncode': rc, 'stdout_preview': stdout_text[:1024]})\n"
-    "    # Update run.json state\n"
-    "    import json\n"
-    "    if meta.exists():\n"
-    "        d = json.loads(meta.read_text('utf-8'))\n"
-    "        d['state'] = 'succeeded' if rc == 0 else 'failed'\n"
-    "        d['exit_code'] = rc\n"
-    "        d['finished_at'] = __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()\n"
-    "        d['version'] = d.get('version', 1) + 1\n"
-    "        meta.write_text(json.dumps(d, sort_keys=True) + '\\n', encoding='utf-8')\n"
+    "    _complete(\n"
+    "        {'lifecycle_state': 'succeeded' if rc == 0 else 'failed', 'exit_code': rc},\n"
+    "        'finished', {'returncode': rc, 'stdout_preview': stdout_text[:1024]},\n"
+    "        'wrapper:finish:' + run_id + ':' + str(rc), 'wrapper: process completed')\n"
     "except Exception as exc:\n"
-    "    _write_event({'event': 'error', 'sequence': _next_seq(), 'error': str(exc)})\n"
-    "    if meta.exists():\n"
-    "        d = json.loads(meta.read_text('utf-8'))\n"
-    "        d['state'] = 'failed'\n"
-    "        d['exit_code'] = -1\n"
-    "        d['version'] = d.get('version', 1) + 1\n"
-    "        meta.write_text(json.dumps(d, sort_keys=True) + '\\n', encoding='utf-8')\n"
-    "    sys.exit(1)\n"
+    "    _complete(\n"
+    "        {'lifecycle_state': 'failed', 'exit_code': -1},\n"
+    "        'error', {'error': str(exc)},\n"
+    "        'wrapper:error:' + run_id, 'wrapper: error: ' + str(exc))\n"
+    "finally:\n"
+    "    store.close()\n"
+    "    journal.close()\n"
 )
 
 
@@ -132,12 +125,19 @@ def start_async(
     project_root: Optional[Path] = None,
     run_id: Optional[str] = None,
     cwd: Optional[Path] = None,
+    reservation_envelope: Optional[Any] = None,
+    route_proof: Optional[Any] = None,
 ) -> RunHandle:
     """Start *command* as a detached background process.
 
+    Routes through ``RunApplicationService.start_async`` so the run is
+    registered in the kernel SQLite store before launch, and the detached
+    child writes completion through the same store.  The service owns
+    native start, completion, cancellation, and reattachment/resume
+    decisions.
+
     The child runs in its own session (process group) so it survives the
-    launcher's exit.  A structured RunHandle is returned immediately; the
-    handle is also persisted under ``.skillweave/runs/<run-id>/run.json``.
+    launcher's exit.  A structured RunHandle is returned immediately.
 
     Parameters
     ----------
@@ -155,47 +155,47 @@ def start_async(
     RunHandle
         The versioned handle for the newly started run.
     """
+    from skillweave.runtime.store import SQLiteRunStore
+    from skillweave.runtime.journal import EventJournal
+    from skillweave.runtime.registry import RawArtifactStore
+    from skillweave.runsvc.service import RunApplicationService
+
     root = Path(project_root or Path.cwd()).resolve()
-    rid = run_id or uuid.uuid4().hex
     child_cwd = str(cwd or root)
 
-    store = RunStateStore(root)
-    store_dir = store.run_dir(rid)
+    db_path = str(root / ".skillweave" / "store.db")
+    (root / ".skillweave").mkdir(parents=True, exist_ok=True)
 
-    # Launch detached wrapper; pass start_seq=1 so the wrapper's first event
-    # gets sequence 2 (after the host's "launched" event at seq=1).
-    proc = subprocess.Popen(
-        [sys.executable, "-c", _WRAPPER_SRC, rid, str(store_dir), "1", *list(command)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        cwd=child_cwd,
+    kernel_store = SQLiteRunStore(db_path)
+    journal = EventJournal(kernel_store)
+    raw_artifacts = RawArtifactStore()
+    service = RunApplicationService(kernel_store, journal, raw_artifacts)
+
+    # Build env with PYTHONPATH for the child.
+    src_path = str(Path(__file__).resolve().parent.parent.parent)
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{src_path}:{existing}" if existing else src_path
+
+    result = service.start_async(
+        command,
+        run_id=run_id,
+        cwd=Path(child_cwd),
+        project_root=root,
+        _env=env,
+        reservation_envelope=reservation_envelope,
+        route_proof=route_proof,
     )
-
-    meta = RunMetadata.create(
-        run_id=rid,
-        command=list(command),
-        pid=proc.pid,
-    )
-    store.write_metadata(meta)
-
-    # Write the launch event
-    store.append_event(rid, {
-        "event": "launched",
-        "sequence": 1,
-        "run_id": rid,
-        "pid": proc.pid,
-        "command": list(command),
-    })
 
     return RunHandle(
-        run_id=rid,
-        pid=proc.pid,
-        command=list(command),
+        run_id=result["run_id"],
+        pid=result["pid"],
+        command=result["command"],
         state="running",
-        created_at=meta.created_at,
-        version=meta.version,
+        created_at=result["created_at"],
+        version=result["version"],
+        process_identity=result.get("process_identity"),
+        lineage=result.get("lineage"),
     )
 
 
@@ -250,17 +250,40 @@ def inspect_run(
         "finished_at": meta.finished_at,
         "version": meta.version,
     }
+    recorded_identity = (meta.metadata or {}).get("process_identity")
+    if recorded_identity is not None:
+        snapshot["process_identity"] = recorded_identity
+    lineage = (meta.metadata or {}).get("lineage")
+    if lineage is not None:
+        snapshot["lineage"] = lineage
 
     events = store.read_events(run_id)
     lane_states: dict[str, Any] = {}
     for ev in events:
         lane_id = ev.get("lane_id") or ev.get("run_id", run_id)
-        if ev.get("event") in ("finished", "error"):
+        if ev.get("event") in ("started", "launched"):
+            lane_states.setdefault(lane_id, "running")
+        elif ev.get("event") in ("finished", "error", "killed", "cancelled"):
             lane_states[lane_id] = "terminal"
-        elif ev.get("event") == "started":
-            lane_states[lane_id] = "running"
+
+    # The lifecycle -> lane projection is *shared* with the support table and
+    # the cancel path (SW-1510-CLI criterion 2).  Applying it here means the
+    # reported lane state can never contradict the reported lifecycle state:
+    # a run whose lifecycle is ``killed`` reports the lane ``advance_or_stop``
+    # (the same value ``cancel`` reports), not a stale event-derived
+    # ``running``.  An unrecognized lifecycle leaves the event-derived value.
+    from skillweave.cli.support import interpret_state, lifecycle_projection
+
+    lane_projection = lifecycle_projection()
+    interpretation = interpret_state(meta.state)
+    canonical_lifecycle = interpretation.canonical or meta.state
+    projected_lane = lane_projection.get(canonical_lifecycle)
+    if projected_lane is not None:
+        lane_states[run_id] = projected_lane
 
     snapshot["lane_states"] = lane_states
+    if projected_lane is not None:
+        snapshot["lane_state"] = projected_lane
     snapshot["event_count"] = len(events)
 
     if mode == InspectMode.SNAPSHOT:
@@ -311,9 +334,10 @@ def kill_run(
 ) -> dict[str, Any]:
     """Kill a run by its ID and recorded PID.
 
-    Graceful (SIGTERM) first, then forced (SIGKILL) after a short grace
-    period.  Verifies the *pid* matches the recorded PID to prevent killing
-    a stale/reused process.
+    Uses the kernel-backed ``RunStateStore`` for CAS-guarded terminal
+    transitions.  Graceful (SIGTERM) first, then forced (SIGKILL) after
+    a short grace period.  Verifies the *pid* matches the recorded PID
+    to prevent killing a stale/reused process.
 
     Parameters
     ----------
@@ -353,6 +377,20 @@ def kill_run(
             "result": "already_terminal",
         }
 
+    # Record a durable cancellation intent BEFORE the irreversible signal
+    # boundary.  If the facade is lost after signalling (or dies at the signal
+    # call itself), the intent stays readable, so a later production resume
+    # (``RunApplicationService.resume_run``) finishes the cancellation instead
+    # of leaving a non-terminal ``running`` run with no restart authority.
+    store._kernel.reconcile_cancellation_intent(
+        run_id,
+        pid=pid,
+        result="pending",
+        event_payload={"pid": pid, "result": "pending"},
+        idempotency_key="kill:" + run_id,
+        reason="lifecycle: kill",
+    ).record_intent()
+
     # Graceful kill (SIGTERM) to the process group
     killed_graceful = False
     try:
@@ -387,11 +425,13 @@ def kill_run(
         except (ProcessLookupError, PermissionError):
             result = "graceful_kill" if killed_graceful else "already_dead"
 
-    store.update_metadata(run_id, state="killed", finished_at=_now())
+    # Use the kernel-backed store for CAS-guarded terminal transition.
+    # Drive the kernel lane state to terminal so the wrapper cannot
+    # resurrect the run after cancellation.
+    store.update_metadata(run_id, expected_version=meta.version, state="killed", finished_at=_now())
 
     store.append_event(run_id, {
         "event": "killed",
-        "sequence": store.latest_event_sequence(run_id) + 1,
         "run_id": run_id,
         "pid": pid,
         "result": result,
@@ -403,6 +443,97 @@ def kill_run(
         "state": "killed",
         "result": result,
     }
+
+
+def cancel_process(
+    run_id: str,
+    pid: Optional[int] = None,
+    *,
+    project_root: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Cancel an owned native run after proving process identity.
+
+    Unlike :func:`kill_run` (which trusts the caller PID), this entry verifies
+    the recorded native identity against the live OS facts and refuses to
+    signal a recycled PID, a stale command or a foreign worker.  It stops the
+    owned process group and records an acknowledgement.  A recorded process
+    that is no longer observable is reported as *unknown* in-flight, never as
+    a fabricated termination.
+
+    Raises the kernel ``ProcessIdentityError`` (subclass of ``StoreError``)
+    when verification does not yield ``match``.
+    """
+    from skillweave.runsvc.service import RunApplicationService
+
+    store, service, root = _service_for(project_root)
+    return service.cancel_process(run_id, pid, project_root=root)
+
+
+def restart_attempt(
+    run_id: str,
+    command: Optional[list[str]] = None,
+    *,
+    project_root: Optional[Path] = None,
+    cwd: Optional[Path] = None,
+    idempotency_key: Optional[str] = None,
+    reservation_envelope: Optional[Any] = None,
+    route_proof: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Launch a NEW identified attempt that continues *run_id*.
+
+    A resume is a real new process with a new recorded identity, never a
+    database transition dressed up as "restarted".  Idempotent on
+    *idempotency_key*: repeating it returns the attempt already launched
+    instead of spawning a duplicate.  When *command* is omitted the source
+    run's recorded command is reused.
+    """
+    from skillweave.runsvc.service import RunApplicationService
+
+    store, service, root = _service_for(project_root)
+
+    if command is None:
+        source = store.get_run(run_id)
+        if source is None:
+            raise RunStateError(f"no run found: {run_id}")
+        command = (source.metadata or {}).get("runlifecycle", {}).get("command")
+        if not command:
+            raise RunStateError(
+                f"no recorded command for run {run_id}; pass a command")
+
+    src_path = str(Path(__file__).resolve().parent.parent.parent)
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{src_path}:{existing}" if existing else src_path
+
+    return service.restart_attempt(
+        run_id,
+        command,
+        project_root=root,
+        cwd=cwd or root,
+        idempotency_key=idempotency_key,
+        _env=env,
+        reservation_envelope=reservation_envelope,
+        route_proof=route_proof,
+    )
+
+
+def _service_for(project_root: Optional[Path]):
+    """Build (kernel_store, RunApplicationService, root) for *project_root*."""
+    from skillweave.runtime.store import SQLiteRunStore
+    from skillweave.runtime.journal import EventJournal
+    from skillweave.runtime.registry import RawArtifactStore
+    from skillweave.runtime.reservation import ReservationStore
+    from skillweave.runsvc.service import RunApplicationService
+
+    root = Path(project_root or Path.cwd()).resolve()
+    db_path = str(root / ".skillweave" / "store.db")
+    (root / ".skillweave").mkdir(parents=True, exist_ok=True)
+    kernel_store = SQLiteRunStore(db_path)
+    service = RunApplicationService(
+        kernel_store, EventJournal(kernel_store), RawArtifactStore(),
+        reservation_store=ReservationStore(db_path),
+    )
+    return kernel_store, service, root
 
 
 # ---------------------------------------------------------------------------

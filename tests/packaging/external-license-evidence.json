@@ -1,0 +1,44 @@
+{
+  "task": "SW-LIC-001",
+  "criterion": 4,
+  "reported_observation": "NOASSERTION",
+  "observation_source": "GitHub license detection for the public mirror revision, as reported in the SW-LIC-001 ticket and the addendum PRD assumption \"Reported GitHub NOASSERTION belongs to the intended mirror revision.\"",
+  "status": "unverified_external",
+  "mirrored_revision_checked": false,
+  "why_unverified": "GitHub license detection runs server-side against the exact mirrored revision. This lane has no network and no publication authority; the mirror is written by .forgejo/workflows/mirror.yml, not from here. No read-only check of the GitHub-side revision was performed.",
+  "action_taken": "none",
+  "transfer_or_push_or_retag": false,
+  "forbidden_test_methods_not_used": [
+    "git push to GitHub to trigger detection",
+    "creating or moving a tag to force a re-scan",
+    "any GitHub API call from this lane"
+  ],
+  "cause_status": "not_determined",
+  "cause_note": "Indentation alone is NOT a proven cause and is not claimed here. The actual LICENSE was a reworded/abridged Apache-2.0 variant (see tests/packaging/test_license_metadata.py and the reviewed LICENSE diff); such a body is a plausible non-matching input for a detector, but that remains a hypothesis until the GitHub-side scanner itself is observed read-only at the mirrored revision.",
+  "local_finding": {
+    "license_was_canonical_apache_2_0": false,
+    "license_now_equals_canonical": true,
+    "canonical_preserved_terms": [
+      "Sections 1-9",
+      "END OF TERMS AND CONDITIONS",
+      "APPENDIX",
+      "Copyright 2026 LangeVC.com"
+    ],
+    "metadata_now_spdx": "Apache-2.0"
+  },
+  "base_revision": "bf85ec53597998111a46dcc14cf1028f629b0723",
+  "base_revision_note": "The accepted pre-change revision of this worktree (binding/scope \"base\"). Immutable. The candidate revision under test is this base plus this lane's bounded commit; its parent is asserted by tests/packaging/test_license_metadata.py.",
+  "local_revision_checked": "8e4c8cf1267cbf2991f07da445e5d7c0e7c48e06",
+  "local_revision_note": "Seed head at the time this record was written; superseded by the bounded SW-LIC-001 commit on branch fix/sw1510-addendum-sw-lic-001. Retained for traceability only; not used as an assertion.",
+  "carry_to": "mirror/publication checkpoint",
+  "carry_action": "At the authorized publication checkpoint, perform an official read-only check of the GitHub-side license detection for the exact mirrored revision (the revision built from this lane's commit) and record whether the report changes from NOASSERTION. Do not publish or retag from this lane to test detection.",
+  "scanner_probe": {
+    "note": "Literal output of the offline scanner-availability probe run in this lane.",
+    "script": "tests/packaging/probe_scanners.py",
+    "script_sha256": "ba7bfad598fdda72247f718e0a3b4d7429411a9afbd9cee37b1d294e79d7a4cb",
+    "result_line": "SCANNER_AVAILABLE=False",
+    "result_summary": "SCANNER_AVAILABLE=False: no third-party license scanner present as a Python module, on PATH, or as an npm global; no network to install one.",
+    "setup_hold": true,
+    "setup_hold_note": "The task treats an unavailable scanner as an explicit setup hold, not a fabricated result. The available offline SPDX validator is packaging.licenses.canonicalize_license_expression (PyPA), exercised with a positive and a negative control in test_local_license_scanner_identifies_apache."
+  }
+}

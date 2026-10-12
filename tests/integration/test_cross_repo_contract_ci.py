@@ -81,6 +81,29 @@ def _resolve_sdk() -> Path | None:
     return None
 
 
+def _sdk_schemas_dir(sdk_root: Path) -> Path:
+    """Resolve the schema directory inside an SDK checkout.
+
+    SDK 0.3.0 ships its schemas as package data at
+    ``src/skillweave_sdk/schemas/`` (27 files: 13 flat + 11 execution + 3
+    adapter); the pre-0.2.0 layout exposed them at ``<checkout>/schemas/``.
+    Resolve the in-package location first and fall back to the legacy root so a
+    tree that still carries the old layout keeps running. An SDK that carries
+    neither is a hard failure, never a silent empty set (the previous defect:
+    globbing ``<checkout>/schemas`` yielded zero files, so the canonical digest
+    hashed the empty set and always "matched").
+    """
+    candidates = (
+        sdk_root / "src" / "skillweave_sdk" / "schemas",
+        sdk_root / "skillweave_sdk" / "schemas",
+        sdk_root / "schemas",
+    )
+    for cand in candidates:
+        if cand.is_dir():
+            return cand
+    return candidates[0]
+
+
 # Published remote hosts. Forgejo (git.langevc.com) is the contract-authority
 # remote; the GitHub mirror is distribution-only. A local path, a file:// URL
 # or an unpublished checkout must NOT match — that is the false-green this
@@ -221,18 +244,30 @@ def _positive_fixtures(lock: dict | None = None) -> dict[str, dict]:
 
 
 def _canonical_sdk_digest(sdk_root: Path) -> str:
-    """Canonical digest over every ``schemas/*.schema.json`` byte in the SDK.
+    """Canonical digest over every ``*.schema.json`` in the SDK schema dir.
 
-    Same algorithm the tested-combination manifest records: sha256 over the
-    sorted ``<name>:<sha256>\\n`` concatenation. It covers schema bytes that no
-    fixture currently exercises, so removing or rewriting such a schema still
-    turns the gate red.
+    Same algorithm and identity the tested-combination manifest records and the
+    SDK's own ``validator.canonical_digest`` computes: sha256 over the sorted
+    ``<key>\\x00<canonical_json>\\x00`` concatenation, where ``key`` is the
+    schema path relative to the schema root (``run-state.schema.json``,
+    ``execution/run-snapshot-v1.schema.json``,
+    ``adapter/adapter-descriptor-v1.schema.json``) and the canonical JSON is
+    ``json.dumps(schema, sort_keys=True, separators=(",", ":"))``. The schema
+    root is the in-package location for SDK 0.3.0 (falling back to the legacy
+    root). Every schema byte is covered even when no fixture exercises it, so a
+    missing, added or rewritten schema turns the gate red.
     """
-    entries = []
-    for schema_file in sorted((sdk_root / "schemas").glob("*.schema.json")):
-        digest = hashlib.sha256(schema_file.read_bytes()).hexdigest()
-        entries.append(f"{schema_file.name}:{digest}\n")
-    return hashlib.sha256("".join(entries).encode("utf-8")).hexdigest()
+    schemas_dir = _sdk_schemas_dir(sdk_root)
+    hasher = hashlib.sha256()
+    for schema_file in sorted(schemas_dir.rglob("*.schema.json")):
+        key = schema_file.relative_to(schemas_dir).as_posix()
+        doc = json.loads(schema_file.read_text(encoding="utf-8"))
+        canonical = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        hasher.update(key.encode("utf-8"))
+        hasher.update(b"\x00")
+        hasher.update(canonical)
+        hasher.update(b"\x00")
+    return hasher.hexdigest()
 
 
 # ── Contract validators ────────────────────────────────────────────────────
@@ -269,17 +304,19 @@ def _core_validator(contract_name: str) -> Draft202012Validator | None:
 
 
 def _sdk_registry(sdk_root: Path) -> Registry:
-    """Registry built from the SDK's lifecycle-contracts (or schemas) dir.
+    """Registry built from the SDK's schema dir.
 
-    The SDK carries schemas under ``schemas/``. We look for the lifecycle
-    contract schemas there, falling back to the SDK root itself.
+    SDK 0.3.0 carries its schemas as package data at
+    ``src/skillweave_sdk/schemas/`` (falling back to the legacy root); resolve
+    that dir and load every ``*.schema.json`` by ``$id``. A tree with no schema
+    files is a hard failure, never a silent empty registry.
     """
-    sdk_schemas = sdk_root / "schemas"
+    sdk_schemas = _sdk_schemas_dir(sdk_root)
     if not sdk_schemas.is_dir():
         pytest.fail(f"SDK schemas dir not found at {sdk_schemas}")
 
     resources = []
-    for schema_file in sorted(sdk_schemas.glob("*.schema.json")):
+    for schema_file in sorted(sdk_schemas.rglob("*.schema.json")):
         doc = json.loads(schema_file.read_text(encoding="utf-8"))
         if "$id" not in doc:
             continue
@@ -460,14 +497,15 @@ class TestPositiveFixtureValidation:
     def test_all_fixtures_validate_against_sdk_schemas(self, fixtures, sdk_checkout):
         """Every positive fixture validates against the SDK's schemas."""
         registry = _sdk_registry(sdk_checkout)
+        sdk_schemas = _sdk_schemas_dir(sdk_checkout)
         failures = []
         for contract, instance in fixtures.items():
             # Map contract name to SDK schema filename.
             schema_name = f"{contract}.preview.schema.json"
-            schema_path = sdk_checkout / "schemas" / schema_name
+            schema_path = sdk_schemas / schema_name
             if not schema_path.is_file():
                 # Try without preview suffix.
-                schema_path = sdk_checkout / "schemas" / f"{contract}.schema.json"
+                schema_path = sdk_schemas / f"{contract}.schema.json"
             if not schema_path.is_file():
                 failures.append((contract, f"no SDK schema for {contract}"))
                 continue
@@ -510,7 +548,8 @@ class TestPositiveFixtureValidation:
         AC1 standalone child-interpreter pattern from
         ``test_lifecycle_contracts.py``.
         """
-        schema_files = sorted((sdk_checkout / "schemas").glob("*.schema.json"))
+        sdk_schemas = _sdk_schemas_dir(sdk_checkout)
+        schema_files = sorted(sdk_schemas.rglob("*.schema.json"))
         assert len(schema_files) > 0, "No SDK schema files found"
 
         # Build a consumer-side registry from SDK schemas only.
@@ -527,9 +566,9 @@ class TestPositiveFixtureValidation:
         failures = []
         for contract, instance in fixtures.items():
             schema_name = f"{contract}.preview.schema.json"
-            schema_path = sdk_checkout / "schemas" / schema_name
+            schema_path = sdk_schemas / schema_name
             if not schema_path.is_file():
-                schema_path = sdk_checkout / "schemas" / f"{contract}.schema.json"
+                schema_path = sdk_schemas / f"{contract}.schema.json"
             if not schema_path.is_file():
                 # AC3: a missing SDK schema is a failure, never a silent skip.
                 failures.append((contract, f"no SDK schema for {contract}"))

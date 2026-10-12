@@ -141,6 +141,70 @@
     },
     "final_deliverable_format": {
       "type": "string"
+    },
+    "methodology": {
+      "type": "string",
+      "enum": ["rex", "ralph", "gauntlet", "assay"],
+      "description": "The execution methodology, named separately from its autonomy policy and session schedule (SW-1510-SKILLS). Assay is never silently substituted by Ralph: the value is carried verbatim."
+    },
+    "autonomy_policy": {
+      "type": "string",
+      "enum": ["conservative", "medium", "unicorn", ""],
+      "description": "The autonomy policy on the methodology's own policy axis, carried as a separate field. 'unicorn' is Assay's declared default; the empty string means the methodology declares no autonomy policy and is never coerced to one."
+    },
+    "session_schedule": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The session scheduling, separate again from the methodology and the autonomy policy."
+    },
+    "execution_envelope": {
+      "$ref": "#/$defs/executionEnvelope"
+    }
+  },
+  "$defs": {
+    "executionEnvelope": {
+      "type": "object",
+      "title": "execution-envelope-v1",
+      "description": "The namespaced execution-envelope-v1 block (SW-1510-SKILLS). It carries methodology, autonomy_policy and session_schedule as three separate fields and records the explicit legacy adapter that produced it.",
+      "required": ["version", "methodology", "autonomy_policy", "session_schedule"],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The envelope version. A consumer refuses a version it does not know."
+        },
+        "methodology": {
+          "type": "string",
+          "enum": ["rex", "ralph", "gauntlet", "assay"]
+        },
+        "autonomy_policy": {
+          "type": "string",
+          "enum": ["conservative", "medium", "unicorn", ""]
+        },
+        "session_schedule": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "enum": ["declared", "legacy"],
+          "description": "'declared' when the methodology came from an explicit declaration; 'legacy' when it was adapted from the legacy execution_mode vocabulary."
+        },
+        "legacy_fields": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "The legacy fields the adapter consumed, recorded so a run can re-trace the compatibility path."
+        },
+        "subject_kind": {
+          "type": "string",
+          "enum": ["configuration"]
+        },
+        "schema_digest": {
+          "type": "string",
+          "description": "The exact canonical schema digest the envelope was compiled against, frozen before implementation."
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

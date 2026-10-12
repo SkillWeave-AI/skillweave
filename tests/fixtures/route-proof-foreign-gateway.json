@@ -1,0 +1,27 @@
+{
+  "schema": "route-proof-v1",
+  "revision": "1.3.11",
+  "catalog_revision": "1.3.11",
+  "approved_gateway": {
+    "host": "192.168.1.100",
+    "port": 9999
+  },
+  "approved_routes": [
+    "byteplus/deepseek-v4-flash",
+    "byteplus/deepseek-v4.1-flash",
+    "byteplus/deepseek-v4-pro",
+    "byteplus/deepseek-v4.1-pro"
+  ],
+  "tier_routes": {
+    "flash": [
+      "byteplus/deepseek-v4-flash",
+      "byteplus/deepseek-v4.1-flash"
+    ],
+    "pro": [
+      "byteplus/deepseek-v4-pro",
+      "byteplus/deepseek-v4.1-pro",
+      "byteplus/deepseek-v4-flash",
+      "byteplus/deepseek-v4.1-flash"
+    ]
+  }
+}

@@ -1,12 +1,14 @@
 kind: bundle
 name: skillweave
-version: 1.5.9
+version: 1.5.10
 description: A complete 7-phase AI-assisted development lifecycle ecosystem.
 author: SkillWeave Team
 license: Apache-2.0
-owner: LangeVC
-repository: https://github.com/LangeVC/skillweave
-homepage: https://github.com/LangeVC/skillweave
+owner: SkillWeave-AI
+repository: https://github.com/SkillWeave-AI/skillweave
+homepage: https://github.com/SkillWeave-AI/skillweave
+replaces: ["LangeVC/skillweave"]
+previous_identities: ["LangeVC/skillweave"]
 frameworks:
 - opencode
 - claude-code

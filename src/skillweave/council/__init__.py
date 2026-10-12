@@ -1,5 +1,10 @@
-"""SkillWeave Council deliberation and profile parsing module."""
+"""SkillWeave Council deliberation, profile parsing, and credential resolution."""
 
+from skillweave.council.credential import (
+    CredentialResolver,
+    CredentialResolution,
+    resolve_envctl_available,
+)
 from skillweave.council.engine import (
     CouncilConfig,
     CouncilDegradedError,
@@ -25,6 +30,9 @@ from skillweave.council.profile_parser import (
 )
 
 __all__ = [
+    "CredentialResolver",
+    "CredentialResolution",
+    "resolve_envctl_available",
     "CouncilConfig",
     "CouncilDegradedError",
     "CouncilEngine",
