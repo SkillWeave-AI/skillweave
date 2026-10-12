@@ -183,6 +183,9 @@ The rule the checker applies:
 
 The flag is removed (or stops being ahead) once the tag exists, at which point
 the ordinary rule resumes and the released version becomes the released fact.
+In the released tree it is therefore **absent**: the version the release-facing
+positions name is a released version whose tag exists, not an early-advertised
+one, and `release_prep` reappears only on the next release-preparation commit.
 
 ## Distribution note
 
