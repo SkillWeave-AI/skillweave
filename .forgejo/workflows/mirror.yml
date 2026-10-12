@@ -70,6 +70,10 @@ on:
 #                               free for public product docs (architecture, roadmap).
 env:
   BLOCKED_PATHS: ".skillweave/**|strategy.md|**/strategy.md|prd*.md|**/prd*.md|prd*.json|**/prd*.json|*.contract*|**/*.contract*|*contract*.md|**/*contract*.md|*proposal*.md|**/*proposal*.md|*.proposal*|**/*.proposal*"
+  # Narrow allow-list (mirror policy part 2): exact paths, no wildcard. These
+  # two public product assets of the shipped skill are skipped before the
+  # BLOCKED_PATHS match; every other path stays blocked.
+  ALLOWED_PATHS: "skills/skillweave-blueprint/assets/prd.schema.json|skills/skillweave-blueprint/references/prd-template.md"
 
 jobs:
   # --- Gate: runs BEFORE the mirror. The mirror depends on it via needs:. ---
@@ -146,10 +150,26 @@ jobs:
           echo "touched files: $(wc -l < "${touched}")"
 
           IFS='|' read -ra GLOBS <<< "$BLOCKED_PATHS"
+          IFS='|' read -ra ALLOWED <<< "$ALLOWED_PATHS"
 
           blocked=""
           while IFS= read -r f; do
             [ -z "${f}" ] && continue
+            # ALLOWED_PATHS holds literal public product assets (no wildcard).
+            # Only a path matching such an entry is skipped, and it is skipped
+            # BEFORE the BLOCKED_PATHS match. A derived sibling of an allowed
+            # asset (e.g. "<allowed>.bak") is NOT the asset: the base
+            # BLOCKED_PATHS globs are end-anchored (prd*.json, **/prd*.json …),
+            # so without this guard a derived copy would slip through the gate
+            # entirely. Fail closed and block it.
+            allowed=""
+            for a in "${ALLOWED[@]}"; do
+              case "${f}" in
+                ${a}) allowed=1; break ;;
+                ${a}?*) blocked="${blocked} ${f}"; allowed=1; break ;;
+              esac
+            done
+            if [ -n "${allowed}" ]; then continue; fi
             for g in "${GLOBS[@]}"; do
               case "${f}" in
                 ${g}) blocked="${blocked} ${f}" ;;
