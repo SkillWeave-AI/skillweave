@@ -1,6 +1,0 @@
-2026-05-06 03:09:01,369 - mcp - INFO - Authenticated — all 4 tools available.
-2026-05-06 03:09:01,384 - mcp.server.lowlevel.server - INFO - Processing request of type ListToolsRequest
-2026-05-06 03:09:09,743 - mcp.server.lowlevel.server - INFO - Processing request of type ListPromptsRequest
-2026-05-08 12:56:52,484 - mcp - WARNING - No PERPLEXITY_COOKIES set — running anonymously. Only perplexity_ask is available. Set PERPLEXITY_COOKIES to enable perplexity_search, perplexity_reason, and perplexity_research.
-2026-05-08 12:56:52,495 - mcp.server.lowlevel.server - INFO - Processing request of type ListToolsRequest
-2026-05-08 12:56:53,862 - mcp.server.lowlevel.server - INFO - Processing request of type ListPromptsRequest
