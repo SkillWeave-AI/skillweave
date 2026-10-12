@@ -82,9 +82,9 @@ page — the value is derived from the repository at read time, so it cannot go
 stale here. The full rule is in `docs/version-truth.md`, enforced by
 `scripts/check-version-truth.py`.
 
-`1.5.10` is this page's **candidate and bundle** version and the **release in
-preparation**: it is **not yet released** — it must not be presented as
-released anywhere until its `v1.5.10` tag exists in the repository.
+`1.5.10` is this page's **candidate and bundle** version and a **released
+version**: its `v1.5.10` tag exists in the repository. The released identity is
+the tag's peeled commit, as derived below.
 
 ---
 
