@@ -25,9 +25,9 @@ SkillWeave orchestrates AI-assisted product development from idea to post-releas
   forges, with the Core/SDK contracts qualified against the installed wheel.
 
 See the [1.5.10 changelog](CHANGELOG.md#v1510-2026-10-11--native-execution-route-lock-mcp-control--trustworthy-publishing)
-for the full release contract. `1.5.10` is the release in preparation — **not
-yet released** until its `v1.5.10` tag exists. Earlier release notes remain in
-the [changelog](CHANGELOG.md) as history.
+for the full release contract. `1.5.10` is a released version: its `v1.5.10`
+tag exists in the repository. Earlier release notes remain in the
+[changelog](CHANGELOG.md) as history.
 
 ---
 
@@ -365,11 +365,11 @@ number. The declared, machine-checked inventory is
 | **candidate** | `[project].version` in `pyproject.toml` (the source of truth) and the bundle `capability.yaml` | `1.5.10` |
 | **released** | the latest canonical **annotated** product tag, by its **peeled commit** (`git rev-parse '<tag>^{}'`) | the tag rule above, printed in full by [docs/version-truth.md](docs/version-truth.md) |
 | **installed** | the distribution metadata of a local install (`importlib.metadata`) | `1.5.10` (may be absent) |
-| **advertised early** | a version named but not yet released | `1.5.10` (the release in preparation; **not yet released** until its tag exists) |
+| **advertised early** | a version named in docs/README before it ships | none — no version is named ahead of its tag; `1.5.10` is released |
 
-The version badge above advertises the candidate `1.5.10`, the release **in
-preparation** — it is deliberately **not** presented as released until its
-`v1.5.10` tag exists. The released fact, whenever it is needed, is derived by
+The version badge above advertises the released version `1.5.10`, whose
+`v1.5.10` tag exists in the repository. The released fact, whenever it is
+needed, is derived by
 the peeled-tag rule from the repository rather than printed here. Historical
 versions (for example the `1.4.0` note in *Host-Neutral Scope*) appear only as
 explicitly historical statements. See
