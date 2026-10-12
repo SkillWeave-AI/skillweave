@@ -491,6 +491,21 @@ def _load_fastmcp() -> Any:
     return require_mcp()
 
 
+def _set_package_version(server: Any) -> Any:
+    """Bind the handshake to Core's version, not the optional MCP library.
+
+    FastMCP 1.x exposes no version constructor argument; its low-level server
+    owns the public version used in initialize. Transport-only test doubles
+    and the degraded placeholder have no protocol server to configure.
+    """
+    protocol_server = getattr(server, "_mcp_server", None)
+    if protocol_server is not None:
+        from skillweave.cli.main import product_version
+
+        protocol_server.version = product_version()
+    return server
+
+
 def _build_server(fastmcp: Any):
     """Build the real ``FastMCP`` server carrying the complete served surface.
 
@@ -501,7 +516,7 @@ def _build_server(fastmcp: Any):
     surface the other lacks -- and every tool carries the module's own
     ``gate_operation`` authorization gate, over the same host-bound authority.
     """
-    server = fastmcp.FastMCP(SERVER_NAME)
+    server = _set_package_version(fastmcp.FastMCP(SERVER_NAME))
     for spec in (*legacy_tool_specs(), *mcp_agent_tool_specs()):
         server.tool()(spec.handler)
     return server

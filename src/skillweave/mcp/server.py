@@ -126,7 +126,7 @@ class _DegradedFastMCP:
 
 
 if _RealFastMCP is not None:
-    mcp = _RealFastMCP(control.SERVER_NAME)
+    mcp = control._set_package_version(_RealFastMCP(control.SERVER_NAME))
 else:
     mcp = _DegradedFastMCP(control.SERVER_NAME)
 
