@@ -25,8 +25,10 @@ Classification + Assay binding (SW-1510-REPAIR)
 -----------------------------------------------
 
 A repair is only ever as good as the *class* of failure it answers. Every
-failure is therefore classified into one of six error classes
-(:class:`ErrorClass`) and each class has exactly one permitted action
+failure is therefore classified into one of the :class:`ErrorClass` values
+(SW-1511-REPAIR separated the coarse ``auth_quota`` umbrella into distinct
+provider-quota, auth-refusal, budget-exhausted, correction-exhausted and
+transport-failure classes) and each class has exactly one permitted action
 (:data:`ALLOWED_ACTION`): a bounded in-place ``remediate``, a ``reschedule``
 against a moved target, an explicit scope-``split``, or a ``hold`` that is
 never automated. The classification is not decorative — it decides the action,
@@ -82,15 +84,49 @@ class UnsupportedAttemptEventVersion(ValueError):
 
 
 class ErrorClass(str, Enum):
-    """The six distinguishable failure classes a bounded repair must separate.
+    """The distinguishable failure classes a bounded repair must separate.
 
     The classification is the *first* decision: it selects exactly one allowed
     action (see :data:`ALLOWED_ACTION`) and is what the Assay controller gates.
+
+    SW-1511-REPAIR (criterion 1) splits the coarse ``auth_quota`` umbrella into
+    the *distinct* conditions it used to conflate, so a genuine provider quota,
+    an authentication refusal, an exhausted local budget envelope, a mechanical
+    correction exhaustion and a local tool/transport failure no longer share one
+    class (and one control policy). ``auth_quota`` is retained as the legacy
+    umbrella value: existing ``attempt-event-v1`` records and the adaptive
+    ``backoff`` kind still carry it, so it stays a live member — it is simply no
+    longer what live classification produces for those conditions.
     """
 
-    #: Auth/quota: the acting authority refused, or the authorized budget is
-    #: spent. There is no authorized fallback — the action is HOLD.
+    #: LEGACY umbrella (SW-1510): the coarse "auth/quota" bucket. Retained for
+    #: backward compatibility with persisted ``attempt-event-v1`` records and
+    #: the adaptive ``backoff`` kind. Live classification now emits the more
+    #: specific classes below; this value still means HOLD.
     AUTH_QUOTA = "auth_quota"
+    #: Provider quota: the provider itself refused with a real quota/rate-limit
+    #: condition (429 / usage limit / out of credits). Distinct from an
+    #: authentication refusal and from a spent local envelope. With no *permitted*
+    #: fallback the action is HOLD; the (separately authorized) fallback that
+    #: stores reset/backoff and resumes the owned session on the same route is a
+    #: later, gated action — never inferred here.
+    PROVIDER_QUOTA = "provider_quota"
+    #: Authentication refusal: the acting authority refused (401/403, an
+    #: unrecognised credential, a refused admission on the actor axis). The
+    #: action is HOLD — never a capability grant, never a silent retry.
+    AUTH_REFUSAL = "auth_refusal"
+    #: Budget exhausted: the owner-authorized deadline/allowance envelope is
+    #: spent. There is no authorized fallback — the action is HOLD.
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    #: Correction exhausted: the *mechanical* bounded repair ran out of its
+    #: attempt / correction-round ceiling. This is a local control-policy
+    #: exhaustion, distinct from a provider quota or an auth refusal; the action
+    #: is HOLD (escalate), and it never widens a budget to keep retrying.
+    CORRECTION_EXHAUSTED = "correction_exhausted"
+    #: Transport failure: a local tool/transport failure (connection refused/
+    #: reset, timeout, DNS, broken pipe, tool-harness crash). A local, not a
+    #: provider-quota, condition; the action is HOLD rather than a blind retry.
+    TRANSPORT_FAILURE = "transport_failure"
     #: Capability mismatch: the acting role lacks a capability the action needs.
     #: Granting it would be an authority expansion — the action is HOLD.
     CAPABILITY_MISMATCH = "capability_mismatch"
@@ -124,8 +160,22 @@ class RepairAction(str, Enum):
 
 #: One permitted action per error class. A class whose permitted action is
 #: HOLD is never automated: it escalates to a human/controller decision.
+#:
+#: SW-1511-REPAIR: the five condition classes split out of the coarse
+#: ``auth_quota`` umbrella all map to HOLD. None of them is a repair the local
+#: loop may take on its own: a real provider quota needs a *permitted* fallback
+#: (a later, separately gated action, never inferred here), an auth refusal must
+#: not become a silent capability grant, a spent budget must not be widened, a
+#: mechanical correction exhaustion must escalate rather than retry forever, and
+#: a transient transport failure is not a groundable artifact to remediate. Each
+#: is a distinct class so the controller can apply a distinct control policy.
 ALLOWED_ACTION: dict[ErrorClass, RepairAction] = {
     ErrorClass.AUTH_QUOTA: RepairAction.HOLD,
+    ErrorClass.PROVIDER_QUOTA: RepairAction.HOLD,
+    ErrorClass.AUTH_REFUSAL: RepairAction.HOLD,
+    ErrorClass.BUDGET_EXHAUSTED: RepairAction.HOLD,
+    ErrorClass.CORRECTION_EXHAUSTED: RepairAction.HOLD,
+    ErrorClass.TRANSPORT_FAILURE: RepairAction.HOLD,
     ErrorClass.CAPABILITY_MISMATCH: RepairAction.HOLD,
     ErrorClass.CONTEXT_PRESSURE: RepairAction.SPLIT,
     ErrorClass.MALFORMED_ARTIFACT: RepairAction.REMEDIATE,
@@ -173,22 +223,34 @@ _IDENTITY_FIELDS = frozenset(
 
 #: Structured axis names the seam attaches to a refusal, mapped to the class
 #: they imply. A named axis is authoritative: it is the *observed* check, not a
-#: keyword guess. Budget/admission axes are auth/quota conditions with no
-#: authorized fallback; capability/scope/authority axes are capability
-#: mismatches; a drift axis is source drift; and so on.
+#: keyword guess. SW-1511-REPAIR separates the actor/admission/auth axes
+#: (authentication refused) from the local budget/deadline/envelope axes (the
+#: owner envelope is spent) and the provider quota/rate-limit axes (the provider
+#: itself refused), so each gets its own control policy; capability/scope/
+#: authority axes are capability mismatches; a drift axis is source drift; and
+#: so on.
 _AXIS_SIGNALS: dict[str, ErrorClass] = {
-    # auth/quota: the acting authority refused or the authorized budget is spent.
-    "actor": ErrorClass.AUTH_QUOTA,
-    "admission": ErrorClass.AUTH_QUOTA,
-    "auth": ErrorClass.AUTH_QUOTA,
-    "budget": ErrorClass.AUTH_QUOTA,
-    "deadline": ErrorClass.AUTH_QUOTA,
-    "envelope": ErrorClass.AUTH_QUOTA,
-    "pin": ErrorClass.AUTH_QUOTA,
-    "quota": ErrorClass.AUTH_QUOTA,
-    "rate_limit": ErrorClass.AUTH_QUOTA,
-    "route": ErrorClass.AUTH_QUOTA,
-    "turn_limit": ErrorClass.AUTH_QUOTA,
+    # authentication refused: the acting authority refused the credential.
+    "actor": ErrorClass.AUTH_REFUSAL,
+    "admission": ErrorClass.AUTH_REFUSAL,
+    "auth": ErrorClass.AUTH_REFUSAL,
+    # budget exhausted: the owner-authorized envelope/deadline is spent.
+    "budget": ErrorClass.BUDGET_EXHAUSTED,
+    "deadline": ErrorClass.BUDGET_EXHAUSTED,
+    "envelope": ErrorClass.BUDGET_EXHAUSTED,
+    "pin": ErrorClass.BUDGET_EXHAUSTED,
+    "route": ErrorClass.BUDGET_EXHAUSTED,
+    "turn_limit": ErrorClass.BUDGET_EXHAUSTED,
+    # provider quota: the provider itself refused with a real quota condition.
+    "quota": ErrorClass.PROVIDER_QUOTA,
+    "rate_limit": ErrorClass.PROVIDER_QUOTA,
+    # correction exhausted: the mechanical correction ceiling was reached.
+    "correction": ErrorClass.CORRECTION_EXHAUSTED,
+    "attempt": ErrorClass.CORRECTION_EXHAUSTED,
+    # transport failure: a local tool/transport failure, not a provider refusal.
+    "transport": ErrorClass.TRANSPORT_FAILURE,
+    "tool": ErrorClass.TRANSPORT_FAILURE,
+    "connection": ErrorClass.TRANSPORT_FAILURE,
     # capability mismatch: the role/route lacks a capability the action needs.
     "authority": ErrorClass.CAPABILITY_MISMATCH,
     "capability": ErrorClass.CAPABILITY_MISMATCH,
@@ -207,11 +269,18 @@ _AXIS_SIGNALS: dict[str, ErrorClass] = {
     "schema": ErrorClass.MALFORMED_ARTIFACT,
 }
 
-#: Hold conditions the classifier maps onto the auth/quota class when they
-#: arrive as an unlisted axis (kept explicit and broad so an unknown budget-ish
-#: axis still fails closed to a HOLD rather than a permissive action).
+#: Hold conditions the classifier maps onto the budget-exhausted class when
+#: they arrive as an unlisted axis (kept explicit and broad so an unknown
+#: budget-ish axis still fails closed to a HOLD rather than a permissive
+#: action). ``auth``/``actor``/``admission`` are authentication refusals and are
+#: mapped explicitly in :data:`_AXIS_SIGNALS`; ``quota``/``rate_limit`` are a
+#: provider quota and likewise mapped there.
 _BUDGET_AXES = frozenset(
-    {"actor", "deadline", "budget", "envelope", "pin", "admission", "turn_limit", "quota", "route"}
+    {
+        "actor", "deadline", "budget", "envelope", "pin", "admission",
+        "turn_limit", "quota", "route", "transport", "tool", "connection",
+        "correction", "attempt",
+    }
 )
 
 #: Ordered typed signals for free-text diagnosis — most specific first. Each
@@ -219,21 +288,60 @@ _BUDGET_AXES = frozenset(
 #: the FIRST matching entry wins, so a specific signal always outranks a broader
 #: one. This is what makes ambiguity deterministic:
 #:
-#: * a 429 / rate/usage limit / insufficient balance / 401-403 / unauthorized is
-#:   a quota condition, never a malformed artifact;
+#: * a 429 / rate/usage limit / insufficient balance / out of credits is a
+#:   *provider quota*, never a malformed artifact, while a 401/403 / unauthorized
+#:   / unauthenticated refusal is an *authentication refusal* — two distinct
+#:   conditions with distinct control policies (SW-1511-REPAIR);
+#: * an exhausted budget/deadline/envelope is a *budget exhaustion*, and an
+#:   exhausted correction/attempt ceiling is a *correction exhaustion* — neither
+#:   is a provider quota;
+#: * a connection refused/reset, timeout, broken pipe or tool-harness crash is a
+#:   *transport failure* (local), never a provider quota;
 #: * "the requested capability is unavailable on this route" is a capability
 #:   mismatch (``capab`` is tested before the merely-incidental ``route``);
 #: * a message that matches nothing is left *unclassified* so the caller fails
 #:   closed to a HOLD — there is no permissive default.
 _SIGNAL_PATTERNS: tuple[tuple[ErrorClass, "re.Pattern[str]"], ...] = (
     (
-        ErrorClass.AUTH_QUOTA,
+        ErrorClass.PROVIDER_QUOTA,
         re.compile(
             r"\b(?:quota|rate[ _-]?limit|too many requests|usage limit|"
             r"insufficient[ _a-z]*(?:quota|credit|balance|funds|token)|payments? required|"
             r"out of credits?|no credits?|"
-            r"(?:un)?authori[sz]ed|unauthenticated|no authorized fallback|"
-            r"auth(?:entication|orization)?|401|402|403|429)\b"
+            r"402|429)\b"
+        ),
+    ),
+    (
+        ErrorClass.AUTH_REFUSAL,
+        re.compile(
+            r"\b(?:(?:un)?authori[sz]ed|unauthenticated|no authorized fallback|"
+            r"authentication (?:failed|refused|required)|"
+            r"invalid (?:credential|api[ _-]?key|token)|"
+            r"credential\w* refused|401|403)\b"
+        ),
+    ),
+    (
+        ErrorClass.CORRECTION_EXHAUSTED,
+        re.compile(
+            r"\b(?:correction (?:budget|limit|rounds?|exhausted)|"
+            r"attempt(?:s)? (?:exhausted|limit)|max(?:imum)? attempts)\b"
+        ),
+    ),
+    (
+        ErrorClass.BUDGET_EXHAUSTED,
+        re.compile(
+            r"\b(?:budget (?:exhausted|spent|depleted)|out of budget|"
+            r"deadline (?:exceeded|passed|reached)|"
+            r"envelope (?:exhausted|spent)|allowance (?:exhausted|spent))\b"
+        ),
+    ),
+    (
+        ErrorClass.TRANSPORT_FAILURE,
+        re.compile(
+            r"\b(?:connection (?:refused|reset|closed|aborted)|"
+            r"timed? ?out|timeout|broken pipe|no route to host|"
+            r"name resolution|dns (?:failure|error)|transport (?:error|failure)|"
+            r"tool (?:failure|error|crash|harness))\b"
         ),
     ),
     (
@@ -295,7 +403,7 @@ def _classify_exception(error: BaseException) -> Optional[ErrorClass]:
     if axis in _AXIS_SIGNALS:
         return _AXIS_SIGNALS[axis]
     if axis in _BUDGET_AXES:
-        return ErrorClass.AUTH_QUOTA
+        return ErrorClass.BUDGET_EXHAUSTED
     text = f"{type(error).__name__} {axis} {error}"
     return _match_signal(text)
 
@@ -335,12 +443,13 @@ def classify_error(
     prior_fingerprints: Optional[Sequence[str]] = None,
     budget_exhausted: bool = False,
 ) -> str:
-    """Classify a failure into one of the six :class:`ErrorClass` values.
+    """Classify a failure into one of the :class:`ErrorClass` values.
 
     Inputs are the grounded diagnosis (``failure``), the raised refusal from the
     controller seam (``error``) and the run's prior correction fingerprints. An
-    exhausted budget is classified before anything else: it is an
-    auth/quota condition with no authorized fallback.
+    exhausted owner budget is classified as :data:`ErrorClass.BUDGET_EXHAUSTED`
+    (distinct from a provider quota and an auth refusal) before anything else:
+    it is a local control-policy exhaustion with no authorized fallback.
 
     A diagnosis that matches no typed signal is returned as
     :data:`ErrorClass.UNCLASSIFIED` — the classification fails closed, because a
@@ -350,7 +459,7 @@ def classify_error(
     if classified is not None and failure is None:
         failure = classified
     if budget_exhausted:
-        return ErrorClass.AUTH_QUOTA.value
+        return ErrorClass.BUDGET_EXHAUSTED.value
     prior = list(prior_fingerprints or [])
     failure_class: Optional[ErrorClass] = None
     if failure is not None:
@@ -409,7 +518,7 @@ class RepairAttempt:
     identifies the dispatch that a successful repair was redispatched as.
 
     SW-1510-REPAIR adds the classified correction evidence required of every
-    correction: ``error_class`` (which of the six classes), ``hypothesis`` (the
+    correction: ``error_class`` (which :class:`ErrorClass`), ``hypothesis`` (the
     falsifiable claim the correction answers), ``verifier_result`` (the outcome
     of revalidating the corrected input) and ``correction_count`` (the bounded
     1-based count of corrections for this fingerprint, so the bound is visible
@@ -697,7 +806,7 @@ class BoundedRepairer:
     def __init__(
         self,
         *,
-        max_attempts: int = 1,
+        max_attempts: Optional[int] = 1,
         max_correction_rounds: int = 0,
         authorize: Optional[Callable[[str, str, PreflightFailure], bool]] = None,
         journal: Any = None,
@@ -705,8 +814,18 @@ class BoundedRepairer:
         controller: Any = None,
         scope: str = "",
     ):
-        if max_attempts < 1:
-            raise ValueError("max_attempts must be >= 1")
+        # SW-1511-REPAIR (criterion 2): the default remains a finite attempt
+        # ceiling, but an *explicitly authorized unconstrained* run may pass
+        # ``max_attempts=None`` to declare "no hard cumulative attempt ceiling".
+        # This does NOT disable the finite owner envelope: the Assay deadline/
+        # budget (``AssayEnvelope``) is enforced independently at the admission
+        # seam, and a progress-free loop still holds on a repeated fingerprint.
+        # A bool is refused even though it is an ``int`` in Python.
+        if max_attempts is not None and (
+            isinstance(max_attempts, bool) or not isinstance(max_attempts, int)
+            or max_attempts < 1
+        ):
+            raise ValueError("max_attempts must be None or an int >= 1")
         if max_correction_rounds < 0:
             raise ValueError("max_correction_rounds must be >= 0")
         self.max_attempts = max_attempts
@@ -922,16 +1041,25 @@ class BoundedRepairer:
             )
 
         # --- attempts / correction-round budget ------------------------------
+        # SW-1511-REPAIR: a local control-policy exhaustion is *not* a provider
+        # quota. Running out of the mechanical attempt ceiling is the
+        # correction-exhausted class (escalate); only the tighter
+        # ``max_correction_rounds`` cap is the budget-exhausted class. Neither
+        # widens a budget to keep retrying, and neither is an ``auth_quota``.
         attempt_limit = self.max_attempts
         limit_reason = HoldReason.ATTEMPTS_EXHAUSTED.value
-        if self.max_correction_rounds > 0 and self.max_correction_rounds < attempt_limit:
+        limit_class = ErrorClass.CORRECTION_EXHAUSTED.value
+        if self.max_correction_rounds > 0 and (
+            attempt_limit is None or self.max_correction_rounds < attempt_limit
+        ):
             attempt_limit = self.max_correction_rounds
             limit_reason = HoldReason.BUDGET_EXHAUSTED.value
-        if len(self.attempts) >= attempt_limit:
+            limit_class = ErrorClass.BUDGET_EXHAUSTED.value
+        if attempt_limit is not None and len(self.attempts) >= attempt_limit:
             return self._finalize_hold(
                 failure=failure,
                 hold_reason=limit_reason,
-                error_class=ErrorClass.AUTH_QUOTA.value,
+                error_class=limit_class,
                 plan_digest=plan_digest,
                 current_target_digest=current_target_digest,
                 command=command,
@@ -1314,7 +1442,7 @@ def repair_plan_from_grounding(
     redispatch: Optional[Callable[[dict[str, Any]], str]] = None,
     journal: Any = None,
     journal_run_id: str = "repair",
-    max_attempts: int = 1,
+    max_attempts: Optional[int] = 1,
     max_correction_rounds: int = 0,
     controller: Any = None,
     scope: str = "",
@@ -1325,7 +1453,7 @@ def repair_plan_from_grounding(
     """Diagnose + classify + repair a task plan from grounding evidence.
 
     This is the integration seam: it grounds the failure from the repository,
-    classifies it into one of the six :class:`ErrorClass` values, then runs
+    classifies it into the :class:`ErrorClass` values, then runs
     :class:`BoundedRepairer` with the allowed action for that class. Prior
     attempts recorded in the journal for this ``journal_run_id`` seed the loop,
     so a failure already seen is held rather than repaired (and re-dispatched)
@@ -1435,9 +1563,26 @@ def repair_plan_from_grounding(
 
 
 def _hold_reason_for_class(error_class: str) -> str:
-    """The local hold reason a classified action maps to when not remediated."""
+    """The local hold reason a classified action maps to when not remediated.
+
+    SW-1511-REPAIR: the five condition classes split out of the coarse
+    ``auth_quota`` umbrella keep their *own* hold reason so a caller can tell an
+    authentication refusal, a provider quota, a spent envelope, a mechanical
+    correction exhaustion and a local transport failure apart — each is a HOLD,
+    but for a different, causally-evidenced reason.
+    """
     if error_class == ErrorClass.AUTH_QUOTA.value:
         return HoldReason.BUDGET_EXHAUSTED.value
+    if error_class == ErrorClass.BUDGET_EXHAUSTED.value:
+        return HoldReason.BUDGET_EXHAUSTED.value
+    if error_class == ErrorClass.CORRECTION_EXHAUSTED.value:
+        return HoldReason.ATTEMPTS_EXHAUSTED.value
+    if error_class == ErrorClass.PROVIDER_QUOTA.value:
+        return HoldReason.BUDGET_EXHAUSTED.value
+    if error_class == ErrorClass.AUTH_REFUSAL.value:
+        return HoldReason.AUTHORITY_EXPANSION.value
+    if error_class == ErrorClass.TRANSPORT_FAILURE.value:
+        return HoldReason.NON_REPAIRABLE_CLASS.value
     if error_class == ErrorClass.CAPABILITY_MISMATCH.value:
         return HoldReason.AUTHORITY_EXPANSION.value
     if error_class == ErrorClass.SOURCE_DRIFT.value:

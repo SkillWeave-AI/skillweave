@@ -118,14 +118,26 @@ class PolicyDecision:
 
 # ── Classified repair binding (SW-1510-REPAIR) ──────────────────────────────
 
-#: The six error classes a bounded repair distinguishes, and the single
-#: permitted action for each. This is the controller-side mirror of
+#: The error classes a bounded repair distinguishes, and the single permitted
+#: action for each. This is the controller-side mirror of
 #: ``semantic_repair.ErrorClass`` / ``ALLOWED_ACTION``; it is kept as data (not
 #: an import) so ``runtime.assay`` carries no dependency on the repair module
 #: and can still be exercised offline. The two must agree — a mirrored pair is
 #: asserted by ``tests/unit/test_1510_repair.py``.
+#:
+#: SW-1511-REPAIR extends the vocabulary with the five condition classes split
+#: out of the coarse ``auth_quota`` umbrella (provider quota, auth refusal,
+#: budget exhaustion, correction exhaustion, transport failure). ``auth_quota``
+#: is retained as the legacy umbrella value for persisted records; all five new
+#: classes map to HOLD, so each gets a distinct control policy without ever
+#: being automated.
 REPAIR_ALLOWED_ACTION: dict[str, str] = {
     "auth_quota": "hold",
+    "provider_quota": "hold",
+    "auth_refusal": "hold",
+    "budget_exhausted": "hold",
+    "correction_exhausted": "hold",
+    "transport_failure": "hold",
     "capability_mismatch": "hold",
     "context_pressure": "split",
     "malformed_artifact": "remediate",

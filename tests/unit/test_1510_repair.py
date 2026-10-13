@@ -6,8 +6,11 @@ controller (:class:`skillweave.runtime.assay.AssayRepairController`), so a
 classified failure becomes exactly one permitted action, and a permitted
 action only happens when the Assay policy and the admission gates say so.
 
-Criterion 1 -- six error classes, each with one tested allowed action:
-  ``auth_quota``/``capability_mismatch`` -> hold, ``context_pressure`` -> split,
+Criterion 1 -- the distinguishable error classes, each with one tested allowed
+  action: ``auth_quota`` (legacy umbrella) and the SW-1511-REPAIR split of it
+  into ``provider_quota``/``auth_refusal``/``budget_exhausted``/
+  ``correction_exhausted``/``transport_failure`` -> hold,
+  ``capability_mismatch`` -> hold, ``context_pressure`` -> split,
   ``malformed_artifact`` -> remediate, ``source_drift`` -> reschedule,
   ``repeated_semantic_failure`` -> hold.
 
@@ -49,15 +52,18 @@ from skillweave.runtime.assay import (  # noqa: E402
     AdmissionRefused,
     AssayAdmission,
     AssayEngine,
+    AssayEnvelope,
     AssayRepairController,
     AssayState,
     RepairActionRequest,
     StaticActorResolver,
+    TurnBudgetExhaustedError,
 )
 from skillweave.runtime.journal import EventJournal  # noqa: E402
 from skillweave.runtime.preflight import (  # noqa: E402
     PreflightResult,
     digest_target,
+    failure_for_missing_path,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -65,10 +71,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 #: The frozen execution-contract id the correction records are emitted under.
 ATTEMPT_EVENT_SCHEMA_ID = "https://skillweave.dev/schemas/execution/attempt-event/v1"
 
-#: class -> the single permitted action, as the contract requires (the six
-#: distinguishable classes of criterion 1).
+#: class -> the single permitted action, as the contract requires. The five
+#: SW-1511-REPAIR condition classes (split out of the legacy ``auth_quota``
+#: umbrella) each get their own entry and a HOLD.
 _CONTRACT_ALLOWED = [
     (sr.ErrorClass.AUTH_QUOTA.value, sr.RepairAction.HOLD.value),
+    (sr.ErrorClass.PROVIDER_QUOTA.value, sr.RepairAction.HOLD.value),
+    (sr.ErrorClass.AUTH_REFUSAL.value, sr.RepairAction.HOLD.value),
+    (sr.ErrorClass.BUDGET_EXHAUSTED.value, sr.RepairAction.HOLD.value),
+    (sr.ErrorClass.CORRECTION_EXHAUSTED.value, sr.RepairAction.HOLD.value),
+    (sr.ErrorClass.TRANSPORT_FAILURE.value, sr.RepairAction.HOLD.value),
     (sr.ErrorClass.CAPABILITY_MISMATCH.value, sr.RepairAction.HOLD.value),
     (sr.ErrorClass.CONTEXT_PRESSURE.value, sr.RepairAction.SPLIT.value),
     (sr.ErrorClass.MALFORMED_ARTIFACT.value, sr.RepairAction.REMEDIATE.value),
@@ -82,6 +94,23 @@ _FAIL_CLOSED_ALLOWED = (sr.ErrorClass.UNCLASSIFIED.value, sr.RepairAction.HOLD.v
 
 #: Every class in the vocabulary and its single permitted action.
 _EXPECTED_ALLOWED = [*_CONTRACT_ALLOWED, _FAIL_CLOSED_ALLOWED]
+
+#: Criterion 1 (SW-1511-REPAIR): each condition a coarse failure message used
+#: to conflate must land in its OWN class -- a mechanical correction exhaustion,
+#: a repeated semantic deadend, an actual provider quota, an authentication
+#: refusal and a local tool/transport failure are five distinct typed classes.
+_DISTINCT_CONDITION_CLASSES = [
+    (sr.ErrorClass.CORRECTION_EXHAUSTED.value, "correction budget exhausted"),
+    (sr.ErrorClass.REPEATED_SEMANTIC_FAILURE.value, "repeated fingerprint"),
+    (sr.ErrorClass.PROVIDER_QUOTA.value, "HTTP 429 usage limit exceeded"),
+    (sr.ErrorClass.AUTH_REFUSAL.value, "401 unauthorized"),
+    (sr.ErrorClass.TRANSPORT_FAILURE.value, "connection refused to the tool"),
+]
+
+#: SW-1510 legacy values still persisted in durable records and still emitted by
+#: the adaptive ``backoff`` kind. They must remain live vocabulary members whose
+#: action is still HOLD, so an old record replays rather than being refused.
+_LEGACY_AUTH_QUOTA = sr.ErrorClass.AUTH_QUOTA.value
 
 
 # ---------------------------------------------------------------------------
@@ -125,17 +154,26 @@ def _repo(tmp_path):
 # Criterion 1: six error classes, one tested allowed action each
 # ---------------------------------------------------------------------------
 
-def test_module_and_controller_agree_on_six_class_action_table():
+def test_module_and_controller_agree_on_class_action_table():
     # The module is the authority; the controller-side mirror must not drift.
     module_table = {
         cls.value: action.value for cls, action in sr.ALLOWED_ACTION.items()
     }
     assert module_table == dict(_EXPECTED_ALLOWED)
     assert REPAIR_ALLOWED_ACTION == module_table
-    # The six distinguishable classes of criterion 1, plus the fail-closed
-    # class that keeps an unclassifiable failure out of a permissive action.
-    assert len(_CONTRACT_ALLOWED) == 6
-    assert len(sr.ErrorClass) == 7
+    # The distinguishable condition classes (SW-1511-REPAIR split the legacy
+    # ``auth_quota`` umbrella into five), plus the fail-closed class that keeps
+    # an unclassifiable failure out of a permissive action.
+    assert len(_CONTRACT_ALLOWED) == 11
+    assert len(sr.ErrorClass) == 12
+    # The legacy umbrella value survives for persisted records...
+    assert sr.ErrorClass.AUTH_QUOTA.value == "auth_quota"
+    # ...while the live conditions it used to conflate are distinct.
+    assert len({
+        sr.ErrorClass.PROVIDER_QUOTA, sr.ErrorClass.AUTH_REFUSAL,
+        sr.ErrorClass.BUDGET_EXHAUSTED, sr.ErrorClass.CORRECTION_EXHAUSTED,
+        sr.ErrorClass.TRANSPORT_FAILURE,
+    }) == 5
 
 
 @pytest.mark.parametrize("error_class,action", _EXPECTED_ALLOWED)
@@ -149,10 +187,11 @@ def test_unknown_error_class_is_refused_not_defaulted():
         sr.allowed_action("totally_made_up")
 
 
-#: Real provider rate-limit / usage-limit / auth phrasings. Each is an
-#: auth/quota condition and must NEVER be classified as a malformed artifact
-#: (which would permit an automated ``remediate`` of a quota failure).
-_QUOTA_PHRASINGS = [
+#: Real *provider quota* phrasings: the provider itself refused with a real
+#: rate/usage/credit condition. Each is a ``provider_quota`` and must NEVER be
+#: classified as a malformed artifact (which would permit an automated
+#: ``remediate`` of a quota failure) nor conflated with an auth refusal.
+_PROVIDER_QUOTA_PHRASINGS = [
     "HTTP 429 rate_limit: you exceeded the 5-hour usage limit",
     "429 Too Many Requests",
     "rate limit exceeded, retry later",
@@ -160,22 +199,47 @@ _QUOTA_PHRASINGS = [
     "insufficient_quota: you exceeded your current quota",
     "insufficient credit balance",
     "402 Payment Required",
-    "401 Unauthorized",
-    "403 Forbidden",
     "you are out of credits",
 ]
 
+#: Real *authentication refusal* phrasings: the acting authority refused the
+#: credential. Distinct from a provider quota, they must classify as
+#: ``auth_refusal`` and never be remediated.
+_AUTH_REFUSAL_PHRASINGS = [
+    "401 Unauthorized",
+    "403 Forbidden",
+    "authentication failed: unrecognised credential",
+    "invalid api key",
+]
 
-@pytest.mark.parametrize("message", _QUOTA_PHRASINGS)
-def test_provider_quota_phrasings_are_auth_quota_never_remediated(message):
+
+@pytest.mark.parametrize("message", _PROVIDER_QUOTA_PHRASINGS)
+def test_provider_quota_phrasings_are_provider_quota_never_remediated(message):
     error_class = sr.classify_error(message=message)
-    assert error_class == sr.ErrorClass.AUTH_QUOTA.value
+    assert error_class == sr.ErrorClass.PROVIDER_QUOTA.value
     assert error_class != sr.ErrorClass.MALFORMED_ARTIFACT.value
+    assert error_class != sr.ErrorClass.AUTH_REFUSAL.value
     # A quota failure is never automated: its only permitted action is HOLD.
     assert sr.allowed_action(error_class) == sr.RepairAction.HOLD.value
 
     # ...and the Assay controller holds it (no automation) rather than
     # approving a remediation on the strength of the wrong class.
+    engine, controller = _controller("unicorn")
+    decision = controller.act(
+        RepairActionRequest(error_class=error_class, action="remediate")
+    )
+    assert decision.approved is False
+    assert decision.requires_human is True
+
+
+@pytest.mark.parametrize("message", _AUTH_REFUSAL_PHRASINGS)
+def test_auth_refusal_phrasings_are_auth_refusal_never_remediated(message):
+    error_class = sr.classify_error(message=message)
+    assert error_class == sr.ErrorClass.AUTH_REFUSAL.value
+    assert error_class != sr.ErrorClass.MALFORMED_ARTIFACT.value
+    assert error_class != sr.ErrorClass.PROVIDER_QUOTA.value
+    assert sr.allowed_action(error_class) == sr.RepairAction.HOLD.value
+
     engine, controller = _controller("unicorn")
     decision = controller.act(
         RepairActionRequest(error_class=error_class, action="remediate")
@@ -192,9 +256,10 @@ def test_mixed_signal_message_resolves_to_the_most_specific_class():
         "unavailable on this route"
     )
     assert sr.classify_error(message=message) == sr.ErrorClass.CAPABILITY_MISMATCH.value
-    # A message that is *only* a quota signal still classifies as quota.
+    # A message that is *only* a quota signal still classifies as a provider
+    # quota (never an incidental capability/route class).
     assert sr.classify_error(message="quota exhausted on the route") == (
-        sr.ErrorClass.AUTH_QUOTA.value
+        sr.ErrorClass.PROVIDER_QUOTA.value
     )
     # Repeated application is deterministic (no ordering flakiness).
     assert sr.classify_error(message=message) == sr.classify_error(message=message)
@@ -258,11 +323,32 @@ def test_correction_count_must_be_a_positive_integer(tmp_path):
 
 
 @pytest.mark.parametrize("error_class,action", _EXPECTED_ALLOWED)
-def test_classify_error_produces_each_of_the_six_classes(error_class, action):
-    """A concrete diagnosis maps to each of the six classes, action included."""
+def test_classify_error_produces_each_of_the_classes(error_class, action):
+    """A concrete diagnosis maps to each class, its permitted action included."""
     if error_class == sr.ErrorClass.AUTH_QUOTA.value:
+        # The legacy umbrella value is still a live vocabulary member; it is no
+        # longer what live classification produces for the condition classes it
+        # used to conflate, so we only assert it is a recognised, held class.
+        assert sr.allowed_action(error_class) == action
+        return
+    if error_class == sr.ErrorClass.PROVIDER_QUOTA.value:
+        assert sr.classify_error(
+            message="HTTP 429 rate_limit: exceeded usage limit"
+        ) == error_class
+    elif error_class == sr.ErrorClass.AUTH_REFUSAL.value:
+        assert sr.classify_error(
+            error=AdmissionRefused("actor", "no credential")
+        ) == error_class
+        assert sr.classify_error(message="401 Unauthorized") == error_class
+    elif error_class == sr.ErrorClass.BUDGET_EXHAUSTED.value:
         assert sr.classify_error(budget_exhausted=True) == error_class
-        assert sr.classify_error(error=AdmissionRefused("actor", "no credential")) == error_class
+        assert sr.classify_error(
+            error=AdmissionRefused("deadline", "deadline exceeded")
+        ) == error_class
+    elif error_class == sr.ErrorClass.CORRECTION_EXHAUSTED.value:
+        assert sr.classify_error(message="correction budget exhausted") == error_class
+    elif error_class == sr.ErrorClass.TRANSPORT_FAILURE.value:
+        assert sr.classify_error(message="connection refused to tool harness") == error_class
     elif error_class == sr.ErrorClass.CAPABILITY_MISMATCH.value:
         assert sr.classify_error(
             error=AdmissionRefused("capability", "role lacks capability")
@@ -491,7 +577,8 @@ def test_hold_on_error_class_action_table_matches_outcomes(tmp_path):
     plan = {"id": "T-5", "lane": {"modifies": ["src/missing.py"]}}
     target = digest_target(plan)
 
-    # Attempts exhausted -> auth_quota (no authorized fallback). A prior
+    # Attempts exhausted -> correction_exhausted (a local control-policy
+    # exhaustion, distinct from a provider quota or an auth refusal). A prior
     # attempt (distinct fingerprint) is seeded first so the loop is already at
     # its ceiling.
     failure = sr.detect_surface_failure(plan, repo, target_digest=target)
@@ -506,7 +593,7 @@ def test_hold_on_error_class_action_table_matches_outcomes(tmp_path):
     exhausted.seed_prior_attempts([prior.to_dict()])
     held = exhausted.repair(plan, failure, role="ops", current_target_digest=target)
     assert held.hold_reason == sr.HoldReason.ATTEMPTS_EXHAUSTED.value
-    assert held.error_class == sr.ErrorClass.AUTH_QUOTA.value
+    assert held.error_class == sr.ErrorClass.CORRECTION_EXHAUSTED.value
     assert held.action_taken == sr.RepairAction.HOLD.value
 
     # Authority expansion -> capability_mismatch; held.
@@ -601,7 +688,7 @@ def test_exhausted_budget_is_never_a_fallback(tmp_path):
         authorize=lambda r, c, f: True, budget_exhausted=True,
     )
     assert outcome.held is True
-    assert outcome.error_class == sr.ErrorClass.AUTH_QUOTA.value
+    assert outcome.error_class == sr.ErrorClass.BUDGET_EXHAUSTED.value
     assert outcome.action_taken == sr.RepairAction.HOLD.value
     assert sr.allowed_action(outcome.error_class) == sr.RepairAction.HOLD.value
 
@@ -618,6 +705,465 @@ def test_non_repairable_identity_failure_is_classified_and_held(tmp_path):
     assert outcome.held is True
     assert outcome.hold_reason == sr.HoldReason.NON_REPAIRABLE_CLASS.value
     assert outcome.error_class == sr.ErrorClass.SOURCE_DRIFT.value
+
+
+# ---------------------------------------------------------------------------
+# Criterion 1 (SW-1511-REPAIR): the five condition classes are distinct
+# ---------------------------------------------------------------------------
+
+def test_the_five_conditions_have_five_distinct_typed_classes():
+    """No two of the five conditions collapse into one class.
+
+    The point of SW-1511-REPAIR is that a mechanical correction exhaustion, a
+    repeated semantic deadend, a real provider quota, an authentication refusal
+    and a local transport failure are *separately typed*, so each can carry a
+    distinct control policy. A regression that re-coalesced any pair would make
+    this fail.
+    """
+    classes = [sr.classify_error(message=msg) for _, msg in _DISTINCT_CONDITION_CLASSES]
+    assert len(set(classes)) == len(classes), classes
+    for (expected, msg), got in zip(_DISTINCT_CONDITION_CLASSES, classes):
+        assert got == expected, f"{msg!r} -> {got!r} (expected {expected!r})"
+
+
+def test_condition_classes_are_never_the_legacy_umbrella_or_unclassified():
+    """The live classification produces the specific class, never ``auth_quota``.
+
+    ``auth_quota`` remains a live value for backward compatibility, but no live
+    message or axis may classify *into* it -- that would re-conflate the very
+    conditions SW-1511-REPAIR separated. None may fall to ``unclassified``
+    either (that would be an under-classification, not a distinct class).
+    """
+    for expected, msg in _DISTINCT_CONDITION_CLASSES:
+        got = sr.classify_error(message=msg)
+        assert got == expected
+        assert got != _LEGACY_AUTH_QUOTA
+        assert got != sr.ErrorClass.UNCLASSIFIED.value
+
+    # The structured axes drive the same split, so a raised refusal (not just a
+    # message) classifies distinctly too.
+    def _refused(axis):
+        return AdmissionRefused(axis, f"{axis} refused")
+
+    assert sr.classify_error(error=_refused("actor")) == sr.ErrorClass.AUTH_REFUSAL.value
+    assert sr.classify_error(error=_refused("quota")) == sr.ErrorClass.PROVIDER_QUOTA.value
+    assert sr.classify_error(error=_refused("correction")) == (
+        sr.ErrorClass.CORRECTION_EXHAUSTED.value
+    )
+    assert sr.classify_error(error=_refused("tool")) == (
+        sr.ErrorClass.TRANSPORT_FAILURE.value
+    )
+    assert sr.classify_error(error=_refused("deadline")) == (
+        sr.ErrorClass.BUDGET_EXHAUSTED.value
+    )
+
+
+# ---------------------------------------------------------------------------
+# Criterion 2: no hard ceiling for an authorized-unconstrained run; the finite
+# owner envelope is what remains enforced
+# ---------------------------------------------------------------------------
+
+def test_unconstrained_authorized_run_has_no_hard_attempt_ceiling(tmp_path):
+    """``max_attempts=None`` imposes no artificial attempt/round ceiling.
+
+    An explicitly owner-authorized unconstrained run carries distict fingerprints
+    that each repair successfully; the loop must not stop it at an invented
+    default ceiling. Distinct fingerprints keep the *repeated-fingerprint* hold
+    (a real progress signal) out of the way, so what is measured here is the
+    absence of a cumulative ceiling -- not a progress hold.
+    """
+    repo = _repo(tmp_path)
+    world = sr.collect_grounding_evidence(repo)
+    repairer = sr.BoundedRepairer(max_attempts=None, authorize=lambda r, c, f: True)
+
+    # 25 distinct, grounded failures. Each `modifies` names a different missing
+    # file and each carries its own target digest, so no two failures share a
+    # fingerprint: the *repeated-fingerprint* hold is a real progress signal and
+    # is kept out of the way, isolating what is measured here -- the absence of
+    # an invented cumulative ceiling. The repair scan supplies the grounding
+    # evidence a real preflight would have produced.
+    for i in range(25):
+        target = digest_target({"probe": "unbounded", "n": i})
+        plan = {"id": "T", "lane": {"modifies": ["src/missing_%d.py" % i]}}
+        failure = sr.detect_surface_failure(
+            plan, repo, target_digest=target, evidence=world
+        )
+        assert failure is not None and failure.failure_class == (
+            sr.FailureClass.NONEXISTENT_MODIFIES_PATH.value
+        ), i
+        outcome = repairer.repair(
+            plan, failure, role="ops", current_target_digest=target,
+            redispatch=lambda p, i=i: "dispatch:u:%d" % i,
+        )
+        assert outcome.repaired is True, (i, outcome.hold_reason)
+        assert outcome.repaired_plan["lane"]["modifies"] == ["src/real_module.py"]
+
+    assert len(repairer.attempts) == 25
+    # No hold of the attempts/budget kind was ever produced.
+    assert all(a.outcome == "repaired" for a in repairer.attempts)
+
+
+def test_finite_attempt_ceiling_is_still_enforced_when_declared(tmp_path):
+    """The no-ceiling path is opt-in: a declared finite ceiling still holds.
+
+    ``max_attempts=1`` refuses a second correction with the
+    correction-exhausted class, so removing a hard ceiling for an
+    *unconstrained* run did not silently remove the finite ceiling a caller
+    declares.
+    """
+    repo = _repo(tmp_path)
+    world = sr.collect_grounding_evidence(repo)
+    repairer = sr.BoundedRepairer(max_attempts=1, authorize=lambda r, c, f: True)
+    base = digest_target({"probe": "bounded", "n": 0})
+    plan_a = {"id": "T", "lane": {"modifies": ["src/a.py"]}}
+    f1 = sr.detect_surface_failure(plan_a, repo, target_digest=base, evidence=world)
+    first = repairer.repair(
+        plan_a, f1, role="ops", current_target_digest=base,
+    )
+    assert first.repaired is True
+
+    moved = digest_target({"probe": "bounded", "n": 1})
+    plan_b = {"id": "T", "lane": {"modifies": ["src/b.py"]}}
+    f2 = sr.detect_surface_failure(plan_b, repo, target_digest=moved, evidence=world)
+    second = repairer.repair(
+        plan_b, f2, role="ops", current_target_digest=moved,
+    )
+    assert second.held is True
+    assert second.hold_reason == sr.HoldReason.ATTEMPTS_EXHAUSTED.value
+    assert second.error_class == sr.ErrorClass.CORRECTION_EXHAUSTED.value
+
+
+def test_max_attempts_non_positive_or_bool_is_refused_not_a_hidden_ceiling():
+    for bad in (0, -1, True, False, 1.5, "3"):
+        with pytest.raises(ValueError):
+            sr.BoundedRepairer(max_attempts=bad, authorize=lambda r, c, f: True)
+
+
+def test_no_cumulative_limit_does_not_weaken_a_finite_owner_envelope():
+    """A finite owner envelope is enforced independently of the attempt ceiling.
+
+    ``max_turns=None`` removes the *turn* ceiling, but a finite
+    ``remaining_budget`` still refuses the next turn at admission -- the
+    "no hard cumulative ceiling" allowance never disables the owner envelope.
+    """
+    resolver = StaticActorResolver({"good": "worker-1"})
+    engine = AssayEngine(
+        policy_name="unicorn", max_turns=None, run_id="run-env",
+        actor_resolver=resolver,
+        envelope=AssayEnvelope(remaining_budget=2),
+    )
+    engine.pin(subject="subj-1", brief="brief-1")
+    admission = AssayAdmission(
+        actor_token="good", subject=engine.subject_digest,
+        brief=engine.brief_digest, envelope=engine.envelope,
+    )
+    engine.advance_turn(admission=admission)
+    engine.advance_turn(admission=admission)
+    with pytest.raises(AdmissionRefused) as exc:
+        engine.advance_turn(admission=admission)
+    assert exc.value.axis == "budget"
+    assert engine.current_turn == 2
+
+
+def test_default_retry_handler_budget_is_not_wired_to_the_repair_path():
+    """The repair path imposes no hidden ``RetryBudget`` cumululative ceiling.
+
+    ``skillweave.execution.retry`` has its own module-local ``RetryBudget``; the
+    bounded repair loop must not import it, or a second, hidden retry ceiling
+    would silently cap an authorized-unconstrained run. This test fails if the
+    repair module ever starts depending on that counter.
+    """
+    import importlib
+
+    retry = importlib.import_module("skillweave.execution.retry")
+    assert retry.RetryBudget().max_retries == 3  # a real, separate default
+    # The repair module's own source names no retry-budget symbol.
+    src_text = Path(sr.__file__).read_text(encoding="utf-8")
+    assert "RetryBudget" not in src_text
+    assert "execution.retry" not in src_text
+    assert "execution import retry" not in src_text
+
+
+def test_unsupported_implicated_field_holds_rather_than_guessing(tmp_path):
+    """A failure naming a field the repair cannot edit must HOLD, not guess.
+
+    Fail-closed control policy: a bounded repair edits ONLY the implicated
+    field. If that field is not one the lane carries, there is nothing safe to
+    change, so the loop holds with a causal reason rather than inventing a
+    correction against some other field.
+    """
+    repo = _repo(tmp_path)
+    world = sr.collect_grounding_evidence(repo)
+    target = digest_target({"probe": "unknown-field"})
+    plan = {"id": "T", "lane": {"modifies": ["src/missing.py"]}}
+    failure = failure_for_missing_path(
+        path="src/missing.py", task_id="T", lane_field="deletes",  # not a lane field
+        target_digest=target,
+        evidence=[
+            {"kind": "missing_target", "path": "src/missing.py"},
+            {"kind": "grounding_candidate", "path": world[0]},
+        ],
+    )
+    repairer = sr.BoundedRepairer(max_attempts=5, authorize=lambda r, c, f: True)
+    outcome = repairer.repair(plan, failure, role="ops", current_target_digest=target)
+    assert outcome.held
+    assert outcome.hold_reason == sr.HoldReason.IMPLICATED_FIELD_UNKNOWN.value
+    # The plan is untouched: nothing was guessed, nothing was widened.
+    assert plan["lane"] == {"modifies": ["src/missing.py"]}
+
+
+def test_repair_never_widens_the_declared_write_scope(tmp_path):
+    """A 1-element write set stays 1 element: a repair is a 1:1 substitution.
+
+    Replacing the single offending entry with every grounded candidate would
+    broaden the lane's declared write scope -- the authority expansion a bounded
+    repair must refuse. The repaired set must have the same cardinality.
+    """
+    target = digest_target({"probe": "no-widen"})
+    plan = {"id": "T", "lane": {"modifies": ["src/missing.py"]}}
+    candidates = ["src/real_module.py", "src/notes.md", "docs/guide.md"]
+    failure = failure_for_missing_path(
+        path="src/missing.py", task_id="T", lane_field="modifies",
+        target_digest=target,
+        evidence=[
+            {"kind": "missing_target", "path": "src/missing.py"},
+            *({"kind": "grounding_candidate", "path": p} for p in candidates),
+        ],
+    )
+    repairer = sr.BoundedRepairer(max_attempts=5, authorize=lambda r, c, f: True)
+    outcome = repairer.repair(plan, failure, role="ops", current_target_digest=target)
+    assert outcome.repaired
+    repaired = outcome.repaired_plan["lane"]["modifies"]
+    # One offending entry in, exactly one substitution out: the declared write
+    # scope never grows, however many candidates were grounded.
+    assert len(repaired) == len(plan["lane"]["modifies"]) == 1
+    assert repaired[0] == candidates[0]
+
+
+# ---------------------------------------------------------------------------
+# Criterion 3: productive attempts extend the turn window; progress-free loops
+# escalate or hold with causal evidence (never blind repeat or PASS)
+# ---------------------------------------------------------------------------
+
+def test_productive_attempt_extends_the_turn_window_with_actor_and_kind():
+    """An authorized productive attempt can extend its own turn window.
+
+    A run that is making progress may raise its turn ceiling; the change is a
+    recorded, actor-attributed ``extension`` -- not a silent widening.
+    """
+    resolver = StaticActorResolver({"good": "alice"})
+    engine = AssayEngine(
+        policy_name="unicorn", max_turns=2, run_id="run-x", actor_resolver=resolver,
+    )
+    engine.pin(subject="subj-1", brief="brief-1")
+    admission = AssayAdmission(
+        actor_token="good", subject=engine.subject_digest,
+        brief=engine.brief_digest, envelope=engine.envelope,
+    )
+    assert engine.max_turns == 2
+    record = engine.set_turn_limit(8, admission=admission)
+    assert record.max_turns == 8
+    assert record.kind == "extension"
+    assert record.actor == "alice"
+    assert engine.max_turns == 8
+    for _ in range(8):
+        engine.advance_turn(admission=admission)
+    assert engine.current_turn == 8
+
+
+def test_unconstrained_turn_window_is_recorded_as_no_cumulative_limit():
+    resolver = StaticActorResolver({"good": "alice"})
+    engine = AssayEngine(
+        policy_name="unicorn", max_turns=2, run_id="run-x", actor_resolver=resolver,
+    )
+    engine.pin(subject="subj-1", brief="brief-1")
+    admission = AssayAdmission(
+        actor_token="good", subject=engine.subject_digest,
+        brief=engine.brief_digest, envelope=engine.envelope,
+    )
+    record = engine.set_turn_limit(None, admission=admission)
+    assert record.kind == "no_cumulative_limit"
+    for _ in range(30):
+        engine.advance_turn(admission=admission)
+    assert engine.current_turn == 30
+
+
+def test_unauthorized_actor_cannot_extend_the_turn_window():
+    resolver = StaticActorResolver({"good": "alice", "bad": ""})
+    engine = AssayEngine(
+        policy_name="unicorn", max_turns=2, run_id="run-x", actor_resolver=resolver,
+    )
+    engine.pin(subject="subj-1", brief="brief-1")
+    bad = AssayAdmission(
+        actor_token="bad", subject=engine.subject_digest,
+        brief=engine.brief_digest, envelope=engine.envelope,
+    )
+    with pytest.raises(AdmissionRefused) as exc:
+        engine.set_turn_limit(999, admission=bad)
+    assert exc.value.axis == "actor"
+    assert engine.max_turns == 2
+
+
+def test_finite_turn_window_still_stops_a_finite_engine():
+    resolver = StaticActorResolver({"good": "alice"})
+    engine = AssayEngine(
+        policy_name="unicorn", max_turns=2, run_id="run-x", actor_resolver=resolver,
+    )
+    engine.pin(subject="subj-1", brief="brief-1")
+    admission = AssayAdmission(
+        actor_token="good", subject=engine.subject_digest,
+        brief=engine.brief_digest, envelope=engine.envelope,
+    )
+    engine.advance_turn(admission=admission)
+    engine.advance_turn(admission=admission)
+    with pytest.raises(TurnBudgetExhaustedError):
+        engine.advance_turn(admission=admission)
+
+
+def test_progress_free_repair_loop_holds_with_causal_evidence_not_blind_repeat(tmp_path):
+    """A progress-free loop holds on the repeated fingerprint, with evidence.
+
+    Re-presenting the *same* failure fingerprint must produce a HOLD carrying
+    the repeated-semantic-failure class, the ``repeated_fingerprint`` reason and
+    a positive correction count -- and must not redispatch. This is the
+    "escalate or hold instead of blind repeat or PASS" half of criterion 3.
+    """
+    repo = _repo(tmp_path)
+    plan = {"id": "T", "lane": {"modifies": ["src/missing.py"]}}
+    target = digest_target(plan)
+    failure = sr.detect_surface_failure(plan, repo, target_digest=target)
+    assert failure is not None
+    journal = EventJournal(":memory:")
+    dispatched = []
+
+    first = sr.repair_plan_from_grounding(
+        plan, repo, role="ops", current_target_digest=target,
+        authorize=lambda r, c, f: True,
+        redispatch=lambda p: dispatched.append("first") or "dispatch:T:1",
+        journal=journal, journal_run_id="loop",
+    )
+    assert first.repaired is True
+
+    second = sr.repair_plan_from_grounding(
+        plan, repo, role="ops", current_target_digest=target,
+        authorize=lambda r, c, f: True,
+        redispatch=lambda p: dispatched.append("second") or "dispatch:T:2",
+        journal=journal, journal_run_id="loop",
+    )
+    assert second.held is True
+    assert second.hold_reason == sr.HoldReason.REPEATED_FINGERPRINT.value
+    assert second.error_class == sr.ErrorClass.REPEATED_SEMANTIC_FAILURE.value
+    assert second.dispatch_identity is None
+    assert dispatched == ["first"]  # the loop never blindly redispatched
+    assert second.attempts[-1].correction_count >= 1
+    assert second.attempts[-1].verifier_result == "repeated_fingerprint"
+
+
+def test_adaptive_progress_free_loop_escalates_or_blocks_with_causal_evidence():
+    """A Flash lane that stops progressing escalates to Pro, or blocks explicitly.
+
+    With no cost ceiling the escalation is to Pro; with a Flash-only ceiling
+    (``cost_ceiling=0``) it blocks and names the reason. Neither path loops, and
+    neither silently *passes* -- the outcome is an explicit escalation or an
+    explicit block.
+    """
+    from skillweave.dispatch.model_policy import (
+        ESCALATION_THRESHOLD,
+        EscalationState,
+        ModelPolicyDeclaration,
+        ModelTier,
+    )
+
+    def _drive(state, declaration):
+        for _ in range(ESCALATION_THRESHOLD):
+            state.record_non_progress()
+        return state.escalate(declaration)
+
+    # No ceiling: escalate to Pro (bounded, evidence-carrying).
+    state = EscalationState()
+    assert _drive(state, ModelPolicyDeclaration(cost_ceiling=None)).tier is ModelTier.PRO
+    assert state.blocked is False
+
+    # Flash-only ceiling: block explicitly instead of looping.
+    blocked = EscalationState()
+    outcome = _drive(blocked, ModelPolicyDeclaration(cost_ceiling=0))
+    assert outcome.tier is ModelTier.FLASH
+    assert outcome.blocked is True
+    assert outcome.blocked_reason  # a reason, not a silent hold
+    # Under the threshold no escalation decision is taken.
+    assert EscalationState().escalate(ModelPolicyDeclaration()).tier is ModelTier.FLASH
+
+
+def test_progress_free_loop_records_an_escalation_with_causal_evidence():
+    """The escalation is recorded with its cause/revisions/outcome, not dropped.
+
+    The adaptive ledger is the durable evidence that a progress-free loop was
+    escalated rather than blindly repeated.
+    """
+    from skillweave.runtime.dagscheduler import (
+        KIND_ESCALATION,
+        SelectionLedger,
+    )
+
+    ledger = SelectionLedger(policy_revision="p-7", catalog_revision="c-3")
+    record = ledger.record_escalation(
+        cause="two accepted non-progress cycles at Flash",
+        candidates=("pro/model-a",),
+        rejected_routes=("flash/model-b",),
+        budget_delta=0.5,
+        outcome="escalated",
+        subject="pro/model-a",
+    )
+    assert record.kind == KIND_ESCALATION
+    assert record.cause
+    assert record.policy_revision == "p-7"
+    assert record.catalog_revision == "c-3"
+    assert record.budget_delta == 0.5
+    assert record.outcome == "escalated"
+    persisted = ledger.to_dict()["records"]
+    assert len(persisted) == 1
+    assert persisted[0]["kind"] == KIND_ESCALATION
+    assert persisted[0]["cause"] == record.cause
+
+
+# ---------------------------------------------------------------------------
+# Backward compatibility: the legacy ``auth_quota`` umbrella still replays
+# ---------------------------------------------------------------------------
+
+def test_legacy_auth_quota_is_still_live_and_held():
+    assert _LEGACY_AUTH_QUOTA in {c.value for c in sr.ErrorClass}
+    assert sr.allowed_action(_LEGACY_AUTH_QUOTA) == sr.RepairAction.HOLD.value
+    assert REPAIR_ALLOWED_ACTION[_LEGACY_AUTH_QUOTA] == "hold"
+    # A legacy table entry is still a recognised held class on the controller.
+    engine, controller = _controller("unicorn")
+    decision = controller.act(
+        RepairActionRequest(error_class=_LEGACY_AUTH_QUOTA, action="hold")
+    )
+    assert decision.approved is False
+    assert decision.requires_human is True
+
+
+def test_legacy_auth_quota_attempt_event_from_the_adaptive_backoff_still_validates():
+    """A persisted legacy ``auth_quota`` correction record still validates.
+
+    The adaptive ``backoff`` kind maps to ``auth_quota`` (its frozen v1 error
+    class); an such a record must still emit and validate under the frozen
+    ``attempt-event-v1`` contract, so old durable records replay rather than
+    being refused by the additive SW-1511 change.
+    """
+    from skillweave.runtime.dagscheduler import AdaptiveDecisionRecord, KIND_BACKOFF
+
+    record = AdaptiveDecisionRecord(
+        kind=KIND_BACKOFF,
+        cause="provider asked for a reset window",
+        candidates=("flash/model-a",),
+        rejected_routes=("pro/model-a",),
+        outcome="backoff",
+        subject="flash/model-a",
+    )
+    event = record.to_attempt_event(run_id="r", task_id="T")
+    assert event["payload"]["error_class"] == _LEGACY_AUTH_QUOTA
+    sr.validate_attempt_event(event)  # still a supported, held class
 
 
 # ---------------------------------------------------------------------------
