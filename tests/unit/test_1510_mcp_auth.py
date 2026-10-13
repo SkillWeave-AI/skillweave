@@ -542,23 +542,45 @@ class TestStdioSupervisorIdentity:
         assert mcp_server.require_supervisor_identity() == "supervisor:ops-1"
 
     def test_main_refuses_before_serving_when_dependency_or_authority_absent(
-        self, monkeypatch
+        self, monkeypatch, capsys
     ):
         """The serving entry checks the dependency first (naming the missing
         package), then the stdio supervisor identity -- a local stdio client is
-        never implicitly trusted."""
+        never implicitly trusted.
+
+        ``main`` is the entry the built wheel's console script actually calls,
+        so *both* refusals are converted there into the documented one-line
+        diagnostic and :data:`mcp_server.EXIT_REFUSED` -- a scriptable exit
+        code, never a propagated traceback. The typed-exception contract at the
+        stdio seam is covered directly by
+        :meth:`test_stdio_requires_an_explicit_supervisor_identity`, which calls
+        :func:`require_supervisor_identity` rather than the exit-converting
+        ``main``.
+        """
         monkeypatch.delenv(mcp_server.SUPERVISOR_ENV, raising=False)
         monkeypatch.setattr(mcp_server, "_AUTHORITY", None)
         from skillweave.mcp import control as _control
 
-        if not _control.mcp_available():
-            with pytest.raises(_control.McpDependencyUnavailable):
-                mcp_server.main()
-            return
-        # With the real dependency present, the supervisor identity is the
-        # next gate.
-        with pytest.raises(UnauthenticatedPrincipal):
+        with pytest.raises(SystemExit) as refusal:
             mcp_server.main()
+
+        assert refusal.value.code == mcp_server.EXIT_REFUSED == 3
+        err = capsys.readouterr().err
+        assert "Traceback" not in err
+        lines = [line for line in err.splitlines() if line.strip()]
+        assert len(lines) == 1, err
+
+        if not _control.mcp_available():
+            # The dependency gate fires first: the missing package is named.
+            assert lines[0].startswith("skillweave-mcp unavailable:")
+            assert _control.DEGRADED_REASON in lines[0]
+            return
+
+        # With the real dependency present, the supervisor identity is the
+        # next gate: the refusal is explicit and names the variable to set.
+        assert lines[0].startswith("skillweave-mcp refused:")
+        assert mcp_server.SUPERVISOR_ENV in lines[0]
+        assert "explicit supervisor identity" in lines[0]
 
 
 class TestHttpAuthorizationControls:
