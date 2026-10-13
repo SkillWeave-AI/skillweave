@@ -949,8 +949,9 @@ def main() -> None:
     """Serve the command server, or refuse with an explicit unavailable state.
 
     This is the only entry the module exposes as a *server*. With no ``mcp``
-    package it raises :class:`~skillweave.mcp.control.McpDependencyUnavailable`
-    (surfaced as a non-zero exit by ``__main__``) rather than silently no-op'ing.
+    package it refuses with the :class:`~skillweave.mcp.control.McpDependencyUnavailable`
+    diagnostic -- a one-line stderr message and :data:`EXIT_REFUSED` -- rather
+    than silently no-op'ing.
 
     A local stdio session must run under an *explicit supervisor identity*
     (:data:`SUPERVISOR_ENV`) and the host must have bound an MCP authority: a
@@ -959,25 +960,26 @@ def main() -> None:
     when the host has not already bound an authority, startup performs the
     production issuance itself (:func:`startup_and_bind_stdio`).
     """
-    control.require_mcp()  # raises the explicit diagnostic when absent
-    require_supervisor_identity()  # local stdio needs a named supervisor
-    if _bound_authority() is None:
-        # The host process did not bind an authority: perform the production
-        # issuance at startup, so a reachable server is authorized rather than
-        # trusted for merely being reachable.
-        startup_and_bind_stdio()
-    runner = getattr(mcp, "run", None)
-    if not callable(runner):
-        raise control.McpDependencyUnavailable(control.DEGRADED_REASON)
-    runner()
-
-
-if __name__ == "__main__":
     # A *documented* non-zero exit for either refusal: the server never starts
     # without its dependency or an explicit, authenticated supervisor identity.
-    # ``EXIT_REFUSED`` is the single code an operator scripts against.
+    # ``EXIT_REFUSED`` is the single code an operator scripts against. The
+    # conversion lives here, in the entry the *wheel* actually calls, so the
+    # refusal is a one-line stderr diagnostic and the documented exit code
+    # whether the server is launched by name (``skillweave-mcp``) or as the
+    # module (``python -m skillweave.mcp.server``); in-process callers of
+    # ``main()`` observe the same single conversion.
     try:
-        main()
+        control.require_mcp()  # raises the explicit diagnostic when absent
+        require_supervisor_identity()  # local stdio needs a named supervisor
+        if _bound_authority() is None:
+            # The host process did not bind an authority: perform the production
+            # issuance at startup, so a reachable server is authorized rather
+            # than trusted for merely being reachable.
+            startup_and_bind_stdio()
+        runner = getattr(mcp, "run", None)
+        if not callable(runner):
+            raise control.McpDependencyUnavailable(control.DEGRADED_REASON)
+        runner()
     except control.McpDependencyUnavailable as exc:
         # Checked first so the dependency-refusal path never has to import the
         # optional authority subpackage. One line, token-free, no traceback.
@@ -989,3 +991,10 @@ if __name__ == "__main__":
         # code rather than dumping a traceback.
         print(f"skillweave-mcp refused: {exc.message}", file=sys.stderr)
         raise SystemExit(EXIT_REFUSED)
+
+
+if __name__ == "__main__":
+    # The refusal semantics live in ``main`` itself, so the module entry is a
+    # plain delegation: the same entry the wheel's console script calls is the
+    # one this module runs.
+    main()
