@@ -74,6 +74,7 @@ skillweave-install = "skillweave.installer:main"
 skillweave-risk-mode = "skillweave.scripts.resolve_risk_mode:main"
 skillweave-interactive-mode = "skillweave.scripts.interactive_mode:main"
 skillweave = "skillweave.cli.main:main"
+skillweave-mcp = "skillweave.mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

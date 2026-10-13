@@ -424,6 +424,7 @@ def test_declared_wheel_metadata_scopes_deps_and_keeps_python_support(wheel):
 
     ep_lines = {line.strip() for line in entry_points.splitlines()}
     assert "skillweave = skillweave.cli.main:main" in ep_lines, ep_lines
+    assert "skillweave-mcp = skillweave.mcp.server:main" in ep_lines, ep_lines
 
 
 def test_base_entry_targets_import_without_optional_capabilities(tmp_path, wheel):
@@ -436,6 +437,7 @@ def test_base_entry_targets_import_without_optional_capabilities(tmp_path, wheel
         "import importlib, importlib.util as u, json\n"
         "targets = {\n"
         "  'skillweave': ('skillweave.cli.main', 'main'),\n"
+        "  'skillweave-mcp': ('skillweave.mcp.server', 'main'),\n"
         "  'skillweave-install': ('skillweave.installer', 'main'),\n"
         "  'skillweave-risk-mode': ('skillweave.scripts.resolve_risk_mode', 'main'),\n"
         "  'skillweave-interactive-mode': ('skillweave.scripts.interactive_mode', 'main'),\n"
