@@ -8,6 +8,19 @@ from .errors import InvalidTransitionError, VersionConflictError
 from .checkpoint import Checkpoint, EnvironmentFingerprint
 from .registry import ArtifactReceipt, EvidenceQuality
 from .handoff import ColdStartBundle, HandoffOffer
+from .native_process import (
+    LEASE_KEY,
+    INTENT_CLAIMING_STATES,
+    INTENT_FAILED,
+    INTENT_LAUNCHED,
+    INTENT_STATES,
+    ControllerLease,
+    DispatchIntent,
+    DuplicateDispatchError,
+    LeaseNotHeldError,
+    LeaseRefusedError,
+    StaleFencingTokenError,
+)
 
 import sqlite3
 import json
@@ -319,6 +332,47 @@ class SQLiteRunStore(RunStore):
             CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency
                 ON events(run_id, idempotency_key)
                 WHERE idempotency_key IS NOT NULL;
+            -- SW-ORCH-001 criterion 2: the SINGLE controller lease with a
+            -- monotonically increasing fencing token.  ``lease_key`` is the
+            -- primary key so at most one row per lease lane exists; the token
+            -- strictly increases on every acquisition, so a recovering
+            -- controller reads a higher token than its predecessor and any
+            -- write presented with a superseded token is refused.
+            CREATE TABLE IF NOT EXISTS controller_lease (
+                lease_key TEXT PRIMARY KEY,
+                holder TEXT NOT NULL,
+                fencing_token INTEGER NOT NULL,
+                acquired_at TEXT NOT NULL,
+                lease_until TEXT,
+                released_at TEXT
+            );
+            -- SW-ORCH-001 criterion 2: durable dispatch intents.  One row per
+            -- owned attempt; the partial unique index below makes a SECOND
+            -- claiming intent for the same execution scope impossible at the
+            -- storage layer, so a duplicate launch cannot start a second
+            -- worker even across processes.
+            CREATE TABLE IF NOT EXISTS dispatch_intents (
+                intent_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                execution_scope TEXT NOT NULL,
+                step TEXT NOT NULL,
+                state TEXT NOT NULL,
+                fencing_token INTEGER NOT NULL,
+                route TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL DEFAULT '',
+                process_identity TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dispatch_intents_run
+                ON dispatch_intents(run_id);
+            CREATE INDEX IF NOT EXISTS idx_dispatch_intents_scope
+                ON dispatch_intents(execution_scope);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_intents_claiming_scope
+                ON dispatch_intents(execution_scope)
+                WHERE state IN ('launched', 'reviewing', 'repairing', 'integrating');
         """)
         self._conn.commit()
         self._migrate_legacy_states()
@@ -990,6 +1044,347 @@ class SQLiteRunStore(RunStore):
             )
             self._conn.commit()
         return claim_ids
+
+    # ---- Controller lease with fencing (SW-ORCH-001 criterion 2) ----
+
+    def _controller_lease_row(self):
+        return self._conn.execute(
+            "SELECT * FROM controller_lease WHERE lease_key = ?", (LEASE_KEY,)
+        ).fetchone()
+
+    def _row_to_controller_lease(self, row) -> ControllerLease:
+        return ControllerLease(
+            holder=row["holder"],
+            fencing_token=row["fencing_token"],
+            lease_until=row["lease_until"],
+            acquired_at=row["acquired_at"],
+            released_at=row["released_at"],
+        )
+
+    def get_controller_lease(self) -> Optional[ControllerLease]:
+        """Return the single controller lease, or ``None`` if never acquired."""
+        row = self._controller_lease_row()
+        return None if row is None else self._row_to_controller_lease(row)
+
+    def acquire_controller_lease(
+        self, holder: str, ttl_seconds: int = 300
+    ) -> ControllerLease:
+        """Acquire the single controller lease, or refuse a live one.
+
+        Exactly one controller holds the lease.  The fencing token strictly
+        increases on every acquisition (takeover or re-acquire after release),
+        so a recovering controller that takes over reads a *higher* token than
+        the controller it replaced.  A live (held, unexpired) lease is refused
+        with :class:`LeaseRefusedError` -- never silently stolen.
+
+        A takeover of an expired lease trusts a new holder *only* for the
+        token; the caller must still re-verify any recorded process identity
+        (:func:`process_identity.verify`) before trusting or signalling a live
+        worker.  This method arbitrates the token alone.
+        """
+        from .write_scope import default_lease_until
+        now = datetime.now(timezone.utc).isoformat()
+        lease_until = default_lease_until(now, ttl_seconds)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._controller_lease_row()
+            if row is not None and row["released_at"] is None:
+                # A held lease with an unexpired (or undatable) deadline is
+                # live: refuse rather than steal.
+                deadline = row["lease_until"]
+                if deadline is None or deadline > now:
+                    self._conn.rollback()
+                    raise LeaseRefusedError(row["holder"], deadline)
+            current_token = row["fencing_token"] if row is not None else 0
+            token = current_token + 1
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO controller_lease "
+                    "(lease_key, holder, fencing_token, acquired_at, lease_until, "
+                    " released_at) VALUES (?, ?, ?, ?, ?, NULL)",
+                    (LEASE_KEY, holder, token, now, lease_until),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE controller_lease SET holder = ?, fencing_token = ?, "
+                    "acquired_at = ?, lease_until = ?, released_at = NULL "
+                    "WHERE lease_key = ?",
+                    (holder, token, now, lease_until, LEASE_KEY),
+                )
+            self._conn.commit()
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return ControllerLease(
+            holder=holder,
+            fencing_token=token,
+            lease_until=lease_until,
+            acquired_at=now,
+            released_at=None,
+        )
+
+    def heartbeat_controller_lease(
+        self, holder: str, fencing_token: int, ttl_seconds: int = 300
+    ) -> bool:
+        """Renew the lease from now; refuse a stale token or wrong holder.
+
+        Returns True when the lease was renewed.  A caller presenting a
+        superseded token is refused (:class:`StaleFencingTokenError`), as is a
+        caller who is not the current holder (:class:`LeaseNotHeldError`): a
+        controller that lost the lease cannot renew it.
+        """
+        from .write_scope import default_lease_until
+        now = datetime.now(timezone.utc).isoformat()
+        lease_until = default_lease_until(now, ttl_seconds)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._controller_lease_row()
+            if row is None or row["released_at"] is not None:
+                self._conn.rollback()
+                raise LeaseNotHeldError(
+                    fencing_token, None if row is None else row["holder"]
+                )
+            if row["fencing_token"] != fencing_token:
+                self._conn.rollback()
+                raise StaleFencingTokenError(fencing_token, row["fencing_token"])
+            if row["holder"] != holder:
+                self._conn.rollback()
+                raise LeaseNotHeldError(fencing_token, row["holder"])
+            self._conn.execute(
+                "UPDATE controller_lease SET lease_until = ? WHERE lease_key = ?",
+                (lease_until, LEASE_KEY),
+            )
+            self._conn.commit()
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return True
+
+    def release_controller_lease(self, fencing_token: int) -> bool:
+        """Release the lease; refuse a stale token.
+
+        Returns True when the held lease carrying ``fencing_token`` was
+        released.  A superseded token is refused rather than releasing a lease
+        the caller no longer owns.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        row = self._controller_lease_row()
+        if row is None or row["released_at"] is not None:
+            raise LeaseNotHeldError(fencing_token, None if row is None else row["holder"])
+        if row["fencing_token"] != fencing_token:
+            raise StaleFencingTokenError(fencing_token, row["fencing_token"])
+        cur = self._conn.execute(
+            "UPDATE controller_lease SET released_at = ? "
+            "WHERE lease_key = ? AND released_at IS NULL AND fencing_token = ?",
+            (now, LEASE_KEY, fencing_token),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def current_fencing_token(self) -> int:
+        """The current fencing token (``0`` when the lease was never taken)."""
+        row = self._controller_lease_row()
+        return 0 if row is None else row["fencing_token"]
+
+    def last_journal_sequence(self, run_id: str) -> int:
+        """The highest journal ``events.sequence`` for *run_id* (``0`` if none).
+
+        The durable journal cursor a recovering controller resumes from: a
+        ``native-process-checkpoint-v1`` records this so a fresh controller
+        continues the run's logical journal without replaying or skipping.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return int(row[0])
+
+    def assert_controller(self, fencing_token: int) -> None:
+        """Refuse a write whose fencing token is not the current held token.
+
+        This is the fence: a stale controller's write is refused with
+        :class:`StaleFencingTokenError` when the presented token is lower than
+        the held one, and with :class:`LeaseNotHeldError` when no lease is
+        held.  A caller must pass here before its durable effect is applied.
+        """
+        row = self._controller_lease_row()
+        if row is None or row["released_at"] is not None:
+            raise LeaseNotHeldError(fencing_token, None if row is None else row["holder"])
+        if row["fencing_token"] != fencing_token:
+            raise StaleFencingTokenError(fencing_token, row["fencing_token"])
+
+    # ---- Durable dispatch intents (SW-ORCH-001 criterion 2) ----
+
+    def _row_to_dispatch_intent(self, row) -> DispatchIntent:
+        return DispatchIntent(
+            intent_id=row["intent_id"],
+            run_id=row["run_id"],
+            task_id=row["task_id"],
+            attempt=row["attempt"],
+            execution_scope=row["execution_scope"],
+            step=row["step"],
+            state=row["state"],
+            fencing_token=row["fencing_token"],
+            route=row["route"],
+            session_id=row["session_id"],
+            process_identity=(
+                json.loads(row["process_identity"])
+                if row["process_identity"] else None
+            ),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def record_dispatch_intent(
+        self,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        execution_scope: str,
+        *,
+        step: str,
+        state: str = INTENT_LAUNCHED,
+        fencing_token: int = 0,
+        route: str = "",
+        session_id: str = "",
+        process_identity: Optional[dict] = None,
+        intent_id: Optional[str] = None,
+    ) -> DispatchIntent:
+        """Record one owned attempt's dispatch intent, refusing a duplicate.
+
+        A *claiming* intent (state in :data:`INTENT_CLAIMING_STATES`) for an
+        execution scope that already carries a claiming intent is refused with
+        :class:`DuplicateDispatchError`; the store's partial unique index
+        enforces the same invariant atomically, so two racing processes cannot
+        both launch the same scope.
+        """
+        import uuid
+
+        if state not in INTENT_STATES:
+            raise ValueError(
+                f"dispatch intent state {state!r} is not one of {sorted(INTENT_STATES)}"
+            )
+        iid = intent_id or str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        pid_json = json.dumps(process_identity) if process_identity is not None else None
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if state in INTENT_CLAIMING_STATES:
+                existing = self._conn.execute(
+                    "SELECT intent_id, run_id FROM dispatch_intents "
+                    "WHERE execution_scope = ? AND state IN "
+                    f"({','.join('?' for _ in INTENT_CLAIMING_STATES)})",
+                    (execution_scope, *sorted(INTENT_CLAIMING_STATES)),
+                ).fetchone()
+                if existing is not None:
+                    self._conn.rollback()
+                    raise DuplicateDispatchError(
+                        execution_scope, existing["intent_id"], existing["run_id"]
+                    )
+            self._conn.execute(
+                "INSERT INTO dispatch_intents "
+                "(intent_id, run_id, task_id, attempt, execution_scope, step, "
+                " state, fencing_token, route, session_id, process_identity, "
+                " created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (iid, run_id, task_id, attempt, execution_scope, step, state,
+                 fencing_token, route, session_id, pid_json, now, now),
+            )
+            self._conn.commit()
+        except DuplicateDispatchError:
+            raise
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return DispatchIntent(
+            intent_id=iid, run_id=run_id, task_id=task_id, attempt=attempt,
+            execution_scope=execution_scope, step=step, state=state,
+            fencing_token=fencing_token, route=route, session_id=session_id,
+            process_identity=process_identity, created_at=now, updated_at=now,
+        )
+
+    def advance_dispatch_intent(
+        self, intent_id: str, state: str, *, step: Optional[str] = None
+    ) -> DispatchIntent:
+        """Advance an intent to ``state``; releases the scope when non-claiming.
+
+        Moving an intent out of a *claiming* state frees its execution scope at
+        the storage layer (the partial unique index no longer covers it), so a
+        subsequent attempt on the same scope is admitted.
+        """
+        if state not in INTENT_STATES:
+            raise ValueError(
+                f"dispatch intent state {state!r} is not one of {sorted(INTENT_STATES)}"
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        if step is None:
+            cur = self._conn.execute(
+                "UPDATE dispatch_intents SET state = ?, updated_at = ? "
+                "WHERE intent_id = ?",
+                (state, now, intent_id),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE dispatch_intents SET state = ?, step = ?, updated_at = ? "
+                "WHERE intent_id = ?",
+                (state, step, now, intent_id),
+            )
+        self._conn.commit()
+        if cur.rowcount == 0:
+            raise KeyError(f"dispatch intent {intent_id!r} does not exist")
+        return self.get_dispatch_intent(intent_id)
+
+    def fail_dispatch_intent(self, intent_id: str) -> DispatchIntent:
+        """Mark an intent failed (a resolved, terminal outcome)."""
+        return self.advance_dispatch_intent(intent_id, INTENT_FAILED)
+
+    def get_dispatch_intent(self, intent_id: str) -> Optional[DispatchIntent]:
+        row = self._conn.execute(
+            "SELECT * FROM dispatch_intents WHERE intent_id = ?", (intent_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_dispatch_intent(row)
+
+    def find_dispatch_intent_by_scope(
+        self, execution_scope: str, *, claiming_only: bool = False
+    ) -> Optional[DispatchIntent]:
+        if claiming_only:
+            row = self._conn.execute(
+                "SELECT * FROM dispatch_intents WHERE execution_scope = ? AND "
+                f"state IN ({','.join('?' for _ in INTENT_CLAIMING_STATES)}) "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (execution_scope, *sorted(INTENT_CLAIMING_STATES)),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM dispatch_intents WHERE execution_scope = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (execution_scope,),
+            ).fetchone()
+        return None if row is None else self._row_to_dispatch_intent(row)
+
+    def list_dispatch_intents(
+        self, run_id: Optional[str] = None, *, claiming_only: bool = False
+    ) -> list[DispatchIntent]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if claiming_only:
+            clauses.append(
+                f"state IN ({','.join('?' for _ in INTENT_CLAIMING_STATES)})"
+            )
+            params.extend(sorted(INTENT_CLAIMING_STATES))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self._conn.execute(
+            "SELECT * FROM dispatch_intents" + where + " ORDER BY created_at, intent_id",
+            params,
+        ).fetchall()
+        return [self._row_to_dispatch_intent(r) for r in rows]
 
     # ---- Evidence persistence ----
 
