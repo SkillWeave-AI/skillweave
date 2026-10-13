@@ -49,7 +49,14 @@ parallelism are decided here declaratively, from observed data handed in.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, List, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence as TypingSequence
+
+# ``class Sequence`` below is a public scheduling primitive (exported in
+# ``__all__``); it deliberately shares the name of ``typing.Sequence``. The
+# typing alias is therefore imported as ``TypingSequence`` and every *generic
+# annotation* uses that alias, so ``TypingSequence[TypingSequence[Lane]]`` can
+# never resolve to the local class and raise
+# ``TypeError: type 'Sequence' is not subscriptable`` at import time.
 
 from .write_scope import resolve_scope_path, paths_overlap, WriteScopeClaim
 
@@ -62,7 +69,7 @@ class CyclicGraphError(Exception):
     cycle must surface as an error, not vanish into a missing task.
     """
 
-    def __init__(self, unresolved: Sequence[str]):
+    def __init__(self, unresolved: TypingSequence[str]):
         self.unresolved = sorted(unresolved)
         super().__init__(
             "Task graph contains a dependency cycle involving: "
@@ -126,7 +133,7 @@ class Lane:
         return self.task.id
 
 
-def build_batches(tasks: Sequence[Task]) -> List[Batch]:
+def build_batches(tasks: TypingSequence[Task]) -> List[Batch]:
     """Resolve ``tasks`` into an ordered list of batches.
 
     A batch is the earliest layer a task can belong to: batch 0 holds tasks
@@ -182,8 +189,8 @@ def _resolved_scopes(task: Task) -> List[str]:
 
 
 def _scope_conflicts(
-    scopes: Sequence[str],
-    others: Sequence[str],
+    scopes: TypingSequence[str],
+    others: TypingSequence[str],
 ) -> bool:
     """True when any path in ``scopes`` overlaps any path in ``others``.
 
@@ -199,7 +206,7 @@ def _scope_conflicts(
 
 
 def build_lanes(
-    tasks: Sequence[Task],
+    tasks: TypingSequence[Task],
     held_claims: tuple[WriteScopeClaim, ...] = (),
 ) -> List[List[Lane]]:
     """Build write-scope-aware lanes into parallel batches.
@@ -571,7 +578,7 @@ def _admit_by_budget(
 
 
 def _split_by_max_parallel(
-    lane_groups: Sequence[Sequence[Lane]],
+    lane_groups: TypingSequence[TypingSequence[Lane]],
     max_parallel: int,
 ) -> List[List[Lane]]:
     """Cap the number of lanes per group at ``max_parallel``.
@@ -944,8 +951,8 @@ class SelectionLedger:
         kind: str,
         *,
         cause: str,
-        candidates: Sequence[str] = (),
-        rejected_routes: Sequence[str] = (),
+        candidates: TypingSequence[str] = (),
+        rejected_routes: TypingSequence[str] = (),
         budget_delta: float = 0.0,
         outcome: str = "",
         subject: str = "",

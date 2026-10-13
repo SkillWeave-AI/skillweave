@@ -20,15 +20,21 @@ unsupported version is refused, never coerced).
 import sys
 import tempfile
 from pathlib import Path
+from typing import get_type_hints
 
 _src = Path(__file__).resolve().parent.parent.parent / "src"
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
+import skillweave.runtime.dagscheduler as _dagscheduler
 from skillweave.runtime.dagscheduler import (
     ReservationSnapshot,
     RouteCapacitySnapshot,
+    Sequence as DagSequence,
+    SelectionLedger,
     Task,
+    _split_by_max_parallel,
+    build_sessions,
 )
 from skillweave.runtime.native_process import (
     CHECKPOINT_SCHEMA_ID,
@@ -567,6 +573,45 @@ def test_checkpoint_requires_a_fencing_token():
         assert False, "a negative fencing token must be refused"
     except ValueError:
         pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Interpreter-compatibility regression (the controller-measured correction)
+#
+# The public scheduling dataclass ``dagscheduler.Sequence`` shares the name of
+# ``typing.Sequence``.  Before the fix, the *generic* annotation
+# ``lane_groups: Sequence[Sequence[Lane]]`` resolved to the local class and
+# raised ``TypeError: type 'Sequence' is not subscriptable`` at import time on
+# CPython 3.11/3.12 (which evaluate annotations eagerly).  These tests fail on
+# every interpreter if that collision is reintroduced, rather than passing
+# silently on 3.14's lazy-annotation semantics.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_dagscheduler_and_store_imports_bind_cleanly_through_the_runtime_package():
+    # ``store`` -> ``native_process`` -> ``dagscheduler``; importing the
+    # observer package traverses that same chain the controller observed.
+    import skillweave.runtime.observer  # noqa: F401  (import is the assertion)
+    import skillweave.runtime.store  # noqa: F401
+    assert _dagscheduler.Sequence is DagSequence
+
+
+def test_generic_annotations_survive_get_type_hints():
+    import typing
+
+    main_hints = get_type_hints(_dagscheduler.build_batches)
+    assert main_hints["tasks"] == typing.Sequence[Task]
+
+    split_hints = get_type_hints(_split_by_max_parallel)
+    assert split_hints["lane_groups"] == typing.Sequence[typing.Sequence[_dagscheduler.Lane]]
+
+    record_hints = get_type_hints(SelectionLedger._record)
+    assert record_hints["candidates"] == typing.Sequence[str]
+    assert record_hints["rejected_routes"] == typing.Sequence[str]
+
+
+def test_public_sequence_annotation_names_the_local_dataclass_not_typing():
+    hints = get_type_hints(build_sessions)
+    assert hints["sequence"] is DagSequence
 
 
 if __name__ == "__main__":
