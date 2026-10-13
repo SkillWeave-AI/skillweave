@@ -7,8 +7,8 @@ binary is executed, in a fixed, auditable precedence:
     1. an **explicit launcher config** (``SearchConfig.mcp_command``) -- the
        caller names the command; it wins over everything;
     2. a **registered compatible runtime** -- a package registered with this
-       resolver (Capacium supplies **launcher metadata only**), whose exact
-       distribution/version is pinned;
+       resolver (by id, or through the resolver's registration seam), whose
+       exact distribution/version is pinned;
     3. a **verified installed binary** -- a console script resolved on ``PATH``
        whose distribution, version and origin are read from installed metadata
        and recorded as provenance;
@@ -82,8 +82,8 @@ class LauncherResolutionError(ValueError):
 class Registration:
     """A known-compatible MCP launcher runtime, registered by a provider.
 
-    ``launch`` is the base command (e.g. ``["capacium-mcp"]`` or
-    ``["python3", "-m", "capacium_mcp.server"]``). ``distribution`` /
+    ``launch`` is the base command (e.g. ``["example-mcp"]`` or
+    ``["python3", "-m", "example_mcp.server"]``). ``distribution`` /
     ``version`` name the exact installed distribution the base command belongs
     to -- never a floating version directory. ``distribution`` is optional for
     an explicitly-registered local runtime whose provenance the caller owns.
@@ -279,26 +279,26 @@ def clear_registrations() -> None:
 
 
 def default_registrations() -> list[Registration]:
-    """The source-owned known-compatible runtimes.
+    """The source-owned known-compatible runtimes -- currently **none**.
 
-    Capacium appears here as **launcher metadata only**: the id, the real
-    console script, and the distribution/version its installed metadata must
-    match. Nothing from Capacium is imported to build this list.
+    A launcher is never trusted because a provider advertises one: an installed
+    console script can exist while its distribution is absent or its module
+    unimportable, so a default registration would resolve to a command that
+    cannot serve the Perplexity tool. The resolver therefore ships **no**
+    default registration and fails closed (``asset="launcher"``) unless a caller
+    supplies an explicit ``mcp_command``, a registration id / candidate that the
+    caller owns, or an installed binary it has verified.
+
+    A registration, when supplied, is still verified against its pinned
+    distribution version *before* its command is executed (see
+    :func:`_verify_registration`).
     """
-    return [
-        Registration(
-            id="capacium-mcp",
-            launch=("capacium-mcp",),
-            distribution="capacium-mcp",
-            version="0.3.0",
-            transport="mcp-stdio",
-            source="capacium:launcher-metadata",
-        ),
-    ]
+    return []
 
 
-for _registration in default_registrations():
-    register(_registration)
+# No ambient/automatic registration: the module registers nothing on import, so
+# ``resolve_launcher()`` with no explicit input fails closed rather than
+# trusting an installed-but-unverified launcher.
 
 
 # ── resolution ─────────────────────────────────────────────────────────────
@@ -309,7 +309,7 @@ def _with_resolved_launcher(
 ) -> tuple[str, ...]:
     """Substitute the *resolved* launcher path for the bare launcher token.
 
-    A registration declares a bare console-script name (``"capacium-mcp"``); the
+    A registration declares a bare console-script name (``"example-mcp"``); the
     resolver located a concrete path for it. Executing the path (never the bare
     name, which can pick up a different ``PATH``) is the point of "verified
     installed binary".
@@ -433,7 +433,9 @@ def resolve_launcher(
     elif registrations is not None:
         candidates = list(registrations)
     else:
-        candidates = [r for r in _REGISTRY.values() if r.id == "capacium-mcp"]
+        # No ambient default: the module registry is empty unless a caller has
+        # explicitly registered a runtime it owns.
+        candidates = list(_REGISTRY.values())
 
     for registration in candidates:
         verified = _verify_registration(

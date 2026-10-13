@@ -5,7 +5,8 @@ This suite pins the replacement: a resolver that names exactly which binary is
 executed, in a fixed, auditable precedence --
 
     1. explicit launcher config (``SearchConfig.mcp_command``)  -- wins;
-    2. registered compatible runtime (Capacium supplies metadata only);
+    2. registered compatible runtime (a caller-owned registration; NO default
+       is shipped -- an installed script is not trusted until verified);
     3. verified installed binary (console script + matching dist metadata);
     4. uvx fallback -- only with an EXACT pin, an EXPLICIT network grant and a
        recorded provenance.
@@ -60,14 +61,87 @@ def _pinned_importable(monkeypatch):
 
 @pytest.fixture
 def no_ambient_registrations(monkeypatch):
-    """Isolate the source-owned registrations, so only the fixture is considered.
+    """Isolate the module registry, so only a test-owned registration is considered.
 
-    The host may genuinely have the real ``capacium-mcp`` runtime installed; a
-    test about the *uvx* rung (or about a *refusal*) must not be served by it,
-    so the module registry is emptied for the duration of the test.
+    The module ships no default registration (``default_registrations()`` is
+    empty), but a prior test in the same process may have left one registered;
+    a test about the *uvx* rung (or a *refusal*) must not be served by any
+    ambient runtime, so the registry is emptied for the duration of the test.
     """
     monkeypatch.setattr(L, "_REGISTRY", {})
     return monkeypatch
+
+
+# ── criterion 1: the default Capacium launcher is dropped ──────────────────
+
+
+class TestDefaultLauncherIsDropped:
+    def test_no_capacium_launcher_remains_in_the_source(self):
+        """The default ``capacium-mcp`` launcher is gone from ``src`` entirely."""
+        import subprocess
+
+        repo_root = Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            ["git", "grep", "-n", r"capacium-mcp\|capacium_mcp", "--", "src"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        # git grep exits 1 (no match) when the token is absent -- the required state.
+        assert result.returncode == 1, result.stdout
+        assert result.stdout == "", result.stdout
+
+    def test_default_registrations_is_empty(self):
+        assert L.default_registrations() == []
+
+    def test_import_registers_nothing_ambiently(self):
+        """Importing the module must not auto-register a launcher.
+
+        Proven in a *fresh* interpreter so the observation is of import-time
+        state, not of anything a prior test may have registered in-process.
+        """
+        import subprocess
+
+        repo_root = Path(__file__).resolve().parents[2]
+        probe = (
+            "import sys; sys.path.insert(0, 'src');"
+            "from skillweave.council import launcher as L;"
+            "print(len(L._REGISTRY), L.default_registrations())"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "0 []", result.stdout
+
+    def test_no_input_fails_closed_with_the_launcher_asset(self):
+        """``resolve_launcher()`` with no input refuses (``asset="launcher"``)."""
+        L.clear_registrations()
+        with pytest.raises(L.LauncherResolutionError) as excinfo:
+            L.resolve_launcher()
+        assert excinfo.value.asset == "launcher"
+
+    def test_council_search_yields_typed_no_binding_and_spawns_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """The Council search seam: an unregistered-default is a typed
+        ``no_binding`` and *no* process is spawned (proven by the argv log)."""
+        log = tmp_path / "argv.log"
+        monkeypatch.setenv("COUNCIL_REFUSAL_ARGV_LOG", str(log))
+        L.clear_registrations()
+        ws = WebSearch()
+        cfg = SearchConfig(provider="perplexity", full_content_results=0, time_range="any")
+        arg = ws._backend_argument("q", cfg, "perplexity-search-mcp")
+        assert not arg.get("command")
+        assert arg["launcher_resolution_error"] == "launcher"
+        assert arg["launcher_provenance"]["kind"] == "unresolved"
+        # Nothing was launched: the argv log (written by any spawned fake launcher)
+        # is absent/empty.
+        spawned = log.read_text() if log.exists() else ""
+        assert spawned == "", f"a launcher was spawned: {spawned!r}"
 
 
 # ── precedence: explicit config wins ───────────────────────────────────────

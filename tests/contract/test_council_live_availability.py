@@ -37,7 +37,18 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 FIX_C = Path(__file__).resolve().parents[1] / "fixtures" / "council"
+FAKE = FIX_C / "fake_mcp_server.py"
 PENDING = FIX_C / "LIVE_PROOF_PENDING.md"
+
+
+def _broken_launcher_command() -> list[str]:
+    """A real, local command that starts but is *not* a usable MCP server.
+
+    No floating install is constructed: a local interpreter + the network-free
+    fake in its ``unavailable`` mode. It exists to prove that an unusable
+    launcher is a typed failure, never a fixture success.
+    """
+    return [sys.executable, str(FAKE), "unavailable"]
 
 from skillweave.adapters import SEARCH_OPERATION  # noqa: E402
 from skillweave.council import launcher as L  # noqa: E402
@@ -102,32 +113,81 @@ class TestNoFixtureSuccessIsSubstituted:
         assert outcome.results == ()
         assert outcome.error_code == "no_binding"
 
-    def test_a_broken_owned_launcher_reports_a_typed_failure_not_fixture_success(
-        self, tmp_path, monkeypatch
-    ):
-        """The source-owned Capacium MCP launcher, if present but unusable, is a
-        typed non-success -- proof the path does not silently substitute a fake."""
-        monkeypatch.setattr(L, "_REGISTRY", {})
-        monkeypatch.setattr(
-            L,
-            "_REGISTRY",
-            {
-                "capacium-mcp": L.Registration(
-                    id="capacium-mcp",
-                    launch=("capacium-mcp",),
-                    distribution="capacium-mcp",
-                    version="0.3.0",
-                    transport="mcp-stdio",
-                    source="capacium:launcher-metadata",
-                )
-            },
+    def test_a_launcher_with_no_tool_lists_are_verified_before_trust(self):
+        """A launcher is trusted only after its tool is verified.
+
+        Two real, local, network-free servers stand in for "a launcher that does
+        not serve ``perplexity_search``": one that cannot start at all and one
+        that starts but advertises a *different* tool. Both must be typed
+        failures with zero results -- never a fixture success.
+        """
+        broken_outcome, _ = run_perplexity_mcp(
+            "a live query", command=_broken_launcher_command(), timeout=15.0
         )
-        try:
-            res = L.resolve_launcher(search_path=os.environ.get("PATH"))
-        except L.LauncherResolutionError:
-            pytest.skip("capacium-mcp is not installed in this environment")
-        # Whatever the resolved command, executing the Perplexity path must not
-        # yield a fixture source: a broken/unavailable launcher is a typed failure.
+        assert broken_outcome.status != "success", broken_outcome
+        assert broken_outcome.results == ()
+        assert broken_outcome.error_code == "launch_failed", broken_outcome
+
+        # A startable server that exposes no ``perplexity_search`` tool: the
+        # backend lists tools, finds it absent, and refuses *before* any query.
+        missing_outcome, _ = run_perplexity_mcp(
+            "a live query",
+            command=[sys.executable, str(FAKE), "missing-tool"],
+            timeout=15.0,
+        )
+        assert missing_outcome.status != "success", missing_outcome
+        assert missing_outcome.results == ()
+        assert missing_outcome.error_code == "tool_missing", missing_outcome
+
+    def test_a_resolved_live_binding_is_verified_before_trust(self):
+        """A *resolved* launcher binding whose server lacks the tool is refused.
+
+        The launcher resolver accepts an explicitly-supplied, non-floating
+        command; the backend must still verify the tool list before it trusts
+        that launcher -- so a binding to a server without ``perplexity_search``
+        is a typed ``tool_missing``, never a fixture success.
+        """
+        from skillweave.council import launcher as _L
+
+        res = _L.resolve_launcher(
+            explicit_command=[sys.executable, str(FAKE), "missing-tool"]
+        )
+        outcome, _ = run_perplexity_mcp(
+            "a live query", command=list(res.command), timeout=15.0
+        )
+        assert outcome.status != "success", outcome
+        assert outcome.results == ()
+        assert outcome.error_code == "tool_missing", outcome
+
+    def test_a_broken_owned_launcher_reports_a_typed_failure_not_fixture_success(self):
+        """An installed-but-unusable launcher is a typed non-success.
+
+        The reference environment's ``capacium-mcp`` console script exists on
+        ``PATH`` while its distribution metadata is absent and its module
+        unimportable (see ``LIVE_PROOF_PENDING.md``). Such a launcher is not
+        trusted: the resolver registers no default, and executing a raw,
+        unusable launcher here yields no fixture source -- a typed failure.
+        """
+        outcome, _ = run_perplexity_mcp(
+            "a live query", command=_broken_launcher_command(), timeout=15.0
+        )
+        assert outcome.status != "success", outcome
+        assert outcome.results == (), "a broken launcher must never yield a source"
+        assert outcome.error_code, outcome
+
+
+class TestResolvedLauncherOutcomeIsHonest:
+    def test_a_resolved_launcher_with_credentials_never_yields_a_fixture_source(self):
+        """A *resolved* launcher with credentials still cannot fabricate a source.
+
+        The resolver is given a real, local, non-floating command -- so a binding
+        *is* produced -- while a credential is present in this process's
+        environment. The unusable server can yield only a typed non-success; a
+        ``success`` here would be a fixture substituted for a live proof, and a
+        success from a genuinely live provider must carry real ``http(s)`` cited
+        sources (the retained success guard).
+        """
+        res = L.resolve_launcher(explicit_command=_broken_launcher_command())
         outcome, _ = run_perplexity_mcp(
             "a live query", command=list(res.command), timeout=15.0
         )

@@ -53,7 +53,9 @@ from skillweave.council import launcher as L  # noqa: E402
 from skillweave.council.perplexity import (  # noqa: E402
     PERPLEXITY_MCP_TOOL,
     PerplexityMcpBackend,
+    run_perplexity_mcp,
 )
+import skillweave.council.perplexity as perplexity_mod  # noqa: E402
 from skillweave.adapters import SEARCH_OPERATION  # noqa: E402
 
 
@@ -338,3 +340,70 @@ class TestTypedFailures:
         with pytest.raises(McpClientError) as excinfo:
             _run(scenario())
         assert excinfo.value.code == -32603
+
+
+# ── criterion 2: a launcher is trusted only after its tool is verified ─────
+
+
+class TestPerplexityToolVerifiedBeforeQuery:
+    """The backend verifies the launcher's tool list *before* any search.
+
+    A launcher is not trusted because it advertises itself or starts: the
+    backend lists tools and refuses with the typed ``tool_missing`` before it
+    ever sends ``tools/call``. The positive control proves the same fake server
+    exposes ``perplexity_search`` and passes; the negative controls prove a
+    server without it -- or one that cannot start at all -- is a typed failure,
+    never a fixture success.
+    """
+
+    def test_a_server_without_the_tool_is_refused_with_tool_missing(self):
+        """Negative control: a server lacking ``perplexity_search``."""
+        backend = PerplexityMcpBackend()
+        outcome = _run(
+            backend.invoke(SEARCH_OPERATION, {"query": "q", "command": _fake("missing-tool")}, {})
+        )
+        assert outcome.status == "error", outcome
+        assert outcome.error_code == "tool_missing", outcome
+        assert outcome.results == ()
+        # The server advertised a *different* tool; the message names the miss.
+        assert "perplexity_search" in (outcome.synthesis or "")
+        assert "not_perplexity" in (outcome.synthesis or "")
+
+    def test_a_server_that_cannot_start_is_a_typed_failure_not_success(self):
+        """Negative control: a server whose stream closes at startup."""
+        backend = PerplexityMcpBackend(timeout=5.0)
+        outcome = _run(
+            backend.invoke(SEARCH_OPERATION, {"query": "q", "command": _fake("unavailable")}, {})
+        )
+        assert outcome.status != "success", outcome
+        assert outcome.results == ()
+        assert outcome.error_code == "launch_failed", outcome
+
+    def test_the_positive_control_exposes_the_tool_and_passes(self):
+        """Positive control: the same server *with* the tool yields a success."""
+        backend = PerplexityMcpBackend()
+        outcome = _run(
+            backend.invoke(SEARCH_OPERATION, {"query": "q", "command": _fake("normal")}, {})
+        )
+        assert outcome.status == "success", outcome
+        assert outcome.results
+
+    def test_the_check_lists_tools_only_and_runs_no_search(self, monkeypatch):
+        """The pre-query check sends ``tools/list`` and *never* ``tools/call``.
+
+        Observed directly: ``McpStdioClient.call_tool`` is spied on, so a call
+        to ``tools/call`` -- the search -- would be recorded. Against the
+        missing-tool server the backend must return ``tool_missing`` with the
+        spy untouched.
+        """
+        calls: list = []
+        original = McpStdioClient.call_tool
+
+        async def _spy(self, name, arguments):
+            calls.append((name, arguments))
+            return await original(self, name, arguments)
+
+        monkeypatch.setattr(McpStdioClient, "call_tool", _spy)
+        outcome, _session = run_perplexity_mcp("q", command=_fake("missing-tool"))
+        assert outcome.error_code == "tool_missing", outcome
+        assert calls == [], f"a search was issued despite a missing tool: {calls}"
