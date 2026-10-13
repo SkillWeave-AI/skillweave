@@ -42,6 +42,24 @@ Every correction is recorded as an ``attempt-event-v1`` record
 (:meth:`RepairAttempt.to_attempt_event`) carrying the failure fingerprint, the
 hypothesis, the changed input, the verifier result and a bounded correction
 count — appended to, never overwriting, the prior attempts.
+
+Attempt-condition control record (SW-1511-REPAIR criterion 4)
+-------------------------------------------------------------
+
+When a provider quota refuses an owned attempt there is no permitted fallback:
+substituting another route/credential/provider would raise the acting
+*authority*, so it is never inferred.  The one control decision available is to
+store the provider's reset/backoff window and *wait*, then resume the **same
+owned session on the same route** — never a substituted one.  That decision is
+represented by :func:`attempt_condition_for_quota`, emitted as an
+``attempt-condition-v1`` record (:meth:`AttemptCondition.to_dict` /
+:meth:`AttemptCondition.to_attempt_condition`).  While the attempt waits the run
+sits in the non-terminal :data:`~skillweave.runtime.store.RunStateModel.
+BLOCKED_WAITING_FOR_GATE` state, so cancellation stays available
+(:data:`AttemptCondition.cancellable` is a live fact, not a promise).  A
+provider quota the caller cannot place on a future window (no reset, or an
+already-elapsed one) is never reported as waiting: the decision fails closed to
+a non-waiting HOLD with no stored window.
 """
 
 from __future__ import annotations
@@ -49,10 +67,10 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .preflight import (
     AUTO_REPAIR_CAPABILITY,
@@ -663,6 +681,461 @@ def validate_attempt_event(event: dict[str, Any]) -> None:
             f"attempt-event error_class {payload['error_class']!r} is not one "
             f"of {sorted(c.value for c in ErrorClass)}"
         ) from exc
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SW-1511-REPAIR criterion 4: the attempt-condition-v1 control record.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A provider quota with no *permitted* fallback is not repaired and does not
+# switch routes/credentials (that would be an authority expansion).  The one
+# control decision is to store the provider's reset/backoff window, wait (the
+# non-terminal blocked_waiting_for_gate state, so cancellation stays available)
+# and resume the SAME owned session on the SAME route.
+
+#: The frozen attempt-condition contract this module produces control records
+#: under.  The baseline (SW-1511-BASE) did not freeze a canonical URI, so the
+#: URI/revision/digest are frozen here, next to the class that implements it,
+#: and a consumer refuses any other version rather than guessing the shape.
+ATTEMPT_CONDITION_SCHEMA_ID = (
+    "https://skillweave.dev/schemas/execution/attempt-condition/v1"
+)
+ATTEMPT_CONDITION_SCHEMA_VERSION = "1.0.0"
+SUPPORTED_ATTEMPT_CONDITION_VERSIONS = frozenset({ATTEMPT_CONDITION_SCHEMA_VERSION})
+
+#: The single control decision this contract represents today: store the
+#: provider reset window and resume the same owned session on the same route.
+#: ``hold`` is the fail-closed alternative (local budget exhaustion, or a
+#: provider quota with no storable future window).  It is a closed set so an
+#: unknown decision fails closed rather than being executed.
+CONDITION_RESUME_SAME_ROUTE = "resume_same_route"
+CONDITION_HOLD = "hold"
+CONDITION_DECISIONS = (CONDITION_RESUME_SAME_ROUTE, CONDITION_HOLD)
+
+
+class UnsupportedAttemptConditionVersion(ValueError):
+    """An attempt condition carries a version this consumer does not support."""
+
+    def __init__(self, version: Any):
+        self.version = version
+        super().__init__(
+            f"unsupported attempt-condition schema_version {version!r}; expected "
+            f"one of {sorted(SUPPORTED_ATTEMPT_CONDITION_VERSIONS)}"
+        )
+
+
+class AttemptConditionKind(str, Enum):
+    """The typed condition an attempt is in, control-policy-wise.
+
+    Criterion 4 is deliberately narrower than :class:`ErrorClass`: it covers
+    exactly the *provider-quota-with-no-permitted-fallback* condition (store
+    reset/backoff, resume the same owned session on the same route) and the
+    local, non-provider *budget exhaustion* (store nothing, HOLD — there is no
+    reset interval to store).  It must not become a second, drifting error
+    vocabulary: any other class is refused rather than mapped onto a wait.
+    """
+
+    PROVIDER_QUOTA = "provider_quota"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+
+
+#: The error classes this contract accepts, mapped to their condition kind.
+#: Anything outside this closed set is refused (see
+#: :func:`attempt_condition_for_quota`) so the contract stays exactly the
+#: quota-vs-local-budget distinction criterion 4 governs.
+_CONDITION_KINDS: dict[str, AttemptConditionKind] = {
+    ErrorClass.PROVIDER_QUOTA.value: AttemptConditionKind.PROVIDER_QUOTA,
+    ErrorClass.BUDGET_EXHAUSTED.value: AttemptConditionKind.BUDGET_EXHAUSTED,
+    ErrorClass.AUTH_QUOTA.value: AttemptConditionKind.PROVIDER_QUOTA,
+}
+
+
+@dataclass(frozen=True)
+class AttemptCondition:
+    """An ``attempt-condition-v1`` control record (SW-1511-REPAIR criterion 4).
+
+    The record is the *producer's* (harness/router/repair-classifier) typed
+    statement of the control decision for one owned attempt, for the *durable
+    controller* (its declared consumer) to persist and act on.  It carries the
+    classification, the state the run waits in, whether cancellation is still
+    available, the fallback disposition, and — when the decision is to wait —
+    the stored reset/backoff window.
+
+    Fail-closed invariants enforced at construction:
+
+    * ``schema_version`` must be a supported version;
+    * the class must be one this contract governs (a provider quota or a local
+      budget exhaustion) — never a repair that belongs to another class;
+    * a decided *wait* must carry a stored ``reset_at`` in the future (an
+      undatable or already-elapsed window is never reported as waiting);
+    * a non-wait decision carries no fabricated window;
+    * the resume target is the *same* owned session on the *same* route, never
+      a substituted one;
+    * a waiting attempt is cancellable and waits in the non-terminal
+      ``blocked_waiting_for_gate`` state.
+    """
+
+    condition: str
+    error_class: str
+    action: str
+    decision: str
+    run_id: str = ""
+    task_id: str = ""
+    attempt: int = 1
+    session_id: str = ""
+    route: str = ""
+    reset_at: Optional[str] = None
+    backoff_seconds: Optional[float] = None
+    resume_attempt: Optional[int] = None
+    resume_route: str = ""
+    fallback_permitted: bool = False
+    fallback_used: bool = False
+    cancellable: bool = True
+    run_state: str = "blocked_waiting_for_gate"
+    measured_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    schema_version: str = ATTEMPT_CONDITION_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != ATTEMPT_CONDITION_SCHEMA_VERSION:
+            raise UnsupportedAttemptConditionVersion(self.schema_version)
+        kind = _CONDITION_KINDS.get(self.error_class)
+        if kind is None:
+            raise ValueError(
+                f"attempt-condition error_class {self.error_class!r} is not one "
+                f"this contract governs (expected one of "
+                f"{sorted(_CONDITION_KINDS)})"
+            )
+        if self.condition != kind.value:
+            raise ValueError(
+                f"attempt-condition condition {self.condition!r} does not match "
+                f"the error_class {self.error_class!r} -> {kind.value!r}"
+            )
+        if self.action != ALLOWED_ACTION[ErrorClass(self.error_class)].value:
+            raise ValueError(
+                f"attempt-condition action {self.action!r} is not the permitted "
+                f"action for {self.error_class!r}"
+            )
+        if self.decision not in CONDITION_DECISIONS:
+            raise ValueError(
+                f"attempt-condition decision {self.decision!r} is not one of "
+                f"{list(CONDITION_DECISIONS)}"
+            )
+        # A permitted fallback is never inferred and is only ever named.
+        if self.fallback_used:
+            raise ValueError(
+                "attempt-condition never records a fallback use: substituting a "
+                "route/credential/provider is an authority expansion"
+            )
+        if self.fallback_permitted:
+            raise ValueError(
+                "attempt-condition only governs the no-permitted-fallback case"
+            )
+
+        waiting = self.decision == CONDITION_RESUME_SAME_ROUTE
+        if waiting and self.condition != AttemptConditionKind.PROVIDER_QUOTA.value:
+            raise ValueError(
+                "only a provider-quota condition may resume the same route"
+            )
+        if waiting:
+            if not isinstance(self.reset_at, str) or not self.reset_at.strip():
+                raise ValueError(
+                    "a provider-quota wait must store the reset/backoff window "
+                    "(reset_at); an undated wait is never reported"
+                )
+            reset = _parse_iso(self.reset_at)
+            if reset is None:
+                raise ValueError(
+                    f"attempt-condition reset_at {self.reset_at!r} is not an ISO "
+                    f"8601 timestamp"
+                )
+            measured = _parse_iso(self.measured_at) or reset
+            if reset <= measured:
+                raise ValueError(
+                    f"attempt-condition reset_at {self.reset_at!r} is not in the "
+                    f"future of measured_at {self.measured_at!r}"
+                )
+            if self.backoff_seconds is None or self.backoff_seconds <= 0:
+                raise ValueError(
+                    "a provider-quota wait must carry a positive backoff_seconds"
+                )
+            if not self.route:
+                raise ValueError(
+                    "a provider-quota wait must name the owned route to resume on"
+                )
+            if not self.session_id:
+                raise ValueError(
+                    "a provider-quota wait must name the owned session to resume"
+                )
+            if self.resume_route != self.route:
+                raise ValueError(
+                    f"attempt-condition resumes on the SAME route; "
+                    f"resume_route {self.resume_route!r} != route {self.route!r}"
+                )
+            if self.resume_attempt is None or self.resume_attempt != self.attempt:
+                raise ValueError(
+                    "attempt-condition resumes the SAME owned attempt "
+                    "(resume_attempt == attempt)"
+                )
+            if not self.cancellable:
+                raise ValueError(
+                    "cancellation remains available while waiting: a waiting "
+                    "attempt-condition must be cancellable"
+                )
+            from .store import RunStateModel
+
+            if self.run_state != RunStateModel.BLOCKED_WAITING_FOR_GATE.value:
+                raise ValueError(
+                    f"a waiting attempt-condition must sit in "
+                    f"{RunStateModel.BLOCKED_WAITING_FOR_GATE.value!r}, not "
+                    f"{self.run_state!r}"
+                )
+            if RunStateModel.is_terminal(self.run_state):
+                raise ValueError(
+                    "a waiting attempt-condition is never terminal"
+                )
+        else:
+            # Local budget exhaustion: no reset interval exists to store, so a
+            # fabricated window would misrepresent a HOLD as a scheduled wait.
+            if self.reset_at is not None or self.backoff_seconds is not None:
+                raise ValueError(
+                    "a local budget exhaustion stores no reset/backoff window"
+                )
+            if self.resume_attempt is not None or self.resume_route:
+                raise ValueError(
+                    "a local budget exhaustion does not schedule a same-route "
+                    "resume"
+                )
+
+    @property
+    def waiting(self) -> bool:
+        """True only when the stored decision is to wait on a stored window."""
+        return self.decision == CONDITION_RESUME_SAME_ROUTE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_id": ATTEMPT_CONDITION_SCHEMA_ID,
+            "schema_version": self.schema_version,
+            "condition": self.condition,
+            "error_class": self.error_class,
+            "action": self.action,
+            "decision": self.decision,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "attempt": self.attempt,
+            "session_id": self.session_id,
+            "route": self.route,
+            "reset_at": self.reset_at,
+            "backoff_seconds": self.backoff_seconds,
+            "resume_attempt": self.resume_attempt,
+            "resume_route": self.resume_route,
+            "fallback_permitted": self.fallback_permitted,
+            "fallback_used": self.fallback_used,
+            "cancellable": self.cancellable,
+            "run_state": self.run_state,
+            "measured_at": self.measured_at,
+        }
+
+    def to_attempt_condition(
+        self, *, principal: str = "", issuer: str = "repair-classifier"
+    ) -> dict[str, Any]:
+        """Export this condition as a full ``attempt-condition-v1`` record.
+
+        The envelope carries the frozen schema id/version, the identity
+        (run/task/attempt/session/route), the decision, and an
+        ``evidence_digest`` over the payload so the durable controller can bind
+        the record it acts on.  Validate it with
+        :func:`validate_attempt_condition`.
+        """
+        payload = self.to_dict()
+        return {
+            "schema_id": ATTEMPT_CONDITION_SCHEMA_ID,
+            "schema_version": ATTEMPT_CONDITION_SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "attempt": self.attempt,
+            "session_id": self.session_id,
+            "route": self.route,
+            "decision": self.decision,
+            "condition": self.condition,
+            "measured_at": self.measured_at,
+            "issuer": issuer,
+            "principal": principal,
+            "evidence_digest": digest_target(payload),
+            "payload": payload,
+        }
+
+
+def validate_attempt_condition(record: Mapping[str, Any]) -> None:
+    """Refuse an ``attempt-condition-v1`` record this consumer cannot support.
+
+    Raises :class:`UnsupportedAttemptConditionVersion` for an unknown version
+    (or an unknown schema id); raises :class:`ValueError` for a record whose
+    declared decision conflicts with the stored window (a wait without a reset,
+    a resume onto a substituted route) or whose evidence digest does not bind
+    its payload.  Never repairs the record into a supported shape.
+    """
+    version = record.get("schema_version")
+    if version not in SUPPORTED_ATTEMPT_CONDITION_VERSIONS:
+        raise UnsupportedAttemptConditionVersion(version)
+    if record.get("schema_id") != ATTEMPT_CONDITION_SCHEMA_ID:
+        raise ValueError(
+            f"attempt-condition schema_id {record.get('schema_id')!r} is not "
+            f"{ATTEMPT_CONDITION_SCHEMA_ID!r}"
+        )
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        raise ValueError("attempt-condition payload must be a mapping")
+
+    # Reconstructing the frozen record re-runs every fail-closed invariant, so a
+    # tampered decision (a wait without a store, a substituted resume route) is
+    # refused here rather than trusted.
+    condition = AttemptCondition(
+        condition=payload.get("condition", ""),
+        error_class=payload.get("error_class", ""),
+        action=payload.get("action", ""),
+        decision=payload.get("decision", ""),
+        run_id=payload.get("run_id", ""),
+        task_id=payload.get("task_id", ""),
+        attempt=payload.get("attempt", 1),
+        session_id=payload.get("session_id", ""),
+        route=payload.get("route", ""),
+        reset_at=payload.get("reset_at"),
+        backoff_seconds=payload.get("backoff_seconds"),
+        resume_attempt=payload.get("resume_attempt"),
+        resume_route=payload.get("resume_route", ""),
+        fallback_permitted=bool(payload.get("fallback_permitted", False)),
+        fallback_used=bool(payload.get("fallback_used", False)),
+        cancellable=bool(payload.get("cancellable", True)),
+        run_state=payload.get("run_state", ""),
+        measured_at=payload.get("measured_at", ""),
+        schema_version=record["schema_version"],
+    )
+    if record.get("evidence_digest") != digest_target(condition.to_dict()):
+        raise ValueError(
+            "attempt-condition evidence_digest does not bind its payload"
+        )
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp, returned timezone-aware (UTC when naive)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def attempt_condition_for_quota(
+    *,
+    error_class: Optional[str] = None,
+    error: Optional[BaseException] = None,
+    message: str = "",
+    run_id: str = "",
+    task_id: str = "",
+    attempt: int = 1,
+    session_id: str = "",
+    route: str = "",
+    fallback_permitted: bool = False,
+    reset_at: Optional[str] = None,
+    backoff_seconds: Optional[float] = None,
+    now: Optional[datetime] = None,
+) -> AttemptCondition:
+    """The ``attempt-condition-v1`` decision for a refused owned attempt.
+
+    Classifies the presented refusal (via :func:`classify_error`, so the
+    SW-1511-REPAIR distinct typed classes are preserved rather than re-derived)
+    and returns the control decision the durable controller persists:
+
+    * a **provider quota** with no permitted fallback stores the reset/backoff
+      window and *waits*, then resumes the **same owned session on the same
+      route** (never a substituted one); cancellation stays available;
+    * a **local budget exhaustion** stores nothing and holds.
+
+    Fail-closed: the condition is *waiting only when a real reset window could
+    be stored* — a caller that presents ``reset_at`` in the past (or none at
+    all) for a provider quota does not receive a fabricated wait; the decision
+    degrades to a non-waiting HOLD whose ``reset_at`` is ``None`` (the caller
+    must still repair the caller without ever sleeping forever).  Any class
+    outside the provider-quota/budget pair is refused: this contract never
+    widens into a repair the repair layer does not own.
+    """
+    classified = (error_class or "").strip()
+    if not classified:
+        classified = classify_error(error=error, message=message)
+    kind = _CONDITION_KINDS.get(classified)
+    if kind is None:
+        raise ValueError(
+            f"attempt-condition does not govern error_class {classified!r}; "
+            f"expected one of {sorted(set(_CONDITION_KINDS))}"
+        )
+
+    action = ALLOWED_ACTION[ErrorClass(classified)].value
+    # The clock the record is measured at, so an injected ``now`` and the
+    # recorded ``measured_at`` cannot disagree (a wait is dated against the same
+    # reference the caller reasoned with).
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    base = dict(
+        condition=kind.value,
+        error_class=classified,
+        action=action,
+        run_id=run_id,
+        task_id=task_id,
+        attempt=attempt,
+        session_id=session_id,
+        route=route,
+        fallback_permitted=fallback_permitted,
+        measured_at=reference.isoformat(),
+    )
+
+    if kind is AttemptConditionKind.BUDGET_EXHAUSTED:
+        return AttemptCondition(**base, decision=CONDITION_HOLD)
+
+    # Provider quota: a wait is only recorded when a real, future window is
+    # stored.  Otherwise the decision degrades to a non-waiting HOLD (fail
+    # closed) rather than fabricating a schedule the provider never gave.
+    stored_reset: Optional[str] = None
+    stored_backoff: Optional[float] = None
+    if reset_at is not None or backoff_seconds is not None:
+        reset_dt = _parse_iso(reset_at) if reset_at is not None else None
+        if reset_dt is None and backoff_seconds is not None:
+            reset_dt = reference + timedelta(seconds=float(backoff_seconds))
+        if reset_dt is not None and reset_dt > reference:
+            stored_reset = reset_dt.isoformat()
+            stored_backoff = (
+                float(backoff_seconds)
+                if backoff_seconds is not None
+                else (reset_dt - reference).total_seconds()
+            )
+
+    if stored_reset is None:
+        # No storable future window: HOLD, do not claim a wait.  ``reset_at`` /
+        # ``backoff_seconds`` are left ``None`` so nothing fabricates a schedule.
+        return AttemptCondition(
+            **base,
+            decision=CONDITION_HOLD,
+            resume_attempt=None,
+            resume_route="",
+        )
+
+    return AttemptCondition(
+        **base,
+        decision=CONDITION_RESUME_SAME_ROUTE,
+        reset_at=stored_reset,
+        backoff_seconds=stored_backoff,
+        resume_attempt=attempt,
+        resume_route=route,
+    )
 
 
 @dataclass

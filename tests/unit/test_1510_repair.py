@@ -38,6 +38,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1336,6 +1337,348 @@ def test_installed_wheel_binds_classified_repair_to_the_assay_controller(tmp_pat
     assert result["unsupported_version_refused"] is True
     assert result["unsupported_route_approved"] is False
     assert result["engine_state"] == "pin"  # the gate never mutated the run
+
+
+# ---------------------------------------------------------------------------
+# SW-1511-REPAIR criterion 4: without a permitted fallback, a real provider
+# quota stores the reset/backoff window and resumes the SAME owned session on
+# the SAME route; cancellation remains available while waiting.  Fail-closed.
+# ---------------------------------------------------------------------------
+
+_NOW = datetime(2026, 10, 13, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _quota_wait(**overrides):
+    kwargs = dict(
+        error_class=sr.ErrorClass.PROVIDER_QUOTA.value,
+        run_id="run-4747",
+        task_id="SW-1511-REPAIR",
+        attempt=2,
+        session_id="sess-abc",
+        route="faigate/pro-model",
+        backoff_seconds=120,
+        now=_NOW,
+    )
+    kwargs.update(overrides)
+    return sr.attempt_condition_for_quota(**kwargs)
+
+
+def test_provider_quota_without_fallback_waits_and_resumes_same_route():
+    condition = _quota_wait()
+    assert condition.error_class == sr.ErrorClass.PROVIDER_QUOTA.value
+    # The permitted action is still the HOLD (SW-1511-REPAIR criterion 1): the
+    # wait is not a repair, it is the holding control policy.
+    assert condition.action == sr.ALLOWED_ACTION[sr.ErrorClass.PROVIDER_QUOTA].value
+    assert condition.decision == sr.CONDITION_RESUME_SAME_ROUTE
+    assert condition.waiting is True
+    # The reset/backoff window is stored, not guessed.
+    assert condition.backoff_seconds == 120
+    assert condition.reset_at is not None
+    reset = datetime.fromisoformat(condition.reset_at)
+    assert reset == _NOW + timedelta(seconds=120)
+    # The resume target is the SAME owned session on the SAME route.
+    assert condition.route == "faigate/pro-model"
+    assert condition.resume_route == condition.route
+    assert condition.resume_attempt == condition.attempt
+    assert condition.session_id == "sess-abc"
+    # No fallback was taken, and none is inferred.
+    assert condition.fallback_used is False
+    assert condition.fallback_permitted is False
+
+
+def test_waiting_attempt_stays_non_terminal_and_cancellable():
+    from skillweave.runtime.store import RunStateModel
+
+    condition = _quota_wait()
+    assert condition.cancellable is True
+    assert condition.run_state == RunStateModel.BLOCKED_WAITING_FOR_GATE.value
+    # The wait state is deliberately non-terminal, so cancellation stays live.
+    assert not RunStateModel.is_terminal(condition.run_state)
+    assert RunStateModel.BLOCKED_WAITING_FOR_GATE in RunStateModel.legal_transitions(
+        RunStateModel.IN_PROGRESS
+    )
+    # And the run can leave the wait to fail (the cancellation path).
+    assert RunStateModel.FAILED in RunStateModel.legal_transitions(
+        RunStateModel.BLOCKED_WAITING_FOR_GATE
+    )
+
+
+def test_local_budget_exhaustion_holds_without_a_stored_window():
+    condition = sr.attempt_condition_for_quota(
+        error_class=sr.ErrorClass.BUDGET_EXHAUSTED.value,
+        run_id="run-1",
+        now=_NOW,
+    )
+    assert condition.decision == sr.CONDITION_HOLD
+    assert condition.waiting is False
+    # No provider reset window is fabricated for a local envelope exhaustion.
+    assert condition.reset_at is None
+    assert condition.backoff_seconds is None
+    assert condition.resume_attempt is None
+    assert condition.resume_route == ""
+
+
+def test_provider_quota_without_a_storable_window_fails_closed_to_hold():
+    # A provider quota the caller cannot date must NOT be reported as a wait:
+    # the decision degrades to a HOLD, never a fabricated schedule.
+    undated = _quota_wait(backoff_seconds=None, reset_at=None)
+    assert undated.decision == sr.CONDITION_HOLD
+    assert undated.waiting is False
+    assert undated.reset_at is None
+
+    # An already-elapsed reset window is equally non-storable.
+    elapsed = _quota_wait(
+        backoff_seconds=None,
+        reset_at=(_NOW - timedelta(seconds=1)).isoformat(),
+    )
+    assert elapsed.decision == sr.CONDITION_HOLD
+    assert elapsed.reset_at is None
+
+
+def test_a_stored_reset_at_in_the_past_is_refused_by_the_record():
+    with pytest.raises(ValueError):
+        sr.AttemptCondition(
+            condition=sr.AttemptConditionKind.PROVIDER_QUOTA.value,
+            error_class=sr.ErrorClass.PROVIDER_QUOTA.value,
+            action=sr.RepairAction.HOLD.value,
+            decision=sr.CONDITION_RESUME_SAME_ROUTE,
+            run_id="r",
+            attempt=1,
+            session_id="s",
+            route="faigate/pro-model",
+            reset_at=(_NOW - timedelta(seconds=5)).isoformat(),
+            backoff_seconds=5,
+            resume_attempt=1,
+            resume_route="faigate/pro-model",
+            measured_at=_NOW.isoformat(),
+        )
+
+
+def test_a_substituted_resume_route_is_refused_by_the_record():
+    with pytest.raises(ValueError):
+        sr.AttemptCondition(
+            condition=sr.AttemptConditionKind.PROVIDER_QUOTA.value,
+            error_class=sr.ErrorClass.PROVIDER_QUOTA.value,
+            action=sr.RepairAction.HOLD.value,
+            decision=sr.CONDITION_RESUME_SAME_ROUTE,
+            run_id="r",
+            attempt=1,
+            session_id="s",
+            route="faigate/pro-model",
+            reset_at=(_NOW + timedelta(seconds=5)).isoformat(),
+            backoff_seconds=5,
+            resume_attempt=1,
+            # A different route would be a credential/route substitution.
+            resume_route="faigate/other-model",
+            measured_at=_NOW.isoformat(),
+        )
+
+
+def test_a_non_cancellable_wait_is_refused_by_the_record():
+    with pytest.raises(ValueError):
+        sr.AttemptCondition(
+            condition=sr.AttemptConditionKind.PROVIDER_QUOTA.value,
+            error_class=sr.ErrorClass.PROVIDER_QUOTA.value,
+            action=sr.RepairAction.HOLD.value,
+            decision=sr.CONDITION_RESUME_SAME_ROUTE,
+            run_id="r",
+            attempt=1,
+            session_id="s",
+            route="faigate/pro-model",
+            reset_at=(_NOW + timedelta(seconds=5)).isoformat(),
+            backoff_seconds=5,
+            resume_attempt=1,
+            resume_route="faigate/pro-model",
+            cancellable=False,
+            measured_at=_NOW.isoformat(),
+        )
+
+
+def test_a_permitted_fallback_is_never_recorded():
+    # The criterion is the *no-permitted-fallback* case; a record that claims a
+    # permitted fallback is outside this contract and refused rather than
+    # silently accepted.
+    with pytest.raises(ValueError):
+        sr.AttemptCondition(
+            condition=sr.AttemptConditionKind.PROVIDER_QUOTA.value,
+            error_class=sr.ErrorClass.PROVIDER_QUOTA.value,
+            action=sr.RepairAction.HOLD.value,
+            decision=sr.CONDITION_RESUME_SAME_ROUTE,
+            run_id="r",
+            attempt=1,
+            session_id="s",
+            route="faigate/pro-model",
+            reset_at=(_NOW + timedelta(seconds=5)).isoformat(),
+            backoff_seconds=5,
+            resume_attempt=1,
+            resume_route="faigate/pro-model",
+            fallback_permitted=True,
+            measured_at=_NOW.isoformat(),
+        )
+
+
+def test_a_class_this_contract_does_not_govern_is_refused():
+    # It must not become a second error vocabulary: an auth refusal, transport
+    # failure or correction exhaustion is not a quota wait.
+    for error_class in (
+        sr.ErrorClass.AUTH_REFUSAL.value,
+        sr.ErrorClass.TRANSPORT_FAILURE.value,
+        sr.ErrorClass.CORRECTION_EXHAUSTED.value,
+        sr.ErrorClass.CONTEXT_PRESSURE.value,
+        sr.ErrorClass.UNCLASSIFIED.value,
+    ):
+        with pytest.raises(ValueError):
+            sr.attempt_condition_for_quota(error_class=error_class, now=_NOW)
+
+
+def test_message_only_call_still_classifies_provider_quota_distinctly():
+    condition = sr.attempt_condition_for_quota(
+        message="HTTP 429 Too Many Requests: usage limit exceeded",
+        run_id="run-1",
+        session_id="s",
+        route="faigate/pro-model",
+        backoff_seconds=60,
+        now=_NOW,
+    )
+    assert condition.error_class == sr.ErrorClass.PROVIDER_QUOTA.value
+    assert condition.decision == sr.CONDITION_RESUME_SAME_ROUTE
+    # A message that matches nothing classifies as UNCLASSIFIED and is refused
+    # by the factory (not a governed class), so the fail-closed path never
+    # fabricates a wait for an unnamed failure.
+    classified = sr.classify_error(message="something odd")
+    assert classified == sr.ErrorClass.UNCLASSIFIED.value
+    with pytest.raises(ValueError):
+        sr.attempt_condition_for_quota(message="something odd", now=_NOW)
+
+
+def test_attempt_condition_round_trips_and_validates():
+    condition = _quota_wait()
+    record = condition.to_attempt_condition(principal="worker-1")
+    sr.validate_attempt_condition(record)
+    assert record["schema_id"] == sr.ATTEMPT_CONDITION_SCHEMA_ID
+    assert record["schema_version"] == sr.ATTEMPT_CONDITION_SCHEMA_VERSION
+    assert record["route"] == "faigate/pro-model"
+    assert record["evidence_digest"]
+    assert record["payload"]["route"] == "faigate/pro-model"
+
+
+def test_unsupported_attempt_condition_version_is_refused_not_guessed():
+    record = _quota_wait().to_attempt_condition()
+    record["schema_version"] = "9.9.9"
+    with pytest.raises(sr.UnsupportedAttemptConditionVersion):
+        sr.validate_attempt_condition(record)
+
+
+def test_tampered_attempt_condition_is_refused_by_the_consumer():
+    record = _quota_wait().to_attempt_condition()
+    # A substituted decision/window would be a fabricated schedule.
+    record["payload"] = dict(record["payload"])
+    record["payload"]["resume_route"] = "faigate/other-model"
+    with pytest.raises(ValueError):
+        sr.validate_attempt_condition(record)
+
+    # A valid record whose payload is edited without re-binding the digest is
+    # refused too.
+    record2 = _quota_wait().to_attempt_condition()
+    record2["payload"] = dict(record2["payload"])
+    record2["payload"]["reset_at"] = "2099-01-01T00:00:00+00:00"
+    with pytest.raises(ValueError):
+        sr.validate_attempt_condition(record2)
+
+
+# Installed native consumer: a fresh wheel's own interpreter, source off
+# sys.path -- so a source-tree shim cannot stand in for the contract.
+
+_CONDITION_INSTALLED_DRIVER = r'''
+import json, sys
+import skillweave
+from skillweave.runtime import semantic_repair as SR
+from skillweave.runtime.store import RunStateModel
+
+condition = SR.attempt_condition_for_quota(
+    error_class=SR.ErrorClass.PROVIDER_QUOTA.value,
+    run_id="run-1", task_id="T", attempt=3, session_id="sess-1",
+    route="faigate/pro-model", backoff_seconds=90,
+)
+record = condition.to_attempt_condition(principal="worker-1")
+SR.validate_attempt_condition(record)
+
+refused_version = False
+bad = json.loads(json.dumps(record))
+bad["schema_version"] = "9.9.9"
+try:
+    SR.validate_attempt_condition(bad)
+except SR.UnsupportedAttemptConditionVersion:
+    refused_version = True
+
+refused_substitution = False
+sub = json.loads(json.dumps(record))
+sub["payload"]["resume_route"] = "faigate/other"
+try:
+    SR.validate_attempt_condition(sub)
+except ValueError:
+    refused_substitution = True
+
+print(json.dumps({
+    "module_file": skillweave.__file__,
+    "schema_id": record["schema_id"],
+    "schema_version": record["schema_version"],
+    "decision": condition.decision,
+    "resume_route": condition.resume_route,
+    "route": condition.route,
+    "resume_attempt": condition.resume_attempt,
+    "attempt": condition.attempt,
+    "backoff_seconds": condition.backoff_seconds,
+    "reset_at": condition.reset_at,
+    "run_state": condition.run_state,
+    "terminal": RunStateModel.is_terminal(condition.run_state),
+    "cancellable": condition.cancellable,
+    "fallback_used": condition.fallback_used,
+    "refused_version": refused_version,
+    "refused_substitution": refused_substitution,
+}, sort_keys=True))
+'''
+
+
+def _run_condition_installed(venv_dir, tmp_path):
+    driver = tmp_path / "condition_driver.py"
+    driver.write_text(_CONDITION_INSTALLED_DRIVER, encoding="utf-8")
+    (tmp_path / "tmp2").mkdir(exist_ok=True)
+    env = _clean_env()
+    env["TMPDIR"] = str(tmp_path / "tmp2")
+    proc = subprocess.run(
+        [str(venv_dir / "bin" / "python"), "-B", str(driver)],
+        cwd=str(tmp_path), env=env, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_installed_wheel_binds_the_attempt_condition_contract(tmp_path):
+    pytest.importorskip("yaml")
+
+    work = tmp_path / "build"
+    work.mkdir()
+    wheel = _build_wheel(work)
+    venv_dir = _install_into_fresh_venv(work, wheel)
+
+    result = _run_condition_installed(venv_dir, tmp_path)
+
+    assert str(venv_dir) in result["module_file"]
+    assert result["schema_id"] == sr.ATTEMPT_CONDITION_SCHEMA_ID
+    assert result["schema_version"] == sr.ATTEMPT_CONDITION_SCHEMA_VERSION
+    assert result["decision"] == sr.CONDITION_RESUME_SAME_ROUTE
+    assert result["route"] == "faigate/pro-model"
+    assert result["resume_route"] == "faigate/pro-model"
+    assert result["resume_attempt"] == result["attempt"] == 3
+    assert result["backoff_seconds"] == 90
+    assert result["reset_at"]
+    assert result["run_state"] == "blocked_waiting_for_gate"
+    assert result["terminal"] is False
+    assert result["cancellable"] is True
+    assert result["fallback_used"] is False
+    assert result["refused_version"] is True
+    assert result["refused_substitution"] is True
 
 
 if __name__ == "__main__":
