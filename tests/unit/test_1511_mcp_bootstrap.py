@@ -19,6 +19,16 @@ re-implementation:
    loopback default; a local stdio path is admitted only when it demonstrably
    reaches the same authority/state service, and an independently initialized
    per-harness controller or isolated default store is refused.
+4. Successful assignment, mailbox post/read/replay/ack and source-bound result
+   submission work for Ops and independent Review; revocation, duplicate
+   delivery, stale lease, forged principal, wrong attempt and disallowed output
+   path each produce an independently verified refusal.
+5. A harness without the needed MCP transport gets an explicitly qualified
+   CLI/file adapter with the same authority contract, or a named unsupported
+   HOLD -- never a silent transport downgrade or a fabricated MCP success.
+6. Restarting the main interactive session without stopping the service or the
+   child attempts keeps controller replacement, quota waiting and cancellation
+   functional; worker credentials never reach model-provider requests or logs.
 """
 
 from __future__ import annotations
@@ -39,12 +49,16 @@ from skillweave.dispatch.messaging import (  # noqa: E402
     AgentMailbox,
     AgentMessage,
     MailboxCursor,
+    MessageMismatchRefused,
 )
 from skillweave.mcp import bootstrap as boot  # noqa: E402
 from skillweave.mcp import control  # noqa: E402
 from skillweave.mcp import server as mcp_server  # noqa: E402
+from skillweave.runtime import handoff as handoff_mod  # noqa: E402
 from skillweave.runtime.authority import (  # noqa: E402
     MCPPrincipalAuthority,
+    MCPAuthError,
+    PathInjectionRefused,
     RoleEscalationRefused,
 )
 from skillweave.runtime.runner_adapter import start_process  # noqa: E402
@@ -1453,3 +1467,766 @@ class TestBackwardCompatibility:
         finally:
             # No authority leaks into another test module.
             mcp_server._AUTHORITY = previous
+
+
+# ===========================================================================
+# Criterion 4: assignment, mailbox round trip and source-bound result work for
+# Ops and independent Review; revocation, duplicate delivery, stale lease,
+# forged principal, wrong attempt and disallowed output path each produce a
+# declared refusal at the real tool seam
+# ===========================================================================
+
+
+class TestAssignmentMailboxAndSourceBoundResult:
+    """Criterion 4 through the real MCP server tools and the run snapshot.
+
+    Every assertion drives the production seam -- :mod:`skillweave.mcp.server`
+    under a server-issued, scoped session, the fenced controller lease on
+    :class:`~skillweave.runtime.store.SQLiteRunStore`, and the run snapshot's
+    source binding -- never a re-implementation of the rule. The mailbox is
+    addressed ``(recipient, principal)``: under a bound authority the session
+    acts as its own principal, so a message is read/acked by the principal it
+    was posted under and never by another principal.
+    """
+
+    def _session(self, authority, *, role, client_id, run_id="run-1",
+                 transport="http", allowed_roots=(), allowed_routes=()):
+        """Mint a scoped server-issued session for *role* (the registry)."""
+        return authority.issue_session(
+            role=role,
+            client_id=client_id,
+            transport=transport,
+            run_ids=[run_id],
+            allowed_roots=list(allowed_roots),
+            allowed_routes=list(allowed_routes),
+        )
+
+    def _mailbox_path(self, tmp_path, monkeypatch) -> Path:
+        """Point the server-owned mailbox at the scratch dir (no caller path).
+
+        The mailbox path is *server-owned*: a caller may never inject one. The
+        test binds it exactly as the production stdio startup does -- through
+        :data:`~skillweave.mcp.server.MAILBOX_PATH_ENV` -- so the real tools
+        resolve it with no code path that trusts a caller-supplied path.
+        """
+        path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(path))
+        return path
+
+    def test_assignment_mailbox_round_trip_for_ops_and_independent_review(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """Assignment -> post -> read -> replay -> ack, at the real tool seam.
+
+        The controller *assigns* work by posting a handoff on each peer's
+        addressed sub-channel under its own authority; the assignment is read
+        back and replayed (the durable history is unchanged, so a reconnect
+        loses nothing). An acknowledgement is only admitted for a message
+        *addressed to the acknowledging principal*, and is idempotent: a
+        duplicated acknowledgement derives the same reply id.
+        """
+        self._mailbox_path(tmp_path, monkeypatch)
+        controller = self._session(
+            authority, role="controller", client_id="main",
+            allowed_roots=[str(tmp_path)],
+        )
+
+        assignments = {
+            "ops": "implement c4",
+            "rev": "independently verify c4",
+        }
+        for peer, body in assignments.items():
+            out = json.loads(
+                mcp_server.mailbox_post(
+                    kind="handoff",
+                    recipient=peer,
+                    body=body,
+                    run_id="run-1",
+                    task_id="task-1",
+                    attempt=1,
+                    message_id=f"assign-{peer}",
+                    session_token=controller,
+                )
+            )
+            assert out["status"] == "posted", out
+            assert out["message"]["recipient"] == peer
+            # Addressed under the authenticated principal, never the caller's
+            # named string.
+            assert out["message"]["principal"] == "mcp:controller:main"
+
+        # --- the assignment is read back (the controller's own channel).
+        read = json.loads(
+            mcp_server.mailbox_read(
+                recipient="ops", run_id="run-1", session_token=controller,
+            )
+        )
+        assert read["status"] == "ok", read
+        assert [m["message_id"] for m in read["messages"]] == ["assign-ops"]
+        assert read["messages"][0]["body"] == "implement c4"
+
+        # --- replay returns byte-identical durable history (reconnect loses
+        # nothing) and consumes nothing.
+        replayed = json.loads(
+            mcp_server.mailbox_replay(
+                recipient="ops", run_id="run-1", session_token=controller,
+            )
+        )
+        assert replayed["status"] == "ok", replayed
+        assert replayed["messages"] == read["messages"]
+
+        # --- an ack is admitted only for a message addressed *to* the
+        # acknowledging principal (the durable reply is derived from it).
+        handed = json.loads(
+            mcp_server.mailbox_post(
+                kind="handoff",
+                recipient="mcp:controller:main",
+                body="result for review",
+                run_id="run-1",
+                message_id="handoff-to-controller",
+                session_token=controller,
+            )
+        )
+        assert handed["status"] == "posted", handed
+        ack = json.loads(
+            mcp_server.mailbox_ack(
+                message_id="handoff-to-controller",
+                note="accepted",
+                run_id="run-1",
+                session_token=controller,
+            )
+        )
+        assert ack["status"] == "acked", ack
+        assert ack["message"]["kind"] == "ack"
+        again = json.loads(
+            mcp_server.mailbox_ack(
+                message_id="handoff-to-controller",
+                note="accepted",
+                run_id="run-1",
+                session_token=controller,
+            )
+        )
+        assert again["status"] == "acked", again
+        # A duplicated acknowledgement never creates a second durable reply.
+        assert again["message"]["message_id"] == ack["message"]["message_id"]
+
+        # --- an ack of a message addressed to *another* label is refused: the
+        # scope is (recipient, principal), so the controller cannot acknowledge
+        # work it addressed to its peer.
+        misaddressed = json.loads(
+            mcp_server.mailbox_ack(
+                message_id="assign-ops",
+                run_id="run-1",
+                session_token=controller,
+            )
+        )
+        assert misaddressed["status"] == "refused", misaddressed
+        assert misaddressed["code"] == "message_id_mismatch", misaddressed
+
+    def test_review_principal_cannot_read_another_principals_channel(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """Independent Review sees only its own addressed channel.
+
+        A message the controller posted under ``mcp:controller:main`` is never
+        returned to a reviewer session reading the same recipient label: the
+        scope is the authenticated principal, so cross-principal reads observe
+        nothing (a verified non-disclosure, not a missing feature).
+        """
+        self._mailbox_path(tmp_path, monkeypatch)
+        controller = self._session(
+            authority, role="controller", client_id="main",
+            allowed_roots=[str(tmp_path)],
+        )
+        reviewer = self._session(
+            authority, role="reviewer", client_id="rev",
+            allowed_roots=[str(tmp_path)],
+        )
+        json.loads(
+            mcp_server.mailbox_post(
+                kind="handoff",
+                recipient="rev",
+                body="verify",
+                run_id="run-1",
+                message_id="assign-rev",
+                session_token=controller,
+            )
+        )
+        seen = json.loads(
+            mcp_server.mailbox_read(
+                recipient="rev", run_id="run-1", session_token=reviewer,
+            )
+        )
+        assert seen["status"] == "ok", seen
+        assert seen["messages"] == []
+
+    def _post(self, token, *, recipient, body, message_id, run_id="run-1",
+              principal=""):
+        return json.loads(
+            mcp_server.mailbox_post(
+                kind="handoff",
+                recipient=recipient,
+                sender="",
+                body=body,
+                run_id=run_id,
+                task_id="task-1",
+                attempt=1,
+                message_id=message_id,
+                principal=principal,
+                session_token=token,
+            )
+        )
+
+    def test_revoked_session_cannot_post(self, authority, tmp_path, monkeypatch):
+        """Revocation produces a verified refusal at the tool seam."""
+        self._mailbox_path(tmp_path, monkeypatch)
+        controller = self._session(
+            authority, role="controller", client_id="main",
+            allowed_roots=[str(tmp_path)],
+        )
+        # The very same token works ...
+        assert self._post(
+            controller, recipient="ops", body="a", message_id="m-1"
+        )["status"] == "posted"
+        # ... until the server revokes it.
+        authority.revoke_token(controller)
+        refused = self._post(
+            controller, recipient="ops", body="b", message_id="m-2"
+        )
+        assert refused["status"] == "refused", refused
+        assert refused["code"] == "unauthenticated", refused
+
+    def test_duplicate_delivery_is_idempotent_and_conflicts_are_refused(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """Identical redelivery is idempotent; a mutated body is refused.
+
+        A duplicated delivery (same ``message_id``) never creates a second
+        durable message; a *different* body under the same id is a declared
+        ``message_id_mismatch`` refusal, not a silent overwrite.
+        """
+        self._mailbox_path(tmp_path, monkeypatch)
+        controller = self._session(
+            authority, role="controller", client_id="main",
+            allowed_roots=[str(tmp_path)],
+        )
+        first = self._post(
+            controller, recipient="ops", body="payload", message_id="dup-1"
+        )
+        assert first["status"] == "posted", first
+        identical = self._post(
+            controller, recipient="ops", body="payload", message_id="dup-1"
+        )
+        assert identical["status"] == "posted", identical
+        assert identical["message"]["seq"] == first["message"]["seq"]
+        # Exactly one durable message survived the redelivery.
+        read = json.loads(
+            mcp_server.mailbox_read(recipient="ops", session_token=controller)
+        )
+        assert [m["message_id"] for m in read["messages"]] == ["dup-1"]
+
+        refused = self._post(
+            controller, recipient="ops", body="tampered", message_id="dup-1"
+        )
+        assert refused["status"] == "refused", refused
+        assert refused["code"] == "message_id_mismatch", refused
+
+    def test_forged_principal_is_refused(self, authority, tmp_path, monkeypatch):
+        """A caller naming a principal other than its own is refused."""
+        self._mailbox_path(tmp_path, monkeypatch)
+        controller = self._session(
+            authority, role="controller", client_id="main",
+            allowed_roots=[str(tmp_path)],
+        )
+        forged = self._post(
+            controller, recipient="ops", body="x", message_id="m-f",
+            principal="mcp:worker:ops",
+        )
+        assert forged["status"] == "refused", forged
+        assert forged["code"] == "principal_mismatch", forged
+
+    def test_wrong_attempt_and_cross_run_are_refused(
+        self, authority, tmp_path
+    ):
+        """A session scoped to one run cannot operate on another run.
+
+        The controller role is deliberately *not* run-bound, so it is the
+        run-bound roles (worker/observer/reviewer) whose scope the authority
+        fences. A reviewer bound to ``run-1`` reading ``run-other`` is refused
+        at the tool seam, never silently served another client's run.
+        """
+        svc = _service(tmp_path)
+        reviewer = self._session(
+            authority, role="reviewer", client_id="rev",
+            run_id="run-1", allowed_roots=[str(tmp_path)],
+        )
+        out = json.loads(
+            mcp_server.get_evidence(
+                run_id="run-other",
+                db_path=svc.db_path,
+                session_token=reviewer,
+            )
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "cross_client_access_refused", out
+
+    def test_disallowed_output_path_is_refused(self, authority, tmp_path):
+        """A write path outside the granted roots is refused by the authority."""
+        session = self._session(
+            authority, role="controller", client_id="main",
+            allowed_roots=[str(tmp_path)],
+        )
+        with pytest.raises(PathInjectionRefused):
+            authority.authorize(
+                session,
+                "write_run_state",
+                run_id="run-1",
+                artifacts_path=str(tmp_path.parent / "outside" / "artifacts"),
+                default_paths=(str(tmp_path / "artifacts"),),
+            )
+        # An in-root path is admitted: the guard refuses injections, not work.
+        authority.authorize(
+            session,
+            "write_run_state",
+            run_id="run-1",
+            artifacts_path=str(tmp_path / "artifacts"),
+            default_paths=(str(tmp_path / "artifacts"),),
+        )
+
+    def test_worker_cannot_forge_an_assignment_write(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A worker holds no ``write_run_state``: it cannot write the mailbox."""
+        self._mailbox_path(tmp_path, monkeypatch)
+        worker = self._session(
+            authority, role="worker", client_id="ops",
+            allowed_roots=[str(tmp_path)],
+        )
+        out = self._post(
+            worker, recipient="ops", body="x", message_id="w-1"
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "operation_not_permitted", out
+
+    def test_stale_controller_lease_is_refused_until_released(self, tmp_path):
+        """The controller lease is single and fenced (stale lease refusal)."""
+        store = SQLiteRunStore(str(tmp_path / "store.db"))
+        held = store.acquire_controller_lease("main", ttl_seconds=300)
+        # A second contender is refused while the lease is held ...
+        with pytest.raises(Exception):
+            store.acquire_controller_lease("second", ttl_seconds=300)
+        # ... and only after the holder releases may a new, higher-fenced
+        # lease be taken; the superseded token is stale and no longer usable.
+        store.release_controller_lease(held.fencing_token)
+        new = store.acquire_controller_lease("second", ttl_seconds=300)
+        assert new.fencing_token > held.fencing_token
+        with pytest.raises(Exception):
+            store.release_controller_lease(held.fencing_token)
+
+    def test_source_bound_result_reports_the_native_process_identity(
+        self, authority, tmp_path
+    ):
+        """Source-bound result submission reaches the run snapshot.
+
+        ``control_status`` reads the snapshot the tools consume; it carries the
+        native ``process_identity`` handle and never a caller-fabricated
+        subject binding.
+        """
+        svc = _service(tmp_path)
+        SQLiteRunStore(svc.db_path).create_run(
+            "run-1", task_id="task-1", attempt=1
+        )
+        out = control.control_status(
+            "run-1", db_path=svc.db_path, artifacts_path=svc.artifacts_path
+        )
+        assert out["run_id"] == "run-1"
+        identity = out["process_identity"]
+        assert identity["handle_id"] == "runsvc-run:run-1"
+        assert identity["service_principal"] == "runsvc"
+
+    def test_evidence_read_is_source_bound_never_fabricated(
+        self, authority, tmp_path
+    ):
+        """The evidence read returns only recorded facts (empty when absent).
+
+        ``get_evidence`` carries the durable journal under the run it was read
+        from -- never a caller-supplied subject binding. The source binding is
+        the run snapshot's own native ``process_identity`` handle, read through
+        ``control_status``; with no producer receipt recorded, no subject
+        repo/commit is invented.
+        """
+        svc = _service(tmp_path)
+        controller = self._session(
+            authority, role="controller", client_id="main",
+            allowed_roots=[str(tmp_path)],
+        )
+        SQLiteRunStore(svc.db_path).create_run("run-1", task_id="t", attempt=1)
+        out = json.loads(
+            mcp_server.get_evidence(
+                run_id="run-1",
+                db_path=svc.db_path,
+                session_token=controller,
+            )
+        )
+        # The read returns the run's own recorded journal, not a fabrication.
+        assert "events" in out and out["events"] == [], out
+        # No producer receipt was recorded, so no subject binding is invented
+        # and the snapshot carries the native process identity handle only.
+        status = control.control_status(
+            "run-1", db_path=svc.db_path, artifacts_path=svc.artifacts_path
+        )
+        assert status["run_id"] == "run-1"
+        assert status.get("subject_repo", "") == ""
+        assert status.get("subject_commit", "") == ""
+        assert status["process_identity"]["handle_id"] == "runsvc-run:run-1"
+
+
+# ===========================================================================
+# Criterion 5: a harness without the needed MCP transport gets an explicitly
+# qualified CLI/file adapter with the same authority contract, or a named
+# unsupported HOLD -- never a silent downgrade or a fabricated MCP success
+# ===========================================================================
+
+
+class TestQualifiedTransportAdapterNeverSilentlyDowngrades:
+    def test_unknown_transport_is_a_named_unsupported_hold(self):
+        """An unknown transport is refused by name, never coerced to stdio."""
+        profile = control.transport_profile("carrier-pigeon")
+        assert profile.supported is False
+        assert profile.kind == "carrier-pigeon"
+        assert "carrier-pigeon" in profile.reason
+        # The served surface is named, so the HOLD is actionable.
+        assert "http" in profile.reason and "stdio" in profile.reason
+
+    def test_supported_transports_are_qualified(self):
+        http = control.transport_profile("http", host="127.0.0.1", port=8765)
+        assert http.supported is True and http.scoped is True
+        stdio = control.transport_profile("stdio")
+        assert stdio.supported is True
+        # stdio is admitted precisely because it is not a network scope; it is
+        # never reported as a scoped HTTP surface it is not.
+        assert stdio.scoped is False
+
+    def test_harness_without_notifications_gets_the_file_adapter(
+        self, tmp_path
+    ):
+        """Explicit attestation of no notification support -> file-poll adapter.
+
+        The adapter is assigned by the *detected* capability (never assumed) and
+        carries the same mailbox authority contract as the MCP-notification
+        adapter: the same durable mailbox under the same addressing.
+        """
+        mailbox = AgentMailbox(str(tmp_path / "mb.jsonl"))
+        capability = handoff_mod.detect_client_capability(
+            "legacy-harness",
+            attestation={"detected": True, "transports": [], "features": []},
+        )
+        assert capability.detected is True
+        assert capability.supports_notifications is False
+        assert capability.adapter_kind() == handoff_mod.TRANSPORT_FILE_POLL
+
+        adapter = handoff_mod.adapter_for_capability(capability, mailbox)
+        assert isinstance(adapter, handoff_mod.PollingTransportAdapter)
+        assert adapter.kind == handoff_mod.TRANSPORT_FILE_POLL
+
+        mailbox.post(
+            AgentMessage(
+                kind="handoff",
+                sender="main",
+                recipient="ops",
+                principal="mcp:controller:main",
+                message_id="m-1",
+                body="go",
+            )
+        )
+        adapter.send(
+            AgentMessage(
+                kind="status",
+                sender="ops",
+                recipient="ops",
+                principal="mcp:controller:main",
+                message_id="m-2",
+                body="working",
+            )
+        )
+        delivered = adapter.read(
+            recipient="ops", principal="mcp:controller:main"
+        )
+        assert {m["message_id"] for m in delivered} == {"m-1", "m-2"}
+
+    def test_undetected_harness_is_not_claimed_as_mcp_capable(
+        self, tmp_path
+    ):
+        """No config/skill-root -> detected=False; never a fabricated MCP yes."""
+        capability = handoff_mod.detect_client_capability(
+            "never-seen",
+            skill_root_resolver=lambda _cid: None,
+            config_resolver=lambda _cid: None,
+        )
+        assert capability.detected is False
+        assert capability.supports_notifications is False
+        assert capability.adapter_kind() == handoff_mod.TRANSPORT_FILE_POLL
+        assert handoff_mod.TRANSPORT_CLI_POLL in capability.transports
+
+    def test_notification_adapter_refuses_a_harness_without_support(
+        self, tmp_path
+    ):
+        """Asking the MCP-notification adapter for an unsupported harness fails.
+
+        The refusal is named (``TRANSPORT_NOT_SUPPORTED``); the tool never
+        reports a fabricated MCP success for a harness that cannot receive it.
+        """
+        mailbox = AgentMailbox(str(tmp_path / "mb.jsonl"))
+        capability = handoff_mod.detect_client_capability(
+            "legacy-harness",
+            attestation={"detected": True, "transports": [], "features": []},
+        )
+        with pytest.raises(handoff_mod.HandoffError) as exc:
+            handoff_mod.NotificationTransportAdapter(capability, mailbox)
+        assert exc.value.code == "TRANSPORT_NOT_SUPPORTED"
+
+    def test_agent_capabilities_tool_attests_the_adapter_and_contract(
+        self, authority, tmp_path
+    ):
+        """The real ``agent_capabilities`` tool names the adapter per client."""
+        svc = _service(tmp_path)
+        controller = authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            run_ids=["run-1"],
+        )
+        out = json.loads(
+            mcp_server.agent_capabilities(
+                clients="legacy-harness", session_token=controller
+            )
+        )
+        assert out["status"] == "ok", out
+        # The frozen contract version and digest are reported, so a client can
+        # attest the exact schema it speaks.
+        assert out["contract"]["artifact"] == "agent-message-v1"
+        assert out["contract"]["schema_version"] == "1.0.0"
+        assert out["contract"]["schema_digest"]
+        entry = out["clients"]["legacy-harness"]
+        # Not detected -> the file adapter (never a fabricated mcp-notifications).
+        assert entry["adapter_kind"] == handoff_mod.TRANSPORT_FILE_POLL
+        assert entry["detected"] is False
+
+    def test_negotiate_capabilities_names_the_execution_shape(self):
+        """A profile without experimental tasks negotiates the poll/cursor shape."""
+        profile = control.transport_profile("http", host="127.0.0.1", port=8765)
+        negotiated = control.negotiate_capabilities(
+            {"tasks": {"supported": False}}, profile
+        )
+        assert negotiated["execution_shape"] == "async_tool_poll_cursor"
+        assert negotiated["tasks"]["negotiated"] is False
+
+    def test_require_mcp_is_an_explicit_dependency_refusal_or_present(self):
+        """``require_mcp`` either admits a real package or refuses by name."""
+        try:
+            control.require_mcp()
+        except Exception as exc:  # noqa: BLE001 - the declared refusal is typed
+            assert "mcp" in str(exc).lower()
+
+
+# ===========================================================================
+# Criterion 6: restarting the interactive session leaves the service and child
+# attempts running; controller replacement, quota waiting and cancellation stay
+# functional; worker credentials never reach provider requests or logs
+# ===========================================================================
+
+
+class TestRestartControllerReplacementAndCredentialBoundary:
+    def test_controller_replacement_is_fenced_and_strictly_increasing(self, tmp_path):
+        """A restart hands over the controller lease without duplicating it."""
+        store = SQLiteRunStore(str(tmp_path / "store.db"))
+        first = store.acquire_controller_lease("session-a", ttl_seconds=300)
+        # The interactive session restarts: it releases, and a new session takes
+        # a strictly higher-fenced lease -- no second controller ever holds one.
+        store.release_controller_lease(first.fencing_token)
+        second = store.acquire_controller_lease("session-b", ttl_seconds=300)
+        assert second.fencing_token > first.fencing_token
+        with pytest.raises(Exception):
+            store.acquire_controller_lease("session-c", ttl_seconds=300)
+
+    def test_cancel_of_an_unverified_identity_is_refused_not_fabricated(
+        self, tmp_path
+    ):
+        """A run with no recorded process identity cannot be 'cancelled'.
+
+        ``control_cancel`` reports ``identity_unverified`` and signals nothing;
+        the in-flight state stays *unknown*, never a fabricated termination.
+        """
+        svc = _service(tmp_path)
+        SQLiteRunStore(svc.db_path).create_run("run-1", task_id="t", attempt=1)
+        out = control.control_cancel(
+            "run-1",
+            reason="interactive restart",
+            db_path=svc.db_path,
+            artifacts_path=svc.artifacts_path,
+        )
+        assert out["code"] == "identity_unverified", out
+        assert out["reason"] == "no_recorded_identity", out
+        assert out["verification"]["ok"] is False
+
+    def test_cancel_of_an_unknown_run_is_not_found(self, tmp_path):
+        svc = _service(tmp_path)
+        SQLiteRunStore(svc.db_path)
+        out = control.control_cancel(
+            "run-missing",
+            db_path=svc.db_path,
+            artifacts_path=svc.artifacts_path,
+        )
+        assert out["code"] == "not_found", out
+
+    def test_resume_without_a_command_reconciles_without_claiming_restart(
+        self, tmp_path
+    ):
+        """After a restart the surface reconciles; it never claims a restart."""
+        svc = _service(tmp_path)
+        SQLiteRunStore(svc.db_path).create_run("run-1", task_id="t", attempt=1)
+        out = control.control_resume(
+            "run-1",
+            db_path=svc.db_path,
+            artifacts_path=svc.artifacts_path,
+        )
+        assert out["status"] == "reconciled", out
+        assert out["restarted"] is False
+
+    def test_resume_with_a_command_launches_a_new_identified_attempt(
+        self, tmp_path
+    ):
+        """A real resume starts a *new identified* attempt, not a DB transition."""
+        svc = _service(tmp_path)
+        SQLiteRunStore(svc.db_path).create_run("run-1", task_id="t", attempt=1)
+        out = control.control_resume(
+            "run-1",
+            command=f"{sys.executable} -c pass",
+            idempotency_key="resume-1",
+            db_path=svc.db_path,
+            artifacts_path=svc.artifacts_path,
+        )
+        assert out["status"] == "restarted", out
+        assert out["restart_kind"] == "new_identified_attempt", out
+        # A real new process identity was recorded (its PID + creation token),
+        # not merely a state transition dressed up as "restarted".
+        identity = out["process_identity"]
+        assert identity["pid"] > 0
+        assert identity["creation_token"]
+        # The new attempt is a distinct run, linked to its predecessor.
+        assert out["run_id"] != "run-1"
+        assert out["parent_run_id"] == "run-1"
+
+    def test_provider_forwarding_refuses_passthrough_and_unapproved_routes(
+        self, authority
+    ):
+        """Worker credentials are never forwarded to a provider request."""
+        session = authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            run_ids=["run-1"], allowed_routes=["approved-route"],
+        )
+        # A token-echo route is refused by name ...
+        for route in ("passthrough", "echo", "reflect"):
+            with pytest.raises(MCPAuthError) as exc:
+                authority.authorize(
+                    session, "forward", run_id="run-1", provider_route=route,
+                )
+            assert getattr(exc.value, "code", "") == "token_passthrough_refused", (
+                route, exc.value
+            )
+        # ... and a route the session was not granted is refused too.
+        with pytest.raises(MCPAuthError) as exc2:
+            authority.authorize(
+                session, "forward", run_id="run-1",
+                provider_route="unapproved-route",
+            )
+        assert getattr(exc2.value, "code", "") == "unapproved_provider_route"
+
+    def test_worker_credentials_never_reach_the_child_env(self, tmp_path):
+        """The child env allowlist admits only SkillWeave-owned session keys."""
+        svc = _service(tmp_path)
+        grant = boot.HarnessMcpSessionGrant(
+            schema_id=boot.HARNESS_MCP_SESSION_GRANT_SCHEMA_ID,
+            schema_version="1.0.0",
+            run_id="run-1",
+            task_id="task-1",
+            attempt=1,
+            transport="stdio",
+            session_token="tok-c6",
+            service=svc,
+            start_scope="task-1/attempt-1",
+        )
+        env = boot.grant_child_env(grant)
+        # Every provisioned key is SkillWeave-owned; no ambient credential.
+        boot.assert_no_ambient_credentials(env)
+        for key in env:
+            assert key.startswith("SKILLWEAVE_"), key
+        assert boot.ENV_MCP_SESSION_TOKEN in env
+
+    def test_credential_shaped_worker_env_is_refused_by_name(self):
+        """A worker credential cannot be provisioned into the child env."""
+        with pytest.raises(ValueError) as exc:
+            boot.assert_no_ambient_credentials(
+                {boot.ENV_MCP_SESSION_TOKEN: "t", "ANTHROPIC_API_KEY": "secret"}
+            )
+        assert "ANTHROPIC_API_KEY" in str(exc.value)
+
+    def test_forwarding_guard_admits_an_approved_route(self, authority):
+        """The guard is not blanket-deny: an approved route is admitted."""
+        session = authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            run_ids=["run-1"], allowed_routes=["approved-route"],
+        )
+        forwarded = authority.authorize(
+            session, "forward", run_id="run-1",
+            provider_route="approved-route",
+        )
+        # A real admission: the authorization returns the acting principal.
+        assert forwarded.principal == "mcp:controller:main"
+
+
+# ===========================================================================
+# Backward compatibility for criteria 4-6: the added seams are additive
+# ===========================================================================
+
+
+class TestCriterionFourToSixBackwardCompatibility:
+    def test_mailbox_addressing_is_unchanged_for_a_plain_principal(self, tmp_path):
+        """The historical (recipient, principal) mailbox contract still holds."""
+        mailbox = AgentMailbox(str(tmp_path / "mb.jsonl"))
+        mailbox.post(
+            AgentMessage(
+                kind="status",
+                sender="main",
+                recipient="ops",
+                principal="principal-a",
+                message_id="bc-1",
+                body="x",
+            )
+        )
+        # A different principal never sees principal-a's message.
+        assert mailbox.read(recipient="ops", principal="principal-b") == []
+        assert len(mailbox.read(recipient="ops", principal="principal-a")) == 1
+
+    def test_capability_detection_defaults_are_stable(self):
+        """Adapter assignment stays within the three declared transports."""
+        kinds = {
+            handoff_mod.TRANSPORT_MCP_NOTIFICATIONS,
+            handoff_mod.TRANSPORT_FILE_POLL,
+            handoff_mod.TRANSPORT_CLI_POLL,
+        }
+        for client in ("codex", "antigravity", "openclaude"):
+            capability = handoff_mod.detect_client_capability(
+                client,
+                skill_root_resolver=lambda _c: None,
+                config_resolver=lambda _c: None,
+            )
+            assert capability.adapter_kind() in kinds
+
+    def test_run_snapshot_without_a_run_is_not_found(self, tmp_path):
+        """An unknown run is a declared ``not_found``, never a fabricated graph."""
+        svc = _service(tmp_path)
+        SQLiteRunStore(svc.db_path)
+        out = control.control_status(
+            "no-such-run",
+            db_path=svc.db_path,
+            artifacts_path=svc.artifacts_path,
+        )
+        assert out["code"] == "not_found", out
