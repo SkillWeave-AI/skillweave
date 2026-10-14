@@ -560,3 +560,185 @@ def test_contract_unknown_state_is_refused():
         pass
     else:
         raise AssertionError("an unknown acceptance state was constructed")
+
+
+# ── the real consumer seam: build_schedule + controller acceptance ──────────
+#
+# These exercise criteria 1 and 3 through the *production* seams named by the
+# contract — the scheduler's dependent-release path (``build_schedule``) and the
+# controller acceptance service (``NativeProcessService``) — not only by direct
+# calls to the gate-receipt module.
+
+from skillweave.runtime.dagscheduler import Task, Sequence, build_schedule
+from skillweave.runtime.native_process import NativeProcessService
+
+
+def _sched_sequence() -> Sequence:
+    # dep depends on producer; producer's gate releases dep.
+    return Sequence(
+        session_boundary="session-1",
+        tasks=[
+            Task(id="producer", gate="gate-p"),
+            Task(id="dep", depends_on=["producer"]),
+        ],
+    )
+
+
+def _receipt_record(
+    *,
+    state: str,
+    producer_artifact: str,
+    accepted: bool,
+    answering: str = "verifier-1",
+    producer: str = "worker-1",
+) -> dict:
+    return IndependentGateReceipt(
+        attempt_id="att-producer",
+        state=state,
+        producer_artifact=producer_artifact,
+        binding=_binding(),
+        role="verifier",
+        answering_identity=answering,
+        producer_identity=producer,
+        accepted=accepted,
+    ).to_dict()
+
+
+def test_seam_launched_attempt_without_artifact_does_not_release_dependents():
+    """Criterion 1/3 through build_schedule: a launched producer releases nothing.
+
+    The producer carries no producer artifact and its gate receipt is only
+    *invoked* — so its dependent must be blocked by the real scheduler.
+    """
+    sequence = _sched_sequence()
+    receipts = {
+        "gate-p": _receipt_record(
+            state=ACCEPTANCE_INVOKED, producer_artifact="", accepted=False
+        )
+    }
+    schedule = build_schedule(sequence, gate_receipts=receipts)
+    assert "dep" in schedule.blocked
+    assert "dep" not in {tid for b in schedule.batches for tid in b.task_ids}
+
+
+def test_seam_accepted_attempt_with_artifact_releases_dependents():
+    sequence = _sched_sequence()
+    receipts = {
+        "gate-p": _receipt_record(
+            state=ACCEPTANCE_ACCEPTED, producer_artifact="artifact-1", accepted=True
+        )
+    }
+    schedule = build_schedule(sequence, gate_receipts=receipts)
+    assert "dep" not in schedule.blocked
+    assert "dep" in {tid for b in schedule.batches for tid in b.task_ids}
+
+
+def test_seam_accepted_state_without_artifact_releases_nothing():
+    """An accepted *state* with no producer artifact is refused, not released.
+
+    The record is built as a raw mapping so the *seam's* validation (not the
+    frozen constructor) is what refuses it.
+    """
+    sequence = _sched_sequence()
+    raw = _receipt_record(
+        state=ACCEPTANCE_ACCEPTED, producer_artifact="artifact-1", accepted=True
+    )
+    raw["producer_artifact"] = ""  # tamper: drop the required producer artifact
+    try:
+        build_schedule(sequence, gate_receipts={"gate-p": raw})
+    except MissingProducerArtifact:
+        pass
+    else:
+        raise AssertionError("an artifact-less accepted receipt released dependents")
+
+
+def test_seam_unsupported_receipt_version_fails_closed():
+    sequence = _sched_sequence()
+    receipts = {
+        "gate-p": _receipt_record(
+            state=ACCEPTANCE_ACCEPTED, producer_artifact="artifact-1", accepted=True
+        )
+    }
+    receipts["gate-p"]["schema_version"] = "9.9.9"
+    try:
+        build_schedule(sequence, gate_receipts=receipts)
+    except UnsupportedContractVersion:
+        pass
+    else:
+        raise AssertionError("an unsupported receipt version was coerced by the seam")
+
+
+def test_seam_omitting_gate_receipts_preserves_existing_behavior():
+    """Backward compatibility: no receipts -> the legacy gate_results path."""
+    sequence = _sched_sequence()
+    # gate_results says the gate failed: dep blocked, exactly as before.
+    blocked_schedule = build_schedule(sequence, gate_results={"gate-p": False})
+    assert "dep" in blocked_schedule.blocked
+
+    passed_schedule = build_schedule(sequence, gate_results={"gate-p": True})
+    assert "dep" not in passed_schedule.blocked
+
+
+def _controller_service(tmp_path):
+    from skillweave.runtime.store import SQLiteRunStore
+
+    store = SQLiteRunStore(db_path=str(tmp_path / "store.db"))
+    service = NativeProcessService(store, holder="controller-1")
+    service.acquire(ttl_seconds=300)
+    return service
+
+
+def test_seam_controller_acceptance_refuses_launched_artifactless(tmp_path):
+    """Criterion 1 through the controller acceptance service."""
+    service = _controller_service(tmp_path)
+    launched = AttemptAcceptance(attempt_id="att-launched", dependents=("dep-a",))
+    # A launched, artifact-less attempt cannot release dependents.
+    try:
+        service.release_accepted_dependents(launched)
+    except MissingProducerArtifact:
+        pass
+    else:
+        raise AssertionError("controller released an artifact-less launch")
+
+    # Recording an acceptance for it is refused too: no producer artifact.
+    try:
+        service.record_acceptance(launched, accepted=True, answering_identity="v1")
+    except MissingProducerArtifact:
+        pass
+    else:
+        raise AssertionError("controller accepted a launched artifact-less attempt")
+
+
+def test_seam_controller_acceptance_requires_independent_identity(tmp_path):
+    """Criterion 3 through the controller acceptance service."""
+    service = _controller_service(tmp_path)
+    accepted = _accepted_attempt()
+    # A producer answering its own acceptance never yields an accepted record.
+    try:
+        service.record_acceptance(
+            accepted,
+            producer_artifact="artifact-1",
+            binding=_binding(),
+            role="verifier",
+            answering_identity="worker-1",
+            producer_identity="worker-1",
+            accepted=True,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("the controller accepted a self-answered attempt")
+
+    # A genuine independent verifier produces a valid accepted receipt.
+    receipt = service.record_acceptance(
+        accepted,
+        producer_artifact="artifact-1",
+        binding=_binding(),
+        role="verifier",
+        answering_identity="verifier-1",
+        producer_identity="worker-1",
+        accepted=True,
+    )
+    assert receipt.accepted is True
+    assert receipt.state == ACCEPTANCE_ACCEPTED
+

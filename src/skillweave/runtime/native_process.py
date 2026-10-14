@@ -68,6 +68,13 @@ from .dagscheduler import (
     measure_max_parallel,
 )
 from .write_scope import WriteScopeClaim
+from ..trace.gate_receipt import (
+    ACCEPTANCE_ACCEPTED,
+    ACCEPTANCE_STATES,
+    IndependentGateReceipt,
+    MissingProducerArtifact,
+    release_dependents,
+)
 
 __all__ = [
     # boundary contracts
@@ -119,6 +126,9 @@ __all__ = [
     "STEP_RE_REVIEW",
     "STEP_CONTROLLED_INTEGRATION",
     "STEP_DEPENDENT_WAVE",
+    # SW-1511-REVIEW criteria 1 and 3: controller acceptance consumer seam
+    "record_acceptance",
+    "release_accepted_dependents",
     "STEPS",
     "INTENT_LAUNCHED",
     "INTENT_REVIEWING",
@@ -1820,6 +1830,72 @@ class NativeProcessService:
     def record_dependent_wave(self, intent_id: str) -> DispatchIntent:
         """A dependent wave was released after this attempt integrated."""
         return self.advance(intent_id, INTENT_INTEGRATED, step=STEP_DEPENDENT_WAVE)
+
+    # -- controller acceptance (SW-1511-REVIEW criteria 1 and 3) ----------
+
+    def record_acceptance(
+        self,
+        attempt: Any,
+        *,
+        producer_artifact: str = "",
+        binding: Any = None,
+        role: str = "",
+        answering_identity: str = "",
+        producer_identity: str = "",
+        accepted: bool = False,
+        captured_at: str = "",
+    ) -> IndependentGateReceipt:
+        """Record the controller's acceptance of an owned attempt.
+
+        This is the ``independent-gate-receipt-v1`` consumer seam named by the
+        contract: the controller acceptance service binds one attempt's
+        acceptance state, its review binding and the deciding evidence into the
+        durable receipt the scheduler and dependent-release path consume.
+
+        Criterion 1 holds here: *accepted* is not the launch state.  The
+        producer artifact is mandatory before an acceptance is recorded — a
+        **launched** attempt that produced no artifact is refused
+        (:class:`~skillweave.trace.gate_receipt.MissingProducerArtifact`) rather
+        than accepted.  Criterion 3 holds through the frozen record: an
+        *accepted* receipt can only be constructed with an answering identity
+        other than the producer, so a model PASS or a producer's own verdict
+        never yields an acceptance.
+        """
+        self._require_controller()
+        state = getattr(attempt, "state", "")
+        if state not in ACCEPTANCE_STATES:
+            raise ValueError(
+                f"attempt state {state!r} is not one of {list(ACCEPTANCE_STATES)}"
+            )
+        artifact = producer_artifact or getattr(attempt, "producer_artifact", "")
+        if accepted and not artifact:
+            raise MissingProducerArtifact(
+                str(getattr(attempt, "attempt_id", "")), str(artifact)
+            )
+        return IndependentGateReceipt(
+            attempt_id=str(getattr(attempt, "attempt_id", "")),
+            state=state,
+            producer_artifact=artifact,
+            binding=binding,
+            role=role,
+            answering_identity=answering_identity,
+            producer_identity=producer_identity,
+            accepted=accepted,
+            captured_at=captured_at or _now_iso(),
+        )
+
+    def release_accepted_dependents(
+        self, attempt: Any, *, producer_identity: str = ""
+    ) -> tuple[str, ...]:
+        """Release an accepted attempt's dependents through the frozen rule.
+
+        Delegates to :func:`skillweave.trace.gate_receipt.release_dependents`:
+        an attempt that is not *accepted*, or that carries no producer
+        artifact, releases nothing.  A launched skill without its required
+        producer artifact cannot release its dependents (criterion 1).
+        """
+        self._require_controller()
+        return release_dependents(attempt)
 
     def record_failure(self, intent_id: str) -> DispatchIntent:
         """Record a resolved (failed) outcome; the execution scope is freed.
