@@ -336,9 +336,14 @@ def test_recovered_controller_refuses_an_unverifiable_owned_attempt():
         first = NativeProcessService(store, "controller-a")
         first.acquire(ttl_seconds=0)
         # A record whose pid is dead on arrival and whose start_time cannot
-        # match any live process.
-        first.dispatch(
-            run_id="run-1", task_id="task-a", attempt=1,
+        # match any live process.  It is planted through the durable store --
+        # the same seam the store-level duplicate test below uses -- so the
+        # *read* resume path is what is exercised; the service's own write-time
+        # identity guard (SW-1511-CMS-TRANSACTION c1-c3) would, correctly,
+        # refuse to record an identity it cannot observe against the live OS.
+        store.record_dispatch_intent(
+            "run-1", "task-a", 1, "run-1/task-a/1",
+            step=STEP_READY_DISPATCH, state=INTENT_LAUNCHED,
             process_identity={
                 "pid": 1, "start_time": "0.0", "exec_path": "/nonexistent",
                 "argv": ["nonexistent"],
@@ -1475,13 +1480,19 @@ def test_resume_without_a_verified_owned_attempt_never_resumes_the_old_session()
         first = NativeProcessService(store, "controller-a")
         first.acquire(ttl_seconds=0)
         # A recorded identity that can no longer be observed: not adoptable.
-        first.dispatch(
-            run_id="run-1", task_id="task-a", attempt=1,
+        # Planted through the durable store -- the same seam the store-level
+        # duplicate test below uses -- so the *read* resume path (and its
+        # refusal to carry a session forward) is what is exercised; the
+        # service's write-time identity guard (SW-1511-CMS-TRANSACTION c1-c3)
+        # would, correctly, refuse to record an unobservable identity.
+        store.record_dispatch_intent(
+            "run-1", "task-a", 1, "run-1/task-a/1",
+            step=STEP_READY_DISPATCH, state=INTENT_LAUNCHED,
+            route="provider/model", session_id="sess-stale",
             process_identity={
                 "pid": 1, "start_time": "0.0", "exec_path": "/nonexistent",
                 "argv": ["nonexistent"],
             },
-            route="provider/model", session_id="sess-stale",
         )
         store.close()
 
