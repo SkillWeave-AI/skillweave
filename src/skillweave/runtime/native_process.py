@@ -76,6 +76,7 @@ from ..trace.gate_receipt import (
     AttemptReview,
     IndependentGateReceipt,
     MissingProducerArtifact,
+    ReviewBinding,
     StaleReviewError,
     assert_review_current,
     collect_package_review,
@@ -183,8 +184,14 @@ __all__ = [
     "SandboxBinding",
     "CmsBindingRefused",
     "resolve_cms_sandbox_binding",
+    "CMS_PRODUCTION_TARGET_MARKERS",
+    "OwnerSandboxDeclaration",
+    "resolve_owner_sandbox_target",
     "PUBLICATION_ACTION_KIND",
     "PUBLICATION_REVIEW_ROLE",
+    "DURABLE_REVIEW_MESSAGE_KIND",
+    "DurableReviewRef",
+    "ResolvedReview",
     "PublicationAuthorization",
     "PublicationDecision",
     "PublicationRefused",
@@ -2597,6 +2604,15 @@ class CmsTransaction:
     restored_hashes: Optional[CmsRawHashes] = None
     capabilities: tuple[str, ...] = CMS_CAPABILITIES
     producer_identity: str = ""
+    #: The owned attempt's dispatch intent this transaction is bound to (the
+    #: durable source of the producer identity).  A transaction with no bound
+    #: intent has no verifiable producer and is refused for publication.
+    intent_id: str = ""
+    #: The *owner-authorized sandbox target* the transaction was opened on.  It
+    #: is recorded so a recovering owner can re-verify (against the owner's
+    #: declaration) that it is resuming on the sandbox it opened, never on a
+    #: production surface reached through a mis-declared binding.
+    sandbox_target: str = ""
     created_at: str = field(default_factory=_now_iso)
     schema_version: str = CMS_TXN_SCHEMA_VERSION
 
@@ -2656,6 +2672,14 @@ class CmsTransaction:
                     "CMS transaction carries restored hashes but is not at the "
                     f"{CMS_STAGE_RESTORED!r} stage"
                 )
+        # A recorded sandbox target must not name a production surface: a
+        # transaction that recorded a production-looking target is refused
+        # rather than trusted (fail closed), so a mis-declared binding that
+        # reached a production target cannot be persisted or replayed.
+        if self.sandbox_target and _looks_like_production(self.sandbox_target):
+            raise CmsBindingRefused(
+                CMS_BINDING_SANDBOX, target=self.sandbox_target
+            )
 
     def verified(self) -> bool:
         """True when the readback reproduces the applied content."""
@@ -2696,6 +2720,8 @@ class CmsTransaction:
             ),
             "capabilities": list(self.capabilities),
             "producer_identity": self.producer_identity,
+            "intent_id": self.intent_id,
+            "sandbox_target": self.sandbox_target,
             "verified": self.verified(),
             "restored": self.restored(),
             "created_at": self.created_at,
@@ -2743,6 +2769,12 @@ class SandboxBinding:
             raise CmsBindingRefused(self.kind, target=self.target)
         if not isinstance(self.target, str) or not self.target.strip():
             raise ValueError("a sandbox binding must name its target")
+        # A target that names a production surface is refused even when the
+        # binding declares ``kind == "sandbox"``: the declared kind is not the
+        # whole check, so ``SandboxBinding(target="production/real-channel")``
+        # cannot smuggle a production surface through the sandbox discriminator.
+        if _looks_like_production(self.target):
+            raise CmsBindingRefused(self.kind, target=self.target)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind, "target": self.target}
@@ -2761,7 +2793,7 @@ def resolve_cms_sandbox_binding(binding: Any) -> str:
     if isinstance(binding, SandboxBinding):
         if binding.kind != CMS_BINDING_SANDBOX:
             raise CmsBindingRefused(binding.kind, target=binding.target)
-        return binding.target
+        return resolve_owner_sandbox_target(binding.target)
     if isinstance(binding, Mapping):
         kind = binding.get("kind", "")
         if kind != CMS_BINDING_SANDBOX:
@@ -2769,8 +2801,98 @@ def resolve_cms_sandbox_binding(binding: Any) -> str:
         target = binding.get("target", "")
         if not isinstance(target, str) or not target.strip():
             raise ValueError("a sandbox binding must name its target")
-        return target
+        return resolve_owner_sandbox_target(target)
     raise CmsBindingRefused(binding)
+
+
+#: Substrings that mark a binding target as *production-looking* even when it
+#: dresses itself up as a sandbox.  A target may not merely *say* "sandbox": the
+#: literal phrase must not also name a production surface, so
+#: ``"production/real-channel"`` and ``"prod/sandbox"`` are refused rather than
+#: accepted on the strength of the declared ``kind`` alone.
+CMS_PRODUCTION_TARGET_MARKERS: tuple[str, ...] = ("production", "prod", "live", "real-channel")
+
+
+class OwnerSandboxDeclaration:
+    """The owner's declaration of exactly which sandbox targets are authorized.
+
+    The binding discriminator (:func:`resolve_cms_sandbox_binding`) proves a
+    binding *declares itself* a sandbox; this is the second, independent half:
+    the resolved target must be **one of the targets the owner actually
+    authorized**.  A binding that names an unlisted target, or any target that
+    looks like a production surface (:data:`CMS_PRODUCTION_TARGET_MARKERS`), is
+    refused fail-closed -- so "kind == sandbox" is not sufficient to reach a
+    surface the owner never declared.  An empty declaration authorizes nothing
+    (fail closed), rather than everything.
+    """
+
+    __slots__ = ("targets",)
+
+    def __init__(self, targets: Any = ()):
+        resolved: list[str] = []
+        for target in targets:
+            if not isinstance(target, str) or not target.strip():
+                raise ValueError(
+                    "an owner sandbox declaration must name non-empty targets"
+                )
+            normalized = target.strip()
+            if _looks_like_production(normalized):
+                raise CmsBindingRefused(
+                    CMS_BINDING_SANDBOX, target=normalized
+                )
+            resolved.append(normalized)
+        self.targets: tuple[str, ...] = tuple(resolved)
+
+    def authorizes(self, target: str) -> bool:
+        """True only for a listed, non-production-looking target."""
+        if not isinstance(target, str) or not target.strip():
+            return False
+        candidate = target.strip()
+        if _looks_like_production(candidate):
+            return False
+        return candidate in self.targets
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"targets": list(self.targets)}
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, OwnerSandboxDeclaration):
+            return self.targets == other.targets
+        return NotImplemented
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"OwnerSandboxDeclaration(targets={list(self.targets)!r})"
+
+
+def _looks_like_production(target: str) -> bool:
+    """True when *target* names a production-looking surface (case-insensitive)."""
+    lowered = target.lower()
+    return any(marker in lowered for marker in CMS_PRODUCTION_TARGET_MARKERS)
+
+
+def resolve_owner_sandbox_target(
+    target: str, *, authorized: Any = None
+) -> str:
+    """Resolve a *recorded* sandbox target against the owner's declaration.
+
+    Fail-closed, in order: the target must be non-empty; it must not look like a
+    production surface; and (when an ``authorized`` declaration is given) it must
+    be one of the owner's declared targets.  A production-looking or unlisted
+    target raises :class:`CmsBindingRefused`, so a target recorded by an earlier
+    binding cannot be replayed onto an unauthorized surface by a recovering
+    owner.
+    """
+    if not isinstance(target, str) or not target.strip():
+        raise CmsBindingRefused(CMS_BINDING_SANDBOX, target="")
+    normalized = target.strip()
+    if _looks_like_production(normalized):
+        raise CmsBindingRefused(CMS_BINDING_SANDBOX, target=normalized)
+    if authorized is not None:
+        if not isinstance(authorized, OwnerSandboxDeclaration):
+            authorized = OwnerSandboxDeclaration(authorized)
+        if not authorized.authorizes(normalized):
+            raise CmsBindingRefused(CMS_BINDING_SANDBOX, target=normalized)
+    return normalized
 
 
 def _hashes_from(record: Optional[Mapping[str, Any]]) -> Optional[CmsRawHashes]:
@@ -2814,6 +2936,8 @@ def validate_cms_transaction(record: Mapping[str, Any]) -> None:
         restored_hashes=_hashes_from(record.get("restored_hashes")),
         capabilities=tuple(record.get("capabilities", ())),
         producer_identity=record.get("producer_identity", ""),
+        intent_id=record.get("intent_id", ""),
+        sandbox_target=record.get("sandbox_target", ""),
         created_at=record.get("created_at", ""),
         schema_version=version,
     )
@@ -2907,6 +3031,142 @@ class PublicationDecision:
 #: publication review is never independent, so this is the only role the
 #: publication path admits.
 PUBLICATION_REVIEW_ROLE = VERIFIER_ROLE
+
+#: The durable kind of the MCP ``review_action`` result record
+#: (:func:`skillweave.mcp.server.review_action` posts a ``status`` message whose
+#: body is bound to the review's run/task/attempt).  A publication review must
+#: be *this* record, loaded from the durable mailbox -- never a caller-created
+#: object.
+DURABLE_REVIEW_MESSAGE_KIND = "status"
+
+
+@dataclass(frozen=True)
+class DurableReviewRef:
+    """A *reference* to a durable review record, not a review.
+
+    The reference is only a locator -- the mailbox it lives in and the id of the
+    record posted by the MCP ``review_action`` tool.  Everything that decides
+    the review is *loaded from that durable record* (:meth:`resolve`), so a
+    caller can point at a review but cannot fabricate its independence, its role
+    or the attempt it answered: those are derived from the server-recorded
+    ``principal`` and the recorded ``run_id``/``task_id``/``attempt``.
+    """
+
+    mailbox_path: str
+    message_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mailbox_path, str) or not self.mailbox_path.strip():
+            raise ValueError("a durable review reference must name its mailbox")
+        if not isinstance(self.message_id, str) or not self.message_id.strip():
+            raise ValueError("a durable review reference must name a message id")
+
+    def resolve(self) -> "ResolvedReview":
+        """Load the referenced durable record and project a :class:`ResolvedReview`.
+
+        Fail-closed: an absent record, a record that is not a review result and a
+        record whose bytes do not match its declared digest are all refused by
+        name (:class:`PublicationRefused`), so a dangling or tampered reference
+        never silently resolves to a review.
+        """
+        from skillweave.dispatch import messaging as _messaging
+
+        mailbox = _messaging.AgentMailbox(self.mailbox_path)
+        record = mailbox.get(self.message_id)
+        if record is None:
+            raise PublicationRefused(
+                f"durable review {self.message_id!r} is not in mailbox "
+                f"{self.mailbox_path!r}; a review must be a durable, server-"
+                f"recorded result",
+                field="review",
+            )
+        return ResolvedReview.from_record(record)
+
+
+@dataclass(frozen=True)
+class ResolvedReview:
+    """A review projected from its *durable* record.
+
+    Every field is *loaded* from the record the MCP server wrote, never supplied
+    by a caller: ``principal`` is the server-issued principal the review was
+    recorded under, ``role`` is the reviewing role, and ``run_id``/``task_id``/
+    ``attempt`` are the scope the review answered.  Independence is decided
+    against the server-recorded ``principal``, so a producer that names itself
+    the reviewer is refused even though it controls its own arguments.
+    """
+
+    message_id: str
+    principal: str
+    role: str
+    run_id: str
+    task_id: str
+    attempt: int
+    subject: str
+    digest: str
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "ResolvedReview":
+        """Project a durable ``review_action`` result record, or refuse it.
+
+        A record that is not a ``status`` result whose body names the review's
+        run/task/attempt is refused by name: only a genuine review result carries
+        the durable scope a publication must bind to.
+        """
+        kind = str(record.get("kind") or "")
+        if kind != DURABLE_REVIEW_MESSAGE_KIND:
+            raise PublicationRefused(
+                f"durable record {record.get('message_id')!r} is a {kind!r} "
+                f"message, not a review result; a publication review must be the "
+                f"server-recorded review result",
+                field="review",
+            )
+        body = record.get("body")
+        if not isinstance(body, Mapping):
+            raise PublicationRefused(
+                f"durable review {record.get('message_id')!r} carries no recorded "
+                f"body to bind",
+                field="review",
+            )
+        principal = str(record.get("principal") or "").strip()
+        if not principal:
+            raise PublicationRefused(
+                f"durable review {record.get('message_id')!r} was recorded under "
+                f"no principal; there is no accountable reviewer",
+                field="review",
+            )
+        role = str(body.get("role") or record.get("role") or "").strip()
+        return cls(
+            message_id=str(record.get("message_id") or ""),
+            principal=principal,
+            role=role,
+            run_id=str(record.get("run_id") or body.get("run_id") or ""),
+            task_id=str(record.get("task_id") or body.get("task_id") or ""),
+            attempt=int(record.get("attempt") or body.get("attempt") or 0),
+            subject=str(body.get("assignment") or ""),
+            digest=str(record.get("digest") or ""),
+        )
+
+
+def _durable_producer_identity(intent: Any) -> str:
+    """The producer identity *derived* from an owned attempt's durable record.
+
+    The producer of a managed CMS transaction is the identity the dispatch
+    intent recorded for the owned attempt, never a string the caller declares at
+    :meth:`NativeProcessService.open_cms_transaction`.  The identity is a
+    fingerprint of the recorded :class:`~skillweave.runtime.process_identity.ProcessIdentity`
+    -- its immutable ``creation_token`` (PID + start instant + image), which a
+    caller cannot forge and which binds the producer to the exact owned process.
+    A legacy attempt that recorded no process identity has no *verifiable*
+    producer, so the empty string is returned and the publication is refused
+    fail-closed rather than trusting a caller-declared name.
+    """
+    identity = getattr(intent, "process_identity", None)
+    if not isinstance(identity, Mapping):
+        return ""
+    record = process_identity.ProcessIdentity.from_dict(dict(identity))
+    if record is None:
+        return ""
+    return f"attempt:{record.creation_token}"
 
 
 def _require_current_independent_review(
@@ -3903,23 +4163,48 @@ class NativeProcessService:
         durably, fenced by the controller lease.  A repository subject or an
         adapter missing a required capability is refused before any effect.
 
-        ``producer_identity`` is the publishing attempt's durable identity: it is
-        mandatory here (an unknown producer is refused), so a later publication
-        can never be self-authorized by omitting it.  The transaction is only
-        ever driven through an *explicitly declared sandbox* ``binding`` -- an
-        undeclared/unknown binding (the default) or a ``production``-declared one
-        is refused fail-closed, so the sandbox is structural, not a name.
+        ``producer_identity`` is a *declaration* of the publishing attempt's
+        identity: it is mandatory here (an unknown producer is refused), but the
+        identity the transaction actually *records* is **derived from the owned
+        attempt's durable process identity**, never taken from the caller.  A
+        declaration that disagrees with the owned attempt is a forgery and is
+        refused; an owned attempt that recorded no verifiable process identity has
+        no producer to own the transaction and is refused fail-closed.  So a
+        producer can neither declare itself someone else nor open a transaction it
+        does not own.  The transaction is only ever driven through an *explicitly
+        declared sandbox* ``binding`` -- an undeclared/unknown binding (the
+        default) or a ``production``-declared one is refused fail-closed, so the
+        sandbox is structural, not a name.
         """
         if not isinstance(producer_identity, str) or not producer_identity.strip():
             raise ValueError(
                 "a managed CMS transaction must carry the producer attempt's "
                 "identity; an unknown producer is refused"
             )
-        resolve_cms_sandbox_binding(binding)
+        sandbox_target = resolve_cms_sandbox_binding(binding)
         identity = self._require_leased_adapter(adapter, subject=subject)
         intent = self._store.get_dispatch_intent(intent_id)
         if intent is None:
             raise ValueError(f"no dispatch intent {intent_id!r} to manage")
+        # The producer identity is *derived from the owned attempt's durable
+        # process identity*, never taken from the caller's declaration.  An
+        # attempt that recorded no verifiable process identity has no producer,
+        # so the transaction is refused fail-closed; a declaration that
+        # disagrees with the derived identity is a forgery and is refused too.
+        durable_producer = _durable_producer_identity(intent)
+        if not durable_producer:
+            raise PublicationRefused(
+                f"the owned attempt {intent_id!r} recorded no verifiable process "
+                f"identity; an unverifiable producer is refused",
+                field="producer_identity",
+            )
+        if producer_identity != durable_producer:
+            raise PublicationRefused(
+                f"the declared producer {producer_identity!r} is not the producer "
+                f"the owned attempt {intent_id!r} recorded "
+                f"({durable_producer!r}); an unverifiable producer is refused",
+                field="producer_identity",
+            )
         baseline_hashes = adapter.read_baseline(baseline)
         txn = CmsTransaction(
             run_id=intent.run_id,
@@ -3930,7 +4215,9 @@ class NativeProcessService:
             txn_id=txn_id or f"{intent.run_id}/{intent_id}",
             baseline_hashes=baseline_hashes,
             capabilities=tuple(adapter.contract.capabilities),
-            producer_identity=producer_identity,
+            producer_identity=durable_producer,
+            intent_id=intent.intent_id,
+            sandbox_target=sandbox_target,
             created_at=now or _now_iso(),
         )
         self._store.save_cms_transaction(txn)
@@ -4057,6 +4344,8 @@ class NativeProcessService:
             restored_hashes=_hashes_from(record.get("restored_hashes")),
             capabilities=tuple(record.get("capabilities", ())),
             producer_identity=record.get("producer_identity", ""),
+            intent_id=record.get("intent_id", ""),
+            sandbox_target=record.get("sandbox_target", ""),
             created_at=record.get("created_at", ""),
             schema_version=record.get("schema_version", CMS_TXN_SCHEMA_VERSION),
         )
@@ -4075,8 +4364,18 @@ class NativeProcessService:
         ``production``-declared or unknown binding is refused here too.
         """
         self._require_controller()
+        # A recovered transaction carries the sandbox target it was opened
+        # against; re-validate it (never trust a legacy/production-looking
+        # recorded target) and, when a fresh binding is given, require that it
+        # names the *same* target, so a takeover cannot re-point the restore
+        # point at an undeclared or production-looking surface.
+        recorded_target = resolve_owner_sandbox_target(txn.sandbox_target)
         if binding is not None:
-            resolve_cms_sandbox_binding(binding)
+            bound_target = resolve_cms_sandbox_binding(binding)
+            if bound_target != recorded_target:
+                raise CmsBindingRefused(
+                    CMS_BINDING_SANDBOX, target=bound_target
+                )
         missing = tuple(
             cap for cap in txn.capabilities
             if not callable(getattr(adapter, cap, None))
@@ -4108,7 +4407,7 @@ class NativeProcessService:
         *,
         authorization: Optional[PublicationAuthorization],
         artifact_digest: str,
-        review: Optional[AttemptReview] = None,
+        review_ref: Optional[DurableReviewRef] = None,
         expected_review_criteria: Sequence[str] = (),
         policy: Any = None,
         scope_target: str = "",
@@ -4117,13 +4416,16 @@ class NativeProcessService:
         """Authorize an irreversible CMS publication at the controller (criterion 2).
 
         The producer identity is **derived from the transaction** (its recorded
-        ``producer_identity``), never accepted from the caller, so a producer can
-        never publish by omitting or blanking the argument -- an unknown producer
-        on the transaction refuses the publication fail-closed.  An *independent*
-        review that is current for the transaction's exact subject revision and
-        the given artifact digest must be presented and must cover every
-        ``expected_review_criteria``; a missing, stale, producer-authored,
-        wrongly-roled or unsupported review is refused.  The designated explicit
+        ``producer_identity``, which :meth:`open_cms_transaction` derived from the
+        owned attempt's durable record), never accepted from the caller, so a
+        producer can never publish by omitting or blanking the argument -- an
+        unknown producer on the transaction refuses the publication fail-closed.
+        The review is presented as a **reference to a durable record**
+        (:class:`DurableReviewRef`), never as a caller-constructed object: the
+        reference is *loaded from the durable mailbox* and its independence is
+        decided against the server-recorded ``principal`` and the recorded
+        ``run_id``/``task_id``/``attempt``, so a caller cannot mint an
+        ``AttemptReview`` claiming independence.  The designated explicit
         authorization must bind to the transaction's *exact* subject revision and
         the given artifact digest, and the governing autonomy policy is consulted
         for the irreversible action, so a Unicorn policy holds rather than
@@ -4132,6 +4434,28 @@ class NativeProcessService:
         caller to record; nothing is published here.
         """
         self._require_controller()
+        if review_ref is None:
+            raise PublicationRefused(
+                "irreversible CMS publication requires a durable, server-recorded "
+                "independent review; a caller-constructed review object is not "
+                "accepted",
+                field="review",
+            )
+        if not isinstance(review_ref, DurableReviewRef):
+            raise PublicationRefused(
+                "the publication review reference is not a durable review "
+                "reference",
+                field="review",
+            )
+        resolved = review_ref.resolve()
+        # The review must answer *this* transaction's owned attempt, not merely
+        # any attempt: a review recorded for another run/task/attempt cannot
+        # authorize this publication.
+        self._require_review_answers_transaction(resolved, txn)
+        review = self._durable_attempt_review(
+            resolved, txn, artifact_digest=artifact_digest,
+            expected_review_criteria=expected_review_criteria,
+        )
         return authorize_publication(
             authorization,
             subject_revision=txn.subject_revision,
@@ -4142,6 +4466,70 @@ class NativeProcessService:
             policy=policy,
             scope_target=scope_target,
             permitted_scope=permitted_scope,
+        )
+
+    def _require_review_answers_transaction(
+        self, resolved: ResolvedReview, txn: CmsTransaction
+    ) -> None:
+        """Refuse a durable review that does not answer the transaction's attempt."""
+        intent = self._store.get_dispatch_intent(txn.intent_id) if txn.intent_id else None
+        if intent is None:
+            raise PublicationRefused(
+                f"the transaction carries no owned attempt to bind a review to",
+                field="review",
+            )
+        if (
+            resolved.run_id != intent.run_id
+            or resolved.task_id != intent.task_id
+            or resolved.attempt != intent.attempt
+        ):
+            raise PublicationRefused(
+                f"the durable review answers attempt "
+                f"{resolved.run_id}/{resolved.task_id}/{resolved.attempt}, not the "
+                f"transaction's owned attempt "
+                f"{intent.run_id}/{intent.task_id}/{intent.attempt}",
+                field="review",
+            )
+
+    def _durable_attempt_review(
+        self,
+        resolved: ResolvedReview,
+        txn: CmsTransaction,
+        *,
+        artifact_digest: str,
+        expected_review_criteria: Sequence[str] = (),
+    ) -> AttemptReview:
+        """Project a loaded durable review into the review the publication checks.
+
+        The answering identity is the *server-recorded principal* the durable
+        record was posted under (never a caller string), and the producer is the
+        transaction's derived producer, so independence
+        (:attr:`AttemptReview.independent`) is decided from durable facts.  The
+        binding carries the *exact* subject revision and artifact digest the
+        publication asserts, so the currentness check
+        (:func:`~skillweave.trace.gate_receipt.assert_review_current`) can only
+        pass for the revision/digest under publication.  The review's recorded
+        subject is carried as its criteria, so an ``expected_review_criteria``
+        request that the durable review does not name is refused.
+        """
+        criteria = tuple(expected_review_criteria) or (
+            (resolved.subject,) if resolved.subject else (PUBLICATION_REVIEW_ROLE,)
+        )
+        binding = ReviewBinding(
+            review_id=resolved.message_id,
+            review_criteria=criteria,
+            subject_revision=txn.subject_revision,
+            artifact_digest=artifact_digest,
+        )
+        return AttemptReview(
+            attempt_id=f"{resolved.run_id}/{resolved.task_id}/{resolved.attempt}",
+            binding=binding,
+            role=resolved.role or PUBLICATION_REVIEW_ROLE,
+            answering_identity=resolved.principal,
+            producer_identity=txn.producer_identity,
+            verdict=ACCEPTANCE_ACCEPTED,
+            accepted_revision=txn.subject_revision,
+            accepted_digest=artifact_digest,
         )
 
 
