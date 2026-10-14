@@ -1085,6 +1085,12 @@ def build_evidence_delta(
     and a ``diagnosed:non-monotonic-cursor`` note is attached.  A healthy,
     monotone poll remains complete.
     """
+    # The record *source* is named before it is normalized to a tuple:
+    # ``_coerce_sequence`` returns a plain tuple, so reading the evidence
+    # source off the normalized value would hide it and make every poll look
+    # evidence-free.  The source exposes either ``list_evidence`` or a bound
+    # ``store.list_evidence``; both are read-only projections of durable state.
+    source = records
     records = _coerce_sequence(records, "records")
     if isinstance(since_evidence_index, bool) or not isinstance(since_evidence_index, int):
         raise ValueError("since_evidence_index must be an integer")
@@ -1161,19 +1167,33 @@ def build_evidence_delta(
     # -- new evidence references (from the evidence store, cursor-scoped).
     new_evidence: list[str] = []
     coverage_complete = True
-    store = getattr(records, "store", None)
-    lister = getattr(records, "list_evidence", None)
+    horizon = _at(journal_cursor)
+    # The evidence source is named by the record source *before* it is
+    # normalized to a tuple: ``_coerce_sequence`` returns a plain tuple, which
+    # would hide the source and make every poll look evidence-free.  A source
+    # is read through the ``list_evidence`` contract (a callable) or, failing
+    # that, through a bound ``store.list_evidence``.  With no source at all the
+    # view cannot prove the receipts, so completeness is only honest when the
+    # caller has not asked to skip any evidence.
+    lister = getattr(source, "list_evidence", None)
+    store = getattr(source, "store", None)
+    rows: Optional[list[Any]] = None
     if callable(lister):
-        rows = list(lister())
+        try:
+            rows = list(lister())
+        except TypeError:
+            rows = None  # a source needing an argument is read from the store
+    if rows is None and store is not None:
+        store_lister = getattr(store, "list_evidence", None)
+        if callable(store_lister):
+            try:
+                rows = list(store_lister(run_id))
+            except TypeError:
+                rows = list(store_lister())
+    if rows is not None:
         new_evidence = [
             _field(row, "artifact_id") for row in rows[since_evidence_index:]
-            if (_field(row, "created_at", "") or "") >= _at(journal_cursor)
-        ]
-    elif store is not None and callable(getattr(store, "list_evidence", None)):
-        rows = list(store.list_evidence(run_id))
-        new_evidence = [
-            _field(row, "artifact_id") for row in rows[since_evidence_index:]
-            if (_field(row, "created_at", "") or "") >= _at(journal_cursor)
+            if (_field(row, "created_at", "") or "") >= horizon
         ]
     elif since_evidence_index > 0:
         # A caller asked to skip evidence, but no evidence source is bound to
@@ -2004,7 +2024,9 @@ class _EvidenceJournalView(Sequence):
 
     def __init__(self, records: Sequence[Any], evidence: Sequence[Any]) -> None:
         self._records = tuple(records)
-        self.store = dict((row.artifact_id, row) for row in evidence)
+        # Receipts may arrive as objects (``ArtifactReceipt``) or as durable
+        # read projections (mappings); both name the same artifact.
+        self.store = dict((_field(row, "artifact_id"), row) for row in evidence)
 
     def __iter__(self):
         return iter(self._records)

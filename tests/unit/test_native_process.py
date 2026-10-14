@@ -805,6 +805,62 @@ def test_service_evidence_delta_reads_the_durable_journal_after_the_cursor():
         store.close()
 
 
+def test_service_delta_names_new_evidence_from_durable_state():
+    # The compact view must name the evidence references it is *newly* aware of
+    # through the real service path -- not only when a bare list is handed to
+    # ``build_evidence_delta``.  The evidence source is bound to the durable
+    # store, so naming it below the journal cursor's timestamp must be refused
+    # as stale rather than reported as new.
+    from skillweave.runtime.registry import ArtifactReceipt
+
+    def _receipt(artifact_id: str, created_at: str, sha: str) -> ArtifactReceipt:
+        return ArtifactReceipt(
+            artifact_id=artifact_id,
+            # A distinct digest per receipt: ``save_evidence`` is content-
+            # addressed, so identical bytes would dedupe to one row.
+            sha256=sha,
+            schema_version="1",
+            producer_command="pytest",
+            subject_repo="skillweave",
+            subject_commit=_SHA,
+            created_at=created_at,
+            evidence_type="artifact",
+            purpose="criterion-4",
+            metadata={"run_id": "run-1"},
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        journal = EventJournal(store)
+        journal.append("run-1", event_type="state_transition", payload={"gates": {"G1": "accepted"}})
+        # A receipt from before the cursor was first observed is *not* new.
+        store.save_evidence(_receipt("evd-old", "2026-01-01T00:00:00+00:00", "b" * 40))
+        svc = NativeProcessService(store, "controller-a")
+        svc.acquire(ttl_seconds=3600)
+
+        seen = svc.evidence_delta("run-1", journal_cursor=0, now="2026-01-02T00:00:00+00:00")
+        assert seen.new_evidence == ()
+        assert seen.coverage_complete is True
+
+        # A receipt created after the cursor's timestamp is a new reference.
+        store.save_evidence(_receipt("evd-new", "2026-01-03T00:00:00+00:00", "c" * 40))
+        fresh = svc.evidence_delta("run-1", journal_cursor=0, now="2026-01-02T00:00:00+00:00")
+        assert fresh.new_evidence == ("evd-new",)
+        assert fresh.coverage_complete is True
+        store.close()
+
+
+def test_service_delta_refuses_to_claim_completeness_without_an_evidence_source():
+    # A caller who skips evidence over a record source that binds no evidence
+    # store cannot have its completeness proven: the view must report that
+    # rather than invent an empty denominator.
+    delta = build_evidence_delta(
+        [_journal_record(1)], "run-1", journal_cursor=0, since_evidence_index=1
+    )
+    assert delta.coverage_complete is False
+    assert delta.new_evidence == ()
+
+
 def test_service_records_a_compact_view_for_a_recovering_controller():
     with tempfile.TemporaryDirectory() as tmp:
         store = _store(tmp)
