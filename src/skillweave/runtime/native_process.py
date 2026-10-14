@@ -73,11 +73,15 @@ from .write_scope import WriteScopeClaim
 from ..trace.gate_receipt import (
     ACCEPTANCE_ACCEPTED,
     ACCEPTANCE_STATES,
+    AttemptReview,
     IndependentGateReceipt,
     MissingProducerArtifact,
+    StaleReviewError,
+    assert_review_current,
     collect_package_review,
     release_dependents,
 )
+from ..trace.gate_receipt import VERIFIER_ROLE
 
 __all__ = [
     # boundary contracts
@@ -165,6 +169,9 @@ __all__ = [
     "CMS_STAGE_APPLIED",
     "CMS_STAGE_READBACK",
     "CMS_STAGE_RESTORED",
+    "CMS_BINDING_SANDBOX",
+    "CMS_BINDING_PRODUCTION",
+    "CMS_BINDING_KINDS",
     "CmsCapabilityContract",
     "validate_cms_capability_contract",
     "CmsRawHashes",
@@ -173,7 +180,11 @@ __all__ = [
     "validate_cms_transaction",
     "CmsCapabilityError",
     "CmsStageError",
+    "SandboxBinding",
+    "CmsBindingRefused",
+    "resolve_cms_sandbox_binding",
     "PUBLICATION_ACTION_KIND",
+    "PUBLICATION_REVIEW_ROLE",
     "PublicationAuthorization",
     "PublicationDecision",
     "PublicationRefused",
@@ -2357,6 +2368,15 @@ CMS_STAGES: tuple[str, ...] = (
     CMS_STAGE_RESTORED,
 )
 
+#: The only binding kind a managed transaction may be driven through.  This is
+#: a structural *discriminator*, not a naming convention: a binding must
+#: explicitly declare ``sandbox`` and any other declaration (an undeclared or
+#: unknown kind, or a ``production``-declared binding) is refused fail-closed --
+#: the owner never touches production content.
+CMS_BINDING_SANDBOX = "sandbox"
+CMS_BINDING_PRODUCTION = "production"
+CMS_BINDING_KINDS: tuple[str, ...] = (CMS_BINDING_SANDBOX, CMS_BINDING_PRODUCTION)
+
 
 class CmsCapabilityError(ValueError):
     """A CMS adapter is missing a capability the managed contract requires.
@@ -2576,6 +2596,7 @@ class CmsTransaction:
     readback_hashes: Optional[CmsRawHashes] = None
     restored_hashes: Optional[CmsRawHashes] = None
     capabilities: tuple[str, ...] = CMS_CAPABILITIES
+    producer_identity: str = ""
     created_at: str = field(default_factory=_now_iso)
     schema_version: str = CMS_TXN_SCHEMA_VERSION
 
@@ -2674,10 +2695,82 @@ class CmsTransaction:
                 None if self.restored_hashes is None else self.restored_hashes.to_dict()
             ),
             "capabilities": list(self.capabilities),
+            "producer_identity": self.producer_identity,
             "verified": self.verified(),
             "restored": self.restored(),
             "created_at": self.created_at,
         }
+
+
+class CmsBindingRefused(ValueError):
+    """A managed transaction was offered a binding that is not an authorized sandbox.
+
+    The managed CMS owner only ever drives a transaction through an *explicitly
+    sandbox-declared* binding.  An undeclared/unknown binding, or a binding that
+    declares itself ``production``, is refused fail-closed rather than touched,
+    so "this is only a sandbox" is enforced structurally instead of by naming.
+    """
+
+    def __init__(self, kind: Any, *, target: str = ""):
+        self.kind = kind
+        self.target = target
+        super().__init__(
+            f"CMS binding kind {kind!r} is not the declared "
+            f"{CMS_BINDING_SANDBOX!r} sandbox binding"
+            + (f" for {target!r}" if target else "")
+            + f"; the owner refuses any undeclared, unknown or "
+            f"{CMS_BINDING_PRODUCTION!r}-declared binding"
+        )
+
+
+@dataclass(frozen=True)
+class SandboxBinding:
+    """The one owner-authorized *sandbox* binding a managed transaction runs on.
+
+    The discriminator is structural: ``kind`` must be explicitly the declared
+    :data:`CMS_BINDING_SANDBOX`.  An empty/unknown ``kind`` (an undeclared
+    binding) or a :data:`CMS_BINDING_PRODUCTION` binding is refused at
+    construction, so no caller can reach a production surface by an implicit
+    default and the sandbox is not merely a naming convention.  ``target`` names
+    the concrete sandbox the owner authorizes.
+    """
+
+    target: str
+    kind: str = CMS_BINDING_SANDBOX
+
+    def __post_init__(self) -> None:
+        if self.kind != CMS_BINDING_SANDBOX:
+            raise CmsBindingRefused(self.kind, target=self.target)
+        if not isinstance(self.target, str) or not self.target.strip():
+            raise ValueError("a sandbox binding must name its target")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "target": self.target}
+
+
+def resolve_cms_sandbox_binding(binding: Any) -> str:
+    """Resolve the owner-authorized sandbox target, refusing everything else.
+
+    This is the structural discriminator that keeps the managed CMS owner on a
+    declared sandbox.  Only a :class:`SandboxBinding` (``kind == "sandbox"``)
+    resolves; a ``None``/undeclared binding, a mapping whose ``kind`` is missing
+    or unknown, or a ``production``-declared binding is refused fail-closed with
+    :class:`CmsBindingRefused`.  The sandbox is therefore declared structurally,
+    not by leaving the binding implicit.
+    """
+    if isinstance(binding, SandboxBinding):
+        if binding.kind != CMS_BINDING_SANDBOX:
+            raise CmsBindingRefused(binding.kind, target=binding.target)
+        return binding.target
+    if isinstance(binding, Mapping):
+        kind = binding.get("kind", "")
+        if kind != CMS_BINDING_SANDBOX:
+            raise CmsBindingRefused(kind, target=str(binding.get("target", "")))
+        target = binding.get("target", "")
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("a sandbox binding must name its target")
+        return target
+    raise CmsBindingRefused(binding)
 
 
 def _hashes_from(record: Optional[Mapping[str, Any]]) -> Optional[CmsRawHashes]:
@@ -2720,6 +2813,7 @@ def validate_cms_transaction(record: Mapping[str, Any]) -> None:
         readback_hashes=_hashes_from(record.get("readback_hashes")),
         restored_hashes=_hashes_from(record.get("restored_hashes")),
         capabilities=tuple(record.get("capabilities", ())),
+        producer_identity=record.get("producer_identity", ""),
         created_at=record.get("created_at", ""),
         schema_version=version,
     )
@@ -2809,35 +2903,154 @@ class PublicationDecision:
     requires_human: bool = False
 
 
+#: The reviewing role that decides a gate.  A producer answering its own
+#: publication review is never independent, so this is the only role the
+#: publication path admits.
+PUBLICATION_REVIEW_ROLE = VERIFIER_ROLE
+
+
+def _require_current_independent_review(
+    review: Optional[AttemptReview],
+    *,
+    producer_identity: str,
+    subject_revision: str,
+    artifact_digest: str,
+    expected_review_criteria: Sequence[str] = (),
+) -> None:
+    """Refuse a publication whose independent review is missing or unusable.
+
+    Fail-closed, in order: a review must be present and have a supported form
+    (an :class:`~skillweave.trace.gate_receipt.AttemptReview` whose role is a
+    real reviewing role); it must be *independent* (not answered by the
+    producer); it must be *current* for the exact revision/digest (a stale
+    review is refused); and it must cover every ``expected_review_criteria``.
+    This is the production caller of
+    :func:`~skillweave.trace.gate_receipt.assert_review_current`, so the
+    review-binds-to-exact-revision half is proven through the real publication
+    path rather than on a helper.
+    """
+    if review is None:
+        raise PublicationRefused(
+            "irreversible CMS publication requires a current independent review "
+            "of the exact subject revision; none was presented",
+            field="review",
+        )
+    if not isinstance(review, AttemptReview):
+        raise PublicationRefused(
+            "the publication review is not a supported independent review form",
+            field="review",
+        )
+    binding = review.binding
+    if binding is None:
+        raise PublicationRefused(
+            "the publication review carries no binding to a subject revision",
+            field="review",
+        )
+    if review.role != PUBLICATION_REVIEW_ROLE:
+        raise PublicationRefused(
+            f"publication review role {review.role!r} is not the independent "
+            f"reviewing role {PUBLICATION_REVIEW_ROLE!r}",
+            field="review",
+        )
+    if review.answering_identity == producer_identity:
+        raise PublicationRefused(
+            f"the publication review was answered by the producer "
+            f"{producer_identity!r}; a producer cannot review its own "
+            f"publication",
+            field="review",
+        )
+    if not review.independent:
+        raise PublicationRefused(
+            "the publication review is not independent of the producer",
+            field="review",
+        )
+    # The review must be current for the exact revision *and* digest.
+    try:
+        assert_review_current(
+            review, subject_revision=subject_revision, artifact_digest=artifact_digest
+        )
+    except StaleReviewError as exc:
+        raise PublicationRefused(
+            f"the publication review is stale for the exact subject: {exc.reason}",
+            field="review",
+        ) from exc
+    if expected_review_criteria:
+        covered = set(binding.review_criteria)
+        missing = tuple(c for c in expected_review_criteria if c not in covered)
+        if missing:
+            raise PublicationRefused(
+                f"the publication review does not cover criteria {list(missing)} "
+                f"for the exact subject revision",
+                field="review",
+            )
+
+
 def authorize_publication(
     authorization: Optional[PublicationAuthorization],
     *,
     subject_revision: str,
     artifact_digest: str,
-    producer_identity: str = "",
+    producer_identity: str,
+    review: Optional[AttemptReview] = None,
+    expected_review_criteria: Sequence[str] = (),
     policy: Any = None,
     scope_target: str = "",
     permitted_scope: Any = None,
 ) -> PublicationDecision:
     """Decide whether an irreversible CMS publication may proceed.
 
-    Three fail-closed checks, in order:
+    Five fail-closed checks, in order:
 
-    1. A *designated explicit* authorization must be present
+    1. ``producer_identity`` is **structurally mandatory** and comes from the
+       publishing attempt's durable identity, never from the caller-hoped-for
+       value: a blank/absent producer fails closed with
+       :class:`PublicationRefused` (field ``producer_identity``).  This closes
+       the self-authorization bypass -- the producer check below cannot be
+       skipped by omitting the identity.
+    2. An *independent* review must be presented (:class:`PublicationRefused`
+       otherwise), must be answered under a reviewing role that is not the
+       producer's, must not be answered by the producer, and must be *current*
+       for the exact ``subject_revision``/``artifact_digest``
+       (:meth:`~skillweave.trace.gate_receipt.assert_review_current`); a stale
+       review, a producer-answered review, or one whose role/criteria are
+       unsupported is refused.  When ``expected_review_criteria`` is given the
+       review must cover every one of them.
+    3. A *designated explicit* authorization must be present
        (:class:`PublicationRefused` otherwise) and must bind to the exact
        ``subject_revision``/``artifact_digest``; and its authorizer must differ
        from ``producer_identity`` (a producer cannot authorize its own
        publication).
-    2. When a ``scope_target`` is given, it must be permitted by
+    4. When a ``scope_target`` is given, it must be permitted by
        ``permitted_scope`` (a :class:`~skillweave.dispatch.work_contract.WriteScope`
        or anything with ``permits``); publishing outside the declared scope is a
        scope expansion and is refused.
-    3. The governing autonomy ``policy`` (an assay policy) is consulted with an
+    5. The governing autonomy ``policy`` (an assay policy) is consulted with an
        :data:`~skillweave.runtime.assay.ActionType.IRREVERSIBLE_ACTION` request:
        a policy that *holds* an irreversible action (Unicorn among them) yields
        an unapproved decision.  No policy means the irreversible action is not
        auto-approved.
     """
+    # 1. The producer identity is mandatory and structural -- an unknown
+    #    producer is refused before anything else, so no later check can be
+    #    bypassed by omitting it.
+    if not isinstance(producer_identity, str) or not producer_identity.strip():
+        raise PublicationRefused(
+            "the publishing attempt's producer identity is unknown; an "
+            "irreversible CMS publication is refused until the producer is "
+            "bound to the exact attempt",
+            field="producer_identity",
+        )
+
+    # 2. Independent, current, exact-revision review.
+    _require_current_independent_review(
+        review,
+        producer_identity=producer_identity,
+        subject_revision=subject_revision,
+        artifact_digest=artifact_digest,
+        expected_review_criteria=expected_review_criteria,
+    )
+
+    # 3. Designated explicit authorization, bound to the exact revision/digest.
     if authorization is None or not authorization.designated:
         raise PublicationRefused(
             "irreversible CMS publication requires a designated explicit "
@@ -2855,7 +3068,7 @@ def authorize_publication(
             f"invalidates the authorization",
             field="subject_revision",
         )
-    if producer_identity and authorization.authorizer == producer_identity:
+    if authorization.authorizer == producer_identity:
         raise PublicationRefused(
             f"publication authorizer {authorization.authorizer!r} is the "
             f"producer; a producer cannot authorize its own publication",
@@ -3678,6 +3891,8 @@ class NativeProcessService:
         adapter: Any,
         *,
         baseline: Any,
+        producer_identity: str,
+        binding: Any = None,
         txn_id: str = "",
         now: Optional[str] = None,
     ) -> CmsTransaction:
@@ -3687,7 +3902,20 @@ class NativeProcessService:
         and records the ``cms-transaction-receipt-v1`` at the ``baseline`` stage,
         durably, fenced by the controller lease.  A repository subject or an
         adapter missing a required capability is refused before any effect.
+
+        ``producer_identity`` is the publishing attempt's durable identity: it is
+        mandatory here (an unknown producer is refused), so a later publication
+        can never be self-authorized by omitting it.  The transaction is only
+        ever driven through an *explicitly declared sandbox* ``binding`` -- an
+        undeclared/unknown binding (the default) or a ``production``-declared one
+        is refused fail-closed, so the sandbox is structural, not a name.
         """
+        if not isinstance(producer_identity, str) or not producer_identity.strip():
+            raise ValueError(
+                "a managed CMS transaction must carry the producer attempt's "
+                "identity; an unknown producer is refused"
+            )
+        resolve_cms_sandbox_binding(binding)
         identity = self._require_leased_adapter(adapter, subject=subject)
         intent = self._store.get_dispatch_intent(intent_id)
         if intent is None:
@@ -3702,6 +3930,7 @@ class NativeProcessService:
             txn_id=txn_id or f"{intent.run_id}/{intent_id}",
             baseline_hashes=baseline_hashes,
             capabilities=tuple(adapter.contract.capabilities),
+            producer_identity=producer_identity,
             created_at=now or _now_iso(),
         )
         self._store.save_cms_transaction(txn)
@@ -3827,19 +4056,27 @@ class NativeProcessService:
             readback_hashes=_hashes_from(record.get("readback_hashes")),
             restored_hashes=_hashes_from(record.get("restored_hashes")),
             capabilities=tuple(record.get("capabilities", ())),
+            producer_identity=record.get("producer_identity", ""),
             created_at=record.get("created_at", ""),
             schema_version=record.get("schema_version", CMS_TXN_SCHEMA_VERSION),
         )
 
-    def bind_cms_sandbox(self, txn: CmsTransaction, adapter: Any) -> None:
+    def bind_cms_sandbox(
+        self, txn: CmsTransaction, adapter: Any, *, binding: Any = None
+    ) -> None:
         """Re-bind the one owner-authorized sandbox adapter to a *recovered* txn.
 
         A controller that loaded a transaction from durable state (a takeover)
         re-binds its single sandbox adapter here so the transaction can resume
         its lifecycle.  The adapter must declare the same capabilities as the
         transaction recorded; a mismatched adapter is refused rather than driven.
+        An explicit sandbox ``binding`` may be supplied and is resolved through
+        the same structural discriminator as :meth:`open_cms_transaction`, so a
+        ``production``-declared or unknown binding is refused here too.
         """
         self._require_controller()
+        if binding is not None:
+            resolve_cms_sandbox_binding(binding)
         missing = tuple(
             cap for cap in txn.capabilities
             if not callable(getattr(adapter, cap, None))
@@ -3871,26 +4108,37 @@ class NativeProcessService:
         *,
         authorization: Optional[PublicationAuthorization],
         artifact_digest: str,
-        producer_identity: str = "",
+        review: Optional[AttemptReview] = None,
+        expected_review_criteria: Sequence[str] = (),
         policy: Any = None,
         scope_target: str = "",
         permitted_scope: Any = None,
     ) -> PublicationDecision:
         """Authorize an irreversible CMS publication at the controller (criterion 2).
 
-        The designated explicit authorization must bind to the transaction's
-        *exact* subject revision and the given artifact digest; the governing
-        autonomy policy is consulted for the irreversible action, so a Unicorn
-        policy holds rather than authorizing an irreversible publication, and a
-        target outside the declared scope is refused as a scope expansion.  The
-        decision is returned for the caller to record; nothing is published here.
+        The producer identity is **derived from the transaction** (its recorded
+        ``producer_identity``), never accepted from the caller, so a producer can
+        never publish by omitting or blanking the argument -- an unknown producer
+        on the transaction refuses the publication fail-closed.  An *independent*
+        review that is current for the transaction's exact subject revision and
+        the given artifact digest must be presented and must cover every
+        ``expected_review_criteria``; a missing, stale, producer-authored,
+        wrongly-roled or unsupported review is refused.  The designated explicit
+        authorization must bind to the transaction's *exact* subject revision and
+        the given artifact digest, and the governing autonomy policy is consulted
+        for the irreversible action, so a Unicorn policy holds rather than
+        authorizing an irreversible publication; a target outside the declared
+        scope is refused as a scope expansion.  The decision is returned for the
+        caller to record; nothing is published here.
         """
         self._require_controller()
         return authorize_publication(
             authorization,
             subject_revision=txn.subject_revision,
             artifact_digest=artifact_digest,
-            producer_identity=producer_identity,
+            producer_identity=txn.producer_identity,
+            review=review,
+            expected_review_criteria=expected_review_criteria,
             policy=policy,
             scope_target=scope_target,
             permitted_scope=permitted_scope,

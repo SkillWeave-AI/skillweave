@@ -39,6 +39,7 @@ from skillweave.runtime.native_process import (
     CMS_STAGE_RESTORED,
     CMS_TXN_SCHEMA_ID,
     CMS_TXN_SCHEMA_VERSION,
+    CmsBindingRefused,
     CmsCapabilityContract,
     CmsCapabilityError,
     CmsRawHashes,
@@ -50,17 +51,47 @@ from skillweave.runtime.native_process import (
     PublicationRefused,
     RawContentAdapter,
     STEP_READY_DISPATCH,
+    SandboxBinding,
     UnsupportedContractVersion,
     WrongIntegrationModeError,
     authorize_publication,
+    resolve_cms_sandbox_binding,
     validate_cms_capability_contract,
     validate_cms_transaction,
     validate_content_transaction,
 )
 from skillweave.runtime.store import SQLiteRunStore
+from skillweave.trace.gate_receipt import AttemptReview, ReviewBinding
 
 _REVISION = "rev-1"
 _BASELINE = {"title": "old", "body": "hello"}
+_PRODUCER = "worker-1"
+_SANDBOX = SandboxBinding(target="sandbox/ch")
+
+
+def _ind_review(
+    *,
+    answering_identity="verifier-1",
+    producer_identity=_PRODUCER,
+    role="verifier",
+    subject_revision=_REVISION,
+    artifact_digest="sha256:x",
+    review_criteria=("cms-c2",),
+    review_id="review-1",
+):
+    """An *independent* current-out-of-the-box review for the criterion-2 path."""
+    return AttemptReview(
+        attempt_id="att-1",
+        binding=ReviewBinding(
+            review_id=review_id,
+            review_criteria=tuple(review_criteria),
+            subject_revision=subject_revision,
+            artifact_digest=artifact_digest,
+        ),
+        role=role,
+        answering_identity=answering_identity,
+        producer_identity=producer_identity,
+    )
 
 
 def _controller_service(tmp_path, *, store=None, holder="controller-1"):
@@ -97,11 +128,12 @@ class _OwnerPublicationPolicy(AssayPolicy):
         return PolicyDecision(approved=False, reason="owner approves only publication")
 
 
-def _to_restored(service, intent):
+def _to_restored(service, intent, *, producer_identity=_PRODUCER):
     """Drive a managed transaction baseline -> restore; return the restored txn."""
     subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
     txn = service.open_cms_transaction(
-        intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE
+        intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+        producer_identity=producer_identity, binding=_SANDBOX,
     )
     txn = service.draft_cms_transaction(txn, change={"title": "new", "body": "hello"})
     txn = service.apply_cms_transaction(txn, change={"title": "new", "body": "hello"})
@@ -120,7 +152,8 @@ def test_c01_seam_owner_drives_baseline_draft_apply_readback_restore(tmp_path):
     subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
 
     txn = service.open_cms_transaction(
-        intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE
+        intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+        producer_identity=_PRODUCER, binding=_SANDBOX,
     )
     assert txn.stage == CMS_STAGE_BASELINE
     assert txn.subject_kind == "content"
@@ -157,7 +190,8 @@ def test_c01_seam_owner_refuses_out_of_order_stages(tmp_path):
     intent = _open_intent(service)
     subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
     txn = service.open_cms_transaction(
-        intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE
+        intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+        producer_identity=_PRODUCER, binding=_SANDBOX,
     )
     # An apply before a dry-run is refused.
     try:
@@ -183,7 +217,8 @@ def test_c01_seam_owner_refuses_a_repository_subject(tmp_path):
     repo = RepositorySubject(repo="org/repo", commit="a" * 40)
     try:
         service.open_cms_transaction(
-            intent.intent_id, repo, RawContentAdapter(), baseline=_BASELINE
+            intent.intent_id, repo, RawContentAdapter(), baseline=_BASELINE,
+            producer_identity=_PRODUCER, binding=_SANDBOX,
         )
     except WrongIntegrationModeError:
         pass
@@ -239,7 +274,8 @@ def test_c01_seam_owner_refuses_an_adapter_missing_a_capability(tmp_path):
     assert not hasattr(broken, "restore")  # but not implemented
     try:
         service.open_cms_transaction(
-            intent.intent_id, subject, broken, baseline=_BASELINE
+            intent.intent_id, subject, broken, baseline=_BASELINE,
+            producer_identity=_PRODUCER, binding=_SANDBOX,
         )
     except (CmsCapabilityError, ValueError):
         pass
@@ -271,7 +307,7 @@ def test_c02_seam_designated_authorization_binds_to_exact_revision(tmp_path):
     )
     decision = service.authorize_cms_publication(
         txn, authorization=good, artifact_digest="sha256:x",
-        producer_identity="worker-1", policy=_OwnerPublicationPolicy(),
+        review=_ind_review(), policy=_OwnerPublicationPolicy(),
     )
     assert decision.approved is True
 
@@ -282,7 +318,7 @@ def test_c02_seam_designated_authorization_binds_to_exact_revision(tmp_path):
     try:
         service.authorize_cms_publication(
             txn, authorization=stale, artifact_digest="sha256:x",
-            producer_identity="worker-1", policy=_OwnerPublicationPolicy(),
+            review=_ind_review(), policy=_OwnerPublicationPolicy(),
         )
     except PublicationRefused:
         pass
@@ -301,7 +337,7 @@ def test_c02_seam_unicorn_cannot_authorize_irreversible_publication(tmp_path):
     )
     decision = service.authorize_cms_publication(
         txn, authorization=auth, artifact_digest="sha256:x",
-        producer_identity="worker-1", policy=create_policy("unicorn"),
+        review=_ind_review(), policy=create_policy("unicorn"),
     )
     assert decision.approved is False
     assert decision.requires_human is True
@@ -321,7 +357,7 @@ def test_c02_seam_unicorn_cannot_widen_the_scope(tmp_path):
     try:
         service.authorize_cms_publication(
             txn, authorization=auth, artifact_digest="sha256:x",
-            producer_identity="worker-1", policy=create_policy("unicorn"),
+            review=_ind_review(), policy=create_policy("unicorn"),
             scope_target="other/channel", permitted_scope=scope,
         )
     except PublicationRefused:
@@ -342,7 +378,7 @@ def test_c02_seam_producer_cannot_authorize_its_own_publication(tmp_path):
     try:
         service.authorize_cms_publication(
             txn, authorization=self_auth, artifact_digest="sha256:x",
-            producer_identity="worker-1", policy=_OwnerPublicationPolicy(),
+            review=_ind_review(), policy=_OwnerPublicationPolicy(),
         )
     except PublicationRefused:
         pass
@@ -388,7 +424,8 @@ def test_c02_scoped_authorization_refuses_unbounded_publication():
     with pytest.raises(PublicationRefused):
         authorize_publication(
             auth, subject_revision=_REVISION, artifact_digest="sha256:x",
-            producer_identity="worker-1", policy=_OwnerPublicationPolicy(),
+            producer_identity=_PRODUCER, review=_ind_review(),
+            policy=_OwnerPublicationPolicy(),
             scope_target="prod/channel",
             permitted_scope=WriteScope(kind="content", allow=["sandbox"]),
         )
@@ -399,6 +436,7 @@ def test_c02_authorization_requires_designation():
     with pytest.raises(PublicationRefused):
         authorize_publication(
             None, subject_revision=_REVISION, artifact_digest="sha256:x",
+            producer_identity=_PRODUCER, review=_ind_review(),
             policy=_OwnerPublicationPolicy(),
         )
 
@@ -449,7 +487,8 @@ def test_c03_restore_failure_yields_a_named_blocker_not_a_claim(tmp_path):
 
     adapter = _DriftingAdapter()
     txn = service.open_cms_transaction(
-        intent.intent_id, subject, adapter, baseline=_BASELINE
+        intent.intent_id, subject, adapter, baseline=_BASELINE,
+        producer_identity=_PRODUCER, binding=_SANDBOX,
     )
     txn = service.draft_cms_transaction(txn, change={"title": "new", "body": "hello"})
     txn = service.apply_cms_transaction(txn, change={"title": "new", "body": "hello"})
@@ -466,7 +505,8 @@ def test_c03_seam_sandbox_binding_survives_a_recovered_controller(tmp_path):
     intent = _open_intent(service)
     subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
     txn = service.open_cms_transaction(
-        intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE
+        intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+        producer_identity=_PRODUCER, binding=_SANDBOX,
     )
     txn = service.draft_cms_transaction(txn, change={"title": "new", "body": "hello"})
     txn = service.apply_cms_transaction(txn, change={"title": "new", "body": "hello"})
@@ -573,6 +613,171 @@ def test_cms_transaction_refuses_a_repository_subject_and_bad_hashes():
             stage=CMS_STAGE_RESTORED,
             restored_hashes=CmsRawHashes(semantic="sha256:x", render="sha256:br"),
         )
+
+
+# ── B1 (safety critical): the producer identity is structurally mandatory ───
+
+
+def test_b1_seam_producer_cannot_bypass_by_omitting_the_identity(tmp_path):
+    """B1: a producer that authors its own authorization and omits/blank the
+    producer identity is *still* refused -- the identity is mandatory at the
+    transaction and derived by the controller, never caller-supplied."""
+    service, store = _controller_service(tmp_path)
+    intent = _open_intent(service)
+    subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
+
+    # Omitting the producer identity when *opening* the transaction is
+    # structurally impossible: the argument is required, so the call cannot
+    # even be made without it.
+    with pytest.raises(TypeError):
+        service.open_cms_transaction(
+            intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+            binding=_SANDBOX,
+        )
+    # Blanking it is refused by the owner (fail closed).
+    with pytest.raises(ValueError):
+        service.open_cms_transaction(
+            intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+            producer_identity="   ", binding=_SANDBOX,
+        )
+
+    # The controller's publication path *derives* the producer from the
+    # transaction: a self-authored authorization is refused even though the
+    # caller passes no producer identity at all.
+    txn = _to_restored(service, intent)  # producer_identity == _PRODUCER
+    self_auth = PublicationAuthorization(
+        authorizer=_PRODUCER, subject_revision=_REVISION, artifact_digest="sha256:x"
+    )
+    with pytest.raises(PublicationRefused):
+        service.authorize_cms_publication(
+            txn, authorization=self_auth, artifact_digest="sha256:x",
+            review=_ind_review(), policy=_OwnerPublicationPolicy(),
+        )
+    store.close()
+
+
+def test_b1_publication_is_refused_when_the_transaction_producer_is_unknown():
+    """B1: an unknown producer on the transaction refuses the publication
+    fail-closed rather than skipping the self-authorization check."""
+    txn = CmsTransaction(
+        run_id="run-1", subject="content:ch/e1@rev-1", subject_kind="content",
+        subject_revision=_REVISION, adapter="raw-dummy",
+        baseline_hashes=CmsRawHashes(semantic="sha256:b", render="sha256:br"),
+        producer_identity="",  # unknown producer
+    )
+    with pytest.raises(PublicationRefused):
+        authorize_publication(
+            PublicationAuthorization(
+                authorizer="owner-1", subject_revision=_REVISION,
+                artifact_digest="sha256:x",
+            ),
+            subject_revision=_REVISION, artifact_digest="sha256:x",
+            producer_identity=txn.producer_identity, review=_ind_review(),
+            policy=_OwnerPublicationPolicy(),
+        )
+
+
+# ── B2: the independent review is wired into the real publication path ──────
+
+
+def test_b2_seam_publication_requires_a_current_independent_review(tmp_path):
+    """B2: the controller refuses publication without a current independent
+    review for the exact revision/digest -- reached through the real service."""
+    service, store = _controller_service(tmp_path)
+    intent = _open_intent(service)
+    txn = _to_restored(service, intent)
+    auth = PublicationAuthorization(
+        authorizer="owner-1", subject_revision=_REVISION, artifact_digest="sha256:x"
+    )
+    policy = _OwnerPublicationPolicy()
+
+    # (a) No review at all.
+    with pytest.raises(PublicationRefused):
+        service.authorize_cms_publication(
+            txn, authorization=auth, artifact_digest="sha256:x", policy=policy,
+        )
+    # (b) A stale review (bound to a different revision) is refused.
+    with pytest.raises(PublicationRefused):
+        service.authorize_cms_publication(
+            txn, authorization=auth, artifact_digest="sha256:x", policy=policy,
+            review=_ind_review(subject_revision="rev-0"),
+        )
+    # (c) A stale review (bound to a different artifact digest) is refused.
+    with pytest.raises(PublicationRefused):
+        service.authorize_cms_publication(
+            txn, authorization=auth, artifact_digest="sha256:x", policy=policy,
+            review=_ind_review(artifact_digest="sha256:other"),
+        )
+    # (d) A review the producer answered to itself is not independent.
+    with pytest.raises(PublicationRefused):
+        service.authorize_cms_publication(
+            txn, authorization=auth, artifact_digest="sha256:x", policy=policy,
+            review=_ind_review(answering_identity=_PRODUCER),
+        )
+    # (e) A review under a non-reviewing role is an unsupported form.
+    with pytest.raises(PublicationRefused):
+        service.authorize_cms_publication(
+            txn, authorization=auth, artifact_digest="sha256:x", policy=policy,
+            review=_ind_review(role="worker"),
+        )
+    # (f) A review that does not cover the required criteria is refused.
+    with pytest.raises(PublicationRefused):
+        service.authorize_cms_publication(
+            txn, authorization=auth, artifact_digest="sha256:x", policy=policy,
+            review=_ind_review(review_criteria=("other",)),
+            expected_review_criteria=("cms-c2",),
+        )
+
+    # The current, independent, criteria-covering review is accepted.
+    decision = service.authorize_cms_publication(
+        txn, authorization=auth, artifact_digest="sha256:x", policy=policy,
+        review=_ind_review(review_criteria=("cms-c2",)),
+        expected_review_criteria=("cms-c2",),
+    )
+    assert decision.approved is True
+    store.close()
+
+
+# ── Advisory (promoted): the sandbox binding is structurally enforced ───────
+
+
+def test_binding_is_structurally_sandbox_and_refuses_everything_else(tmp_path):
+    """The binding discriminator: only an explicitly declared sandbox resolves;
+    an undeclared, unknown or production-declared binding is refused."""
+    # Constructing a production-declared or unknown-kind binding is refused.
+    with pytest.raises(CmsBindingRefused):
+        SandboxBinding(target="prod/ch", kind="production")
+    with pytest.raises(CmsBindingRefused):
+        SandboxBinding(target="x", kind="")
+    # Resolution refuses None (undeclared), unknown kinds and production.
+    with pytest.raises(CmsBindingRefused):
+        resolve_cms_sandbox_binding(None)
+    with pytest.raises(CmsBindingRefused):
+        resolve_cms_sandbox_binding({"kind": "staging", "target": "x"})
+    with pytest.raises(CmsBindingRefused):
+        resolve_cms_sandbox_binding({"kind": "production", "target": "prod/ch"})
+    assert resolve_cms_sandbox_binding(SandboxBinding(target="sandbox/ch")) == "sandbox/ch"
+    assert resolve_cms_sandbox_binding(
+        {"kind": "sandbox", "target": "sandbox/ch"}
+    ) == "sandbox/ch"
+
+    # The owner refuses to open a transaction on an undeclared binding ...
+    service, store = _controller_service(tmp_path)
+    intent = _open_intent(service)
+    subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
+    with pytest.raises(CmsBindingRefused):
+        service.open_cms_transaction(
+            intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+            producer_identity=_PRODUCER,  # no binding -> undeclared
+        )
+    # ... and on a production-declared binding.
+    with pytest.raises(CmsBindingRefused):
+        service.open_cms_transaction(
+            intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+            producer_identity=_PRODUCER,
+            binding={"kind": "production", "target": "prod/ch"},
+        )
+    store.close()
 
 
 if __name__ == "__main__":
