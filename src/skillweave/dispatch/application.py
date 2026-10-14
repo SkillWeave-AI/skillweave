@@ -1244,12 +1244,23 @@ class OperatorDispatchApplication:
         strict_adapter: Optional[HarnessAdapterProfile] = None,
         strict_skill_digests: Optional[Mapping[str, str]] = None,
         env: Optional[dict[str, str]] = None,
+        mcp_grant: Optional[Any] = None,
     ) -> DispatchRun:
         """Execute one wave and return a machine-readable run identifier.
 
         ``sink`` is the JSONL text stream the event stream appends to (defaults
         to ``sys.stdout``). Returns a :class:`DispatchRun` whose ``run_id`` is
         the machine-readable identifier.
+
+        ``mcp_grant`` (optional) is a
+        :class:`skillweave.mcp.bootstrap.HarnessMcpSessionGrant` threaded into
+        the *actual* child launch of every worker lane (both the single-lane
+        inline seam and the parallel fan-out seam): the adapter provisions the
+        granted MCP configuration into that child's environment and verifies,
+        from the child's own resolved environment, that it reaches the same
+        authority/state service. A child that lands elsewhere is refused, so a
+        grant never degrades to the interactive harness profile. Omitting it
+        (``None``, the default) preserves the historical launch exactly.
 
         ``gate_input`` (optional) carries the observed topology/integration facts
         (explicit integration lanes, a semantic conflict, per-lane eligibility).
@@ -1401,6 +1412,7 @@ class OperatorDispatchApplication:
                         round_=0,
                         provisioned=provisioned,
                         env=env,
+                        mcp_grant=mcp_grant,
                     )
                 else:
                     self._fanout_group(
@@ -1413,6 +1425,7 @@ class OperatorDispatchApplication:
                         round_=0,
                         provisioned=provisioned,
                         env=env,
+                        mcp_grant=mcp_grant,
                     )
 
             # Failure policy applied to typed failures; the legacy/untyped
@@ -1956,6 +1969,7 @@ class OperatorDispatchApplication:
         round_: int,
         provisioned: Optional[dict[str, ProvisionedWorkspace]] = None,
         env: Optional[dict[str, str]] = None,
+        mcp_grant: Optional[Any] = None,
     ) -> bool:
         stream.lane_started(wave=wave, lane_id=lane.id)
         command = self._command_for(lane, resolved)
@@ -2030,6 +2044,7 @@ class OperatorDispatchApplication:
                 artifact_store=self._active_store,
                 on_child_lifecycle=lifecycle,
                 env=env,
+                mcp_grant=mcp_grant,
             )
             children = _fanout_children(result)
             self._record_child_results(lane, children, round_=round_)
@@ -2080,6 +2095,7 @@ class OperatorDispatchApplication:
         round_: int,
         provisioned: Optional[dict[str, ProvisionedWorkspace]] = None,
         env: Optional[dict[str, str]] = None,
+        mcp_grant: Optional[Any] = None,
     ) -> None:
         # Start every lane in the group at once (overlap), then record per-lane.
         commands = [self._command_for(lane, resolved) for lane in group]
@@ -2171,6 +2187,7 @@ class OperatorDispatchApplication:
                 artifact_store=self._active_store,
                 on_child_lifecycle=lifecycle,
                 env=env,
+                mcp_grant=mcp_grant,
             )
             children = getattr(result, "children", None) or []
             for lane, child, dispatch_id in zip(group, children, dispatch_ids):

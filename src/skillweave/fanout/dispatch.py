@@ -352,6 +352,7 @@ def fan_out_dispatch(
     artifact_store: Optional[Any] = None,
     on_child_lifecycle: Optional[Callable[..., None]] = None,
     env: Optional[dict[str, str]] = None,
+    mcp_grant: Optional[Any] = None,
 ) -> FanOutResult:
     """Start every command as a real process, then wait for all.
 
@@ -414,6 +415,12 @@ def fan_out_dispatch(
     still reaped, and after the fan-out has finished the exception surfaces as a
     :class:`LifecycleObservationError` — never as an unreaped child and never as
     a silently dropped success.
+
+    ``mcp_grant`` (optional) is a
+    :class:`skillweave.mcp.bootstrap.HarnessMcpSessionGrant` provisioned into
+    every child's actual launch and verified from that child's own resolved
+    environment; a child that does not reach the granted authority/state
+    service is refused. Omitting it preserves the historical fan-out exactly.
     """
     created_at = created_at or datetime.now(timezone.utc).isoformat()
 
@@ -464,6 +471,30 @@ def fan_out_dispatch(
             return ctx.subject_repo, ctx.subject_commit, ctx.tool, ctx.cwd
         return subject_repo, subject_commit, tool, cwd
 
+    # ``mcp_grant`` (optional) is the same "provision then verify inside the
+    # actual child launch" seam the single-lane inline path uses: the granted
+    # MCP configuration is merged into the child's env and, immediately after
+    # the child starts, its *own* resolved environment is checked to reach the
+    # same authority/state service. A child that landed elsewhere is refused,
+    # never silently downgraded to the interactive harness profile. Omitting
+    # it (``None``, the default) preserves the historical fan-out exactly.
+    grant_env: Optional[dict[str, str]] = None
+    if mcp_grant is not None:
+        from skillweave.mcp import bootstrap as _mcp_bootstrap
+
+        grant_env = _mcp_bootstrap.grant_child_env(mcp_grant)
+        _mcp_bootstrap.assert_no_ambient_credentials(grant_env)
+
+    child_env: Optional[dict[str, str]] = env
+    child_allowlist: Optional[List[str]] = None
+    if grant_env is not None:
+        child_env = {**(env or {}), **grant_env}
+        # The granted child is launched under an *explicit* allowlist (the
+        # granted MCP keys plus whatever the caller named), so an ambient
+        # provider credential can never leak alongside the grant -- the same
+        # discipline the single-lane inline seam applies.
+        child_allowlist = sorted(set(env or ()) | set(grant_env))
+
     handles: List[Tuple[int, Any, List[str]]] = []
     for index, argv in enumerate(commands):
         child_run_id = f"{run_id}-{index}"
@@ -478,8 +509,11 @@ def fan_out_dispatch(
                 model=resolved_models[index],
                 created_at=created_at,
                 cwd=child_cwd,
-                env=env,
+                env=child_env,
+                env_allowlist=child_allowlist,
             )
+            if mcp_grant is not None:
+                handle = _mcp_bootstrap.verify_child_launch(mcp_grant, handle)
         except Exception as exc:  # noqa: BLE001
             # A child that never spawned is a launch failure, never a silent
             # gap: it still lands in ``children`` with its own outcome and a

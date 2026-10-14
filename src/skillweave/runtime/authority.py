@@ -349,7 +349,7 @@ _NON_FORWARDABLE_ROUTES = frozenset({"passthrough", "echo", "reflect"})
 #: ``reviewer`` is refused -- the role is read from the registry, not the wire.
 MCP_ROLE_SCOPES: dict[str, dict[str, Any]] = {
     "worker": {
-        "operations": frozenset({"read_run", "write_own_artifact", "start_own_attempt"}),
+        "operations": frozenset({"read_run", "write_own_artifact", "start_own_attempt", "attach_harness"}),
         "can_review": False,
         "can_approve": False,
         "can_mutate_run_state": False,
@@ -365,7 +365,7 @@ MCP_ROLE_SCOPES: dict[str, dict[str, Any]] = {
         "requires_run_binding": True,
     },
     "reviewer": {
-        "operations": frozenset({"read_run", "review_run", "approve_gate"}),
+        "operations": frozenset({"read_run", "review_run", "approve_gate", "attach_harness"}),
         "can_review": True,
         "can_approve": True,
         "can_mutate_run_state": False,
@@ -375,7 +375,8 @@ MCP_ROLE_SCOPES: dict[str, dict[str, Any]] = {
     "controller": {
         "operations": frozenset(
             {"read_run", "write_run_state", "start_run", "cancel_run",
-             "resume_run", "admit_gate", "forward"}
+             "resume_run", "admit_gate", "forward", "attach_harness",
+             "start_own_attempt", "write_own_artifact"}
         ),
         "can_review": False,
         "can_approve": False,
@@ -1199,9 +1200,10 @@ class MCPPrincipalAuthority:
         Unlike :meth:`refuse_role_escalation` (which compares a *demand* for the
         caller's own role), this governs what a principal may **mint**: the
         roles are distinct capability sets, so a child is admitted only when the
-        child's operations are a subset of the principal's. A controller can
-        attach a worker; a worker can never attach a reviewer or controller --
-        the child carries no authority the parent did not hold.
+        child's operations are a subset of the principal's. The controller (the
+        dispatch root, Main) holds every attachable operation, so it may attach
+        a worker (Ops) or a reviewer; a worker can never attach a reviewer or
+        controller -- the child carries no authority the parent did not hold.
         """
         if child_role not in MCP_ROLE_SCOPES:
             raise RoleEscalationRefused(
@@ -1211,9 +1213,6 @@ class MCPPrincipalAuthority:
                 action="attach",
                 extra={"child_role": child_role},
             )
-        # The controller owns dispatch, so it may attach a child of any role.
-        if principal.role == "controller":
-            return
         parent_ops = MCP_ROLE_SCOPES[principal.role]["operations"]
         child_ops = MCP_ROLE_SCOPES[child_role]["operations"]
         if not child_ops <= parent_ops:

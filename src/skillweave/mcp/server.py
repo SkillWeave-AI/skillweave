@@ -965,14 +965,19 @@ def harness_session_grant(
     """Mint a ``harness-mcp-session-grant-v1`` bound to run/task/attempt.
 
     This is the **real consumer/controller seam** for criterion 1: the caller is
-    authorized first (so only an already-authenticated controller may attach a
-    child), and the resulting grant carries a *server-issued* token scoped to
-    the actual run. The authority the grant mints is ``role``; the gate refuses
-    a client asking for a stronger role than its authenticated principal holds
-    (never granted), whether it names that role directly or via
+    authorized first on the *delegation* operation (``attach_harness``), so the
+    three first-class principals -- Main (``controller``), Ops (``worker``) and
+    Reviewer (``reviewer``) -- each reach this seam under their own
+    server-issued identity, and the resulting grant carries a *server-issued*
+    token scoped to the actual run. The authority the grant mints is ``role``;
+    the gate refuses a client asking for a stronger role than its authenticated
+    principal holds (never granted), whether it names that role directly or via
     ``requested_role``. A principal may only attach a child whose authority is
-    **no broader than its own** -- so a controller can attach a worker, but a
-    worker can never mint a reviewer/controller child.
+    **no broader than its own** -- so a controller can attach a worker or a
+    reviewer, but a worker can never mint a reviewer/controller child (the
+    subset rule above decides, by capability, for every non-controller; the
+    controller is the dispatch root and already *holds* every attachable role's
+    operations, so the same subset rule admits it too).
 
     The grant is bound to the one logical durable process service composed from
     ``db_path``/``mailbox_path``/``artifacts_path``/``stream_root``; a caller
@@ -980,7 +985,7 @@ def harness_session_grant(
     attach to an isolated per-harness controller.
     """
     gate_principal, refusal = gate_operation(
-        "start_run" if not run_id else "write_run_state",
+        "attach_harness",
         session_token,
         requested_role=requested_role,
         run_id=run_id,
@@ -989,13 +994,24 @@ def harness_session_grant(
     )
     if refusal is not None:
         return refusal
+    if gate_principal is None:
+        # In-process/direct-caller path (no authority bound, the CLI-parity
+        # seam): there is no server registry to mint against, so the seam is
+        # explicitly unavailable rather than silently serving an unscoped grant.
+        return json.dumps(
+            {"status": "refused", "code": "harness_grant_requires_authority",
+             "message": "harness session grants require a bound MCP authority"}
+        )
     try:
         from skillweave.mcp import bootstrap as _bootstrap
 
         # The *minted* authority is gated too: a child may never carry authority
-        # broader than the authenticated principal's own (criterion 1).
-        if gate_principal is not None:
-            _bound_authority().refuse_child_role_escalation(gate_principal, role)
+        # broader than the authenticated principal's own (criterion 1). This is
+        # load-bearing for every first-class principal because the operation
+        # above already admitted Main/Ops/Reviewer (a stronger role demand is
+        # refused by ``refuse_role_escalation``), so the subset rule -- not an
+        # unreachable short-circuit -- is what bounds the minted child.
+        _bound_authority().refuse_child_role_escalation(gate_principal, role)
 
         service = control.service_for_binding(
             db_path,
@@ -1008,7 +1024,7 @@ def harness_session_grant(
         grant = issue_harness_session_grant(
             authority=authority,
             role=role,
-            client_id=client_id or (principal.client_id if principal else "controller"),
+            client_id=client_id or principal.client_id,
             transport=transport,
             run_id=run_id,
             task_id=task_id,
@@ -1118,7 +1134,7 @@ def startup_and_bind_stdio(
     return _READY_SESSION_TOKEN
 
 
-def main() -> None:
+def main(*, process_service: "object | None" = None, bind_service: bool = False) -> None:
     """Serve the command server, or refuse with an explicit unavailable state.
 
     This is the only entry the module exposes as a *server*. With no ``mcp``
@@ -1132,6 +1148,18 @@ def main() -> None:
     proof of authorization. Both are enforced before the runner is invoked;
     when the host has not already bound an authority, startup performs the
     production issuance itself (:func:`startup_and_bind_stdio`).
+
+    ``process_service`` (optional) is the
+    :class:`skillweave.mcp.bootstrap.HarnessProcessService` the started stdio
+    session operates against; when supplied, the minted controller session is
+    scoped to it (criterion 3). ``bind_service`` (optional, default ``False``)
+    is the opt-in that makes the *production* start compose that one service
+    itself from the server-owned binding (``SKILLWEAVE_AGENT_MAILBOX`` +
+    :func:`default_mailbox_path`) and pass it to the startup seam, so a real
+    ``python -m skillweave.mcp.server`` / ``skillweave-mcp`` start is admitted
+    onto the same authority/state service rather than an unscoped session. With
+    the default ``False`` (or a host that already bound an authority) the
+    historical unscoped start is preserved exactly, so this remains additive.
     """
     # A *documented* non-zero exit for either refusal: the server never starts
     # without its dependency or an explicit, authenticated supervisor identity.
@@ -1148,7 +1176,18 @@ def main() -> None:
             # The host process did not bind an authority: perform the production
             # issuance at startup, so a reachable server is authorized rather
             # than trusted for merely being reachable.
-            startup_and_bind_stdio()
+            if process_service is None and bind_service:
+                # Opt-in production binding: compose the one durable process
+                # service from the server-owned inputs and scope the minted
+                # controller stdio session to it (criterion 3). The default
+                # (``bind_service=False``) keeps the historical unscoped start.
+                default_db, default_artifacts = server_default_paths()
+                process_service = control.service_for_binding(
+                    default_db,
+                    mailbox_path=default_mailbox_path(),
+                    artifacts_path=default_artifacts,
+                )
+            startup_and_bind_stdio(process_service=process_service)
         runner = getattr(mcp, "run", None)
         if not callable(runner):
             raise control.McpDependencyUnavailable(control.DEGRADED_REASON)

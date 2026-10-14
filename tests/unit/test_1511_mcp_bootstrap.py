@@ -225,16 +225,18 @@ class TestOneProcessServiceScopedPrincipals:
     ):
         """A child may never carry authority the parent does not hold.
 
-        A worker asking for a reviewer child grant is refused -- whether by the
-        operation gate (a worker may not write run state) or the minted-role
-        check (reviewer authority is not a subset of worker authority). Either
-        way the refusal is typed and no token is issued; the caller gains no
-        authority by naming a stronger ``role``. (A controller *may* attach a
+        A worker asking for a reviewer child grant is refused -- the worker
+        legitimately reaches the delegation operation ``attach_harness`` (every
+        first-class principal does), so the *only* thing that bounds the minted
+        child is the subset rule: reviewer authority is not a subset of worker
+        authority. The refusal is typed and no token is issued; the caller gains
+        no authority by naming a stronger ``role``. (A controller *may* attach a
         worker child -- proven by the scoped-grant test above.)
         """
         svc = _service(tmp_path)
         worker = authority.issue_session(
-            role="worker", client_id="ops", transport="stdio", run_ids=["run-1"]
+            role="worker", client_id="ops", transport="stdio", run_ids=["run-1"],
+            allowed_roots=[str(tmp_path)],
         )
         out = mcp_server.harness_session_grant(
             role="reviewer",
@@ -251,11 +253,42 @@ class TestOneProcessServiceScopedPrincipals:
         )
         record = json.loads(out)
         assert record["status"] == "refused"
-        assert record["code"] in (
-            "role_escalation_refused",
-            "operation_not_permitted",
-        ), record
+        assert record["code"] == "role_escalation_refused", record
         assert "env" not in record  # nothing minted
+
+    def test_worker_reaches_the_delegation_operation_for_its_own_role(
+        self, authority, tmp_path
+    ):
+        """Ops (worker) is a first-class attaching principal, not a bypass.
+
+        The delegation operation ``attach_harness`` is held by Main, Ops and
+        Reviewer alike, so the worker is admitted *to the seam* and the subset
+        rule -- not an operation gate that only a controller could pass -- is
+        what decides the minted child. A worker may attach a child of its own
+        (no broader) authority.
+        """
+        svc = _service(tmp_path)
+        worker = authority.issue_session(
+            role="worker", client_id="ops", transport="stdio", run_ids=["run-1"],
+            allowed_roots=[str(tmp_path)],
+        )
+        out = mcp_server.harness_session_grant(
+            role="worker",
+            client_id="ops",
+            transport="stdio",
+            run_id="run-1",
+            task_id="task-1",
+            attempt=1,
+            db_path=svc.db_path,
+            artifacts_path=svc.artifacts_path,
+            stream_root=svc.stream_root,
+            mailbox_path=svc.mailbox_path,
+            session_token=worker,
+        )
+        record = json.loads(out)
+        assert record["status"] == "ok", record
+        issued = authority.verify_session(record["env"][boot.ENV_MCP_SESSION_TOKEN])
+        assert issued.role == "worker"
 
     def test_worker_cannot_mint_a_reviewer_child_via_a_permitted_operation(
         self, authority, tmp_path
@@ -614,6 +647,324 @@ class TestScopedHttpAndStdioSameAuthority:
         finally:
             # No authority leaks into another test module.
             mcp_server._AUTHORITY = previous
+
+
+# ===========================================================================
+# Criterion 2/3 through the *production* entry points: the dispatch application
+# launch path and the server's own ``main()``/stdio startup
+# ===========================================================================
+
+
+def _main_stubs(monkeypatch, server_mod):
+    """Make ``main()`` reachable without the real ``mcp`` dependency.
+
+    ``main()`` first calls ``control.require_mcp()`` (an explicit dependency
+    refusal when the real package is absent) and only then ``mcp.run()``. Both
+    seams are stubbed so the test observes the *startup* path (issuance + the
+    process-service binding), never a live server. The real
+    ``startup_and_bind_stdio`` is wrapped (not replaced) so the token is still
+    minted by the production issuance while the ``process_service`` it was
+    handed is recorded.
+    """
+    monkeypatch.setattr(server_mod.control, "require_mcp", lambda: None)
+    minted: dict = {}
+    real_startup = server_mod.startup_and_bind_stdio
+
+    def _record_startup(*, process_service=None):
+        minted["service"] = process_service
+        token = real_startup(process_service=process_service)
+        minted["bound"] = server_mod._bound_authority()
+        return token
+
+    monkeypatch.setattr(server_mod, "startup_and_bind_stdio", _record_startup)
+
+    def _capture():
+        minted["token"] = server_mod._READY_SESSION_TOKEN
+
+    monkeypatch.setattr(server_mod, "mcp", _McpStub(_capture), raising=False)
+    return minted
+
+
+class TestProductionEntryPointsWireTheGrantAndTheService:
+    def test_dispatch_application_threads_the_grant_into_the_inline_launch(
+        self, tmp_path, monkeypatch
+    ):
+        """The real ``DispatchRun._run_lane`` inline seam gets the grant.
+
+        Criterion 2 is only discharged when the *production* dispatch call
+        provisions the grant inside the actual child launch. This drives the
+        application's own single-lane path (``_run_lane`` -> its inline seam),
+        not ``_default_inline_seam`` directly, and proves the grant reaches
+        ``runner_adapter.start_process`` with the MCP allowlist attached.
+        """
+        import types
+
+        from skillweave.dispatch.application import OperatorDispatchApplication
+        from skillweave.dispatch.application import _default_inline_seam as _seam
+
+        svc = _service(tmp_path)
+        grant = boot.HarnessMcpSessionGrant(
+            schema_id=boot.HARNESS_MCP_SESSION_GRANT_SCHEMA_ID,
+            schema_version="1.0.0",
+            run_id="run-1",
+            task_id="task-1",
+            attempt=1,
+            transport="stdio",
+            session_token="tok-c2",
+            service=svc,
+            start_scope="task-1/attempt-1",
+        )
+        captured = {}
+
+        def fake_start(command, **kwargs):
+            captured.update(kwargs)
+            return _FakeHandle(effective_env=kwargs.get("env"))
+
+        # The *real* inline seam is left in place: only its child primitive is
+        # stubbed, so the assertion proves the application threaded the grant
+        # into the production launch path rather than into a fake seam.
+        monkeypatch.setattr(
+            "skillweave.runtime.runner_adapter.start_process",
+            fake_start,
+            raising=False,
+        )
+
+        run = OperatorDispatchApplication()
+        lane = types.SimpleNamespace(
+            id="ops",
+            role="worker",
+            requires_stdin=False,
+            repo="",
+            base="",
+            execution_model=None,
+            criteria_covered=lambda: None,
+        )
+        resolved = types.SimpleNamespace(
+            role=lambda r: types.SimpleNamespace(
+                tool=types.SimpleNamespace(name="claude"), model=None
+            )
+        )
+        run._command_for = lambda lane, resolved: ["echo", "hi"]
+        run._claim_namespace = lambda *a, **k: None
+        run._record_child_results = lambda *a, **k: None
+        run._record_job_attempt = lambda *a, **k: None
+        run._gate_required_evidence = lambda *a, **k: None
+        run._record_failure = lambda *a, **k: None
+        run._active_store = None
+        run._typed_failure = {}
+        run._wired_lifecycle = lambda *a, **k: (lambda **kwargs: None)
+        run._active_heartbeat_pumps = {}
+        run._emit_status = lambda *a, **k: None
+        run._inline = lambda: _seam
+        run._lane_cwd = lambda *a, **k: str(tmp_path)
+        run._model_for = lambda *a, **k: "claude-sonnet-4"
+
+        class _Stream:
+            def __getattr__(self, _name):
+                return lambda **kwargs: None
+
+        run._run_lane(
+            "run-1",
+            "0",
+            lane,
+            resolved,
+            _Stream(),
+            b"",
+            round_=0,
+            env={},
+            mcp_grant=grant,
+        )
+        # Criterion 2: the effective child env is provisioned inside the launch.
+        assert captured["env"][boot.ENV_MCP_SESSION_TOKEN] == "tok-c2"
+        assert captured["env_allowlist"] is not None
+        assert boot.ENV_MCP_SESSION_TOKEN in captured["env_allowlist"]
+
+    def test_dispatch_application_without_a_grant_keeps_legacy_env(
+        self, tmp_path, monkeypatch
+    ):
+        """No grant threaded -> the historical env path is byte-for-byte intact."""
+        import types
+
+        from skillweave.dispatch.application import OperatorDispatchApplication
+
+        captured = {}
+
+        def fake_start(command, **kwargs):
+            captured.update(kwargs)
+            return _FakeHandle(effective_env=kwargs.get("env"))
+
+        monkeypatch.setattr(
+            "skillweave.runtime.runner_adapter.start_process",
+            fake_start,
+            raising=False,
+        )
+
+        run = OperatorDispatchApplication()
+        lane = types.SimpleNamespace(
+            id="ops",
+            role="worker",
+            requires_stdin=False,
+            repo="",
+            base="",
+            criteria_covered=lambda: None,
+        )
+        resolved = types.SimpleNamespace(
+            role=lambda r: types.SimpleNamespace(
+                tool=types.SimpleNamespace(name="claude"), model=None
+            )
+        )
+        run._command_for = lambda lane, resolved: ["echo", "hi"]
+        run._claim_namespace = lambda *a, **k: None
+        run._record_child_results = lambda *a, **k: None
+        run._record_job_attempt = lambda *a, **k: None
+        run._gate_required_evidence = lambda *a, **k: None
+        run._record_failure = lambda *a, **k: None
+        run._active_store = None
+        run._typed_failure = {}
+        run._wired_lifecycle = lambda *a, **k: (lambda **kwargs: None)
+        run._active_heartbeat_pumps = {}
+        run._emit_status = lambda *a, **k: None
+        run._lane_cwd = lambda *a, **k: str(tmp_path)
+        run._model_for = lambda *a, **k: "claude-sonnet-4"
+
+        class _Stream:
+            def __getattr__(self, _name):
+                return lambda **kwargs: None
+
+        run._run_lane(
+            "run-1",
+            "0",
+            lane,
+            resolved,
+            _Stream(),
+            b"",
+            round_=0,
+            env={"LEGACY": "1"},
+        )
+        # Additive: with no grant there is no allowlist and the caller env is
+        # passed through untouched.
+        assert captured["env"] == {"LEGACY": "1"}
+        assert captured.get("env_allowlist") is None
+
+    def test_fanout_seam_provisions_and_verifies_the_grant(
+        self, tmp_path, monkeypatch
+    ):
+        """The parallel fan-out seam also provisions + verifies the grant.
+
+        Criterion 2 covers the *parallel* child launch too: every child of a
+        fan-out group is launched with the granted MCP configuration under an
+        explicit allowlist and verified from its own resolved environment.
+        """
+        from skillweave.fanout.dispatch import fan_out_dispatch
+
+        svc = _service(tmp_path)
+        grant = boot.HarnessMcpSessionGrant(
+            schema_id=boot.HARNESS_MCP_SESSION_GRANT_SCHEMA_ID,
+            schema_version="1.0.0",
+            run_id="run-1",
+            task_id="task-1",
+            attempt=1,
+            transport="stdio",
+            session_token="tok-fan",
+            service=svc,
+            start_scope="task-1/attempt-1",
+        )
+        started = []
+
+        def fake_start(command, **kwargs):
+            started.append(kwargs)
+            return _FakeHandle(effective_env=kwargs.get("env"))
+
+        monkeypatch.setattr(
+            "skillweave.runtime.runner_adapter.start_process",
+            fake_start,
+            raising=False,
+        )
+
+        result = fan_out_dispatch(
+            [["echo", "a"], ["echo", "b"]],
+            run_id="run-1",
+            subject_repo="repo",
+            subject_commit="deadbeef",
+            tool="claude",
+            model="claude-sonnet-4",
+            env={"LEGACY": "1"},
+            mcp_grant=grant,
+        )
+        assert len(started) == 2
+        for kwargs in started:
+            assert kwargs["env"][boot.ENV_MCP_SESSION_TOKEN] == "tok-fan"
+            assert kwargs["env"]["LEGACY"] == "1"
+            allowlist = kwargs["env_allowlist"]
+            assert allowlist is not None
+            assert boot.ENV_MCP_SESSION_TOKEN in allowlist
+            assert "LEGACY" in allowlist
+        assert result is not None
+
+    def test_main_binds_a_process_service_when_opted_in(
+        self, tmp_path, monkeypatch
+    ):
+        """``main(bind_service=True)`` scopes the started session to one service.
+
+        Criterion 3 is discharged at the real ``main()`` entry: with the opt-in
+        the production start composes the one durable process service itself and
+        the minted controller stdio session is bound to it.
+        """
+        import skillweave.mcp.server as server_mod
+
+        monkeypatch.setenv(server_mod.SUPERVISOR_ENV, "local-main")
+        monkeypatch.setenv(server_mod.MAILBOX_PATH_ENV, str(tmp_path / "mb.jsonl"))
+        # Keep the default store binding inside the tmp tree.
+        monkeypatch.chdir(tmp_path)
+        previous = server_mod._AUTHORITY
+        previous_ready = server_mod._READY_SESSION_TOKEN
+        minted = _main_stubs(monkeypatch, server_mod)
+        try:
+            server_mod.main(bind_service=True)
+        finally:
+            server_mod._AUTHORITY = previous
+            server_mod._READY_SESSION_TOKEN = previous_ready
+
+        # Criterion 3: the session is scoped to the one composed process
+        # service, not an unscoped per-harness start.
+        assert minted["service"] is not None
+        auth = minted["bound"]
+        assert auth is not None
+        principal = auth.verify_session(minted["token"])
+        assert principal.role == "controller"
+
+    def test_main_without_opt_in_keeps_the_historical_unscoped_start(
+        self, tmp_path, monkeypatch
+    ):
+        """Default ``main()`` preserves the historical unscoped session."""
+        import skillweave.mcp.server as server_mod
+
+        monkeypatch.setenv(server_mod.SUPERVISOR_ENV, "local-main")
+        monkeypatch.chdir(tmp_path)
+        previous = server_mod._AUTHORITY
+        previous_ready = server_mod._READY_SESSION_TOKEN
+        minted = _main_stubs(monkeypatch, server_mod)
+        try:
+            server_mod.main()
+        finally:
+            server_mod._AUTHORITY = previous
+            server_mod._READY_SESSION_TOKEN = previous_ready
+
+        # Additive: the default start binds no process service at all.
+        assert minted["service"] is None
+        auth = minted["bound"]
+        principal = auth.verify_session(minted["token"])
+        assert principal.role == "controller"
+
+
+class _McpStub:
+    """A minimal stand-in for the ``mcp`` package in ``main()`` tests."""
+
+    def __init__(self, runner):
+        self._runner = runner
+
+    def run(self):
+        return self._runner()
 
 
 # ===========================================================================
