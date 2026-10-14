@@ -36,6 +36,12 @@ from typing import Any, Mapping, Optional, Sequence
 #: The provider-neutral capability vocabulary. Core dispatch branches on the
 #: *capability*, never on the adapter; an adapter's data file maps itself to a
 #: subset of these. A missing capability falls closed to ``False``.
+#:
+#: SW-1511-RECOVERY criterion 2 adds ``session-resume``: an adapter attests it
+#: *only* when it can resume an actual provider session across a controller
+#: restart. A recovered controller uses actual session resume only against an
+#: attested adapter and otherwise reports a named checkpoint continuation --
+#: never fabricated session-UUID continuity.
 CAPABILITIES: tuple[str, ...] = (
     "native-tool",
     "external-process",
@@ -45,6 +51,7 @@ CAPABILITIES: tuple[str, ...] = (
     "cancel",
     "state-namespace",
     "installed-skill-digest",
+    "session-resume",
 )
 
 

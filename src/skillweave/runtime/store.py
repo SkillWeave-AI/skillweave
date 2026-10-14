@@ -25,6 +25,17 @@ from .native_process import (
     # the module -- resumes the one verified owned attempt instead of replaying
     # the predecessor's pending launch intent.
     NativeProcessService,
+    # SW-1511-RECOVERY criterion 2: the ``harness-continuation-v1`` decision.
+    # Re-exported through the same store seam so the recovered controller (via
+    # ``NativeProcessService.resume``) continues an owned attempt with an
+    # actual session resume *only* for an attested harness capability, and
+    # otherwise a named-limitation checkpoint continuation.
+    HARNESS_CONTINUATION_SCHEMA_ID,
+    HARNESS_SESSION_RESUME_CAPABILITY,
+    CONTINUATION_SESSION_RESUME,
+    CONTINUATION_CHECKPOINT,
+    HarnessContinuation,
+    plan_harness_continuation,
     StaleFencingTokenError,
 )
 

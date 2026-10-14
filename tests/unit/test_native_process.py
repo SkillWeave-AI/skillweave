@@ -49,6 +49,12 @@ from skillweave.runtime.native_process import (
     EVIDENCE_VIEW_SCHEMA_ID,
     EVIDENCE_VIEW_SCHEMA_VERSION,
     GATE_ACCEPTED,
+    CONTINUATION_CHECKPOINT,
+    CONTINUATION_SESSION_RESUME,
+    HARNESS_CONTINUATION_SCHEMA_ID,
+    HARNESS_SESSION_RESUME_CAPABILITY,
+    LIMITATION_SESSION_UNKNOWN,
+    LIMITATION_UNSUPPORTED_RESUME,
     INTEGRATION_CONTENT_TRANSACTION,
     INTEGRATION_GIT_MERGE,
     INTENT_FAILED,
@@ -71,6 +77,7 @@ from skillweave.runtime.native_process import (
     DispatchIntent,
     DuplicateDispatchError,
     EvidenceDelta,
+    HarnessContinuation,
     LeaseNotHeldError,
     LeaseRefusedError,
     NativeProcessCheckpoint,
@@ -88,6 +95,7 @@ from skillweave.runtime.native_process import (
     integration_mode_for,
     is_repository_subject,
     plan_continuation,
+    plan_harness_continuation,
     plan_readiness,
     resolve_integration,
     subject_kind_of,
@@ -1338,6 +1346,197 @@ def test_generic_annotations_survive_get_type_hints():
 def test_public_sequence_annotation_names_the_local_dataclass_not_typing():
     hints = get_type_hints(build_sessions)
     assert hints["sequence"] is DagSequence
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SW-1511-RECOVERY criterion 2: harness-continuation-v1.
+#
+# Actual session resume is used *only* for an attested harness capability; an
+# unsupported resume reports a named limitation and continues from the durable
+# checkpoint -- the predecessor's session UUID is never carried forward as if
+# the session were still live.  These exercise the seam a real controller
+# takeover reaches: ``NativeProcessService.resume`` (the same call the durable
+# store re-exports) produces the ``harness_continuation`` statement, and the
+# checkpoint carries it.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_resume_without_attested_capability_reports_named_checkpoint_continuation():
+    # Negative path: the adapter does NOT attest session resume, so the
+    # recovered controller continues from the durable checkpoint and reports
+    # the limitation by name -- no session UUID is carried forward.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = NativeProcessService(store, "controller-a")
+        first.acquire(ttl_seconds=0)  # expired: forcible takeover
+        first.dispatch(
+            run_id="run-1", task_id="task-a", attempt=1,
+            process_identity=_live_identity_record(),
+            route="provider/model", session_id="sess-live",
+        )
+        store.close()
+
+        reopened = _store(tmp)
+        recovered = NativeProcessService(reopened, "controller-b")
+        _, checkpoint = recovered.resume(
+            ttl_seconds=3600, resume_capability_attested=False,
+        )
+        continuation = checkpoint.harness_continuation
+        assert continuation is not None
+        assert continuation["schema_id"] == HARNESS_CONTINUATION_SCHEMA_ID
+        assert continuation["mode"] == CONTINUATION_CHECKPOINT
+        assert continuation["session_id"] == ""  # never a fabricated UUID
+        assert continuation["limitation"] == LIMITATION_UNSUPPORTED_RESUME
+        assert continuation["reason"]  # a named reason, never a bare False
+        assert continuation["resume_capability_attested"] is False
+        # The checkpoint still adopts the one verified owned attempt (criterion
+        # 1) -- the continuation is *how* it continues, not *whether*.
+        assert checkpoint.resume_decision_event["decision"] == RESUME_ADOPTED
+        reopened.close()
+
+
+def test_resume_with_attested_capability_resumes_the_actual_session_uuid():
+    # Positive path: the adapter attests session resume and the predecessor's
+    # session identity is durably recorded, so the recovered controller resumes
+    # the *actual* session UUID (the same one), not a fabricated continuation.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = NativeProcessService(store, "controller-a")
+        first.acquire(ttl_seconds=0)
+        intent, _ = first.dispatch(
+            run_id="run-1", task_id="task-a", attempt=1,
+            process_identity=_live_identity_record(),
+            route="provider/model", session_id="sess-live",
+        )
+        store.close()
+
+        reopened = _store(tmp)
+        recovered = NativeProcessService(reopened, "controller-b")
+        _, checkpoint = recovered.resume(
+            ttl_seconds=3600, resume_capability_attested=True,
+        )
+        continuation = checkpoint.harness_continuation
+        assert continuation is not None
+        assert continuation["mode"] == CONTINUATION_SESSION_RESUME
+        assert continuation["resume_capability_attested"] is True
+        assert continuation["session_id"] == "sess-live"
+        assert continuation["intent_id"] == intent.intent_id
+        assert continuation["limitation"] == ""
+        reopened.close()
+
+
+def test_resume_attested_but_no_recorded_session_falls_to_checkpoint():
+    # Fail-closed: the adapter attests the capability but no prior session
+    # identity was durably recorded, so an actual session resume is NOT
+    # fabricated -- the continuation names the limitation and carries no UUID.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = NativeProcessService(store, "controller-a")
+        first.acquire(ttl_seconds=0)
+        first.dispatch(
+            run_id="run-1", task_id="task-a", attempt=1,
+            process_identity=_live_identity_record(),
+            route="provider/model", session_id="",  # no session recorded
+        )
+        store.close()
+
+        reopened = _store(tmp)
+        recovered = NativeProcessService(reopened, "controller-b")
+        _, checkpoint = recovered.resume(
+            ttl_seconds=3600, resume_capability_attested=True,
+        )
+        continuation = checkpoint.harness_continuation
+        assert continuation["mode"] == CONTINUATION_CHECKPOINT
+        assert continuation["session_id"] == ""
+        assert continuation["limitation"] == LIMITATION_SESSION_UNKNOWN
+        reopened.close()
+
+
+def test_resume_without_a_verified_owned_attempt_never_resumes_the_old_session():
+    # Negative path: nothing verifiable is in flight, so the recovered
+    # controller refuses the adoption (criterion 1) AND must not resume the
+    # predecessor's session -- even with the capability attested, an
+    # un-adopted attempt has no owned session to continue.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = NativeProcessService(store, "controller-a")
+        first.acquire(ttl_seconds=0)
+        # A recorded identity that can no longer be observed: not adoptable.
+        first.dispatch(
+            run_id="run-1", task_id="task-a", attempt=1,
+            process_identity={
+                "pid": 1, "start_time": "0.0", "exec_path": "/nonexistent",
+                "argv": ["nonexistent"],
+            },
+            route="provider/model", session_id="sess-stale",
+        )
+        store.close()
+
+        reopened = _store(tmp)
+        recovered = NativeProcessService(reopened, "controller-b")
+        _, checkpoint = recovered.resume(
+            ttl_seconds=3600, resume_capability_attested=True,
+        )
+        assert checkpoint.resume_decision_event["decision"] == (
+            RESUME_REFUSED_NO_OWNED_ATTEMPT
+        )
+        continuation = checkpoint.harness_continuation
+        assert continuation["mode"] == CONTINUATION_CHECKPOINT
+        assert continuation["session_id"] == ""
+        assert continuation["limitation"] == LIMITATION_SESSION_UNKNOWN
+        reopened.close()
+
+
+# NOTE: the pure-constructor invariants (a session resume without attestation,
+# a checkpoint carrying a session id, a limitation-less checkpoint, an
+# unsupported version, and planner purity) are exercised directly by the
+# ``plan_harness_continuation`` block above; these two tests add only what that
+# block cannot: the *durable* v1 round-trip and the reconstruction guard.
+
+
+# ── criterion 2 backward compatibility ─────────────────────────────────────
+
+def test_v1_checkpoint_without_a_continuation_round_trips_unchanged():
+    # Additive contract: a v1 checkpoint produced *without* a harness
+    # continuation carries ``harness_continuation: None`` and round-trips
+    # through validate unchanged -- an existing v1 record is never disturbed.
+    record = {
+        "schema_id": "https://skillweave.dev/schemas/storage/"
+                     "native-process-checkpoint/v1",
+        "schema_version": "1.0.0",
+        "run_id": "run-legacy",
+        "fencing_token": 3,
+        "journal_offset": 0,
+        "in_flight": [["run-legacy/task-a/1", "ready_dispatch"]],
+        "route": "",
+        "session_id": "",
+        "captured_at": "2026-01-01T00:00:00+00:00",
+        "resume_decision_event": None,
+    }
+    validate_native_process_checkpoint(record)
+    # The reconstructed record defaults the continuation to None.
+    reconstructed = NativeProcessCheckpoint(
+        run_id="run-legacy", fencing_token=3, journal_offset=0,
+        in_flight=(("run-legacy/task-a/1", "ready_dispatch"),),
+    )
+    assert reconstructed.harness_continuation is None
+    assert reconstructed.to_dict()["harness_continuation"] is None
+
+
+def test_a_checkpoint_cannot_smuggle_a_fabricated_session_resume():
+    # A checkpoint carrying a continuation that claims a session resume without
+    # the attestation is refused when the record is reconstructed.
+    try:
+        NativeProcessCheckpoint(
+            run_id="run-1", fencing_token=1, journal_offset=0,
+            harness_continuation={
+                "mode": CONTINUATION_SESSION_RESUME,
+                "resume_capability_attested": False,
+                "session_id": "sess-fabricated",
+            },
+        )
+        assert False, "a checkpoint must not carry a fabricated session resume"
+    except ValueError:
+        pass
 
 
 if __name__ == "__main__":

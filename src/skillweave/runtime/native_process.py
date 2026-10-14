@@ -85,6 +85,18 @@ __all__ = [
     "RESUME_DECISION_SCHEMA_ID",
     "RESUME_ADOPTED",
     "RESUME_REFUSED_NO_OWNED_ATTEMPT",
+    # criterion 2: harness-continuation-v1
+    "HARNESS_CONTINUATION_SCHEMA_ID",
+    "HARNESS_CONTINUATION_SCHEMA_VERSION",
+    "SUPPORTED_HARNESS_CONTINUATION_VERSIONS",
+    "HARNESS_SESSION_RESUME_CAPABILITY",
+    "CONTINUATION_SESSION_RESUME",
+    "CONTINUATION_CHECKPOINT",
+    "LIMITATION_UNSUPPORTED_RESUME",
+    "LIMITATION_NO_ATTESTED_CAPABILITY",
+    "LIMITATION_SESSION_UNKNOWN",
+    "HarnessContinuation",
+    "plan_harness_continuation",
     "DISPATCH_SCHEMA_ID",
     "DISPATCH_SCHEMA_VERSION",
     "SUPPORTED_DISPATCH_VERSIONS",
@@ -205,6 +217,45 @@ RESUME_DECISION_SCHEMA_ID = (
     "https://skillweave.dev/schemas/storage/native-process-resume-decision/v1"
 )
 
+# SW-1511-RECOVERY criterion 2: the harness-continuation contract.  The PRD
+# declares ``harness-continuation-v1`` for the **harness adapter** producer and
+# the **native process recovery** consumer; its URI/revision/digest were not
+# frozen at the baseline, so they are frozen here, next to the decision that
+# implements them.  The contract is *opt-in* and *fail-closed*: an adapter that
+# does not attest a session-resume capability is reported as a named limitation
+# (a checkpoint continuation), never granted fabricated session-UUID continuity.
+HARNESS_CONTINUATION_SCHEMA_ID = (
+    "https://skillweave.dev/schemas/process/harness-continuation/v1"
+)
+HARNESS_CONTINUATION_SCHEMA_VERSION = "1.0.0"
+SUPPORTED_HARNESS_CONTINUATION_VERSIONS = frozenset(
+    {HARNESS_CONTINUATION_SCHEMA_VERSION}
+)
+
+#: The single capability an adapter must attest before this controller uses an
+#: *actual* session resume.  An adapter that does not attest it falls closed to
+#: a checkpoint continuation -- the recovered controller resumes owned work
+#: from durable state rather than pretending the predecessor's session UUID is
+#: still live.
+HARNESS_SESSION_RESUME_CAPABILITY = "session-resume"
+
+#: The two continuation modes.  ``SESSION_RESUME`` is admissible *only* when the
+#: adapter attested the capability; otherwise the mode is
+#: ``CHECKPOINT_CONTINUATION``, which names the limitation instead of carrying a
+#: session id forward.
+CONTINUATION_SESSION_RESUME = "session_resume"
+CONTINUATION_CHECKPOINT = "checkpoint_continuation"
+_CONTINUATION_MODES: frozenset[str] = frozenset(
+    {CONTINUATION_SESSION_RESUME, CONTINUATION_CHECKPOINT}
+)
+
+#: The named limitations a checkpoint continuation reports.  A limitation is a
+#: machine-readable reason the actual session was not resumed, so a consumer
+#: never mistakes a checkpoint continuation for UUID continuity.
+LIMITATION_UNSUPPORTED_RESUME = "unsupported_session_resume_capability"
+LIMITATION_NO_ATTESTED_CAPABILITY = "no_attested_capability"
+LIMITATION_SESSION_UNKNOWN = "session_identity_unknown"
+
 DISPATCH_SCHEMA_ID = (
     "https://skillweave.dev/schemas/process/owned-attempt-dispatch/v1"
 )
@@ -263,6 +314,13 @@ class NativeProcessCheckpoint:
     # checkpoint that carries no continuation statement, so an existing v1
     # record round-trips unchanged.
     resume_decision_event: Optional[dict] = None
+    # Optional, additive (v1-compatible, criterion 2): the ``harness-
+    # continuation-v1`` decision the recovering controller used for the owned
+    # attempt -- an actual session resume *only* when the adapter attested the
+    # capability, otherwise a named-limitation checkpoint continuation that
+    # carries no session UUID.  ``None`` for a checkpoint that was not produced
+    # through the resume path, so an existing v1 record round-trips unchanged.
+    harness_continuation: Optional[dict] = None
     schema_version: str = CHECKPOINT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -314,6 +372,28 @@ class NativeProcessCheckpoint:
                         "a resume adoption must name the execution scope it "
                         "resumes"
                     )
+        if self.harness_continuation is not None:
+            continuation = self.harness_continuation
+            if not isinstance(continuation, Mapping):
+                raise ValueError(
+                    "native-process checkpoint harness_continuation must be a "
+                    "mapping when present"
+                )
+            # Re-run the continuation contract's own fail-closed invariants so a
+            # checkpoint cannot carry a fabricated session resume (a session id
+            # with no attested capability) or a session id on a checkpoint
+            # continuation.
+            HarnessContinuation(
+                run_id=continuation.get("run_id", self.run_id),
+                mode=continuation.get("mode", ""),
+                resume_capability_attested=bool(
+                    continuation.get("resume_capability_attested", False)
+                ),
+                session_id=continuation.get("session_id", ""),
+                intent_id=continuation.get("intent_id", ""),
+                limitation=continuation.get("limitation", ""),
+                reason=continuation.get("reason", ""),
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -329,6 +409,10 @@ class NativeProcessCheckpoint:
             "resume_decision_event": (
                 None if self.resume_decision_event is None
                 else dict(self.resume_decision_event)
+            ),
+            "harness_continuation": (
+                None if self.harness_continuation is None
+                else dict(self.harness_continuation)
             ),
         }
 
@@ -1426,6 +1510,160 @@ def plan_continuation(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Criterion 2: harness-continuation-v1 (attested session resume)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A recovered controller wants to continue an owned attempt.  The *only* way it
+# may resume the predecessor's actual provider session is when the harness
+# adapter attests the capability to do so.  Otherwise it continues from the
+# durable checkpoint and reports the limitation *by name* -- it never carries
+# the predecessor's session UUID forward as if the session were still live.
+#
+# The decision is a pure function of the *attested* capability: the caller (a
+# recovery seam that holds the adapter) passes whether the adapter attested the
+# capability and the predecessor's recorded session identity.  A decision that
+# claims a session resume without the attestation is refused at construction,
+# so a fabricated UUID can never masquerade as continuity.
+
+@dataclass(frozen=True)
+class HarnessContinuation:
+    """A ``harness-continuation-v1`` record: how a recovered controller continues.
+
+    Fail-closed invariants enforced at construction:
+
+    * ``schema_version`` must be supported (an unknown version is refused, never
+      approximated);
+    * ``mode`` is one of :data:`CONTINUATION_SESSION_RESUME` /
+      :data:`CONTINUATION_CHECKPOINT`;
+    * a **session resume** is admissible only when the adapter attested the
+      session-resume capability *and* a prior session identity is present --
+      otherwise it is refused (this is the "never fabricated UUID continuity"
+      invariant);
+    * a **checkpoint continuation** carries a named ``limitation`` and never a
+      ``session_id``: the durable checkpoint is the continuation, so no session
+      UUID is carried forward.
+    """
+
+    run_id: str
+    mode: str
+    resume_capability_attested: bool = False
+    session_id: str = ""
+    intent_id: str = ""
+    limitation: str = ""
+    reason: str = ""
+    schema_version: str = HARNESS_CONTINUATION_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version not in SUPPORTED_HARNESS_CONTINUATION_VERSIONS:
+            raise UnsupportedContractVersion(
+                "harness-continuation-v1", self.schema_version,
+                SUPPORTED_HARNESS_CONTINUATION_VERSIONS,
+            )
+        if not self.run_id:
+            raise ValueError(
+                "a harness continuation must name its run_id"
+            )
+        if self.mode not in _CONTINUATION_MODES:
+            raise ValueError(
+                f"harness continuation mode {self.mode!r} is not one of "
+                f"{sorted(_CONTINUATION_MODES)}"
+            )
+        if self.mode == CONTINUATION_SESSION_RESUME:
+            if not self.resume_capability_attested:
+                raise ValueError(
+                    "a session resume requires an attested "
+                    f"{HARNESS_SESSION_RESUME_CAPABILITY!r} capability; "
+                    "refusing to fabricate session-UUID continuity"
+                )
+            if not self.session_id:
+                raise ValueError(
+                    "a session resume must name the prior session it resumes"
+                )
+        else:  # CONTINUATION_CHECKPOINT
+            if not self.limitation:
+                raise ValueError(
+                    "a checkpoint continuation must name the limitation it "
+                    "reports"
+                )
+            if self.session_id:
+                raise ValueError(
+                    "a checkpoint continuation must not carry a session id "
+                    "forward (that would be fabricated UUID continuity)"
+                )
+
+    @property
+    def resumes_session(self) -> bool:
+        """True only for a genuine, capability-attested session resume."""
+        return self.mode == CONTINUATION_SESSION_RESUME
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_id": HARNESS_CONTINUATION_SCHEMA_ID,
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "mode": self.mode,
+            "resume_capability_attested": bool(self.resume_capability_attested),
+            "session_id": self.session_id,
+            "intent_id": self.intent_id,
+            "limitation": self.limitation,
+            "reason": self.reason,
+        }
+
+
+def plan_harness_continuation(
+    run_id: str,
+    *,
+    resume_capability_attested: bool,
+    prior_session_id: str = "",
+    intent_id: str = "",
+) -> HarnessContinuation:
+    """Decide how a recovered controller continues an owned attempt (criterion 2).
+
+    Actual session resume is used *only* for an attested harness capability:
+    when ``resume_capability_attested`` is true and a prior session identity is
+    known, the continuation mode is :data:`CONTINUATION_SESSION_RESUME`.
+    Otherwise -- the adapter does not attest the capability, or no prior session
+    is known -- the mode is :data:`CONTINUATION_CHECKPOINT` and the record names
+    the *limitation*, carrying no session id.  A caller cannot get a session
+    resume without the attestation: the refusal is enforced in
+    :class:`HarnessContinuation`'s constructor.
+    """
+    if resume_capability_attested and prior_session_id:
+        return HarnessContinuation(
+            run_id=run_id,
+            mode=CONTINUATION_SESSION_RESUME,
+            resume_capability_attested=True,
+            session_id=prior_session_id,
+            intent_id=intent_id,
+            reason=(
+                f"adapter attested {HARNESS_SESSION_RESUME_CAPABILITY!r}: "
+                f"resume session {prior_session_id!r}"
+            ),
+        )
+    if not resume_capability_attested:
+        limitation = LIMITATION_UNSUPPORTED_RESUME
+        reason = (
+            f"adapter did not attest {HARNESS_SESSION_RESUME_CAPABILITY!r}: "
+            "continue from the durable checkpoint, not the prior session"
+        )
+    else:
+        limitation = LIMITATION_SESSION_UNKNOWN
+        reason = (
+            "adapter attests session resume but no prior session identity was "
+            "recorded: continue from the durable checkpoint"
+        )
+    return HarnessContinuation(
+        run_id=run_id,
+        mode=CONTINUATION_CHECKPOINT,
+        resume_capability_attested=bool(resume_capability_attested),
+        session_id="",  # a checkpoint continuation never carries a session id
+        intent_id=intent_id,
+        limitation=limitation,
+        reason=reason,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Criterion 5: repository and non-repository subjects
 # ═══════════════════════════════════════════════════════════════════════════
 #
@@ -2017,12 +2255,19 @@ class NativeProcessService:
 
     # -- recovery (native-process-checkpoint-v1) -------------------------
 
-    def checkpoint(self) -> NativeProcessCheckpoint:
+    def checkpoint(
+        self,
+        *,
+        harness_continuation: Optional[HarnessContinuation] = None,
+    ) -> NativeProcessCheckpoint:
         """Produce the checkpoint a *recovering controller* resumes from.
 
         The in-flight set is read from the durable intents -- never from this
         process's memory -- so a controller that lost the lease leaves a
         resumable statement of what was owned and under which fencing token.
+        ``harness_continuation`` is the additive criterion-2 statement of *how*
+        the owned attempt is continued (an attested session resume, or a named
+        checkpoint continuation); a plain ``checkpoint()`` carries none.
         """
         intents = tuple(self._store.list_dispatch_intents(claiming_only=True))
         in_flight = tuple((i.execution_scope, i.step) for i in intents)
@@ -2037,6 +2282,10 @@ class NativeProcessService:
             journal_offset=self._store.last_journal_sequence(run_id),
             in_flight=in_flight,
             resume_decision_event=self._resume_decision(intents, run_id),
+            harness_continuation=(
+                None if harness_continuation is None
+                else harness_continuation.to_dict()
+            ),
         )
 
     def _resume_decision(
@@ -2084,7 +2333,12 @@ class NativeProcessService:
             "verified": verified,
         }
 
-    def resume(self, *, ttl_seconds: int = 300) -> tuple[ControllerLease, NativeProcessCheckpoint]:
+    def resume(
+        self,
+        *,
+        ttl_seconds: int = 300,
+        resume_capability_attested: bool = False,
+    ) -> tuple[ControllerLease, NativeProcessCheckpoint]:
         """Take over the lease and read the checkpoint to resume the loop.
 
         The fencing token read here is strictly higher than the predecessor's,
@@ -2093,9 +2347,48 @@ class NativeProcessService:
         checkpoint additionally carries the ``resume_decision_event``: the
         recovered controller *adopts* the one verified in-flight attempt
         rather than replaying its pending launch intent.
+
+        ``resume_capability_attested`` is the harness adapter's attestation
+        that it can *actually* resume a provider session (criterion 2).  The
+        recovered controller uses an actual session resume **only** for an
+        attested capability; otherwise the checkpoint carries a
+        ``harness-continuation-v1`` record naming the limitation and the
+        continuation is the durable checkpoint -- the predecessor's session
+        UUID is never carried forward as if the session were still live.
         """
         lease = self.acquire(ttl_seconds=ttl_seconds)
-        return lease, self.checkpoint()
+        checkpoint = self.checkpoint()
+        # The verified owned attempt (the resume decision's adoption) is the
+        # only attempt a session resume may continue.  The prior session id is
+        # read from that *durable intent* -- the record the predecessor wrote
+        # when it launched -- never invented, and only for the attempt the
+        # recovered controller actually adopted.
+        event = checkpoint.resume_decision_event or {}
+        adopted = (
+            event.get("decision") == RESUME_ADOPTED
+            and bool(event.get("intent_id"))
+        )
+        intent_id = event.get("intent_id", "") if adopted else ""
+        prior_session_id = self._adopted_session_id(intent_id) if adopted else ""
+        continuation = plan_harness_continuation(
+            checkpoint.run_id,
+            resume_capability_attested=resume_capability_attested,
+            prior_session_id=prior_session_id,
+            intent_id=intent_id,
+        )
+        return lease, self.checkpoint(harness_continuation=continuation)
+
+    def _adopted_session_id(self, intent_id: str) -> str:
+        """The session identity the predecessor durably recorded for an intent.
+
+        Read from the store -- the same durable record the launch wrote -- so a
+        session resume is bound to an *observed* session, never a fabricated
+        UUID.  An intent that recorded no session yields the empty string.
+        """
+        for intent in self._store.list_dispatch_intents():
+            if intent.intent_id == intent_id:
+                return intent.session_id
+        return ""
 
     def _run_id_label(self) -> str:
         """A stable label for the run this service is driving."""

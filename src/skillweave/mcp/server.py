@@ -1286,6 +1286,14 @@ def handoff_adapter(
     is the authenticated one (never a caller field); a direct in-process caller
     with no bound authority names its own principal, exactly as the mailbox
     tools do.
+
+    SW-1511-RECOVERY criterion 2: when the caller names the ``run_id`` it is
+    continuing, the response also carries the ``harness-continuation-v1``
+    **continuation decision** for that run, derived from the client's
+    *attested* capability -- actual session resume only when the client
+    attested it and a prior session identity was recorded, and otherwise a
+    named ``checkpoint_continuation`` limitation. This is the production seam a
+    recovered controller reaches; it never fabricates session-UUID continuity.
     """
     gate_principal, refusal = gate_operation("read_run", session_token, run_id=run_id)
     if refusal is not None:
@@ -1328,7 +1336,7 @@ def handoff_adapter(
                 _handoff.SUPPORTED_HANDOFF_TRANSPORTS
             ),
         })
-    return json.dumps({
+    payload = {
         "status": "ok",
         "client_id": capability.client_id,
         "contract": {
@@ -1339,7 +1347,16 @@ def handoff_adapter(
         },
         "adapter": adapter.to_dict(),
         "authority_contract": contract.to_dict(),
-    })
+    }
+    if run_id:
+        # The recovered controller's continuation decision, driven by the
+        # *attested* capability (never assumed): session resume only when the
+        # client attested it; otherwise a named checkpoint continuation that
+        # carries no session id forward.
+        payload["continuation"] = capability.continuation_decision(
+            run_id, intent_id=run_id
+        ).to_dict()
+    return json.dumps(payload)
 
 
 #: The mailbox operations a first-class principal may drive on its own channel.

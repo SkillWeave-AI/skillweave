@@ -7,6 +7,14 @@ import hashlib
 import json
 import uuid
 
+# SW-1511-RECOVERY criterion 2: the capability name an adapter attests before an
+# actual session resume is admissible. Imported from the recovery contract so
+# the vocabulary name has one definition; only the *name* is used here (the
+# decision value type is imported lazily to keep module import acyclic).
+from skillweave.runtime.native_process import (
+    HARNESS_SESSION_RESUME_CAPABILITY,
+)
+
 
 class HandoffState(str, Enum):
     OFFERED = "offered"
@@ -276,6 +284,14 @@ class HarnessClientCapability:
     positive signal existed; ``False`` means the client was not observable and
     the surface was assumed *least capable*. ``reason`` names how the decision
     was reached, so a fallback is attributable rather than silent.
+
+    ``resume_capability_attested`` (SW-1511-RECOVERY criterion 2) is the
+    *positive* attestation that this client can resume an actual provider
+    session across a restart. It defaults to ``False`` -- absent a positive
+    attestation the capability is *not* assumed, so a recovered controller falls
+    closed to a checkpoint continuation rather than fabricating session
+    continuity. An explicit attestation supplies it through the
+    ``session-resume`` entry of ``features``.
     """
 
     client_id: str
@@ -283,6 +299,16 @@ class HarnessClientCapability:
     transports: frozenset[str]
     features: dict[str, Any]
     reason: str
+    resume_capability_attested: bool = False
+
+    @property
+    def supports_session_resume(self) -> bool:
+        """Whether this client attested it can resume an actual session.
+
+        Falls closed: only a genuine positive attestation is ``True``, so an
+        undetected or unattested client never grants actual session resume.
+        """
+        return bool(self.resume_capability_attested)
 
     @property
     def supports_notifications(self) -> bool:
@@ -307,7 +333,30 @@ class HarnessClientCapability:
             "features": dict(self.features),
             "reason": self.reason,
             "adapter_kind": self.adapter_kind(),
+            "resume_capability_attested": bool(self.resume_capability_attested),
         }
+
+    def continuation_decision(
+        self, run_id: str, *, prior_session_id: str = "", intent_id: str = ""
+    ) -> "HarnessContinuation":
+        """Decide how a recovered controller continues this client's work.
+
+        The decision is driven by the *attested* capability, never assumed: an
+        attested client with a recorded prior session resumes that session; any
+        other client (unattested, or attested but with no recorded session)
+        continues from the durable checkpoint and names the limitation. This is
+        the production decision a recovered controller reaches through the
+        client's capability surface (see
+        :func:`skillweave.runtime.native_process.plan_harness_continuation`).
+        """
+        from skillweave.runtime.native_process import plan_harness_continuation
+
+        return plan_harness_continuation(
+            run_id,
+            resume_capability_attested=self.supports_session_resume,
+            prior_session_id=prior_session_id,
+            intent_id=intent_id,
+        )
 
 
 #: The positive, file-backed presence anchor per known client. The name is the
@@ -389,6 +438,14 @@ def detect_client_capability(
         # A notification transport may not be claimed without also being the
         # client's own attested transport; an empty set is the polling fallback.
         features = dict(attestation.get("features") or {})
+        # SW-1511-RECOVERY criterion 2: a session-resume attestation is a
+        # *positive* fact. An explicit attestation may supply it either as a
+        # top-level ``session-resume`` key or within ``features``; anything else
+        # (absent, false) falls closed to no session resume.
+        resume = bool(
+            attestation.get(HARNESS_SESSION_RESUME_CAPABILITY)
+            or features.get(HARNESS_SESSION_RESUME_CAPABILITY)
+        )
         if not transports:
             transports = frozenset({TRANSPORT_FILE_POLL})
         return HarnessClientCapability(
@@ -397,6 +454,7 @@ def detect_client_capability(
             transports=transports,
             features=features,
             reason="explicit operator attestation",
+            resume_capability_attested=resume,
         )
 
     skill_root = None
