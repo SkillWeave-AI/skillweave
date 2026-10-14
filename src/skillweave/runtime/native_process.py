@@ -58,6 +58,8 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 import hashlib
 import json
+import os
+import signal
 
 from . import process_identity
 from .dagscheduler import (
@@ -97,6 +99,21 @@ __all__ = [
     "LIMITATION_SESSION_UNKNOWN",
     "HarnessContinuation",
     "plan_harness_continuation",
+    # criterion 3: owned-child drain + useful-slot occupancy
+    "CHILD_DRAIN_SCHEMA_ID",
+    "CHILD_DRAIN_SCHEMA_VERSION",
+    "SUPPORTED_CHILD_DRAIN_VERSIONS",
+    "CHILD_DRAINED",
+    "CHILD_DRAIN_REFUSED",
+    "CHILD_DRAIN_REFUSED_NOT_OWNED",
+    "CHILD_DRAIN_REFUSED_NO_RECORD",
+    "CHILD_PROBE",
+    "CHILD_HEARTBEAT_ONLY",
+    "USEFUL_SLOT_OCCUPIED",
+    "USEFUL_SLOT_EXEMPT_STALLED",
+    "USEFUL_SLOT_FREED",
+    "OwnedChildDrain",
+    "plan_child_drain",
     "DISPATCH_SCHEMA_ID",
     "DISPATCH_SCHEMA_VERSION",
     "SUPPORTED_DISPATCH_VERSIONS",
@@ -262,6 +279,46 @@ DISPATCH_SCHEMA_ID = (
 DISPATCH_SCHEMA_VERSION = "1.0.0"
 SUPPORTED_DISPATCH_VERSIONS = frozenset({DISPATCH_SCHEMA_VERSION})
 
+# SW-1511-RECOVERY criterion 3: the owned-child drain report.  The native
+# process recovery consumer drains a *background probe child* by its **owned
+# identity** -- a child whose recorded identity still verifies as the attempt
+# the controller launched -- and reports a heartbeat-only stalled child as a
+# **useful-slot exemption** so it neither suppresses a completed review nor
+# occupies a useful slot.  Additive to the v1 checkpoint: an existing v1 record
+# carries none and round-trips unchanged.
+CHILD_DRAIN_SCHEMA_ID = (
+    "https://skillweave.dev/schemas/process/owned-child-drain/v1"
+)
+CHILD_DRAIN_SCHEMA_VERSION = "1.0.0"
+SUPPORTED_CHILD_DRAIN_VERSIONS = frozenset({CHILD_DRAIN_SCHEMA_VERSION})
+
+#: The typed outcomes of draining one background probe child.  Each is named so
+#: a consumer never mistakes a refused drain for a performed one.
+CHILD_DRAINED = "drained"
+CHILD_DRAIN_REFUSED = "refused"
+#: The identity-verification outcomes that refuse a drain.  A child whose
+#: recorded identity cannot be re-verified as the owned attempt is *never*
+#: signalled: a recycled PID, a stale command, a foreign worker or an
+#: unobservable process is reported distinctly.
+CHILD_DRAIN_REFUSED_NOT_OWNED = "not_owned_identity"
+CHILD_DRAIN_REFUSED_NO_RECORD = "no_recorded_identity"
+_CHILD_DRAIN_OUTCOMES: frozenset[str] = frozenset(
+    {CHILD_DRAINED, CHILD_DRAIN_REFUSED}
+)
+
+#: The kinds of child the drain distinguishes.  A **probe** child is a
+#: background tool the attempt launched (a concurrency/search probe): it is a
+#: *useful slot* only while it is genuinely progressing.  A **heartbeat-only**
+#: child emits liveness traffic but no useful progress -- it is a *stall*, not
+#: a worker, so it is excluded from useful-slot occupancy.
+CHILD_PROBE = "probe"
+CHILD_HEARTBEAT_ONLY = "heartbeat_only"
+
+#: The measured useful-slot occupancy states a refill reasons about.
+USEFUL_SLOT_OCCUPIED = "occupied"
+USEFUL_SLOT_EXEMPT_STALLED = "exempt_stalled"
+USEFUL_SLOT_FREED = "freed"
+
 
 class UnsupportedContractVersion(ValueError):
     """A boundary record carries a version this service does not support.
@@ -321,6 +378,13 @@ class NativeProcessCheckpoint:
     # carries no session UUID.  ``None`` for a checkpoint that was not produced
     # through the resume path, so an existing v1 record round-trips unchanged.
     harness_continuation: Optional[dict] = None
+    # Optional, additive (v1-compatible, criterion 3): the owned-child drain
+    # report the recovering controller publishes -- which background probe
+    # children it drained by owned identity, which it refused to signal, and
+    # which heartbeat-only stalls it exempted from useful-slot occupancy.
+    # ``None`` for a checkpoint produced without draining children, so an
+    # existing v1 record round-trips unchanged.
+    child_drain_report: Optional[dict] = None
     schema_version: str = CHECKPOINT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -394,6 +458,29 @@ class NativeProcessCheckpoint:
                 limitation=continuation.get("limitation", ""),
                 reason=continuation.get("reason", ""),
             )
+        if self.child_drain_report is not None:
+            report = self.child_drain_report
+            if not isinstance(report, Mapping):
+                raise ValueError(
+                    "native-process checkpoint child_drain_report must be a "
+                    "mapping when present"
+                )
+            # The report re-runs the drain's own fail-closed invariants: every
+            # child outcome is a declared one, and a *drained* child must have
+            # carried a verified owned identity (a drain without a verified
+            # identity would be a signal to an un-owned process).
+            for child in report.get("children", ()):
+                outcome = child.get("outcome")
+                if outcome not in _CHILD_DRAIN_OUTCOMES:
+                    raise ValueError(
+                        f"child drain outcome {outcome!r} is not one of "
+                        f"{sorted(_CHILD_DRAIN_OUTCOMES)}"
+                    )
+                if outcome == CHILD_DRAINED and not child.get("verified"):
+                    raise ValueError(
+                        "a drained child must have been verified as the owned "
+                        "identity; refusing a drain with no verified identity"
+                    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -413,6 +500,10 @@ class NativeProcessCheckpoint:
             "harness_continuation": (
                 None if self.harness_continuation is None
                 else dict(self.harness_continuation)
+            ),
+            "child_drain_report": (
+                None if self.child_drain_report is None
+                else dict(self.child_drain_report)
             ),
         }
 
@@ -445,6 +536,8 @@ def validate_native_process_checkpoint(record: Mapping[str, Any]) -> None:
         session_id=record.get("session_id", ""),
         captured_at=record.get("captured_at", ""),
         resume_decision_event=record.get("resume_decision_event"),
+        harness_continuation=record.get("harness_continuation"),
+        child_drain_report=record.get("child_drain_report"),
         schema_version=version,
     )
 
@@ -1664,6 +1757,258 @@ def plan_harness_continuation(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Criterion 3: owned-child drain + useful-slot occupancy
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A recovered controller resumes the owned attempt -- and the attempt may have
+# left **background probe children** behind: the concurrency/search probes it
+# launched, each with its own recorded process identity.  Two distinct facts
+# must not be conflated:
+#
+#   * a child that is **still the owned attempt's process** (its recorded
+#     identity re-verifies as a ``match``) is drained -- ended by *owned
+#     identity*, so a recycled PID, a stale command or a foreign worker is
+#     reported as a refusal, never signalled;
+#   * a child that emits **heartbeat traffic but no useful progress** is a
+#     *stall*, not a worker.  It must not be counted as occupying a useful
+#     slot, and it must not indefinitely suppress a *completed* review.
+#
+# The drain report is a pure function of the caller's verification of each
+# child's recorded identity against the OS: the caller (the service that holds
+# the lease) passes the observed facts, and the planner classifies each child
+# distinctly.  A child whose identity cannot be verified is never reported as
+# drained.
+
+@dataclass(frozen=True)
+class _OwnedChildFact:
+    """One background child's recorded identity and observed drain verification.
+
+    ``verification`` is the :class:`~skillweave.runtime.process_identity.
+    IdentityVerification` the caller obtained by re-observing the recorded
+    identity against the live OS -- the planner never observes the OS itself.
+    """
+
+    child_id: str
+    scope: str
+    recorded_identity: Optional[dict]
+    verification: Any
+    kind: str = CHILD_PROBE
+    progressing: bool = False
+    heartbeat_only: bool = False
+
+
+@dataclass(frozen=True)
+class OwnedChildDrain:
+    """An ``owned-child-drain-v1`` report over one run's background children.
+
+    Fail-closed invariants enforced at construction:
+
+    * ``schema_version`` must be supported (an unknown version is refused);
+    * every child outcome is a declared one (:data:`CHILD_DRAINED` or
+      :data:`CHILD_DRAIN_REFUSED`);
+    * a **drained** child carries ``verified`` true -- a drain without a
+      re-verified owned identity would be a signal to an un-owned process;
+    * a **heartbeat-only** child is exempted from useful-slot occupancy and is
+      never reported as occupying one.
+    """
+
+    run_id: str
+    children: tuple[dict, ...] = ()
+    captured_at: str = field(default_factory=_now_iso)
+    schema_version: str = CHILD_DRAIN_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version not in SUPPORTED_CHILD_DRAIN_VERSIONS:
+            raise UnsupportedContractVersion(
+                "owned-child-drain-v1", self.schema_version,
+                SUPPORTED_CHILD_DRAIN_VERSIONS,
+            )
+        if not self.run_id:
+            raise ValueError("an owned-child drain must name its run_id")
+        for child in self.children:
+            if not isinstance(child, Mapping):
+                raise ValueError(
+                    "each owned-child drain entry must be a mapping"
+                )
+            outcome = child.get("outcome")
+            if outcome not in _CHILD_DRAIN_OUTCOMES:
+                raise ValueError(
+                    f"child drain outcome {outcome!r} is not one of "
+                    f"{sorted(_CHILD_DRAIN_OUTCOMES)}"
+                )
+            if outcome == CHILD_DRAINED and not child.get("verified"):
+                raise ValueError(
+                    "a drained child must carry a verified owned identity; "
+                    "refusing to report a drain that was never verified"
+                )
+            if child.get("kind") == CHILD_HEARTBEAT_ONLY:
+                if child.get("useful_slot") == USEFUL_SLOT_OCCUPIED:
+                    raise ValueError(
+                        "a heartbeat-only stalled child must not occupy a "
+                        "useful slot"
+                    )
+
+    @property
+    def drained(self) -> tuple[str, ...]:
+        """The child ids drained by owned identity."""
+        return tuple(
+            c.get("child_id", "") for c in self.children
+            if c.get("outcome") == CHILD_DRAINED
+        )
+
+    @property
+    def refused(self) -> tuple[str, ...]:
+        """The child ids a drain was refused for (never signalled)."""
+        return tuple(
+            c.get("child_id", "") for c in self.children
+            if c.get("outcome") == CHILD_DRAIN_REFUSED
+        )
+
+    @property
+    def occupied_slots(self) -> int:
+        """The useful slots the surviving children still occupy.
+
+        Measured from the report, not from heartbeat traffic: a child whose
+        useful-slot state is :data:`USEFUL_SLOT_OCCUPIED` occupies a slot; a
+        freed or exempted (heartbeat-only stalled) child does not.
+        """
+        return sum(
+            1 for c in self.children
+            if c.get("useful_slot") == USEFUL_SLOT_OCCUPIED
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_id": CHILD_DRAIN_SCHEMA_ID,
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "children": [dict(c) for c in self.children],
+            "occupied_slots": self.occupied_slots,
+            "captured_at": self.captured_at,
+        }
+
+
+def _child_drain_entry(fact: _OwnedChildFact) -> dict:
+    """Classify one background child into its durable drain entry.
+
+    The classification never signals anything; it reports what a drain *would*
+    do, gated on the caller's identity verification:
+
+    * a :data:`CHILD_HEARTBEAT_ONLY` child is a stall -- it is exempted from
+      useful-slot occupancy (``USEFUL_SLOT_EXEMPT_STALLED``) and a drain is
+      refused, because a heartbeat is liveness traffic, not proof the process
+      still *is* the owned attempt;
+    * an unverified identity (no record, recycled, stale command, foreign or
+      not alive) refuses the drain distinctly;
+    * only a ``match`` verification of a genuinely progressing probe yields a
+      :data:`CHILD_DRAINED` entry with ``verified`` true.
+    """
+    verification = fact.verification
+    verified = bool(getattr(verification, "ok", False)) and (
+        getattr(verification, "reason", "") == process_identity.REASON_MATCH
+    )
+    reason = getattr(verification, "reason", "identity_unverified")
+
+    if fact.kind == CHILD_HEARTBEAT_ONLY or fact.heartbeat_only:
+        # A heartbeat-only stalled child: exempt from useful-slot occupancy.
+        return {
+            "child_id": fact.child_id,
+            "scope": fact.scope,
+            "kind": CHILD_HEARTBEAT_ONLY,
+            "outcome": CHILD_DRAIN_REFUSED,
+            "drain_refused_reason": "heartbeat_only_stall_not_useful",
+            "verified": False,
+            "useful_slot": USEFUL_SLOT_EXEMPT_STALLED,
+            "progress": False,
+        }
+
+    if not verified:
+        refusal = (
+            CHILD_DRAIN_REFUSED_NO_RECORD
+            if reason == process_identity.REASON_NO_RECORD
+            else CHILD_DRAIN_REFUSED_NOT_OWNED
+        )
+        return {
+            "child_id": fact.child_id,
+            "scope": fact.scope,
+            "kind": CHILD_PROBE,
+            "outcome": CHILD_DRAIN_REFUSED,
+            "drain_refused_reason": reason,
+            "refusal": refusal,
+            "verified": False,
+            # A refused probe is still a live useful worker (we did not end it),
+            # so it keeps occupying its slot: freeing it would over-admit.
+            "useful_slot": USEFUL_SLOT_OCCUPIED,
+            "progress": bool(fact.progressing),
+        }
+
+    return {
+        "child_id": fact.child_id,
+        "scope": fact.scope,
+        "kind": CHILD_PROBE,
+        "outcome": CHILD_DRAINED,
+        "drain_refused_reason": "",
+        "refusal": "",
+        "verified": True,
+        "useful_slot": USEFUL_SLOT_FREED,
+        "progress": bool(fact.progressing),
+    }
+
+
+def plan_child_drain(
+    run_id: str,
+    children: Sequence[_OwnedChildFact],
+    *,
+    captured_at: str = "",
+) -> OwnedChildDrain:
+    """Classify each background child into a drain report (criterion 3).
+
+    A background probe child is drained **by owned identity**: the caller
+    supplies each child's recorded identity *and* the verification it obtained
+    by re-observing the live OS, and only a ``match`` verification is reported
+    as :data:`CHILD_DRAINED`.  A heartbeat-only stalled child is exempted from
+    useful-slot occupancy and refused a drain, so it neither suppresses a
+    completed review nor holds a useful slot.
+    """
+    entries = tuple(_child_drain_entry(fact) for fact in children)
+    return OwnedChildDrain(
+        run_id=run_id,
+        children=entries,
+        captured_at=captured_at or _now_iso(),
+    )
+
+
+def _child_field(child: Any, name: str, default: Any) -> Any:
+    """Read one field from a background child (mapping or object), never raise.
+
+    The service accepts a child as a mapping or as a duck-typed object, so the
+    same call site reads either.  A missing field yields *default* -- the drain
+    never invents a fact the caller did not supply.
+    """
+    if isinstance(child, Mapping):
+        return child.get(name, default)
+    return getattr(child, name, default)
+
+
+def _assert_no_stall_occupies_slot(report: "OwnedChildDrain") -> None:
+    """Refuse a report where a heartbeat-only stall holds a useful slot.
+
+    This is the fail-closed check for a *completed* review: when a review has
+    completed, no heartbeat-only stalled child may be reported as occupying a
+    useful slot -- such a stall suppresses nothing and occupies nothing.
+    """
+    for child in report.children:
+        if (
+            child.get("kind") == CHILD_HEARTBEAT_ONLY
+            and child.get("useful_slot") == USEFUL_SLOT_OCCUPIED
+        ):
+            raise ValueError(
+                "a completed review must not be suppressed by a heartbeat-only "
+                "stalled child occupying a useful slot"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Criterion 5: repository and non-repository subjects
 # ═══════════════════════════════════════════════════════════════════════════
 #
@@ -2259,6 +2604,7 @@ class NativeProcessService:
         self,
         *,
         harness_continuation: Optional[HarnessContinuation] = None,
+        child_drain_report: Optional[OwnedChildDrain] = None,
     ) -> NativeProcessCheckpoint:
         """Produce the checkpoint a *recovering controller* resumes from.
 
@@ -2267,7 +2613,11 @@ class NativeProcessService:
         resumable statement of what was owned and under which fencing token.
         ``harness_continuation`` is the additive criterion-2 statement of *how*
         the owned attempt is continued (an attested session resume, or a named
-        checkpoint continuation); a plain ``checkpoint()`` carries none.
+        checkpoint continuation); ``child_drain_report`` is the additive
+        criterion-3 statement of which background probe children were drained
+        by owned identity, which drains were refused, and which heartbeat-only
+        stalls were exempted from useful-slot occupancy.  A plain
+        ``checkpoint()`` carries neither.
         """
         intents = tuple(self._store.list_dispatch_intents(claiming_only=True))
         in_flight = tuple((i.execution_scope, i.step) for i in intents)
@@ -2286,7 +2636,115 @@ class NativeProcessService:
                 None if harness_continuation is None
                 else harness_continuation.to_dict()
             ),
+            child_drain_report=(
+                None if child_drain_report is None
+                else child_drain_report.to_dict()
+            ),
         )
+
+    # -- owned-child drain (criterion 3) ---------------------------------
+
+    def drain_background_probe_children(
+        self,
+        children: Sequence[Any],
+        *,
+        review_completed: bool = False,
+        captured_at: str = "",
+    ) -> OwnedChildDrain:
+        """Drain an owned attempt's background probe children by owned identity.
+
+        This is criterion 3's consumer seam: the same controller lease that
+        owns dispatch and resume owns the drain.  Each child carries its own
+        recorded process identity (``child.recorded_identity`` on an object, or
+        a mapping in an iterable); the drain re-observes each against the live
+        OS through :mod:`skillweave.runtime.process_identity` -- the *same*
+        verification :meth:`verify_owned_attempt` uses -- and only a ``match``
+        is drained.  A recycled PID, a stale command, a foreign worker or an
+        unobservable process is reported as a refused drain, never signalled.
+
+        A **heartbeat-only** child (``heartbeat_only`` true, or an explicit
+        ``kind`` of :data:`CHILD_HEARTBEAT_ONLY`) is a stall: it is exempted
+        from useful-slot occupancy and refused a drain, so it neither occupies
+        a useful slot nor -- given ``review_completed`` -- suppresses a review
+        that already completed.  The returned report records the exempted
+        stall alongside the drained children, so the recovered controller
+        measures useful occupancy separately from heartbeat traffic.
+        """
+        self._require_controller()
+        run_id = self._run_id_label()
+        facts = []
+        for child in children:
+            child_id = str(_child_field(child, "child_id", ""))
+            scope = str(_child_field(child, "scope", ""))
+            recorded = _child_field(child, "recorded_identity", None)
+            kind = str(_child_field(child, "kind", CHILD_PROBE) or CHILD_PROBE)
+            heartbeat_only = bool(_child_field(child, "heartbeat_only", False))
+            progressing = bool(_child_field(child, "progressing", False))
+            # Re-observe the *recorded* identity against the live OS.  No
+            # recorded identity -> NO_RECORD, never a silent success.
+            if isinstance(recorded, Mapping) and recorded.get("pid"):
+                verification = process_identity.verify(recorded, int(recorded["pid"]))
+            else:
+                verification = process_identity.verify(None, 0)
+            verified = bool(getattr(verification, "ok", False))
+            facts.append(
+                _OwnedChildFact(
+                    child_id=child_id,
+                    scope=scope,
+                    recorded_identity=recorded if isinstance(recorded, Mapping) else None,
+                    verification=verification,
+                    kind=kind,
+                    progressing=progressing,
+                    heartbeat_only=heartbeat_only,
+                )
+            )
+            # Only a verified owned identity is signalled.  A heartbeat-only
+            # child is never drained by an identity match alone: its heartbeat
+            # is liveness traffic, not proof it is still the owned attempt, so
+            # it is excluded from the signal path even if it also verified.
+            if verified and not heartbeat_only and kind != CHILD_HEARTBEAT_ONLY:
+                self._signal_owned_child(recorded)
+        report = plan_child_drain(run_id, facts, captured_at=captured_at)
+        if review_completed:
+            # The drain must not leave a heartbeat-only stall suppressing the
+            # completed review: it holds no useful slot in the report.
+            _assert_no_stall_occupies_slot(report)
+        return report
+
+    def _signal_owned_child(self, recorded: Mapping[str, Any]) -> None:
+        """End one verified owned child's process group (criterion 3).
+
+        Reached *only* from :meth:`drain_background_probe_children` after a
+        ``match`` verification.  The signal targets the child's own process
+        group, and any membership change after the verification is a fact the
+        OS resolves (a recycled PID would have been refused earlier by
+        ``verify``).  A signal that the OS rejects (the process already exited)
+        is not an error: the drain's *report* is the statement, and the child
+        is reported drained by its verified identity.
+
+        A verified owned child is a process the controller *launched*, so it
+        has its own process group distinct from the controller's.  Signalling
+        the controller's own process group would target the controller, not an
+        owned child, so that group is refused here -- the drain may only ever
+        end a child, never the process performing the drain.
+        """
+        pid = int(recorded.get("pid", 0))
+        if pid <= 0:
+            return
+        pgid = int(recorded.get("pgid", pid) or pid)
+        if pgid <= 0 or pgid == os.getpgrp():
+            # The child's recorded group is this controller's own group: that
+            # is not an owned child to end, so no signal is sent.  A verified
+            # child that genuinely shares the controller's group cannot be
+            # drained by group signal without ending the controller itself.
+            return
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            # The owned process already exited, or the group is not signalable
+            # by this user; neither is a fabricated termination.  The report
+            # already carries the verified drain.
+            return
 
     def _resume_decision(
         self, in_flight: Sequence["DispatchIntent"], run_id: str
@@ -2338,6 +2796,8 @@ class NativeProcessService:
         *,
         ttl_seconds: int = 300,
         resume_capability_attested: bool = False,
+        background_children: Sequence[Any] = (),
+        review_completed: bool = False,
     ) -> tuple[ControllerLease, NativeProcessCheckpoint]:
         """Take over the lease and read the checkpoint to resume the loop.
 
@@ -2355,6 +2815,12 @@ class NativeProcessService:
         ``harness-continuation-v1`` record naming the limitation and the
         continuation is the durable checkpoint -- the predecessor's session
         UUID is never carried forward as if the session were still live.
+
+        ``background_children`` is the predecessor's background probe children
+        (criterion 3): the recovered controller drains each child *by owned
+        identity* and the checkpoint carries the ``owned-child-drain-v1``
+        report.  A heartbeat-only stalled child is exempted from useful-slot
+        occupancy and never suppresses a review that ``review_completed``.
         """
         lease = self.acquire(ttl_seconds=ttl_seconds)
         checkpoint = self.checkpoint()
@@ -2376,7 +2842,21 @@ class NativeProcessService:
             prior_session_id=prior_session_id,
             intent_id=intent_id,
         )
-        return lease, self.checkpoint(harness_continuation=continuation)
+        # Drain the predecessor's background probe children by owned identity
+        # (criterion 3) -- only when the recovered controller actually adopted
+        # the predecessor's owned attempt.  Either way the checkpoint carries
+        # the report, so a heartbeat-only stall never holds a useful slot.
+        drain = (
+            self.drain_background_probe_children(
+                background_children, review_completed=review_completed
+            )
+            if adopted
+            else None
+        )
+        return lease, self.checkpoint(
+            harness_continuation=continuation,
+            child_drain_report=drain,
+        )
 
     def _adopted_session_id(self, intent_id: str) -> str:
         """The session identity the predecessor durably recorded for an intent.

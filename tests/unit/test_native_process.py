@@ -53,6 +53,18 @@ from skillweave.runtime.native_process import (
     CONTINUATION_SESSION_RESUME,
     HARNESS_CONTINUATION_SCHEMA_ID,
     HARNESS_SESSION_RESUME_CAPABILITY,
+    CHILD_DRAIN_SCHEMA_ID,
+    CHILD_DRAINED,
+    CHILD_DRAIN_REFUSED,
+    CHILD_DRAIN_REFUSED_NO_RECORD,
+    CHILD_DRAIN_REFUSED_NOT_OWNED,
+    CHILD_HEARTBEAT_ONLY,
+    CHILD_PROBE,
+    USEFUL_SLOT_EXEMPT_STALLED,
+    USEFUL_SLOT_FREED,
+    USEFUL_SLOT_OCCUPIED,
+    OwnedChildDrain,
+    plan_child_drain,
     LIMITATION_SESSION_UNKNOWN,
     LIMITATION_UNSUPPORTED_RESUME,
     INTEGRATION_CONTENT_TRANSACTION,
@@ -1535,6 +1547,341 @@ def test_a_checkpoint_cannot_smuggle_a_fabricated_session_resume():
             },
         )
         assert False, "a checkpoint must not carry a fabricated session resume"
+    except ValueError:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SW-1511-RECOVERY criterion 3: background probe children are drained by owned
+# identity; heartbeat-only stalled children do not indefinitely suppress a
+# completed review or occupy useful slots.
+#
+# These exercise the seam a real controller operation reaches: the recovered
+# controller takes over through the durable store's re-exported service and
+# calls ``resume``/``drain_background_probe_children`` -- the same calls a
+# takeover drives.  The identity verification is the *real* one
+# (``process_identity.verify`` re-observing the OS), not a stub; a drained
+# child's recorded identity is a live process the test actually owns.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _live_child(identifier: str = "probe-1", **extra) -> dict:
+    """A background child whose recorded identity is a live owned process.
+
+    Recorded from the OS (this test interpreter) so the real
+    ``process_identity.verify`` observes a ``match`` -- the positive owned-
+    identity path.  ``scope``/``child_id`` name the child distinctly.
+    """
+    child = {
+        "child_id": identifier,
+        "scope": f"run-1/child/{identifier}",
+        "recorded_identity": _live_identity_record(),
+        "kind": CHILD_PROBE,
+        "progressing": True,
+    }
+    child.update(extra)
+    return child
+
+
+def test_drained_by_owned_identity_only_when_the_child_verifies():
+    # Positive path: a background probe child whose recorded identity still
+    # re-verifies as the owned process is drained by owned identity -- the
+    # drain is reached through the resumed controller's real drain seam.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = NativeProcessService(store, "controller-a")
+        first.acquire(ttl_seconds=0)
+        first.dispatch(
+            run_id="run-1", task_id="task-a", attempt=1,
+            process_identity=_live_identity_record(),
+        )
+        store.close()
+
+        reopened = _store(tmp)
+        recovered = StoreReexportedService(reopened, "controller-b")
+        _, checkpoint = recovered.resume(
+            ttl_seconds=3600,
+            background_children=[_live_child("probe-1")],
+        )
+        report = checkpoint.child_drain_report
+        assert report is not None
+        assert report["schema_id"] == CHILD_DRAIN_SCHEMA_ID
+        assert len(report["children"]) == 1
+        child = report["children"][0]
+        assert child["outcome"] == CHILD_DRAINED
+        assert child["verified"] is True
+        assert child["useful_slot"] == USEFUL_SLOT_FREED
+        assert report["occupied_slots"] == 0
+        reopened.close()
+
+
+def test_drain_refuses_a_child_whose_identity_no_longer_verifies():
+    # Negative path: the child's recorded identity is a dead/foreign process,
+    # so the real OS verification does NOT return ``match`` -- the drain is
+    # refused by name and the child is never reported drained.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = NativeProcessService(store, "controller-a")
+        first.acquire(ttl_seconds=0)
+        first.dispatch(
+            run_id="run-1", task_id="task-a", attempt=1,
+            process_identity=_live_identity_record(),
+        )
+        store.close()
+
+        reopened = _store(tmp)
+        recovered = StoreReexportedService(reopened, "controller-b")
+        _, checkpoint = recovered.resume(
+            ttl_seconds=3600,
+            background_children=[{
+                "child_id": "probe-stale",
+                "scope": "run-1/child/probe-stale",
+                "recorded_identity": {
+                    "pid": 1, "start_time": "0.0",
+                    "exec_path": "/nonexistent", "argv": ["nonexistent"],
+                },
+                "kind": CHILD_PROBE,
+            }],
+        )
+        child = checkpoint.child_drain_report["children"][0]
+        assert child["outcome"] == CHILD_DRAIN_REFUSED
+        assert child["verified"] is False
+        assert child["drain_refused_reason"]  # a named reason, never a bare False
+        # A refused probe we did not end still occupies its useful slot.
+        assert child["useful_slot"] == USEFUL_SLOT_OCCUPIED
+        reopened.close()
+
+
+def test_no_recorded_identity_refuses_the_drain_distinctly():
+    # Fail-closed: a child with no recorded identity at all is refused with the
+    # distinct ``no_recorded_identity`` reason -- the drain never invents an
+    # owned identity to signal.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        svc = StoreReexportedService(store, "controller-a")
+        svc.acquire(ttl_seconds=3600)
+        svc.dispatch(run_id="run-1", task_id="task-a", attempt=1)
+        report = svc.drain_background_probe_children(
+            [{"child_id": "probe-norec", "scope": "run-1/child/probe-norec"}]
+        )
+        child = report.children[0]
+        assert child["outcome"] == CHILD_DRAIN_REFUSED
+        assert child["refusal"] == CHILD_DRAIN_REFUSED_NO_RECORD
+        assert child["verified"] is False
+        store.close()
+
+
+def test_heartbeat_only_stalled_child_is_exempt_from_useful_slots():
+    # Criterion 3: a heartbeat-only stalled child emits liveness traffic but no
+    # useful progress.  It is a stall, not a worker: it holds NO useful slot,
+    # and it is refused a drain (a heartbeat is not proof of owned identity).
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        svc = StoreReexportedService(store, "controller-a")
+        svc.acquire(ttl_seconds=3600)
+        svc.dispatch(run_id="run-1", task_id="task-a", attempt=1)
+        report = svc.drain_background_probe_children(
+            [{
+                "child_id": "probe-stall",
+                "scope": "run-1/child/probe-stall",
+                "kind": CHILD_HEARTBEAT_ONLY,
+                "heartbeat_only": True,
+                # Even with a live identity, a heartbeat-only child is a stall:
+                # its heartbeat is not proof it still *is* the owned attempt.
+                "recorded_identity": _live_identity_record(),
+            }],
+            review_completed=True,
+        )
+        child = report.children[0]
+        assert child["outcome"] == CHILD_DRAIN_REFUSED
+        assert child["kind"] == CHILD_HEARTBEAT_ONLY
+        assert child["useful_slot"] == USEFUL_SLOT_EXEMPT_STALLED
+        assert child["verified"] is False
+        # The stalled child holds no useful slot: useful occupancy measured
+        # separately from heartbeat traffic is zero.
+        assert report.occupied_slots == 0
+        store.close()
+
+
+def test_heartbeat_only_stall_does_not_suppress_a_completed_review():
+    # Criterion 3: a completed review is not indefinitely suppressed by a
+    # heartbeat-only stalled child.  With the review completed the drain runs
+    # through the real `resume` seam and returns a report in which the stall
+    # holds no useful slot -- the completed review is released, not withheld.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = NativeProcessService(store, "controller-a")
+        first.acquire(ttl_seconds=0)
+        intent, _ = first.dispatch(
+            run_id="run-1", task_id="task-a", attempt=1,
+            process_identity=_live_identity_record(),
+        )
+        store.close()
+
+        reopened = _store(tmp)
+        recovered = StoreReexportedService(reopened, "controller-b")
+        _, checkpoint = recovered.resume(
+            ttl_seconds=3600,
+            background_children=[
+                # One genuinely owned probe child, drained by identity ...
+                _live_child("probe-owned"),
+                # ... and one heartbeat-only stall, which must not occupy a
+                # useful slot nor suppress the completed review.
+                {
+                    "child_id": "probe-stall",
+                    "scope": "run-1/child/probe-stall",
+                    "kind": CHILD_HEARTBEAT_ONLY,
+                    "heartbeat_only": True,
+                    "recorded_identity": _live_identity_record(),
+                },
+            ],
+            review_completed=True,
+        )
+        report = checkpoint.child_drain_report
+        assert report is not None
+        stalled = [c for c in report["children"]
+                   if c["kind"] == CHILD_HEARTBEAT_ONLY][0]
+        assert stalled["useful_slot"] == USEFUL_SLOT_EXEMPT_STALLED
+        # Exactly one useful slot is occupied by neither child: the drained
+        # owned probe freed its slot, the stall holds none.
+        assert report["occupied_slots"] == 0
+        # The two distinct facts are separate: the owned probe is drained, the
+        # stall is not.
+        owned = [c for c in report["children"]
+                 if c["child_id"] == "probe-owned"][0]
+        assert owned["outcome"] == CHILD_DRAINED
+        assert stalled["outcome"] == CHILD_DRAIN_REFUSED
+        reopened.close()
+
+
+def test_plan_child_drain_is_a_pure_classifier_over_verification():
+    # The planner is a pure function of the caller's verification: a ``match``
+    # drains, anything else refuses; a heartbeat-only child is exempted.
+    from skillweave.runtime.process_identity import IdentityVerification
+
+    matched = IdentityVerification(ok=True, reason="match", recorded_pid=123)
+    refused = IdentityVerification(ok=False, reason="recycled_pid", recorded_pid=123)
+    report = plan_child_drain(
+        "run-pure",
+        [
+            _Fact("probe-ok", "s1", {"pid": 123}, matched),
+            _Fact("probe-bad", "s2", {"pid": 123}, refused),
+            _Fact("probe-stall", "s3", {"pid": 123}, matched,
+                  kind=CHILD_HEARTBEAT_ONLY, heartbeat_only=True),
+        ],
+    )
+    assert isinstance(report, OwnedChildDrain)
+    by_id = {c["child_id"]: c for c in report.children}
+    assert by_id["probe-ok"]["outcome"] == CHILD_DRAINED
+    assert by_id["probe-ok"]["verified"] is True
+    assert by_id["probe-bad"]["outcome"] == CHILD_DRAIN_REFUSED
+    assert by_id["probe-bad"]["drain_refused_reason"] == "recycled_pid"
+    assert by_id["probe-stall"]["useful_slot"] == USEFUL_SLOT_EXEMPT_STALLED
+    assert report.drained == ("probe-ok",)
+    assert report.refused == ("probe-bad", "probe-stall")
+    assert report.occupied_slots == 1  # only the refused live probe
+
+
+class _Fact:
+    """A minimal ``_OwnedChildFact``-shaped value for the pure planner test."""
+
+    def __init__(self, child_id, scope, recorded_identity, verification,
+                 kind=CHILD_PROBE, progressing=False, heartbeat_only=False):
+        self.child_id = child_id
+        self.scope = scope
+        self.recorded_identity = recorded_identity
+        self.verification = verification
+        self.kind = kind
+        self.progressing = progressing
+        self.heartbeat_only = heartbeat_only
+
+
+def test_a_drain_report_cannot_claim_a_drain_without_verification():
+    # Fail-closed: a report whose child is marked ``drained`` but NOT verified
+    # is refused at construction -- a drain without a re-verified owned identity
+    # would be a signal to an un-owned process.
+    try:
+        OwnedChildDrain(
+            run_id="run-1",
+            children=(
+                {"child_id": "probe-x", "outcome": CHILD_DRAINED,
+                 "verified": False, "kind": CHILD_PROBE,
+                 "useful_slot": USEFUL_SLOT_FREED},
+            ),
+        )
+        assert False, "a drained child with no verified identity must be refused"
+    except ValueError:
+        pass
+
+
+def test_a_drain_report_cannot_report_a_stall_occupying_a_useful_slot():
+    # Fail-closed: a heartbeat-only child reported as occupying a useful slot
+    # is refused -- the stall must never hold a useful slot.
+    try:
+        OwnedChildDrain(
+            run_id="run-1",
+            children=(
+                {"child_id": "probe-stall", "kind": CHILD_HEARTBEAT_ONLY,
+                 "outcome": CHILD_DRAIN_REFUSED, "verified": False,
+                 "useful_slot": USEFUL_SLOT_OCCUPIED},
+            ),
+        )
+        assert False, "a heartbeat-only child must not occupy a useful slot"
+    except ValueError:
+        pass
+
+
+def test_unsupported_child_drain_version_fails_closed():
+    try:
+        OwnedChildDrain(run_id="run-1", schema_version="2.0.0")
+        assert False, "an unsupported child-drain version must be refused"
+    except UnsupportedContractVersion:
+        pass
+
+
+# ── criterion 3 backward compatibility ─────────────────────────────────────
+
+def test_v1_checkpoint_without_a_drain_report_round_trips_unchanged():
+    # Additive contract: a v1 checkpoint produced without draining children
+    # carries ``child_drain_report: None`` and round-trips unchanged.
+    record = {
+        "schema_id": "https://skillweave.dev/schemas/storage/"
+                     "native-process-checkpoint/v1",
+        "schema_version": "1.0.0",
+        "run_id": "run-legacy",
+        "fencing_token": 3,
+        "journal_offset": 0,
+        "in_flight": [["run-legacy/task-a/1", "ready_dispatch"]],
+        "route": "",
+        "session_id": "",
+        "captured_at": "2026-01-01T00:00:00+00:00",
+        "resume_decision_event": None,
+    }
+    validate_native_process_checkpoint(record)
+    reconstructed = NativeProcessCheckpoint(
+        run_id="run-legacy", fencing_token=3, journal_offset=0,
+        in_flight=(("run-legacy/task-a/1", "ready_dispatch"),),
+    )
+    assert reconstructed.child_drain_report is None
+    assert reconstructed.to_dict()["child_drain_report"] is None
+
+
+def test_a_checkpoint_cannot_smuggle_a_drain_without_verification():
+    # A checkpoint carrying a drain report that claims a drain without a
+    # verified identity is refused when the record is reconstructed.
+    try:
+        NativeProcessCheckpoint(
+            run_id="run-1", fencing_token=1, journal_offset=0,
+            child_drain_report={
+                "schema_id": CHILD_DRAIN_SCHEMA_ID,
+                "run_id": "run-1",
+                "children": [
+                    {"child_id": "probe-x", "outcome": CHILD_DRAINED,
+                     "verified": False, "kind": CHILD_PROBE},
+                ],
+            },
+        )
+        assert False, "a checkpoint must not carry an unverified drain"
     except ValueError:
         pass
 

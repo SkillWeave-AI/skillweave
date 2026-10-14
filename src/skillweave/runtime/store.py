@@ -36,6 +36,22 @@ from .native_process import (
     CONTINUATION_CHECKPOINT,
     HarnessContinuation,
     plan_harness_continuation,
+    # SW-1511-RECOVERY criterion 3: the ``owned-child-drain-v1`` report.
+    # Re-exported through the same store seam so the recovered controller (via
+    # ``NativeProcessService.resume``/``drain_background_probe_children``)
+    # drains the predecessor's background probe children *by owned identity*
+    # and reports a heartbeat-only stalled child as a useful-slot exemption --
+    # never counting heartbeat traffic as useful slot occupancy.
+    CHILD_DRAIN_SCHEMA_ID,
+    CHILD_DRAINED,
+    CHILD_DRAIN_REFUSED,
+    CHILD_PROBE,
+    CHILD_HEARTBEAT_ONLY,
+    USEFUL_SLOT_OCCUPIED,
+    USEFUL_SLOT_EXEMPT_STALLED,
+    USEFUL_SLOT_FREED,
+    OwnedChildDrain,
+    plan_child_drain,
     StaleFencingTokenError,
 )
 
