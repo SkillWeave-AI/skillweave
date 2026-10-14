@@ -82,6 +82,9 @@ __all__ = [
     "CHECKPOINT_SCHEMA_ID",
     "CHECKPOINT_SCHEMA_VERSION",
     "SUPPORTED_CHECKPOINT_VERSIONS",
+    "RESUME_DECISION_SCHEMA_ID",
+    "RESUME_ADOPTED",
+    "RESUME_REFUSED_NO_OWNED_ATTEMPT",
     "DISPATCH_SCHEMA_ID",
     "DISPATCH_SCHEMA_VERSION",
     "SUPPORTED_DISPATCH_VERSIONS",
@@ -195,6 +198,13 @@ CHECKPOINT_SCHEMA_ID = (
 CHECKPOINT_SCHEMA_VERSION = "1.0.0"
 SUPPORTED_CHECKPOINT_VERSIONS = frozenset({CHECKPOINT_SCHEMA_VERSION})
 
+# SW-1511-RECOVERY criterion 1: the resume decision a recovered controller
+# records when it adopts (or refuses to adopt) in-flight work.  Additive to the
+# v1 checkpoint: an existing v1 record without it round-trips unchanged.
+RESUME_DECISION_SCHEMA_ID = (
+    "https://skillweave.dev/schemas/storage/native-process-resume-decision/v1"
+)
+
 DISPATCH_SCHEMA_ID = (
     "https://skillweave.dev/schemas/process/owned-attempt-dispatch/v1"
 )
@@ -246,6 +256,13 @@ class NativeProcessCheckpoint:
     route: str = ""
     session_id: str = ""
     captured_at: str = field(default_factory=_now_iso)
+    # Optional, additive (v1-compatible): a resume statement the recovering
+    # controller publishes when it does NOT admit the predecessor's in-flight
+    # intent -- the durable decision a continuing controller reads so it adopts
+    # (or refuses) the attempt instead of re-dispatching it.  ``None`` for a
+    # checkpoint that carries no continuation statement, so an existing v1
+    # record round-trips unchanged.
+    resume_decision_event: Optional[dict] = None
     schema_version: str = CHECKPOINT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -272,6 +289,31 @@ class NativeProcessCheckpoint:
             raise ValueError(
                 "native-process checkpoint journal_offset must be >= 0"
             )
+        if self.resume_decision_event is not None:
+            event = self.resume_decision_event
+            if not isinstance(event, Mapping):
+                raise ValueError(
+                    "native-process checkpoint resume_decision_event must be a "
+                    "mapping when present"
+                )
+            decision = event.get("decision")
+            if decision not in _RESUME_DECISIONS:
+                raise ValueError(
+                    f"native-process checkpoint resume decision {decision!r} is "
+                    f"not one of {sorted(_RESUME_DECISIONS)}"
+                )
+            # An admission is a durable claim that the predecessor's intent is
+            # still the owned attempt of this run; it must name it.
+            if decision == RESUME_ADOPTED:
+                if not event.get("intent_id"):
+                    raise ValueError(
+                        "a resume adoption must name the owned intent it resumes"
+                    )
+                if not event.get("execution_scope"):
+                    raise ValueError(
+                        "a resume adoption must name the execution scope it "
+                        "resumes"
+                    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -284,6 +326,10 @@ class NativeProcessCheckpoint:
             "route": self.route,
             "session_id": self.session_id,
             "captured_at": self.captured_at,
+            "resume_decision_event": (
+                None if self.resume_decision_event is None
+                else dict(self.resume_decision_event)
+            ),
         }
 
 
@@ -314,6 +360,7 @@ def validate_native_process_checkpoint(record: Mapping[str, Any]) -> None:
         route=record.get("route", ""),
         session_id=record.get("session_id", ""),
         captured_at=record.get("captured_at", ""),
+        resume_decision_event=record.get("resume_decision_event"),
         schema_version=version,
     )
 
@@ -491,6 +538,19 @@ INTENT_TERMINAL: frozenset[str] = frozenset({
     INTENT_REVIEWED,
     INTENT_INTEGRATED,
     INTENT_FAILED,
+})
+
+# Resume decisions a recovering controller publishes in its checkpoint
+# (SW-1511-RECOVERY criterion 1).  A resumed controller *adopts* exactly the
+# one in-flight attempt it can still verify as owned -- it never re-dispatches
+# the predecessor's pending intent, because dispatch is refused for an already
+# claiming scope.  When it cannot adopt (no verifiable owned attempt), it
+# *refuses* by name rather than replaying a launch intent.
+RESUME_ADOPTED = "adopted"
+RESUME_REFUSED_NO_OWNED_ATTEMPT = "refused_no_owned_attempt"
+_RESUME_DECISIONS: frozenset[str] = frozenset({
+    RESUME_ADOPTED,
+    RESUME_REFUSED_NO_OWNED_ATTEMPT,
 })
 
 
@@ -1964,10 +2024,8 @@ class NativeProcessService:
         process's memory -- so a controller that lost the lease leaves a
         resumable statement of what was owned and under which fencing token.
         """
-        in_flight = tuple(
-            (i.execution_scope, i.step)
-            for i in self._store.list_dispatch_intents(claiming_only=True)
-        )
+        intents = tuple(self._store.list_dispatch_intents(claiming_only=True))
+        in_flight = tuple((i.execution_scope, i.step) for i in intents)
         run_id = self._run_id_label()
         return NativeProcessCheckpoint(
             run_id=run_id,
@@ -1978,14 +2036,63 @@ class NativeProcessService:
             ),
             journal_offset=self._store.last_journal_sequence(run_id),
             in_flight=in_flight,
+            resume_decision_event=self._resume_decision(intents, run_id),
         )
+
+    def _resume_decision(
+        self, in_flight: Sequence["DispatchIntent"], run_id: str
+    ) -> Optional[dict]:
+        """The resume statement a recovering controller publishes (criterion 1).
+
+        A controller that takes over the lease must resume *exactly one owned
+        attempt without replaying a pending launch intent*.  The predecessor's
+        in-flight intent is a pending launch; the resumed controller does not
+        re-dispatch it (dispatch is refused for an already claiming scope),
+        it *adopts* it -- but only when it can still verify the recorded
+        process as the owned attempt.  When nothing is in flight, or the
+        recorded identity can no longer be verified, the decision is an
+        explicit, named refusal.  A refusal is *left undurable* by this read
+        path (the controller that holds the lease writes the decision to the
+        journal); the checkpoint is the statement either way.
+        """
+        if not in_flight:
+            return {
+                "schema_id": RESUME_DECISION_SCHEMA_ID,
+                "decision": RESUME_REFUSED_NO_OWNED_ATTEMPT,
+                "run_id": run_id,
+                "reason": "no_in_flight_attempt",
+                "intent_id": "",
+                "execution_scope": "",
+                "verified": False,
+            }
+        # The in-flight set is the loop's claiming frontier; adopt the single
+        # owned attempt it names when its recorded identity still verifies.
+        intent = in_flight[0]
+        verification = self.verify_owned_attempt(intent)
+        verified = bool(getattr(verification, "ok", False))
+        return {
+            "schema_id": RESUME_DECISION_SCHEMA_ID,
+            "decision": (
+                RESUME_ADOPTED if verified else RESUME_REFUSED_NO_OWNED_ATTEMPT
+            ),
+            "run_id": run_id,
+            "reason": "" if verified else getattr(
+                verification, "reason", "identity_unverified"
+            ),
+            "intent_id": intent.intent_id,
+            "execution_scope": intent.execution_scope,
+            "verified": verified,
+        }
 
     def resume(self, *, ttl_seconds: int = 300) -> tuple[ControllerLease, NativeProcessCheckpoint]:
         """Take over the lease and read the checkpoint to resume the loop.
 
         The fencing token read here is strictly higher than the predecessor's,
         and the returned checkpoint lists exactly the in-flight intents of the
-        prior controller -- this service resumes from durable state.
+        prior controller -- this service resumes from durable state.  The
+        checkpoint additionally carries the ``resume_decision_event``: the
+        recovered controller *adopts* the one verified in-flight attempt
+        rather than replaying its pending launch intent.
         """
         lease = self.acquire(ttl_seconds=ttl_seconds)
         return lease, self.checkpoint()

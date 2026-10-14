@@ -19,6 +19,12 @@ from .native_process import (
     DuplicateDispatchError,
     LeaseNotHeldError,
     LeaseRefusedError,
+    # SW-1511-RECOVERY criterion 1: the resumed-controller seam.  A controller
+    # that takes over the lease through the durable store re-exports the native
+    # process service so the surviving controller -- not just a direct import of
+    # the module -- resumes the one verified owned attempt instead of replaying
+    # the predecessor's pending launch intent.
+    NativeProcessService,
     StaleFencingTokenError,
 )
 
