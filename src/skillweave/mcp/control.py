@@ -396,6 +396,22 @@ def current_http_token() -> str:
     return _CURRENT_HTTP_TOKEN.get()
 
 
+def _emit_http_refusal(message: str) -> str:
+    """Emit an HTTP refusal line through the server's log-emission boundary.
+
+    The refusal line carries no token by construction (it names only the
+    failure reason), but it is still emitted through
+    :func:`skillweave.mcp.server.emit_log` -- the redact-then-verify boundary --
+    so the credential-never-in-logs property holds for *every* real emission
+    path, this one included, rather than only for a caller-supplied blob. The
+    import is deferred (GLE-020) so importing this module never forces the
+    server's optional closure.
+    """
+    from skillweave.mcp import server as _server
+
+    return _server.emit_log(message)
+
+
 def _load_asgi_http_types():
     """The Starlette request/response types the HTTP middleware uses.
 
@@ -443,9 +459,10 @@ def _make_http_auth_middleware(token: str, *, authority: Any = None):
                 presented = check_http_authorization(request.headers, token)
             except HttpRequestUnauthorized as exc:
                 # No token in the log line; the reason names only the failure.
-                print(
-                    f"skillweave-mcp http refused: {exc.reason}", file=sys.stderr
-                )
+                # The line goes through the server's real log-emission boundary
+                # (redact-then-verify) so a credential-shaped header can never
+                # reach stderr from the HTTP refusal path either.
+                _emit_http_refusal(f"skillweave-mcp http refused: {exc.reason}")
                 response = response_cls(
                     HTTP_UNAUTHENTICATED_BODY.decode("utf-8"),
                     status_code=401,

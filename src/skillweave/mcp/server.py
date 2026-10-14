@@ -514,6 +514,100 @@ def _auth_error_payload(exc) -> str:
     return json.dumps({"status": "refused", **exc.to_dict()})
 
 
+# ---------------------------------------------------------------------------
+# SW-1511-MCP-BOOTSTRAP C6: the log-emission boundary and the restart seam
+# ---------------------------------------------------------------------------
+
+#: The environment variable naming the *interactive session* a restart is
+#: evaluated against. A restarted main session reconnects under the same
+#: identity, so this names the view, never the work.
+SESSION_IDENTITY_ENV = "SKILLWEAVE_MCP_SESSION_IDENTITY"
+
+#: The environment variable naming the durable process service a restart must
+#: land on. A restart that resolves a *different* service is refused rather
+#: than silently re-launched onto an isolated store.
+HANDLE_IDENTITY_ENV = "SKILLWEAVE_MCP_CHILD_HANDLE"
+
+
+def emit_log(message: str, *, environ=None) -> str:
+    """The real log-emission boundary: redact *then* fail closed.
+
+    **Every** log line the server emits passes through here, so the credential
+    property holds for actual output rather than a caller-supplied blob. A
+    worker's provider credential value is redacted before the line is written,
+    and the emitted line is then re-scanned -- a credential that still appears
+    verbatim (an unusually-shaped value the redactor did not recognise) is a
+    hard failure, never a silent leak.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    env = os.environ if environ is None else environ
+    redacted = _bootstrap.redact_worker_credentials(message, env)
+    _bootstrap.assert_worker_credentials_not_in_logs(redacted, env)
+    print(redacted, file=sys.stderr)
+    return redacted
+
+
+def reconnect_session(
+    *,
+    service: "object | None" = None,
+    service_fingerprint: str = "",
+    session_identity: str = "",
+    handle: "object | None" = None,
+    environ=None,
+) -> dict:
+    """The real entry a *restarted* main session goes through when it reconnects.
+
+    Restarting the interactive session must not disturb the single durable
+    process service or a child attempt that is mid-flight (quota waiting). This
+    is the production seam that **verifies** rather than re-launches:
+
+    * the granted service identity must match ``service_fingerprint`` (the one
+      the pre-restart session recorded), so a reconnect that resolves a
+      *different* service -- an isolated per-harness controller, a diverged
+      store -- is a named ``hold`` (``service_identity_mismatch``), never a
+      silent re-admission; and
+    * the child attempt is re-verified against the live OS facts through
+      :func:`skillweave.mcp.bootstrap.child_attempt_alive`, so a reconnect
+      reports *ready* only when a genuine live child survives the restart.
+
+    It never stops the service or the child and never launches a replacement.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    env = os.environ if environ is None else environ
+    identity = (session_identity or env.get(SESSION_IDENTITY_ENV, "")).strip()
+    fingerprint = (service_fingerprint or env.get(HANDLE_IDENTITY_ENV, "")).strip()
+    if service is None:
+        return {
+            "status": "hold",
+            "code": "no_service_bound",
+            "session_identity": identity,
+            "reason": "no durable process service is bound to this session",
+        }
+    observed = service.identity()
+    if fingerprint and fingerprint != observed:
+        return {
+            "status": "hold",
+            "code": "service_identity_mismatch",
+            "session_identity": identity,
+            "expected_service": fingerprint,
+            "observed_service": observed,
+            "reason": (
+                "the reconnect resolved a different durable process service; "
+                "refusing to re-admit the session onto a diverged store"
+            ),
+        }
+    child_alive = _bootstrap.child_attempt_alive(handle) if handle is not None else False
+    return {
+        "status": "ready" if child_alive else "hold",
+        "code": "" if child_alive else "child_not_verified_alive",
+        "session_identity": identity,
+        "service_identity": observed,
+        "service_reachable": True,
+        "child_alive": child_alive,
+    }
+
 
 @mcp.tool()
 def create_run(tool: str, model: str, subject_repo: str, subject_commit: str, command: str, db_path: str = ".skillweave/store.db", artifacts_path: str = ".skillweave/artifacts", methodology: str = "ralph", autonomy_policy: str = "", task_id: str = "", attempt: int = 1, output_root: str = "", stream_root: str = "", artifact_evidence: str = "", source_root: str = "", analysis_root: str = "", session_token: str = "", route_proof: str = "") -> str:
@@ -1429,13 +1523,15 @@ def main(
     except control.McpDependencyUnavailable as exc:
         # Checked first so the dependency-refusal path never has to import the
         # optional authority subpackage. One line, token-free, no traceback.
-        print(f"skillweave-mcp unavailable: {exc.reason}", file=sys.stderr)
+        # The diagnostic goes through the real log-emission boundary, so a
+        # worker credential can never reach stderr even here.
+        emit_log(f"skillweave-mcp unavailable: {exc.reason}")
         raise SystemExit(EXIT_REFUSED)
     except _authority_module().MCPAuthError as exc:
         # A missing supervisor identity (the stdio seam) or any other auth
         # refusal: print the actionable one-liner and exit with the documented
-        # code rather than dumping a traceback.
-        print(f"skillweave-mcp refused: {exc.message}", file=sys.stderr)
+        # code rather than dumping a traceback -- through the same guard.
+        emit_log(f"skillweave-mcp refused: {exc.message}")
         raise SystemExit(EXIT_REFUSED)
 
 

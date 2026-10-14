@@ -1769,6 +1769,35 @@ class TestAssignmentMailboxAndSourceBoundResult:
         assert out["status"] == "refused", out
         assert out["code"] == "cross_client_access_refused", out
 
+    def test_literal_wrong_attempt_start_is_refused(
+        self, authority, tmp_path
+    ):
+        """A second start of the *same attempt* is a duplicate, refused by scope.
+
+        Distinct from the cross-run case: the same task/run is named, but the
+        attempt value is reused. The authority fences on the start scope
+        (``task/attempt-N``), so the second start of an *already-launched*
+        attempt is a ``duplicate_start_refused`` -- a wrong attempt value can
+        never silently launch a second child of the same attempt.
+        """
+        session = self._session(
+            authority, role="controller", client_id="main",
+            allowed_roots=[str(tmp_path)],
+        )
+        scope = mcp_server.start_scope_for(task_id="task-1", attempt=1)
+        # The first start of attempt 1 is admitted ...
+        authority.authorize(session, "start_run", start_scope=scope)
+        # ... and a second start naming the *same literal attempt* is refused.
+        with pytest.raises(MCPAuthError) as exc:
+            authority.authorize(session, "start_run", start_scope=scope)
+        assert exc.value.code == "duplicate_start_refused", exc.value.to_dict()
+        # A genuinely *different* attempt value is not caught by that fence: it
+        # is a distinct scope, so the refusal above is not a blanket refusal.
+        authority.authorize(
+            session, "start_run",
+            start_scope=mcp_server.start_scope_for(task_id="task-1", attempt=2),
+        )
+
     def test_disallowed_output_path_is_refused(self, authority, tmp_path):
         """A write path outside the granted roots is refused by the authority."""
         session = self._session(
@@ -1888,14 +1917,53 @@ class TestAssignmentMailboxAndSourceBoundResult:
 
 
 class TestQualifiedTransportAdapterNeverSilentlyDowngrades:
-    def test_unknown_transport_is_a_named_unsupported_hold(self):
-        """An unknown transport is refused by name, never coerced to stdio."""
-        profile = control.transport_profile("carrier-pigeon")
-        assert profile.supported is False
-        assert profile.kind == "carrier-pigeon"
-        assert "carrier-pigeon" in profile.reason
-        # The served surface is named, so the HOLD is actionable.
-        assert "http" in profile.reason and "stdio" in profile.reason
+    def test_unknown_transport_is_a_named_unsupported_hold(self, tmp_path):
+        """An unknown transport is refused by name at the *selection* seam.
+
+        The earlier version of this test asserted on
+        ``control.transport_profile`` (the served-surface description), which is
+        a *different* seam. The finding was that the real selection seam
+        (``select_handoff_adapter``) silently coerced an unknown requested
+        transport to the polling adapter for a client that cannot receive
+        notifications. This exercises the selection seam directly.
+        """
+        mailbox = AgentMailbox(str(tmp_path / "mb.jsonl"))
+        capability = handoff_mod.detect_client_capability(
+            "legacy-harness",
+            attestation={"detected": True, "transports": [], "features": []},
+        )
+        assert capability.supports_notifications is False
+        with pytest.raises(handoff_mod.HandoffError) as exc:
+            handoff_mod.select_handoff_adapter(
+                capability, mailbox, requested_transport="carrier-pigeon"
+            )
+        assert exc.value.code == "TRANSPORT_NOT_SUPPORTED"
+
+    def test_unknown_transport_is_a_named_hold_through_the_tool(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """The same HOLD holds through the real ``handoff_adapter`` tool.
+
+        A client that cannot receive notifications must not have an unknown
+        requested transport silently coerced to file-poll with status ok.
+        """
+        monkeypatch.setenv(
+            mcp_server.MAILBOX_PATH_ENV, str(tmp_path / "mb.jsonl")
+        )
+        controller = authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            run_ids=["run-1"],
+        )
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="legacy-harness",
+                recipients="ops",
+                transport="carrier-pigeon",
+                session_token=controller,
+            )
+        )
+        assert out["status"] == "hold", out
+        assert out["code"] == "TRANSPORT_NOT_SUPPORTED", out
 
     def test_supported_transports_are_qualified(self):
         http = control.transport_profile("http", host="127.0.0.1", port=8765)
@@ -2625,3 +2693,82 @@ class TestRestartSurvivalAndCredentialLogBoundary:
         finally:
             proc.terminate()
             proc.wait()
+
+    def test_reconnect_session_entry_verifies_a_surviving_child(self, tmp_path):
+        """The real reconnect entry a restarted main session goes through.
+
+        ``server.reconnect_session`` is the production seam invoked after an
+        interactive restart; it re-verifies the durable service identity and a
+        live child (through ``child_attempt_alive``), rather than re-launching.
+        """
+        import subprocess
+        import time
+
+        from skillweave.runtime import process_identity as _pi
+
+        svc = _service(tmp_path)
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            time.sleep(0.1)
+            record = _pi.capture(proc.pid).to_dict()
+
+            class _LiveHandle:
+                pid = proc.pid
+                _sw_process_identity = record
+
+            out = mcp_server.reconnect_session(
+                service=svc,
+                service_fingerprint=svc.identity(),
+                session_identity="main",
+                handle=_LiveHandle(),
+            )
+            assert out["status"] == "ready", out
+            assert out["service_reachable"] is True
+            assert out["child_alive"] is True
+            assert out["session_identity"] == "main"
+            # Observational: the child survives the reconnect verification.
+            assert proc.poll() is None
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_reconnect_session_holds_on_a_different_service(self, tmp_path):
+        """A reconnect that lands on a *different* service fails closed."""
+        svc = _service(tmp_path)
+        other = boot.HarnessProcessService(
+            authority="skillweave-process-service",
+            db_path=str(tmp_path / "other.db"),
+            mailbox_path=str(tmp_path / "other-mailbox.jsonl"),
+            artifacts_path=str(tmp_path / "other-artifacts"),
+            stream_root=str(tmp_path / "other-streams"),
+        )
+        out = mcp_server.reconnect_session(
+            service=svc,
+            service_fingerprint=other.identity(),
+        )
+        assert out["status"] == "hold", out
+        assert out["code"] == "service_identity_mismatch", out
+
+    def test_emit_log_redacts_then_fails_closed_on_real_output(
+        self, capsys
+    ):
+        """The real log-emission boundary redacts, then re-verifies output.
+
+        Every server emission goes through ``server.emit_log``: a credential
+        value is redacted before the line is written, and the emitted line is
+        re-scanned so a value the redactor did not recognise is a hard refusal
+        -- the property holds for actual output, not a passed-in blob.
+        """
+        environ = {"ANTHROPIC_API_KEY": "sk-real-secret"}
+        # A recognised credential value is redacted in the *actual* output.
+        emitted = mcp_server.emit_log(
+            "provider call failed key=sk-real-secret", environ=environ
+        )
+        assert "sk-real-secret" not in emitted
+        assert "sk-real-secret" not in capsys.readouterr().err
+        # A credential-shaped value that reaches an emitted line verbatim is a
+        # hard failure, never a silent leak.
+        with pytest.raises(ValueError):
+            boot.assert_worker_credentials_not_in_logs(
+                "leak sk-real-secret", environ
+            )

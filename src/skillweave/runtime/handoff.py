@@ -678,6 +678,16 @@ def select_handoff_adapter(
     adapter for every other client (including an undetected one). Every selected
     adapter carries the same ``authority_contract``.
     """
+    # An *unknown* requested transport is a named HOLD for *every* client class,
+    # checked before any capability-driven branch: a client that cannot receive
+    # notifications must never have an unrecognized transport silently coerced
+    # to the polling adapter.
+    if requested_transport and requested_transport not in SUPPORTED_HANDOFF_TRANSPORTS:
+        raise HandoffError(
+            f"unsupported handoff transport {requested_transport!r}; supported "
+            f"transports are {sorted(SUPPORTED_HANDOFF_TRANSPORTS)}",
+            code="TRANSPORT_NOT_SUPPORTED",
+        )
     if not capability.supports_notifications:
         # A client that cannot receive MCP notifications must never be handed
         # the notification adapter: the fallback is the qualified polling
@@ -690,12 +700,6 @@ def select_handoff_adapter(
             )
         return PollingTransportAdapter(
             capability, mailbox, authority_contract
-        )
-    if requested_transport and requested_transport not in SUPPORTED_HANDOFF_TRANSPORTS:
-        raise HandoffError(
-            f"unsupported handoff transport {requested_transport!r}; supported "
-            f"transports are {sorted(SUPPORTED_HANDOFF_TRANSPORTS)}",
-            code="TRANSPORT_NOT_SUPPORTED",
         )
     return NotificationTransportAdapter(
         capability, mailbox, authority_contract
