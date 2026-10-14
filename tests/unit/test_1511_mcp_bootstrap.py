@@ -2899,6 +2899,262 @@ class TestHandoffAdapterSelectionSeam:
         assert out["continuation"]["mode"] == "checkpoint_continuation", out
         assert out["continuation"]["session_id"] == ""
 
+    # -- SW-1511-RECOVERY criterion 2 (D, teeth): the selection is the native
+    # *ordering-first* decision. A non-verifying ordering-first intent REFUSES
+    # (named checkpoint) -- it is never skipped to adopt a later live intent --
+    # and several intents in both orders resolve by the frontier order, not by
+    # identity. --------------------------------------------------------------
+
+    def _forged_identity(self):
+        """A recycled-pid identity captured live then made non-verifying."""
+        forged = process_identity.capture(os.getpid()).to_dict()
+        forged["start_time"] = "0.0"  # a recycled pid: never the owned attempt
+        return forged
+
+    def test_handoff_tool_refuses_a_non_verifying_ordering_first_intent(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A stale ordering-first intent refuses; it is not skipped for a live one.
+
+        The frontier's *first* record (by ``created_at``/``intent_id``) is a
+        recycled-identity intent and a *live* intent is recorded after it. The
+        native decision adopts only ``in_flight[0]`` and, when that does not
+        verify, refuses with ``refused_no_owned_attempt`` -- the server must do
+        the same: a named checkpoint with an *empty* session id, never the live
+        intent's session reached by skipping the stale first record.
+        """
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        self._attested(monkeypatch)
+        live = process_identity.capture(os.getpid())
+        db_path = str(tmp_path / "store.db")
+        # The ordering-first intent: recorded FIRST, identity does not verify.
+        self._seed_intent(
+            db_path, session_id="sess-stale", state="launched",
+            process_identity=self._forged_identity(),
+            attempt=1, scope="run-1/task-a/1", intent_id="intent-stale",
+        )
+        # A *live* intent recorded after it -- which a skipping selection would
+        # wrongly adopt.
+        self._seed_intent(
+            db_path, session_id="sess-live", state="launched",
+            process_identity=live.to_dict(),
+            attempt=2, scope="run-1/task-a/2", intent_id="intent-live",
+        )
+        token = self._rooted_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        continuation = out["continuation"]
+        assert continuation["mode"] == "checkpoint_continuation", out
+        assert continuation["session_id"] == "", out
+        assert continuation["limitation"] == "session_identity_unknown", out
+
+    def test_handoff_tool_adopts_the_verifying_ordering_first_intent(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """With the *live* intent ordering-first, it is adopted; no skipping.
+
+        The mirror of the refusal case: the live intent is recorded first and a
+        stale intent after it. Native ``in_flight[0]`` verifies, so the session
+        resume names the live intent -- and never the later stale record.
+        """
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        self._attested(monkeypatch)
+        live = process_identity.capture(os.getpid())
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-live", state="launched",
+            process_identity=live.to_dict(),
+            attempt=2, scope="run-1/task-a/2", intent_id="intent-live",
+        )
+        self._seed_intent(
+            db_path, session_id="sess-stale", state="launched",
+            process_identity=self._forged_identity(),
+            attempt=1, scope="run-1/task-a/1", intent_id="intent-stale",
+        )
+        token = self._rooted_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        assert out["continuation"]["mode"] == "session_resume", out
+        assert out["continuation"]["session_id"] == "sess-live", out
+        assert out["continuation"]["intent_id"] == "intent-live", out
+
+    def test_handoff_tool_several_intents_resolve_by_frontier_order(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """With several live intents the *ordering-first* one is adopted.
+
+        Three in-flight intents are recorded in a known order; the adopted
+        session must be the ordering-first one (by ``created_at``/
+        ``intent_id``), never "any verified intent" reached by iteration order.
+        """
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        self._attested(monkeypatch)
+        live = process_identity.capture(os.getpid())
+        db_path = str(tmp_path / "store.db")
+        for n, sid in ((1, "sess-1"), (2, "sess-2"), (3, "sess-3")):
+            self._seed_intent(
+                db_path, session_id=sid, state="launched",
+                process_identity=live.to_dict(),
+                attempt=n, scope=f"run-1/task-a/{n}", intent_id=f"intent-{n}",
+            )
+        token = self._rooted_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        assert out["continuation"]["mode"] == "session_resume", out
+        assert out["continuation"]["session_id"] == "sess-1", out
+        assert out["continuation"]["intent_id"] == "intent-1", out
+
+    def test_handoff_tool_several_intents_with_a_stale_first_refuse(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """Several intents with a non-verifying ordering-first one refuse.
+
+        The first of three in-flight intents carries a recycled identity; even
+        though two later live intents exist, the native decision refuses on
+        ``in_flight[0]`` rather than adopting a later intent -- the server must
+        yield the named checkpoint, never skip forward.
+        """
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        self._attested(monkeypatch)
+        live = process_identity.capture(os.getpid())
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-stale", state="launched",
+            process_identity=self._forged_identity(),
+            attempt=1, scope="run-1/task-a/1", intent_id="intent-stale",
+        )
+        for n, sid in ((2, "sess-2"), (3, "sess-3")):
+            self._seed_intent(
+                db_path, session_id=sid, state="launched",
+                process_identity=live.to_dict(),
+                attempt=n, scope=f"run-1/task-a/{n}", intent_id=f"intent-{n}",
+            )
+        token = self._rooted_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        assert out["continuation"]["mode"] == "checkpoint_continuation", out
+        assert out["continuation"]["session_id"] == "", out
+        assert out["continuation"]["limitation"] == "session_identity_unknown", out
+
+    # -- SW-1511-RECOVERY criterion 2 (C, teeth): the reader is scoped to the
+    # run recorded *in the record itself*, in both directions. ---------------
+
+    def _two_run_token(self, authority, root):
+        """A controller bound to ``run-1`` *and* ``run-2`` with one root."""
+        return authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            run_ids=["run-1", "run-2"], allowed_roots=[str(root)],
+        )
+
+    def _persisted_record(self, mailbox_path: Path, run_id: str) -> dict:
+        """The durable ``harness-continuation`` status record for ``run_id``."""
+        records = AgentMailbox(str(mailbox_path)).read(
+            recipient="mcp:controller:main", principal="mcp:controller:main",
+            kinds=["status"],
+        )
+        matches = [
+            r for r in records
+            if r.get("run_id") == run_id
+            and isinstance(r.get("body"), dict)
+            and r["body"].get("schema_id")
+            == "https://skillweave.dev/schemas/process/harness-continuation/v1"
+        ]
+        assert matches, records
+        return matches[-1]
+
+    def _persist_for_run(self, mailbox_path: Path, run_id: str, *, session_id: str) -> None:
+        """Post a ``harness-continuation`` status record owned by ``run_id``.
+
+        The record is written the way :func:`_persist_continuation_decision`
+        writes it -- scoped to ``run_id`` and the principal -- but directly, so
+        a multi-run mailbox can be built without driving a second store.
+        """
+        from skillweave.runtime.native_process import plan_harness_continuation
+
+        decision = plan_harness_continuation(
+            run_id, resume_capability_attested=True, prior_session_id=session_id,
+            intent_id=f"intent-{session_id}",
+        )
+        principal = "mcp:controller:main"
+        AgentMailbox(str(mailbox_path)).post(
+            AgentMessage(
+                kind="status", sender=principal, recipient=principal,
+                principal=principal, run_id=run_id,
+                message_id=f"harness-continuation-{run_id}-{decision.mode}",
+                body=decision.to_dict(),
+            )
+        )
+
+    def test_read_continuation_decision_is_scoped_to_the_records_run(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A record for another run is never returned for the requested run.
+
+        A controller bound to ``run-1`` and ``run-2`` persisted a decision for
+        each. Reading ``run-1`` must return *run-1's* record -- never run-2's
+        mislabelled with ``run_id="run-1"``.
+        """
+        mailbox_path = self._mailbox_path(tmp_path, monkeypatch)
+        self._persist_for_run(mailbox_path, "run-1", session_id="sess-1")
+        self._persist_for_run(mailbox_path, "run-2", session_id="sess-2")
+        token = self._two_run_token(authority, tmp_path)
+        read = json.loads(
+            mcp_server.read_continuation_decision(
+                run_id="run-1", session_token=token,
+            )
+        )
+        assert read["status"] == "ok", read
+        assert read["found"] is True, read
+        assert read["run_id"] == "run-1", read
+        assert read["decision"]["session_id"] == "sess-1", read
+        assert read["decision"]["run_id"] == "run-1", read
+
+    def test_read_continuation_decision_for_a_run_without_a_record_is_absent(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """Reading a run that has no record is ``found: false``, not a foreign one.
+
+        A decision exists for ``run-1`` only; reading ``run-2`` (bound, but with
+        no record of its own) must be fail-closed absent -- never run-1's
+        decision relabelled as run-2's.
+        """
+        mailbox_path = self._mailbox_path(tmp_path, monkeypatch)
+        self._persist_for_run(mailbox_path, "run-1", session_id="sess-1")
+        token = self._two_run_token(authority, tmp_path)
+        read = json.loads(
+            mcp_server.read_continuation_decision(
+                run_id="run-2", session_token=token,
+            )
+        )
+        assert read["status"] == "ok", read
+        assert read["found"] is False, read
+        assert read["run_id"] == "run-2", read
+        assert "decision" not in read, read
+
     # -- SW-1511-RECOVERY criterion 2 (C): the persisted decision has a real
     # production reader, without instantiating NativeProcessService. --------
 

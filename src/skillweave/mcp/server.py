@@ -1387,25 +1387,27 @@ def handoff_adapter(
 
 
 def _recorded_session_for_run(db_path: str, run_id: str) -> tuple[str, str]:
-    """The *verified* in-flight attempt's recorded ``(intent_id, session_id)``.
+    """The *ordering-first* in-flight attempt's verified ``(intent_id, session_id)``.
 
     Reads the durable dispatch record for ``run_id`` -- the same record a launch
     wrote -- so a session resume is bound to an *observed* session, never a
-    caller-supplied or invented one.  Only the run's **in-flight** attempt
-    (state in the claiming frontier: ``launched``/``reviewing``/``repairing``/
-    ``integrating``) whose recorded process identity still verifies against the
-    live OS may be adopted -- mirroring the native controller's own
-    ``_resume_decision``/``verify_owned_attempt``.  A superseded, failed or
-    terminal attempt is never selected, and an attempt whose identity no longer
-    verifies (recycled pid, stale command, foreign worker, unobservable) is a
-    fail-closed ``("", "")`` -- the continuation then falls to the named
-    checkpoint rather than naming a session whose owner is unverified.  A store
-    that cannot be opened is likewise a fail-closed ``("", "")``.
+    caller-supplied or invented one.  The selection is the native controller's
+    own: :meth:`NativeProcessService._resume_decision` adopts the
+    **ordering-first** in-flight intent (``in_flight[0]``, the frontier's
+    ``created_at``/``intent_id`` order) when its recorded identity still
+    verifies through :meth:`NativeProcessService.verify_owned_attempt`, and
+    otherwise **refuses** -- it never skips the first intent to adopt a later
+    one.  A first intent whose identity no longer verifies (recycled pid, stale
+    command, foreign worker, unobservable) therefore yields a fail-closed
+    ``("", "")`` and the named checkpoint, exactly as the native decision
+    refuses with ``refused_no_owned_attempt`` rather than silently continuing a
+    different attempt.  A store that cannot be opened is likewise a fail-closed
+    ``("", "")``.
     """
     store = None
     try:
         store = _get_store(db_path)
-        # Only the in-flight frontier carries a resumable owned attempt; a
+        # Only the claiming frontier carries a resumable owned attempt; a
         # reviewed/integrated/failed intent is a superseded record, not the one
         # a recovered controller continues.
         intents = store.list_dispatch_intents(run_id, claiming_only=True)
@@ -1417,11 +1419,13 @@ def _recorded_session_for_run(db_path: str, run_id: str) -> tuple[str, str]:
                 store.close()
             except Exception:
                 pass
-    # The claiming frontier names at most one owned attempt per scope; adopt it
-    # only when its recorded identity still verifies as the live process.
-    for intent in intents:
-        if _intent_identity_verified(intent):
-            return intent.intent_id, intent.session_id
+    if not intents:
+        return "", ""
+    # Identical to the native decision: adopt only the ordering-first in-flight
+    # intent when its recorded identity still verifies; refuse rather than skip.
+    first = intents[0]
+    if _intent_identity_verified(first):
+        return first.intent_id, first.session_id
     return "", ""
 
 
@@ -1494,6 +1498,14 @@ def read_continuation_decision(
     Returns ``found: true`` with the stored decision when one is present, and a
     fail-closed ``found: false`` (never a fabricated decision) when no decision
     has been persisted for the run or the read is refused.
+
+    The read is scoped to ``run_id`` by the run recorded **in the record
+    itself**, not by the caller argument alone: a mailbox read filters by
+    recipient and principal only, so a caller bound to several runs would
+    otherwise receive the newest decision across all of them mislabelled with
+    the requested run.  A record that belongs to a different run is never
+    returned and is never relabelled with the requested ``run_id`` -- when no
+    record of that run exists the read is ``found: false``.
     """
     gate_principal, refusal = gate_operation("read_run", session_token, run_id=run_id)
     if refusal is not None:
@@ -1509,6 +1521,10 @@ def read_continuation_decision(
     except _authority_module().MCPAuthError as exc:
         return _auth_error_payload(exc)
     for record in reversed(messages):
+        # The run on the durable record is authoritative; the caller's run_id
+        # only ever narrows the search, it never relabels a foreign record.
+        if record.get("run_id") != run_id:
+            continue
         body = record.get("body")
         if (
             isinstance(body, dict)
@@ -1517,7 +1533,7 @@ def read_continuation_decision(
             return json.dumps({
                 "status": "ok",
                 "found": True,
-                "run_id": run_id or record.get("run_id", ""),
+                "run_id": record.get("run_id"),
                 "message_id": record.get("message_id"),
                 "seq": record.get("seq"),
                 "decision": body,
