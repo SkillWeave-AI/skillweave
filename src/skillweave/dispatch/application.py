@@ -28,6 +28,7 @@ wave the caller names) and makes no claim of stable 1.4 transport compatibility.
 from __future__ import annotations
 
 import importlib
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -800,6 +801,26 @@ def _default_inline_seam(
 # ── Tee sink (observer replay) ──────────────────────────────────────────────
 
 
+def _guard_worker_credentials(line: str) -> str:
+    """Redact any ambient worker credential value from a teed output line.
+
+    The dispatch/child-launch output path writes to a caller-supplied sink, so
+    a worker's provider credential must never be observable there.  The guard
+    runs on the actual line being written (never on a caller-supplied blob):
+    a credential-shaped value is replaced with the explicit redaction marker,
+    and any residual value is refused rather than forwarded.  The bootstrap
+    module is imported lazily so this module stays free of a hard MCP import.
+    """
+    try:
+        from skillweave.mcp import bootstrap as _bootstrap
+    except Exception:  # pragma: no cover - import boundary must never break output
+        return line
+    environ = os.environ
+    redacted = _bootstrap.redact_worker_credentials(line, environ)
+    _bootstrap.assert_worker_credentials_not_in_logs(redacted, environ)
+    return redacted
+
+
 class _TeeSink:
     """A text sink that forwards to a caller sink while recording emitted lines.
 
@@ -807,6 +828,11 @@ class _TeeSink:
     wave produced — not a copy owned by the observer. The tee is transparent to
     the caller: every write and flush is forwarded immediately, so the live
     consumer still sees ``wave_started`` before the first worker launch.
+
+    This is a real output path for a launched child and its dispatch lifecycle,
+    so every line is passed through the worker-credential guard before it
+    reaches the caller sink — a worker's provider credential is redacted here,
+    on the actual write, never merely assumed absent.
     """
 
     def __init__(self, caller_sink: Any) -> None:
@@ -814,8 +840,9 @@ class _TeeSink:
         self._lines: list[str] = []
 
     def write(self, s: str) -> int:
-        self._lines.append(s)
-        return self._caller.write(s)
+        guarded = _guard_worker_credentials(str(s))
+        self._lines.append(guarded)
+        return self._caller.write(guarded)
 
     def flush(self) -> None:
         self._caller.flush()

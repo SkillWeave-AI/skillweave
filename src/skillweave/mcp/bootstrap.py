@@ -609,6 +609,88 @@ def child_attempt_alive(handle: Any) -> bool:
     return bool(getattr(verified, "ok", False))
 
 
+class _RecordedChildHandle:
+    """A handle rebuilt from a run's *recorded* native process identity.
+
+    A restart has no live handle object in memory -- it has the identity the
+    durable service recorded when the child was launched.  This adapts that
+    recorded fact back into the shape :func:`child_attempt_alive` verifies
+    against the live OS facts, so a restart re-verifies the *recorded* child
+    rather than assuming a survivor.
+    """
+
+    def __init__(self, pid: int, identity: Mapping[str, Any]) -> None:
+        self.pid = int(pid)
+        self._sw_process_identity = dict(identity)
+
+
+def recorded_child_handle(recorded: Any) -> Optional[_RecordedChildHandle]:
+    """Rebuild a child handle from a run's recorded ``process_identity``.
+
+    ``recorded`` is the identity dict the service persisted at launch (or a
+    ``RunRecord``-shaped object carrying it under ``metadata``).  Returns
+    ``None`` when no usable recorded identity was persisted, so a restart is
+    reported as *not verified* rather than assumed safe.
+    """
+    if recorded is None:
+        return None
+    if isinstance(recorded, Mapping):
+        identity = recorded
+    else:
+        metadata = getattr(recorded, "metadata", None) or {}
+        identity = metadata.get("process_identity") or (
+            (metadata.get("runlifecycle") or {}).get("process_identity")
+        )
+    if not identity:
+        return None
+    pid = identity.get("pid")
+    if not pid:
+        return None
+    return _RecordedChildHandle(int(pid), identity)
+
+
+def service_identity_for(service: Any) -> str:
+    """The identity digest of *any* resolved process service (duck-typed).
+
+    The real reconnect path may hold a service object that is not literally a
+    :class:`HarnessProcessService` (a wrapper, a test double that carries the
+    same identity contract).  This resolves the same digest
+    :meth:`HarnessProcessService.identity` produces without forcing the caller
+    to be that exact class, so the reconnect verifies the service the serving
+    seam actually resolved rather than assuming a type.
+    """
+    if isinstance(service, HarnessProcessService):
+        return service.identity()
+    try:
+        identity = service.identity()
+    except AttributeError:
+        return ""
+    return identity or ""
+
+
+def restart_ready_by_service(
+    service: Any, handle: Any
+) -> dict[str, Any]:
+    """Restart readiness driven by a resolved service, not a minted grant.
+
+    A reconnecting main session has the *service it resolves to*, not the
+    original child grant (that was consumed at launch).  This is the same
+    readiness check :func:`restart_ready` performs -- service identity
+    reachable and child verifiably alive -- applied to the reconnecting
+    session's own service resolution, so the check is reachable through the
+    real reconnect path.
+    """
+    identity = service_identity_for(service)
+    service_ok = bool(identity)
+    child_ok = child_attempt_alive(handle)
+    return {
+        "status": "ready" if (service_ok and child_ok) else "hold",
+        "service_identity": identity,
+        "service_reachable": service_ok,
+        "child_alive": child_ok,
+    }
+
+
 def restart_ready(grant: HarnessMcpSessionGrant, handle: Any) -> dict[str, Any]:
     """Whether the interactive session may restart without disturbing the work.
 
@@ -620,14 +702,7 @@ def restart_ready(grant: HarnessMcpSessionGrant, handle: Any) -> dict[str, Any]:
     replacement: it only verifies the invariants a restart relies on, and it
     fails closed (``False``) when the child cannot be verified.
     """
-    service_ok = bool(grant.service.identity())
-    child_ok = child_attempt_alive(handle)
-    return {
-        "status": "ready" if (service_ok and child_ok) else "hold",
-        "service_identity": grant.service.identity(),
-        "service_reachable": service_ok,
-        "child_alive": child_ok,
-    }
+    return restart_ready_by_service(grant.service, handle)
 
 
 # --------------------------------------------------------------------------
@@ -717,8 +792,11 @@ __all__ = [
     "assert_worker_credentials_not_in_logs",
     "child_attempt_alive",
     "grant_child_env",
+    "recorded_child_handle",
     "redact_worker_credentials",
     "restart_ready",
+    "restart_ready_by_service",
+    "service_identity_for",
     "mailbox_binding_for_grant",
     "refuse_isolated_controller",
     "same_authority",

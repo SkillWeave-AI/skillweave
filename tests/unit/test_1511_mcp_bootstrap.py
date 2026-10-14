@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -98,6 +99,18 @@ def _service(root: Path) -> boot.HarnessProcessService:
         artifacts_path=str(root / "artifacts"),
         stream_root=str(root / "streams"),
     )
+
+
+def _bind_mailbox(monkeypatch, svc: boot.HarnessProcessService) -> None:
+    """Bind the server-owned mailbox so the serving seam resolves *this* service.
+
+    ``control.service_for_binding`` -- the seam the reconnect tool and the real
+    serving path both use -- resolves the mailbox from the server-owned
+    ``MAILBOX_PATH_ENV``. The test harness points that env at the same mailbox
+    ``_service`` uses, so a restarted session resolving "its" service reaches
+    the same durable store (the same identity digest).
+    """
+    monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, svc.mailbox_path)
 
 
 class _FakeHandle:
@@ -2772,3 +2785,303 @@ class TestRestartSurvivalAndCredentialLogBoundary:
             boot.assert_worker_credentials_not_in_logs(
                 "leak sk-real-secret", environ
             )
+
+    def test_restart_session_tool_reverifies_a_recorded_live_child(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """The registered tool a *restarted* main session actually calls.
+
+        The pre-restart session held a live child; the restart has no live
+        handle object -- only the *recorded* native process identity in the
+        durable store. ``mcp_server.restart_session`` is the registered tool a
+        restarted session goes through: it resolves the server-owned service,
+        rebuilds the handle from the durable record, and re-verifies the
+        surviving child through ``restart_ready`` without stopping it.
+        """
+        import time
+
+        from skillweave.runtime import process_identity as _pi
+
+        svc = _service(tmp_path)
+        _bind_mailbox(monkeypatch, svc)
+        store = SQLiteRunStore(svc.db_path)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        )
+        try:
+            time.sleep(0.1)
+            identity = _pi.capture(proc.pid).to_dict()
+            # The durable service records the child identity at launch; the
+            # restarted session has *only* this fact.
+            store.create_run(
+                "run-live", task_id="t", attempt=1, process_identity=identity
+            )
+
+            session = authority.issue_session(
+                role="controller", client_id="main", transport="http",
+                allowed_roots=[str(tmp_path)],
+            )
+            out = json.loads(
+                mcp_server.restart_session(
+                    run_id="run-live",
+                    db_path=svc.db_path,
+                    artifacts_path=svc.artifacts_path,
+                    service_fingerprint=svc.identity(),
+                    session_token=session,
+                )
+            )
+            assert out["status"] == "ready", out
+            assert out["service_reachable"] is True
+            assert out["child_alive"] is True
+            assert out["service_identity"] == svc.identity()
+            # Observational: the restart verification did not stop the child.
+            assert proc.poll() is None
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_restart_session_tool_holds_when_the_recorded_child_is_gone(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A restart whose recorded child is dead fails closed (named hold).
+
+        The durable record outlives the child; the registered tool must not
+        report a survivor it cannot verify against the live OS facts.
+        """
+        import time
+
+        from skillweave.runtime import process_identity as _pi
+
+        svc = _service(tmp_path)
+        _bind_mailbox(monkeypatch, svc)
+        store = SQLiteRunStore(svc.db_path)
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        time.sleep(0.05)
+        captured = _pi.capture(proc.pid)
+        stale = captured.to_dict() if captured is not None else {
+            "pid": proc.pid, "start_time": "", "identity_token": "stale"
+        }
+        store.create_run("run-dead", task_id="t", attempt=1, process_identity=stale)
+
+        session = authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            allowed_roots=[str(tmp_path)],
+        )
+        out = json.loads(
+            mcp_server.restart_session(
+                run_id="run-dead",
+                db_path=svc.db_path,
+                artifacts_path=svc.artifacts_path,
+                service_fingerprint=svc.identity(),
+                session_token=session,
+            )
+        )
+        assert out["status"] == "hold", out
+        assert out["child_alive"] is False
+
+    def test_startup_seam_verifies_restart_survival_before_admitting(
+        self, authority, tmp_path
+    ):
+        """The startup path a restarted session goes through verifies survival.
+
+        ``startup_and_bind_stdio`` is the real startup seam. When the
+        environment declares the pre-restart session identity, a start that
+        cannot verify the surviving service/child is refused (failing closed);
+        the same start with a verified live child is admitted.
+        """
+        import time
+
+        from skillweave.runtime import process_identity as _pi
+
+        svc = _service(tmp_path)
+        store = SQLiteRunStore(svc.db_path)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        )
+        try:
+            time.sleep(0.1)
+            identity = _pi.capture(proc.pid).to_dict()
+            store.create_run(
+                "run-start", task_id="t", attempt=1, process_identity=identity
+            )
+
+            env = {
+                mcp_server.SESSION_IDENTITY_ENV: "run-start",
+                mcp_server.HANDLE_IDENTITY_ENV: svc.identity(),
+                mcp_server.SUPERVISOR_ENV: "operator",
+            }
+            # A restart that verifies the surviving child is admitted.
+            token = mcp_server.startup_and_bind_stdio(
+                process_service=svc, environ=env
+            )
+            assert token
+            assert proc.poll() is None
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_restart_does_not_break_a_recorded_quota_wait_or_cancellation(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A recorded quota wait and a cancellation survive a session restart.
+
+        The scenario the criterion names end-to-end: a child is mid-flight
+        waiting on a provider quota window, with the wait *recorded* in the
+        durable run metadata. The main interactive session restarts (the live
+        handle is discarded; only the durable record survives). After the
+        simulated restart: (a) the recorded quota wait is still intact, and
+        (b) cancellation still verifies the *recorded* identity and signals the
+        still-living child through the real ``control.control_cancel`` entry --
+        neither the restart nor the cancel fabricates a termination.
+        """
+        import time
+
+        from skillweave.runtime import process_identity as _pi
+        from skillweave.runtime.semantic_repair import (
+            attempt_condition_for_quota,
+        )
+
+        svc = _service(tmp_path)
+        _bind_mailbox(monkeypatch, svc)
+        store = SQLiteRunStore(svc.db_path)
+        # ``start_new_session`` gives the child its own process group: the
+        # cancellation signals the *owned* group by pgid, so a child sharing
+        # the test runner's group would signal the runner itself.
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+        )
+        try:
+            time.sleep(0.1)
+            identity = _pi.capture(proc.pid).to_dict()
+            wait = attempt_condition_for_quota(
+                error_class="provider_quota",
+                run_id="run-quota",
+                task_id="task-1",
+                attempt=1,
+                session_id="sess-1",
+                route="owned-route",
+                reset_at=None,
+                backoff_seconds=900.0,
+            )
+            store.create_run(
+                "run-quota",
+                task_id="task-1",
+                attempt=1,
+                process_identity=identity,
+                attempt_condition=wait.to_dict(),
+            )
+            recorded_wait = store.get_run("run-quota").metadata["attempt_condition"]
+
+            # ── the main session restarts: the live handle is gone ─────────
+            session = authority.issue_session(
+                role="controller", client_id="main-restarted",
+                transport="http", allowed_roots=[str(tmp_path)],
+            )
+            ready = json.loads(
+                mcp_server.restart_session(
+                    run_id="run-quota",
+                    db_path=svc.db_path,
+                    artifacts_path=svc.artifacts_path,
+                    service_fingerprint=svc.identity(),
+                    session_token=session,
+                )
+            )
+            assert ready["status"] == "ready", ready
+            assert ready["child_alive"] is True
+
+            # (a) The recorded quota wait is unchanged across the restart.
+            after_restart = store.get_run("run-quota").metadata["attempt_condition"]
+            assert after_restart == recorded_wait
+            assert after_restart["decision"] == "resume_same_route", after_restart
+
+            # (b) Cancellation still works: the recorded identity verifies and
+            #     the still-living child is signalled -- no fabricated result.
+            cancelled = control.control_cancel(
+                "run-quota",
+                reason="interactive restart",
+                db_path=svc.db_path,
+                artifacts_path=svc.artifacts_path,
+            )
+            assert cancelled["status"] == "cancel_requested", cancelled
+            assert cancelled["identity_verified"] is True, cancelled
+            proc.wait(timeout=10)
+            assert proc.poll() is not None
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait()
+
+
+# ===========================================================================
+# Criterion 6 (continued): the credential rule holds on the *real* output
+# paths of the dispatch stream and of child launch -- never a caller blob
+# ===========================================================================
+
+
+class TestWorkerCredentialGuardOnRealOutputPaths:
+    """The worker-credential rule is enforced where output is actually written.
+
+    Criterion 6 requires a worker's provider credential never reach a
+    model-provider request or a log. These tests drive the *real* dispatch
+    output paths -- the dispatch event stream's sink and the teed child-launch
+    sink -- with a credential value already present, and prove it is redacted
+    on the write, not merely assumed absent from a caller-supplied blob.
+    """
+
+    def _credential(self, monkeypatch):
+        environ = {"ANTHROPIC_API_KEY": "sk-dispatch-secret"}
+        monkeypatch.setattr(os, "environ", environ, raising=False)
+        return environ
+
+    def test_dispatch_event_stream_sink_redacts_a_credential_on_write(
+        self, tmp_path, monkeypatch
+    ):
+        """The stream's own JSONL sink never carries a credential value.
+
+        ``DispatchEventStream`` writes each event to its sink; the guard runs
+        on the *encoded line actually written*, so a credential value that
+        reached an event field is redacted before it reaches the sink.
+        """
+        from skillweave.dispatch import events as _events
+
+        self._credential(monkeypatch)
+        sink_path = tmp_path / "stream.jsonl"
+        with open(sink_path, "w", encoding="utf-8") as sink:
+            stream = _events.DispatchEventStream("run-1", sink)
+            stream.emit(
+                wave="w1",
+                lane_id="lane-1",
+                dispatch_id="d1",
+                event_type=_events.EventType.LANE_STARTED,
+                process_status=_events.ProcessStatus.RUNNING,
+                task_status=_events.TaskStatus.IN_PROGRESS,
+                payload={"note": "worker used sk-dispatch-secret"},
+            )
+        written = sink_path.read_text(encoding="utf-8")
+        assert "sk-dispatch-secret" not in written, written
+        assert "<redacted-credential>" in written, written
+
+    def test_tee_sink_redacts_a_credential_on_child_launch_output(
+        self, tmp_path, monkeypatch
+    ):
+        """The teed child-launch sink never carries a credential value.
+
+        ``_TeeSink`` is the real output sink the dispatch/child-launch path
+        forwards to the caller. Every written line passes through the guard on
+        the write, so a credential value in a launched child's line is redacted
+        before the caller sees it.
+        """
+        from skillweave.dispatch import application as _app
+
+        self._credential(monkeypatch)
+        import io
+
+        caller = io.StringIO()
+        tee = _app._TeeSink(caller)
+        tee.write('{"line": "child env key=sk-dispatch-secret"}\n')
+        forwarded = caller.getvalue()
+        assert "sk-dispatch-secret" not in forwarded, forwarded
+        assert "<redacted-credential>" in forwarded, forwarded
+        assert all("sk-dispatch-secret" not in line for line in tee.lines)

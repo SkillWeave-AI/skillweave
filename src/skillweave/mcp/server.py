@@ -554,6 +554,7 @@ def reconnect_session(
     service_fingerprint: str = "",
     session_identity: str = "",
     handle: "object | None" = None,
+    recorded_handle: "object | None" = None,
     environ=None,
 ) -> dict:
     """The real entry a *restarted* main session goes through when it reconnects.
@@ -568,8 +569,14 @@ def reconnect_session(
       store -- is a named ``hold`` (``service_identity_mismatch``), never a
       silent re-admission; and
     * the child attempt is re-verified against the live OS facts through
-      :func:`skillweave.mcp.bootstrap.child_attempt_alive`, so a reconnect
+      :func:`skillweave.mcp.bootstrap.restart_ready_by_service`, so a reconnect
       reports *ready* only when a genuine live child survives the restart.
+
+    ``handle`` is a live child handle when the caller still holds one;
+    ``recorded_handle`` is a handle rebuilt from the durable service's recorded
+    process identity (:func:`skillweave.mcp.bootstrap.recorded_child_handle`),
+    which is what a *restarted* process actually has. Either is re-verified;
+    a reconnect with neither reports the child as not-verified (``hold``).
 
     It never stops the service or the child and never launches a replacement.
     """
@@ -585,7 +592,7 @@ def reconnect_session(
             "session_identity": identity,
             "reason": "no durable process service is bound to this session",
         }
-    observed = service.identity()
+    observed = _bootstrap.service_identity_for(service)
     if fingerprint and fingerprint != observed:
         return {
             "status": "hold",
@@ -598,15 +605,91 @@ def reconnect_session(
                 "refusing to re-admit the session onto a diverged store"
             ),
         }
-    child_alive = _bootstrap.child_attempt_alive(handle) if handle is not None else False
+    # Re-verify the child against the live OS facts through the same readiness
+    # seam a restart relies on (``restart_ready`` -> ``restart_ready_by_service``
+    # -> ``child_attempt_alive``).  A live handle is preferred; otherwise the
+    # handle rebuilt from the durable service's *recorded* identity is used, so
+    # a restarted process re-verifies the recorded child rather than assuming
+    # one.  The reconnect never stops the service or the child and never
+    # launches a replacement -- it only verifies.
+    effective_handle = handle if handle is not None else recorded_handle
+    readiness = _bootstrap.restart_ready_by_service(service, effective_handle)
+    child_alive = bool(readiness["child_alive"])
     return {
-        "status": "ready" if child_alive else "hold",
+        "status": readiness["status"],
         "code": "" if child_alive else "child_not_verified_alive",
         "session_identity": identity,
         "service_identity": observed,
-        "service_reachable": True,
+        "service_reachable": readiness["service_reachable"],
         "child_alive": child_alive,
     }
+
+
+@mcp.tool()
+def restart_session(
+    run_id: str = "",
+    db_path: str = ".skillweave/store.db",
+    artifacts_path: str = ".skillweave/artifacts",
+    service_fingerprint: str = "",
+    session_token: str = "",
+) -> str:
+    """The entry a *restarted* main session calls to re-admit itself.
+
+    A restart of the interactive session must not disturb the single durable
+    process service or a child attempt that is mid-flight (quota waiting). This
+    is the registered tool a restarted session goes through: it resolves the
+    *same* server-owned durable process service the pre-restart session ran
+    against, rebuilds the child handle from the durable run's recorded native
+    process identity, and re-verifies -- through
+    :func:`skillweave.mcp.reconnect_session` ->
+    :func:`skillweave.mcp.bootstrap.restart_ready` -- that the service identity
+    is unchanged and the owned child is still verifiably alive. It never stops
+    the service or the child and never launches a replacement, so a running
+    quota wait and cancellation keep working across the restart.
+
+    A reconnect that resolves a *different* service (an isolated per-harness
+    controller, a diverged store), or a recorded child that is no longer
+    verifiably alive, is a named ``hold`` -- never a silent re-admission.
+
+    SW-1510-MCP-AUTH: the reconnect is authorized at this boundary; the caller
+    may not name a service other than the server-owned one.
+    """
+    _principal, refusal = gate_operation(
+        "restart_session", session_token, db_path=db_path,
+    )
+    if refusal is not None:
+        return refusal
+    # The reconnecting session resolves the *server-owned* durable process
+    # service from the same inputs the serving seam uses -- a caller cannot
+    # name a different one.
+    service = control.service_for_binding(
+        db_path,
+        artifacts_path=artifacts_path,
+        stream_root=_default_stream_root(db_path),
+        mailbox_path=default_mailbox_path(),
+    )
+    recorded_handle = None
+    if run_id:
+        try:
+            store = control._get_store(db_path)
+            record = store.get_run(run_id)
+        except Exception:  # noqa: BLE001 - an unreadable store is not a failure
+            record = None
+        recorded_handle = _bootstrap_recorded_child_handle(record)
+    outcome = reconnect_session(
+        service=service,
+        service_fingerprint=service_fingerprint,
+        session_identity=run_id,
+        recorded_handle=recorded_handle,
+    )
+    return json.dumps(outcome)
+
+
+def _bootstrap_recorded_child_handle(record):
+    """Rebuild a recorded child handle from a run record (lazy bootstrap import)."""
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    return _bootstrap.recorded_child_handle(record)
 
 
 @mcp.tool()
@@ -1389,10 +1472,59 @@ def review_action(
         return _auth_error_payload(exc)
 
 
+def _verify_restart_survival(
+    process_service: "object | None", *, environ=None
+) -> None:
+    """Verify a restarted session's surviving service and owned child.
+
+    The start seam a restarted main session goes through. When the environment
+    declares the pre-restart session identity and the durable run it was
+    driving, the *recorded* child handle is rebuilt from the durable store and
+    re-verified against live OS facts through
+    :func:`skillweave.mcp.bootstrap.restart_ready` -- the service identity must
+    be unchanged and the owned child must be verifiably alive. It never stops
+    the service or the child.
+
+    A restart that cannot verify survival (a different service, a dead/recycled
+    child) is refused here (failing closed): the restarted session must not be
+    re-admitted onto state it cannot prove it owns. An environment that declares
+    no prior identity (an ordinary start) is untouched.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    env = os.environ if environ is None else environ
+    prior_identity = (env.get(SESSION_IDENTITY_ENV, "") or "").strip()
+    if not prior_identity or process_service is None:
+        return
+    fingerprint = (env.get(HANDLE_IDENTITY_ENV, "") or "").strip()
+    recorded_handle = None
+    db_path = getattr(process_service, "db_path", "") or ""
+    if db_path:
+        try:
+            store = control._get_store(db_path)
+            record = store.get_run(prior_identity)
+        except Exception:  # noqa: BLE001 - an unreadable store declares no child
+            record = None
+        recorded_handle = _bootstrap_recorded_child_handle(record)
+    readiness = _bootstrap.restart_ready_by_service(process_service, recorded_handle)
+    if fingerprint and fingerprint != readiness["service_identity"]:
+        raise _authority_module().MCPAuthError(
+            "skillweave-mcp restart refused: the surviving process service "
+            "identity does not match the pre-restart session's recorded service"
+        )
+    if not readiness["service_reachable"] or not readiness["child_alive"]:
+        raise _authority_module().MCPAuthError(
+            "skillweave-mcp restart refused: the owned child attempt is not "
+            "verifiably alive; the service was not stopped and no replacement "
+            "was launched"
+        )
+
+
 def startup_and_bind_stdio(
     supervisor: str = "",
     process_service: "object | None" = None,
     authority: "MCPPrincipalAuthority | None" = None,
+    environ=None,
 ) -> str:
     """Production issuance point: bind the authority and mint the stdio session.
 
@@ -1415,14 +1547,28 @@ def startup_and_bind_stdio(
 
     An HTTP deployment does not use this path: the host binds its own authority
     and each HTTP client presents its own issued token.
+
+    A **restarted** session goes through this same startup seam. When the
+    environment declares the pre-restart session identity
+    (:data:`SESSION_IDENTITY_ENV`) and the durable service it ran against,
+    startup *verifies* the surviving process service identity and any owned
+    child attempt still recorded in the durable store before it mints the new
+    session -- it never stops the service or the child and never launches a
+    replacement. A restart that resolves a *different* service, or whose
+    recorded child is no longer verifiably alive, is a named ``hold`` and the
+    start is refused (failing closed) rather than re-admitted onto an isolated
+    store. An ordinary (non-restart) start declares no prior identity and is
+    unchanged.
     """
     global _READY_SESSION_TOKEN
-    identity = (supervisor or require_supervisor_identity()).strip()
+    env = os.environ if environ is None else environ
+    identity = (supervisor or (env.get(SUPERVISOR_ENV, "") or "").strip()).strip()
     if not identity:
         raise _authority_module().UnauthenticatedPrincipal(
             f"local stdio requires an explicit supervisor identity; set "
             f"{SUPERVISOR_ENV} to name the supervising principal"
         )
+    _verify_restart_survival(process_service, environ=env)
     auth = authority if authority is not None else _authority_module().MCPPrincipalAuthority()
     bind_authority(auth)
     if process_service is not None:

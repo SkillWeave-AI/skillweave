@@ -77,6 +77,7 @@ LEGACY_TOOLS: tuple[str, ...] = (
     "status_run",
     "cancel_run",
     "resume_run",
+    "restart_session",
     "get_evidence",
     "review_run",
 )
@@ -1481,6 +1482,7 @@ def legacy_tool_specs() -> list[ToolSpec]:
         "status_run": _server.status_run,
         "cancel_run": _server.cancel_run,
         "resume_run": _server.resume_run,
+        "restart_session": _server.restart_session,
         "get_evidence": _server.get_evidence,
         "review_run": _server.review_run,
     }

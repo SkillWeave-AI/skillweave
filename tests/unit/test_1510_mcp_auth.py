@@ -392,6 +392,12 @@ class TestEveryToolIsGated:
             "status_run": lambda: mcp_server.status_run("run-1", db_path=db),
             "cancel_run": lambda: mcp_server.cancel_run("run-1", db_path=db),
             "resume_run": lambda: mcp_server.resume_run("run-1", db_path=db),
+            # SW-1511-MCP-BOOTSTRAP: the restart/reconnect tool a restarted main
+            # session calls is gated at the same seam -- an unauthenticated
+            # principal is refused before any service/child is re-verified.
+            "restart_session": lambda: mcp_server.restart_session(
+                "run-1", db_path=db
+            ),
             "get_evidence": lambda: mcp_server.get_evidence("run-1", db_path=db),
             "review_run": lambda: mcp_server.review_run(
                 "run-1", "pass", "ok", db_path=db

@@ -375,8 +375,8 @@ MCP_ROLE_SCOPES: dict[str, dict[str, Any]] = {
     "controller": {
         "operations": frozenset(
             {"read_run", "write_run_state", "start_run", "cancel_run",
-             "resume_run", "admit_gate", "forward", "attach_harness",
-             "start_own_attempt", "write_own_artifact"}
+             "resume_run", "restart_session", "admit_gate", "forward",
+             "attach_harness", "start_own_attempt", "write_own_artifact"}
         ),
         "can_review": False,
         "can_approve": False,
