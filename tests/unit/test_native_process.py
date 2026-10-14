@@ -52,6 +52,8 @@ from skillweave.runtime.native_process import (
     CONTINUATION_CHECKPOINT,
     CONTINUATION_SESSION_RESUME,
     HARNESS_CONTINUATION_SCHEMA_ID,
+    HARNESS_CONTINUATION_SCHEMA_VERSION,
+    SUPPORTED_HARNESS_CONTINUATION_VERSIONS,
     HARNESS_SESSION_RESUME_CAPABILITY,
     CHILD_DRAIN_SCHEMA_ID,
     CHILD_DRAINED,
@@ -1498,11 +1500,132 @@ def test_resume_without_a_verified_owned_attempt_never_resumes_the_old_session()
         reopened.close()
 
 
-# NOTE: the pure-constructor invariants (a session resume without attestation,
-# a checkpoint carrying a session id, a limitation-less checkpoint, an
-# unsupported version, and planner purity) are exercised directly by the
-# ``plan_harness_continuation`` block above; these two tests add only what that
-# block cannot: the *durable* v1 round-trip and the reconstruction guard.
+# The constructor/planner fail-closed invariants are exercised directly below
+# (``test_harness_continuation_*`` and ``test_plan_harness_continuation_*``),
+# each pinning one invariant so removing that guard fails exactly its test;
+# the two tests here add the *durable* v1 round-trip and the reconstruction
+# guard.
+
+
+# ── criterion 2 fail-closed invariants (one test per guard) ─────────────────
+
+def test_harness_continuation_refuses_an_unsupported_schema_version():
+    # Invariant 1: an unknown schema version is refused, never approximated.
+    assert HARNESS_CONTINUATION_SCHEMA_VERSION in (
+        SUPPORTED_HARNESS_CONTINUATION_VERSIONS
+    )
+    try:
+        HarnessContinuation(
+            run_id="run-1", mode=CONTINUATION_CHECKPOINT,
+            limitation=LIMITATION_UNSUPPORTED_RESUME,
+            schema_version="9.9.9",
+        )
+        assert False, "an unsupported schema version must be refused"
+    except UnsupportedContractVersion:
+        pass
+
+
+def test_harness_continuation_requires_a_run_id():
+    # Invariant 2: a continuation must name its run.
+    try:
+        HarnessContinuation(run_id="", mode=CONTINUATION_CHECKPOINT,
+                            limitation=LIMITATION_UNSUPPORTED_RESUME)
+        assert False, "a continuation without a run_id must be refused"
+    except ValueError:
+        pass
+
+
+def test_harness_continuation_refuses_an_unknown_mode():
+    # Invariant 3: the mode vocabulary is closed.
+    try:
+        HarnessContinuation(run_id="run-1", mode="teleport",
+                            limitation=LIMITATION_UNSUPPORTED_RESUME)
+        assert False, "an unknown continuation mode must be refused"
+    except ValueError:
+        pass
+
+
+def test_session_resume_requires_the_attested_capability():
+    # Invariant 4 (the core "never fabricate UUID continuity" guard): a session
+    # resume without the attestation is refused at construction.
+    try:
+        HarnessContinuation(
+            run_id="run-1", mode=CONTINUATION_SESSION_RESUME,
+            resume_capability_attested=False, session_id="sess-x",
+        )
+        assert False, "a session resume without attestation must be refused"
+    except ValueError:
+        pass
+
+
+def test_session_resume_must_name_the_prior_session():
+    # Invariant 5: an attested session resume with no session id is refused.
+    try:
+        HarnessContinuation(
+            run_id="run-1", mode=CONTINUATION_SESSION_RESUME,
+            resume_capability_attested=True, session_id="",
+        )
+        assert False, "a session resume must name the prior session"
+    except ValueError:
+        pass
+
+
+def test_checkpoint_continuation_must_name_a_limitation():
+    # Invariant 6: a checkpoint continuation reports a named limitation.
+    try:
+        HarnessContinuation(
+            run_id="run-1", mode=CONTINUATION_CHECKPOINT, limitation="",
+        )
+        assert False, "a checkpoint continuation must name its limitation"
+    except ValueError:
+        pass
+
+
+def test_checkpoint_continuation_must_not_carry_a_session_id():
+    # Invariant 7 (the guard that previously had no covering test): a checkpoint
+    # continuation that carries a session id forward is refused -- that would be
+    # fabricated UUID continuity.
+    try:
+        HarnessContinuation(
+            run_id="run-1", mode=CONTINUATION_CHECKPOINT,
+            limitation=LIMITATION_UNSUPPORTED_RESUME, session_id="sess-smuggled",
+        )
+        assert False, "a checkpoint continuation must not carry a session id"
+    except ValueError:
+        pass
+
+
+def test_plan_harness_continuation_resumes_only_attested_with_a_session():
+    # Planner purity, positive: attested + a recorded session resumes that id.
+    decision = plan_harness_continuation(
+        "run-1", resume_capability_attested=True, prior_session_id="sess-live",
+        intent_id="intent-1",
+    )
+    assert decision.mode == CONTINUATION_SESSION_RESUME
+    assert decision.session_id == "sess-live"
+    assert decision.intent_id == "intent-1"
+    assert decision.limitation == ""
+
+
+def test_plan_harness_continuation_unattested_names_unsupported_resume():
+    # Planner purity, negative: no attestation -> checkpoint, unsupported name.
+    decision = plan_harness_continuation(
+        "run-1", resume_capability_attested=False, prior_session_id="sess-live",
+    )
+    assert decision.mode == CONTINUATION_CHECKPOINT
+    assert decision.session_id == ""
+    assert decision.limitation == LIMITATION_UNSUPPORTED_RESUME
+
+
+def test_plan_harness_continuation_attested_but_no_session_names_unknown():
+    # Planner purity, fail-closed: attested but no recorded session -> checkpoint
+    # with the session-identity-unknown limitation, never a fabricated id.
+    decision = plan_harness_continuation(
+        "run-1", resume_capability_attested=True, prior_session_id="",
+    )
+    assert decision.mode == CONTINUATION_CHECKPOINT
+    assert decision.session_id == ""
+    assert decision.limitation == LIMITATION_SESSION_UNKNOWN
 
 
 # ── criterion 2 backward compatibility ─────────────────────────────────────

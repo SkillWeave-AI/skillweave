@@ -2561,6 +2561,134 @@ class TestHandoffAdapterSelectionSeam:
             )
         assert exc.value.code == "TRANSPORT_NOT_SUPPORTED"
 
+    # -- SW-1511-RECOVERY criterion 2: the continuation decision through the
+    # real tool, with the prior session id read from the durable record. -----
+
+    def _seed_owned_attempt(self, root: Path, *, session_id: str) -> str:
+        """Write a durable dispatch record for ``run-1`` and return the db path.
+
+        This is the *durable record a launch wrote*: the continuation must read
+        the prior session id from here, never from a caller field.
+        """
+        from skillweave.runtime.store import SQLiteRunStore
+
+        db_path = str(root / "store.db")
+        store = SQLiteRunStore(db_path)
+        store.record_dispatch_intent(
+            run_id="run-1", task_id="task-a", attempt=1,
+            execution_scope="run-1/task-a/1", step="ready_dispatch",
+            route="provider/model", session_id=session_id,
+            process_identity={"pid": 4242, "start_time": "1.0",
+                              "exec_path": "/bin/x", "argv": ["x"]},
+        )
+        store.close()
+        return db_path
+
+    def _driving_token(self, authority):
+        return authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            run_ids=["run-1"],
+        )
+
+    def test_handoff_tool_attested_with_recorded_session_resumes_that_session(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """The real tool resumes the *recorded* session for an attested client.
+
+        Driving ``handoff_adapter`` with an explicit ``session-resume``
+        attestation and a durably recorded session id returns a session-resume
+        decision naming that exact id -- read from the record, and persisted to
+        the run's mailbox where a recovered controller reads it.
+        """
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        monkeypatch.setenv(
+            handoff_mod.CAPABILITY_ATTESTATION_ENV,
+            json.dumps({"transports": [], "features": {"session-resume": True}}),
+        )
+        db_path = self._seed_owned_attempt(tmp_path, session_id="sess-live")
+        token = self._driving_token(authority)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        continuation = out["continuation"]
+        assert continuation["mode"] == "session_resume"
+        assert continuation["resume_capability_attested"] is True
+        assert continuation["session_id"] == "sess-live"
+        assert continuation["limitation"] == ""
+        # The decision is persisted durably where a recovered controller reads
+        # it -- the run's mailbox, as a status record carrying the decision.
+        assert out["continuation_persisted"]["status"] == "persisted"
+        records = AgentMailbox(str(mailbox_path)).read(
+            recipient="mcp:controller:main", principal="mcp:controller:main"
+        )
+        persisted = [r for r in records
+                     if r.get("kind") == "status"
+                     and isinstance(r.get("body"), dict)
+                     and "mode" in r["body"]]
+        assert persisted, records
+        assert persisted[-1]["body"]["mode"] == "session_resume"
+        assert persisted[-1]["body"]["session_id"] == "sess-live"
+
+    def test_handoff_tool_attested_without_recorded_session_falls_to_checkpoint(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """An attested client with no recorded session falls to the checkpoint.
+
+        The attestation is present but the durable record carries no session id,
+        so the tool must NOT fabricate one: the decision is a named
+        ``checkpoint_continuation`` with the session-identity-unknown limitation.
+        """
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        monkeypatch.setenv(
+            handoff_mod.CAPABILITY_ATTESTATION_ENV,
+            json.dumps({"transports": [], "features": {"session-resume": True}}),
+        )
+        db_path = self._seed_owned_attempt(tmp_path, session_id="")
+        token = self._driving_token(authority)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        continuation = out["continuation"]
+        assert continuation["mode"] == "checkpoint_continuation"
+        assert continuation["session_id"] == ""
+        assert continuation["limitation"] == "session_identity_unknown"
+
+    def test_handoff_tool_unattested_client_falls_to_named_checkpoint(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """An unattested client never gets a session resume, even with a record.
+
+        The durable record *does* carry a session id, but the client did not
+        attest the capability -- so the tool returns a named
+        ``checkpoint_continuation`` that carries no session id forward.
+        """
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        monkeypatch.delenv(handoff_mod.CAPABILITY_ATTESTATION_ENV, raising=False)
+        db_path = self._seed_owned_attempt(tmp_path, session_id="sess-live")
+        token = self._driving_token(authority)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="unattested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        continuation = out["continuation"]
+        assert continuation["mode"] == "checkpoint_continuation"
+        assert continuation["session_id"] == ""
+        assert continuation["limitation"] == "unsupported_session_resume_capability"
+
 
 # ===========================================================================
 # Criterion 6 (restart survival of the service+child; credentials never logged)

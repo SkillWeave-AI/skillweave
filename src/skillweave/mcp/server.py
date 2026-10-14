@@ -1262,6 +1262,7 @@ def handoff_adapter(
     recipients: str = "",
     transport: str = "",
     run_id: str = "",
+    db_path: str = ".skillweave/store.db",
     session_token: str = "",
 ) -> str:
     """Select and return the qualified transport adapter for *client_id*.
@@ -1290,10 +1291,14 @@ def handoff_adapter(
     SW-1511-RECOVERY criterion 2: when the caller names the ``run_id`` it is
     continuing, the response also carries the ``harness-continuation-v1``
     **continuation decision** for that run, derived from the client's
-    *attested* capability -- actual session resume only when the client
-    attested it and a prior session identity was recorded, and otherwise a
-    named ``checkpoint_continuation`` limitation. This is the production seam a
-    recovered controller reaches; it never fabricates session-UUID continuity.
+    *attested* capability and the *durably recorded* prior session identity of
+    the run's owned attempt -- actual session resume only when the client
+    attested it **and** a prior session identity is recorded for that attempt;
+    otherwise a named ``checkpoint_continuation`` limitation. The prior session
+    id is read from the durable dispatch record (never a caller field and never
+    invented), and the decision is persisted durably to the run's mailbox so a
+    recovered controller reads the *same* decision. This is the production seam
+    a recovered controller reaches; it never fabricates session-UUID continuity.
     """
     gate_principal, refusal = gate_operation("read_run", session_token, run_id=run_id)
     if refusal is not None:
@@ -1350,13 +1355,86 @@ def handoff_adapter(
     }
     if run_id:
         # The recovered controller's continuation decision, driven by the
-        # *attested* capability (never assumed): session resume only when the
-        # client attested it; otherwise a named checkpoint continuation that
-        # carries no session id forward.
-        payload["continuation"] = capability.continuation_decision(
-            run_id, intent_id=run_id
-        ).to_dict()
+        # *attested* capability (never assumed) and the *durably recorded* prior
+        # session of the run's owned attempt (never a caller field): session
+        # resume only when the client attested it *and* that attempt recorded a
+        # session id; otherwise a named checkpoint continuation that carries no
+        # session id forward.  The session id is read from the durable dispatch
+        # record -- an unrecorded or unreadable record yields the empty string,
+        # so the decision falls closed rather than fabricating an id.
+        intent_id, prior_session_id = _recorded_session_for_run(db_path, run_id)
+        decision = capability.continuation_decision(
+            run_id, prior_session_id=prior_session_id, intent_id=intent_id
+        )
+        payload["continuation"] = decision.to_dict()
+        # Persist the decision where a recovered controller reads it: the run's
+        # durable mailbox, addressed under the *authenticated* scoped principal
+        # and idempotent by message_id (a re-driven selection appends nothing).
+        persisted = _persist_continuation_decision(
+            decision, run_id=run_id, principal=principal
+        )
+        payload["continuation_persisted"] = persisted
     return json.dumps(payload)
+
+
+def _recorded_session_for_run(db_path: str, run_id: str) -> tuple[str, str]:
+    """The owned attempt's durably recorded ``(intent_id, session_id)``.
+
+    Reads the durable dispatch record for ``run_id`` -- the same record a launch
+    wrote -- so a session resume is bound to an *observed* session, never a
+    caller-supplied or invented one.  A run with no recorded intent, or an
+    intent that recorded no session, yields ``("", "")`` and the continuation
+    falls closed to the named checkpoint.  A store that cannot be opened is a
+    fail-closed ``("", "")`` -- the reader never guesses an id.
+    """
+    store = None
+    try:
+        store = _get_store(db_path)
+        intents = store.list_dispatch_intents(run_id)
+    except Exception:
+        return "", ""
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+    if not intents:
+        return "", ""
+    # The *latest* recorded attempt is the one a recovered controller continues
+    # (the predecessor's most recent launch); its recorded session id is the
+    # only session a resume may name.
+    chosen = intents[-1]
+    return chosen.intent_id, chosen.session_id
+
+
+def _persist_continuation_decision(decision, *, run_id: str, principal: str) -> dict:
+    """Persist a continuation decision to the run's durable mailbox.
+
+    The decision is posted as a ``status`` ``agent-message-v1`` record scoped to
+    ``run_id`` and the authenticated ``principal``, with a deterministic
+    ``message_id`` so a re-driven selection re-posts the *same* record (a
+    duplicate delivery is idempotent, never a second decision).  The durable
+    record is where a recovered controller reads the decision; a persisted
+    record is never a fabricated success -- the returned mapping reports the
+    real outcome.
+    """
+    _messaging, mailbox = _open_mailbox()
+    message_id = f"harness-continuation-{run_id}-{decision.mode}"
+    message = _messaging.AgentMessage(
+        kind="status",
+        sender=principal,
+        recipient=principal,
+        principal=principal,
+        run_id=run_id,
+        message_id=message_id,
+        body=decision.to_dict(),
+    )
+    try:
+        record = mailbox.post(message)
+    except _messaging.MessageChannelError as exc:
+        return {"status": "refused", **exc.to_dict()}
+    return {"status": "persisted", "message_id": record.get("message_id"), "seq": record.get("seq")}
 
 
 #: The mailbox operations a first-class principal may drive on its own channel.
