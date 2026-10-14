@@ -373,6 +373,42 @@ class SQLiteRunStore(RunStore):
             CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_intents_claiming_scope
                 ON dispatch_intents(execution_scope)
                 WHERE state IN ('launched', 'reviewing', 'repairing', 'integrating');
+            -- SW-ORCH-001 criterion 4: the last compact changed-state view
+            -- served for a run.  Persisting it lets a reattached controller
+            -- resume from the durable cursor instead of re-reading the
+            -- transcript: the newest row per run is the view an unchanged poll
+            -- returns.  Additive and opt-in; no existing table changes.
+            CREATE TABLE IF NOT EXISTS evidence_deltas (
+                delta_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                journal_cursor INTEGER NOT NULL,
+                accepted_gates TEXT NOT NULL DEFAULT '[]',
+                required_gates TEXT NOT NULL DEFAULT '[]',
+                new_evidence TEXT NOT NULL DEFAULT '[]',
+                observed_at TEXT NOT NULL,
+                record TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_evidence_deltas_run
+                ON evidence_deltas(run_id, delta_id);
+            -- SW-ORCH-001 criterion 5: a controlled content transaction (CMS
+            -- integration) for a non-repository subject.  Keyed by
+            -- (run_id, txn_id) so a reattached controller reads the applied /
+            -- verified transaction rather than re-applying it.  No Git merge
+            -- participates.  Additive and opt-in.
+            CREATE TABLE IF NOT EXISTS content_transactions (
+                run_id TEXT NOT NULL,
+                txn_id TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                subject_kind TEXT NOT NULL,
+                baseline TEXT NOT NULL,
+                applied_digest TEXT NOT NULL,
+                readback_digest TEXT NOT NULL DEFAULT '',
+                applied INTEGER NOT NULL DEFAULT 0,
+                verified INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                record TEXT NOT NULL,
+                PRIMARY KEY (run_id, txn_id)
+            );
         """)
         self._conn.commit()
         self._migrate_legacy_states()
@@ -1200,6 +1236,130 @@ class SQLiteRunStore(RunStore):
             (run_id,),
         ).fetchone()
         return int(row[0])
+
+    # ---- Read projections for the compact view / content transactions ----
+
+    def list_journal_events(self, run_id: str, after_sequence: int = 0) -> list[dict]:
+        """Journal events for *run_id* with ``sequence > after_sequence``.
+
+        A read-only projection of the shared ``events`` table in journal order.
+        The compact evidence view consumes exactly the changed window (events
+        strictly after its cursor), so an unchanged poll reads nothing new.
+        """
+        rows = self._conn.execute(
+            "SELECT sequence, run_id, event_type, payload, correlation_id, "
+            "causation_id, idempotency_key, timestamp, version "
+            "FROM events WHERE run_id = ? AND sequence > ? ORDER BY sequence",
+            (run_id, after_sequence),
+        ).fetchall()
+        events: list[dict] = []
+        for row in rows:
+            data = dict(row)
+            payload = data.get("payload")
+            if isinstance(payload, str):
+                try:
+                    data["payload"] = json.loads(payload)
+                except (ValueError, TypeError):
+                    data["payload"] = {}
+            events.append(data)
+        return events
+
+    def list_evidence(self, run_id: Optional[str] = None) -> list[ArtifactReceipt]:
+        """Evidence receipts, in insertion order (optionally scoped to a run).
+
+        ``ArtifactReceipt`` has no run column, so *run_id* is matched against
+        the receipt's ``metadata['run_id']`` when supplied; with no *run_id* the
+        full content-addressed set is returned.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM evidence ORDER BY rowid"
+        ).fetchall()
+        receipts = [self._row_to_evidence(r) for r in rows]
+        if run_id is None:
+            return receipts
+        return [
+            r for r in receipts
+            if (r.metadata or {}).get("run_id") == run_id
+        ]
+
+    def save_evidence_delta(self, delta: Any) -> Any:
+        """Persist one ``evidence-view-v1`` compact view (append, never update).
+
+        The newest row per run is the view a reattached controller resumes from;
+        the whole frozen record is retained so a recovering controller resumes
+        from a durable cursor rather than re-reading the transcript.
+        """
+        record = delta.to_dict()
+        self._conn.execute(
+            """INSERT INTO evidence_deltas
+               (run_id, journal_cursor, accepted_gates, required_gates,
+                new_evidence, observed_at, record)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record["run_id"],
+                int(record["journal_cursor"]),
+                json.dumps(list(record.get("accepted_gates") or [])),
+                json.dumps(list(record.get("required_gates") or [])),
+                json.dumps(list(record.get("new_evidence") or [])),
+                record.get("observed_at", ""),
+                json.dumps(record),
+            ),
+        )
+        self._conn.commit()
+        return delta
+
+    def get_evidence_delta(self, run_id: str) -> Optional[dict]:
+        """The newest persisted compact view for *run_id* (or ``None``)."""
+        row = self._conn.execute(
+            "SELECT record FROM evidence_deltas WHERE run_id = ? "
+            "ORDER BY delta_id DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["record"])
+
+    def save_content_transaction(self, txn: Any) -> Any:
+        """Persist one controlled content transaction, keyed by (run, txn).
+
+        A re-apply of the same ``(run_id, txn_id)`` is refused, so a controlled
+        content transaction is idempotent by identity rather than re-applied.
+        """
+        record = txn.to_dict()
+        self._conn.execute(
+            """INSERT INTO content_transactions
+               (run_id, txn_id, subject, subject_kind, baseline, applied_digest,
+                readback_digest, applied, verified, created_at, record)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record["run_id"],
+                record["txn_id"],
+                record["subject"],
+                record.get("subject_kind", ""),
+                record["baseline"],
+                record["applied_digest"],
+                record.get("readback_digest", ""),
+                1 if record.get("applied") else 0,
+                1 if bool(record.get("readback_digest"))
+                and record.get("readback_digest") == record.get("applied_digest")
+                else 0,
+                record.get("created_at", ""),
+                json.dumps(record),
+            ),
+        )
+        self._conn.commit()
+        return txn
+
+    def get_content_transaction(self, run_id: str, txn_id: str) -> Optional[dict]:
+        """The persisted content transaction for ``(run_id, txn_id)`` (or None)."""
+        row = self._conn.execute(
+            "SELECT record FROM content_transactions "
+            "WHERE run_id = ? AND txn_id = ?",
+            (run_id, txn_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["record"])
 
     def assert_controller(self, fencing_token: int) -> None:
         """Refuse a write whose fencing token is not the current held token.

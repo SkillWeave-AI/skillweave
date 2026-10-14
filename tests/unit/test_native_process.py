@@ -37,10 +37,20 @@ from skillweave.runtime.dagscheduler import (
     build_sessions,
 )
 from skillweave.runtime.native_process import (
+    ACCEPTED_GATE_STATUSES,
+    ARCHITECT_HEALTHY,
+    ARCHITECT_QUOTA_EXHAUSTED,
     CHECKPOINT_SCHEMA_ID,
     CHECKPOINT_SCHEMA_VERSION,
+    CONTENT_TXN_SCHEMA_ID,
+    CONTENT_TXN_SCHEMA_VERSION,
     DISPATCH_SCHEMA_ID,
     DISPATCH_SCHEMA_VERSION,
+    EVIDENCE_VIEW_SCHEMA_ID,
+    EVIDENCE_VIEW_SCHEMA_VERSION,
+    GATE_ACCEPTED,
+    INTEGRATION_CONTENT_TRANSACTION,
+    INTEGRATION_GIT_MERGE,
     INTENT_FAILED,
     INTENT_INTEGRATED,
     INTENT_LAUNCHED,
@@ -52,9 +62,12 @@ from skillweave.runtime.native_process import (
     STEP_READY_DISPATCH,
     STEP_REPAIR,
     STEP_RE_REVIEW,
+    ContentTransaction,
+    ContinuationDecision,
     ControllerLease,
     DispatchIntent,
     DuplicateDispatchError,
+    EvidenceDelta,
     LeaseNotHeldError,
     LeaseRefusedError,
     NativeProcessCheckpoint,
@@ -62,11 +75,32 @@ from skillweave.runtime.native_process import (
     NotControllerError,
     OwnedAttemptDispatch,
     StaleFencingTokenError,
+    SubjectMismatchError,
+    UnknownSubjectKind,
     UnsupportedContractVersion,
+    WrongIntegrationModeError,
+    build_evidence_delta,
+    evidence_view_fingerprint,
+    evidence_view_header,
+    integration_mode_for,
+    is_repository_subject,
+    plan_continuation,
     plan_readiness,
+    resolve_integration,
+    subject_kind_of,
+    validate_content_transaction,
+    validate_evidence_delta,
     validate_native_process_checkpoint,
     validate_owned_attempt_dispatch,
 )
+from skillweave.dispatch.work_contract import (
+    ConfigurationSubject,
+    ContentSubject,
+    DeploymentSubject,
+    IncidentSubject,
+    RepositorySubject,
+)
+from skillweave.runtime.journal import EventJournal
 from skillweave.runtime.store import SQLiteRunStore
 from skillweave.runtime.write_scope import ScopeConflictError
 
@@ -573,6 +607,424 @@ def test_checkpoint_requires_a_fencing_token():
         assert False, "a negative fencing token must be refused"
     except ValueError:
         pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Criterion 4: the compact changed-state/evidence view
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _journal_record(sequence, event_type="state_transition", payload=None):
+    return {
+        "sequence": sequence,
+        "run_id": "run-1",
+        "event_type": event_type,
+        "payload": payload or {},
+        "timestamp": "2026-10-14T00:00:00+00:00",
+    }
+
+
+def test_unchanged_poll_returns_an_empty_delta_with_the_same_cursor():
+    records = [_journal_record(1), _journal_record(2)]
+    delta = build_evidence_delta(records, "run-1", journal_cursor=2)
+    assert delta.new_evidence == ()
+    assert delta.journal_cursor == 2  # unchanged: nothing new to read
+    assert delta.coverage_complete is True
+
+
+def test_new_journal_facts_advance_the_cursor_and_are_reported():
+    records = [_journal_record(1), _journal_record(2), _journal_record(3)]
+    delta = build_evidence_delta(records, "run-1", journal_cursor=1)
+    # The changed window moved the cursor from 1 to the newest fact (3); a poll
+    # handed back 3 sees nothing further.
+    assert delta.journal_cursor == 3
+    assert delta.monotonically_increasing_cursor is True
+    assert delta.coverage_complete is True
+    settled = build_evidence_delta(records, "run-1", journal_cursor=3)
+    assert settled.journal_cursor == 3
+    assert settled.new_evidence == ()
+
+
+def test_gate_denominator_is_disjoint_and_process_success_is_never_a_gate():
+    # A process's clean exit is not a gate verdict: only explicitly accepted
+    # gates are authoritative, everything else stays required.
+    view = EvidenceDelta(
+        run_id="run-1",
+        gates={"G1": GATE_ACCEPTED, "G2": "required", "G3": "pending"},
+    )
+    assert view.accepted_gates == ("G1",)
+    assert set(view.accepted_gates) & set(view.required_gates) == set()
+    assert set(view.accepted_gates) | set(view.required_gates) == {"G1", "G2", "G3"}
+
+
+def test_a_gate_both_accepted_and_required_is_refused():
+    # The accepted/required denominators are derived from ``gates`` so they are
+    # disjoint by construction, and every gate lands in exactly one set.
+    view = EvidenceDelta(
+        run_id="run-1",
+        gates={"G1": GATE_ACCEPTED, "G2": "required", "G3": "pending"},
+    )
+    assert set(view.accepted_gates).isdisjoint(view.required_gates)
+    assert set(view.accepted_gates) | set(view.required_gates) == {"G1", "G2", "G3"}
+
+    # A tampered record that folds a process outcome into a gate status cannot be
+    # reconstructed as a valid view: the boundary refuses the foreign status
+    # instead of accepting an ambiguous denominator.
+    good = EvidenceDelta(run_id="run-1", gates={"G1": GATE_ACCEPTED}).to_dict()
+    try:
+        validate_evidence_delta({**good, "gates": {"G1": "merged"}})
+        assert False, "a process-derived gate status must be refused"
+    except ValueError:
+        pass
+    # The same boundary refuses a record that names no run.
+    try:
+        validate_evidence_delta({**good, "run_id": ""})
+        assert False, "a view that names no run must be refused"
+    except ValueError:
+        pass
+
+
+def test_process_success_cannot_be_folded_into_a_gate_status():
+    try:
+        EvidenceDelta(run_id="run-1", gates={"G1": "succeeded"})
+        assert False, "a process-derived gate status must be refused"
+    except ValueError:
+        pass
+    assert GATE_ACCEPTED in ACCEPTED_GATE_STATUSES
+
+
+def test_unsupported_evidence_view_version_fails_closed():
+    record = EvidenceDelta(run_id="run-1").to_dict()
+    record["schema_version"] = "2.0.0"
+    try:
+        validate_evidence_delta(record)
+        assert False, "an unsupported evidence-view version must fail closed"
+    except UnsupportedContractVersion:
+        pass
+    try:
+        EvidenceDelta(run_id="run-1", schema_version="9.9.9")
+        assert False
+    except UnsupportedContractVersion:
+        pass
+
+
+def test_evidence_view_fingerprint_is_cursor_independent():
+    a = EvidenceDelta(run_id="run-1", gates={"G1": GATE_ACCEPTED}, journal_cursor=5)
+    b = EvidenceDelta(run_id="run-1", gates={"G1": GATE_ACCEPTED}, journal_cursor=9)
+    # The cursor a caller hands in is not an observation: the header matches.
+    assert evidence_view_fingerprint(a.to_dict()) == evidence_view_fingerprint(b.to_dict())
+    header = evidence_view_header(a.to_dict())
+    assert "journal_cursor" not in header
+    assert header["run_id"] == "run-1"
+    # A real change (the gate denominator) changes the fingerprint.
+    c = EvidenceDelta(run_id="run-1", gates={"G1": "required"}, journal_cursor=5)
+    assert evidence_view_fingerprint(a.to_dict()) != evidence_view_fingerprint(c.to_dict())
+
+
+def test_quota_exhausted_architect_continues_execution_and_gates():
+    decision = plan_continuation(
+        ARCHITECT_QUOTA_EXHAUSTED, prior_session_id="sess-1", prior_route="provider/model"
+    )
+    assert decision.continue_execution is True
+    assert decision.gates_continue is True
+    assert decision.resume_same_route is True
+    assert decision.escalate is False
+    assert decision.interrupt_delegated_workers is False
+    assert decision.wait is True
+    assert "sess-1" in decision.reason
+
+
+def test_healthy_architect_continues_with_no_wait():
+    decision = plan_continuation(ARCHITECT_HEALTHY)
+    assert decision.continue_execution is True
+    assert decision.gates_continue is True
+    assert decision.wait is False
+    assert decision.resume_same_route is False
+
+
+def test_quota_is_not_a_repair_verdict_or_escalation_permission():
+    try:
+        ContinuationDecision(
+            architect_health=ARCHITECT_QUOTA_EXHAUSTED,
+            resume_same_route=False,
+            wait=True,
+        )
+        assert False, "a quota-exhausted architect must resume the same route"
+    except ValueError:
+        pass
+    try:
+        ContinuationDecision(
+            architect_health=ARCHITECT_QUOTA_EXHAUSTED,
+            resume_same_route=True,
+            escalate=True,
+        )
+        assert False, "quota must never be an escalation permission"
+    except ValueError:
+        pass
+
+
+def test_a_stopped_architect_does_not_interrupt_its_delegated_workers():
+    try:
+        ContinuationDecision(
+            architect_health=ARCHITECT_QUOTA_EXHAUSTED,
+            resume_same_route=True,
+            interrupt_delegated_workers=True,
+        )
+        assert False, "a stopped architect must not interrupt its workers"
+    except ValueError:
+        pass
+    try:
+        ContinuationDecision(architect_health=ARCHITECT_HEALTHY, interrupt_delegated_workers=True)
+        assert False
+    except ValueError:
+        pass
+
+
+def test_unknown_architect_health_is_refused():
+    for health in ("degraded", "", "quota_exhausted"):
+        try:
+            plan_continuation(health)
+            assert False, f"unknown architect health {health!r} must be refused"
+        except ValueError:
+            pass
+
+
+def test_service_evidence_delta_reads_the_durable_journal_after_the_cursor():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        journal = EventJournal(store)
+        journal.append("run-1", event_type="state_transition", payload={"gates": {"G1": "accepted"}})
+        journal.append("run-1", event_type="batch_complete", payload={"task_id": "task-a"})
+        svc = NativeProcessService(store, "controller-a")
+        svc.acquire(ttl_seconds=3600)
+        empty = svc.evidence_delta("run-1", journal_cursor=2)
+        assert empty.new_evidence == ()
+        assert empty.journal_cursor == 2
+        fresh = svc.evidence_delta("run-1", journal_cursor=0)
+        assert fresh.journal_cursor == 2
+        assert store.last_journal_sequence("run-1") == 2
+        store.close()
+
+
+def test_service_records_a_compact_view_for_a_recovering_controller():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        svc = NativeProcessService(store, "controller-a")
+        svc.acquire(ttl_seconds=3600)
+        delta = svc.evidence_delta("run-1", journal_cursor=0)
+        svc.record_evidence_delta(delta)
+        stored = store.get_evidence_delta("run-1")
+        assert stored is not None
+        assert stored["run_id"] == "run-1"
+        assert stored["journal_cursor"] == delta.journal_cursor
+        store.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Criterion 5: repository and non-repository subjects under one controller
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SHA = "a" * 40
+
+
+def test_subject_kind_is_read_for_every_variant():
+    assert subject_kind_of(RepositorySubject(repo="org/repo", commit=_SHA)) == "repository"
+    assert subject_kind_of(ContentSubject(channel="c", content_id="e", revision="r")) == "content"
+    assert subject_kind_of(
+        ConfigurationSubject(config_id="c", environment="e", version="v")
+    ) == "configuration"
+    assert subject_kind_of(
+        DeploymentSubject(target="t", environment="e", artifact_digest="d")
+    ) == "deployment"
+    assert subject_kind_of(
+        IncidentSubject(incident_id="i", state="open", severity="high")
+    ) == "incident"
+
+
+def test_unknown_subject_kind_is_refused_never_inferred_repository():
+    class _Bogus:
+        kind = "not-a-kind"
+
+    try:
+        subject_kind_of(_Bogus())
+        assert False, "an unknown subject kind must be refused"
+    except UnknownSubjectKind:
+        pass
+    try:
+        subject_kind_of({"kind": "repository?"})
+        assert False
+    except UnknownSubjectKind:
+        pass
+
+
+def test_repository_and_non_repository_integrate_by_different_modes():
+    repo = RepositorySubject(repo="org/repo", commit=_SHA)
+    content = ContentSubject(channel="c", content_id="e", revision="r")
+    assert is_repository_subject(repo) is True
+    assert is_repository_subject(content) is False
+    assert integration_mode_for(repo) == INTEGRATION_GIT_MERGE
+    assert integration_mode_for(content) == INTEGRATION_CONTENT_TRANSACTION
+
+
+def test_resolve_integration_refuses_a_wrong_mode_record():
+    content = ContentSubject(channel="c", content_id="e", revision="r")
+    repo = RepositorySubject(repo="org/repo", commit=_SHA)
+    assert resolve_integration(content) == INTEGRATION_CONTENT_TRANSACTION
+    # A record that declares the wrong mode for the subject is refused.
+    try:
+        resolve_integration(content, record={"integration_mode": INTEGRATION_GIT_MERGE})
+        assert False, "a content subject must not integrate via git_merge"
+    except WrongIntegrationModeError:
+        pass
+    try:
+        resolve_integration(repo, record={"integration_mode": INTEGRATION_CONTENT_TRANSACTION})
+        assert False, "a repository subject must not integrate via content_transaction"
+    except WrongIntegrationModeError:
+        pass
+    # A matching mode is fine.
+    assert resolve_integration(
+        content, record={"integration_mode": INTEGRATION_CONTENT_TRANSACTION}
+    ) == INTEGRATION_CONTENT_TRANSACTION
+
+
+def test_content_transaction_requires_verification_and_bounded_restore():
+    base = dict(
+        run_id="run-1",
+        subject="content:c/e@r",
+        subject_kind="content",
+        baseline="sha256:baseline",
+        applied_digest="sha256:applied",
+    )
+    try:
+        ContentTransaction(**base, verify_readback=False, restore_bounded=True)
+        assert False, "an unverified transaction must be refused"
+    except ValueError:
+        pass
+    try:
+        ContentTransaction(**base, verify_readback=True, restore_bounded=False)
+        assert False, "an unbounded transaction must be refused"
+    except ValueError:
+        pass
+
+
+def test_content_transaction_refuses_a_repository_subject():
+    try:
+        ContentTransaction(
+            run_id="run-1",
+            subject="repository:org/repo@" + _SHA,
+            subject_kind="repository",
+            baseline="sha256:b",
+            applied_digest="sha256:a",
+            verify_readback=True,
+            restore_bounded=True,
+        )
+        assert False, "a repository must integrate through Git, not a content txn"
+    except SubjectMismatchError:
+        pass
+
+
+def test_content_transaction_readback_must_reproduce_the_apply():
+    base = dict(
+        run_id="run-1",
+        subject="content:c/e@r",
+        subject_kind="content",
+        baseline="sha256:b",
+        applied_digest="sha256:applied",
+        verify_readback=True,
+        restore_bounded=True,
+    )
+    try:
+        ContentTransaction(**base, readback_digest="sha256:different")
+        assert False, "a readback that contradicts the apply must be refused"
+    except ValueError:
+        pass
+    ok = ContentTransaction(**base, readback_digest="sha256:applied", applied=True)
+    assert ok.verified() is True
+    assert ok.applied is True
+
+
+def test_content_transaction_round_trips_and_validates():
+    txn = ContentTransaction(
+        run_id="run-1",
+        subject="content:c/e@r",
+        subject_kind="content",
+        txn_id="txn-1",
+        baseline="sha256:b",
+        applied_digest="sha256:a",
+        readback_digest="sha256:a",
+        applied=True,
+        verify_readback=True,
+        restore_bounded=True,
+    )
+    record = txn.to_dict()
+    assert record["schema_id"] == CONTENT_TXN_SCHEMA_ID
+    assert record["schema_version"] == CONTENT_TXN_SCHEMA_VERSION
+    validate_content_transaction(record)
+
+
+def test_unsupported_content_transaction_version_fails_closed():
+    record = ContentTransaction(
+        run_id="run-1", subject="content:c/e@r", subject_kind="content",
+        baseline="sha256:b", applied_digest="sha256:a",
+        verify_readback=True, restore_bounded=True,
+    ).to_dict()
+    record["schema_version"] = "3.0.0"
+    try:
+        validate_content_transaction(record)
+        assert False, "an unsupported content-transaction version must fail closed"
+    except UnsupportedContractVersion:
+        pass
+
+
+def test_service_applies_and_verifies_a_content_subject():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        svc = NativeProcessService(store, "controller-a")
+        svc.acquire(ttl_seconds=3600)
+        intent, _ = svc.dispatch(
+            run_id="run-1", task_id="task-a", attempt=1, step=STEP_READY_DISPATCH
+        )
+        content = ContentSubject(channel="c", content_id="e", revision="r")
+        txn = svc.record_content_integration(
+            intent.intent_id,
+            content,
+            baseline_digest="sha256:base",
+            applied_digest="sha256:applied",
+        )
+        assert txn.verified() is True
+        assert txn.subject_kind == "content"
+        assert txn.bypass_git_merge is True  # no mandatory Git merge
+        # The owned intent advanced to the controlled-integration step.
+        advanced = store.get_dispatch_intent(intent.intent_id)
+        assert advanced.state == INTENT_INTEGRATED
+        assert advanced.step == STEP_CONTROLLED_INTEGRATION
+        # And the transaction is durable, readable by a recovering controller.
+        stored = store.get_content_transaction("run-1", txn.txn_id)
+        assert stored is not None
+        assert stored["applied_digest"] == "sha256:applied"
+        assert stored["readback_digest"] == "sha256:applied"
+        store.close()
+
+
+def test_service_refuses_to_integrate_a_repository_through_a_content_transaction():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        svc = NativeProcessService(store, "controller-a")
+        svc.acquire(ttl_seconds=3600)
+        intent, _ = svc.dispatch(
+            run_id="run-1", task_id="task-a", attempt=1, step=STEP_READY_DISPATCH
+        )
+        repo = RepositorySubject(repo="org/repo", commit=_SHA)
+        try:
+            svc.record_content_integration(
+                intent.intent_id, repo,
+                baseline_digest="sha256:b", applied_digest="sha256:a",
+            )
+            assert False, "a repository must integrate through Git, not a content txn"
+        except WrongIntegrationModeError:
+            pass
+        # The intent is untouched by the refused integration.
+        assert store.get_dispatch_intent(intent.intent_id).state == INTENT_LAUNCHED
+        store.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
