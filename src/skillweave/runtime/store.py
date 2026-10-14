@@ -442,6 +442,28 @@ class SQLiteRunStore(RunStore):
                 record TEXT NOT NULL,
                 PRIMARY KEY (run_id, txn_id)
             );
+            -- SW-1511-CMS-TRANSACTION criteria 1-3: a *managed* CMS
+            -- transaction (cms-transaction-receipt-v1) driven by one owner
+            -- through baseline -> draft/dry-run -> apply/readback -> restore
+            -- over a neutral capability contract.  Keyed by (run_id, txn_id) so
+            -- a reattached controller resumes the transaction from the stage it
+            -- reached rather than re-applying it.  Additive and opt-in; no
+            -- existing table changes.
+            CREATE TABLE IF NOT EXISTS cms_transactions (
+                run_id TEXT NOT NULL,
+                txn_id TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                subject_kind TEXT NOT NULL,
+                subject_revision TEXT NOT NULL,
+                adapter TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                baseline_semantic TEXT NOT NULL,
+                baseline_render TEXT NOT NULL,
+                restored INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                record TEXT NOT NULL,
+                PRIMARY KEY (run_id, txn_id)
+            );
         """)
         self._conn.commit()
         self._migrate_legacy_states()
@@ -1388,6 +1410,63 @@ class SQLiteRunStore(RunStore):
         row = self._conn.execute(
             "SELECT record FROM content_transactions "
             "WHERE run_id = ? AND txn_id = ?",
+            (run_id, txn_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["record"])
+
+    def save_cms_transaction(self, txn: Any, *, upsert: bool = False) -> Any:
+        """Persist one managed CMS transaction, keyed by (run, txn).
+
+        The *opening* write (``upsert=False``) is idempotent by identity: a
+        re-open of the same ``(run_id, txn_id)`` is refused, so a managed
+        transaction is never silently re-baselined.  A *stage advance*
+        (``upsert=True``) updates the same row, carrying the transaction to its
+        new stage -- the readback/restored hashes are re-derived by the frozen
+        record on read, so a tampered row fails closed.
+        """
+        record = txn.to_dict()
+        baseline = record.get("baseline_hashes") or {}
+        restored = 1 if record.get("restored") else 0
+        values = (
+            record["subject"],
+            record.get("subject_kind", ""),
+            record.get("subject_revision", ""),
+            record.get("adapter", ""),
+            record.get("stage", ""),
+            baseline.get("semantic", ""),
+            baseline.get("render", ""),
+            restored,
+            record.get("created_at", ""),
+            json.dumps(record),
+        )
+        if upsert:
+            self._conn.execute(
+                """UPDATE cms_transactions
+                   SET subject = ?, subject_kind = ?, subject_revision = ?,
+                       adapter = ?, stage = ?, baseline_semantic = ?,
+                       baseline_render = ?, restored = ?, created_at = ?,
+                       record = ?
+                   WHERE run_id = ? AND txn_id = ?""",
+                values + (record["run_id"], record["txn_id"]),
+            )
+        else:
+            self._conn.execute(
+                """INSERT INTO cms_transactions
+                   (run_id, txn_id, subject, subject_kind, subject_revision,
+                    adapter, stage, baseline_semantic, baseline_render, restored,
+                    created_at, record)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (record["run_id"], record["txn_id"]) + values,
+            )
+        self._conn.commit()
+        return txn
+
+    def get_cms_transaction(self, run_id: str, txn_id: str) -> Optional[dict]:
+        """The persisted managed CMS transaction for ``(run_id, txn_id)``."""
+        row = self._conn.execute(
+            "SELECT record FROM cms_transactions WHERE run_id = ? AND txn_id = ?",
             (run_id, txn_id),
         ).fetchone()
         if row is None:

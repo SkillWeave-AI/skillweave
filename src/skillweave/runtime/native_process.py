@@ -53,7 +53,7 @@ and is never repaired into a shape this service happens to support.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 import hashlib
@@ -152,6 +152,32 @@ __all__ = [
     "UnknownSubjectKind",
     "SubjectMismatchError",
     "WrongIntegrationModeError",
+    # SW-1511-CMS-TRANSACTION criteria 1-3: the neutral CMS capability contract,
+    # the managed transaction owner and the publication authorization binding
+    "CMS_TXN_SCHEMA_ID",
+    "CMS_TXN_SCHEMA_VERSION",
+    "SUPPORTED_CMS_TXN_VERSIONS",
+    "CMS_CAPABILITIES",
+    "CMS_STAGES",
+    "CMS_STAGE_BASELINE",
+    "CMS_STAGE_DRAFTED",
+    "CMS_STAGE_DRY_RUN",
+    "CMS_STAGE_APPLIED",
+    "CMS_STAGE_READBACK",
+    "CMS_STAGE_RESTORED",
+    "CmsCapabilityContract",
+    "validate_cms_capability_contract",
+    "CmsRawHashes",
+    "RawContentAdapter",
+    "CmsTransaction",
+    "validate_cms_transaction",
+    "CmsCapabilityError",
+    "CmsStageError",
+    "PUBLICATION_ACTION_KIND",
+    "PublicationAuthorization",
+    "PublicationDecision",
+    "PublicationRefused",
+    "authorize_publication",
     # controlled loop
     "STEP_READY_DISPATCH",
     "STEP_INDEPENDENT_REVIEW",
@@ -2275,6 +2301,609 @@ def resolve_integration(subject: Any, *, record: Optional[Mapping[str, Any]] = N
     return mode
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# The neutral CMS capability contract and its transaction owner
+# (SW-1511-CMS-TRANSACTION criteria 1-3)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# ``cms-transaction-receipt-v1`` is the *neutral* boundary between a
+# **capability-bound CMS adapter** (a producer) and the **generic lifecycle
+# transaction owner** (this controller).  "Neutral" is load-bearing: the
+# contract names the *capabilities* an adapter must provide -- read a baseline,
+# draft a change, dry-run it, apply it, read it back and restore it -- and never
+# a provider, a channel SDK or a transformer.  One owner drives every CMS
+# subject kind through this same contract, exactly as one controller drives every
+# repository subject through Git.
+#
+# The contract is **additive and opt-in**: an existing ``content-transaction-v1``
+# record validates unchanged, an adapter that does not declare the capability
+# contract is simply not usable for a *managed* transaction, and an unsupported
+# version fails closed (:class:`UnsupportedContractVersion`) rather than being
+# repaired into a shape this owner happens to support.
+
+CMS_TXN_SCHEMA_ID = (
+    "https://skillweave.dev/schemas/content/cms-transaction-receipt/v1"
+)
+CMS_TXN_SCHEMA_VERSION = "1.0.0"
+SUPPORTED_CMS_TXN_VERSIONS = frozenset({CMS_TXN_SCHEMA_VERSION})
+
+#: The neutral capabilities a CMS adapter must provide to drive a managed
+#: transaction.  Each is a verb on the adapter, never a provider named by the
+#: contract.  ``restore`` is mandatory: a transaction whose baseline cannot be
+#: put back is not a *reversible* transaction.
+CMS_CAPABILITIES: tuple[str, ...] = (
+    "read_baseline",
+    "draft",
+    "dry_run",
+    "apply",
+    "readback",
+    "restore",
+)
+
+#: The ordered lifecycle stages a managed CMS transaction passes through.  The
+#: owner refuses a transaction that skips a stage or runs one out of order.
+CMS_STAGE_BASELINE = "baseline"
+CMS_STAGE_DRAFTED = "drafted"
+CMS_STAGE_DRY_RUN = "dry_run"
+CMS_STAGE_APPLIED = "applied"
+CMS_STAGE_READBACK = "readback"
+CMS_STAGE_RESTORED = "restored"
+CMS_STAGES: tuple[str, ...] = (
+    CMS_STAGE_BASELINE,
+    CMS_STAGE_DRAFTED,
+    CMS_STAGE_DRY_RUN,
+    CMS_STAGE_APPLIED,
+    CMS_STAGE_READBACK,
+    CMS_STAGE_RESTORED,
+)
+
+
+class CmsCapabilityError(ValueError):
+    """A CMS adapter is missing a capability the managed contract requires.
+
+    Raised when an adapter cannot provide one of :data:`CMS_CAPABILITIES`; the
+    owner refuses to drive a managed transaction through an adapter that cannot
+    read a baseline, dry-run, apply, read back or restore.
+    """
+
+    def __init__(self, missing: Sequence[str], adapter: str = ""):
+        self.missing = tuple(missing)
+        self.adapter = adapter
+        super().__init__(
+            f"CMS adapter {adapter or '<unnamed>'!r} is missing required "
+            f"capabilities {list(self.missing)}; a managed transaction needs "
+            f"all of {list(CMS_CAPABILITIES)}"
+        )
+
+
+class CmsStageError(ValueError):
+    """A transaction was driven through the lifecycle out of order."""
+
+    def __init__(self, expected: str, got: str):
+        self.expected = expected
+        self.got = got
+        super().__init__(
+            f"CMS transaction stage {got!r} is not reachable from {expected!r}; "
+            f"the managed lifecycle is {list(CMS_STAGES)}"
+        )
+
+
+@dataclass(frozen=True)
+class CmsCapabilityContract:
+    """The neutral capability contract a CMS adapter binds to.
+
+    This is the contract *identity*: it names the artifact, its frozen version
+    and the exact capability set it requires -- nothing provider-specific.  An
+    adapter is usable by the managed owner only when it declares this contract
+    and actually provides every capability in it.
+    """
+
+    adapter: str
+    capabilities: tuple[str, ...] = CMS_CAPABILITIES
+    schema_version: str = CMS_TXN_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version not in SUPPORTED_CMS_TXN_VERSIONS:
+            raise UnsupportedContractVersion(
+                "cms-transaction-receipt-v1", self.schema_version,
+                SUPPORTED_CMS_TXN_VERSIONS,
+            )
+        if not isinstance(self.adapter, str) or not self.adapter.strip():
+            raise ValueError("a CMS capability contract must name its adapter")
+        missing = tuple(
+            cap for cap in CMS_CAPABILITIES if cap not in self.capabilities
+        )
+        if missing:
+            raise CmsCapabilityError(missing, self.adapter)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_id": CMS_TXN_SCHEMA_ID,
+            "schema_version": self.schema_version,
+            "adapter": self.adapter,
+            "capabilities": list(self.capabilities),
+        }
+
+
+def validate_cms_capability_contract(record: Mapping[str, Any]) -> None:
+    """Refuse a capability contract this owner cannot support.
+
+    An unknown version (or a record whose schema id is not the CMS receipt's)
+    fails closed with :class:`UnsupportedContractVersion`; a contract missing a
+    required capability is refused by reconstruction.
+    """
+    version = record.get("schema_version")
+    if version not in SUPPORTED_CMS_TXN_VERSIONS:
+        raise UnsupportedContractVersion(
+            "cms-transaction-receipt-v1", version, SUPPORTED_CMS_TXN_VERSIONS
+        )
+    if record.get("schema_id") != CMS_TXN_SCHEMA_ID:
+        raise ValueError(
+            f"CMS capability contract schema_id {record.get('schema_id')!r} is "
+            f"not {CMS_TXN_SCHEMA_ID!r}"
+        )
+    CmsCapabilityContract(
+        adapter=record.get("adapter", ""),
+        capabilities=tuple(record.get("capabilities", ())),
+        schema_version=version,
+    )
+
+
+@dataclass(frozen=True)
+class CmsRawHashes:
+    """The raw semantic and render hashes of a CMS artifact.
+
+    Restoration is established *by these hashes*, not by a claim: a restore is
+    verified only when the raw semantic and render hashes read back after the
+    restore equal the baseline's.  Two independently-derived hashes are carried
+    so a "restored" claim that only matches on one dimension (a render that
+    looks right while the semantic content drifted, or vice versa) is refused.
+    """
+
+    semantic: str
+    render: str
+
+    def __post_init__(self) -> None:
+        for name, value in (("semantic", self.semantic), ("render", self.render)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"CMS raw hashes must carry a non-empty {name} hash"
+                )
+
+    def matches(self, other: "CmsRawHashes") -> bool:
+        """True when both dimensions reproduce the *other* hashes exactly."""
+        return self.semantic == other.semantic and self.render == other.render
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"semantic": self.semantic, "render": self.render}
+
+
+def _hash_cms_content(content: Any) -> CmsRawHashes:
+    """A deterministic raw semantic/render hash pair for CMS content.
+
+    The neutral owner never inspects a provider's content shape: it hashes a
+    canonical JSON encoding of whatever the adapter hands back, deriving the
+    *semantic* hash from the content itself and the *render* hash from the
+    semantic hash (so a render that is not anchored to the semantic content is
+    impossible).  This is the deterministic stub the dummy adapter binds to; a
+    real pack adapter would supply provider-derived raw bytes.
+    """
+    semantic_blob = json.dumps(content, sort_keys=True, separators=(",", ":"), default=str)
+    semantic = "sha256:" + hashlib.sha256(semantic_blob.encode("utf-8")).hexdigest()
+    render = "sha256:" + hashlib.sha256(
+        ("render:" + semantic).encode("utf-8")
+    ).hexdigest()
+    return CmsRawHashes(semantic=semantic, render=render)
+
+
+class RawContentAdapter:
+    """A capability-bound *dummy* CMS adapter over raw in-memory content.
+
+    This is the dummy adapter criterion 3 names: it declares the neutral
+    :class:`CmsCapabilityContract` and implements every capability against a
+    plain in-memory value, so apply / readback / restore can be reproduced
+    without a provider, a transformer or live egress.  It exposes only verbs the
+    contract names -- no provider, no channel and no transformer.
+    """
+
+    contract: CmsCapabilityContract
+
+    def __init__(self, *, adapter: str = "raw-dummy") -> None:
+        self.contract = CmsCapabilityContract(adapter=adapter)
+        self._current: Any = None
+        self._restore_point: Any = None
+
+    # -- capabilities -----------------------------------------------------
+
+    def read_baseline(self, content: Any) -> CmsRawHashes:
+        """Read the baseline the transaction starts from."""
+        self._current = content
+        self._restore_point = content
+        return _hash_cms_content(content)
+
+    def draft(self, content: Any, change: Any) -> Any:
+        """Draft the changed content (still not applied)."""
+        return change
+
+    def dry_run(self, content: Any) -> CmsRawHashes:
+        """Hash the drafted content without applying it."""
+        return _hash_cms_content(content)
+
+    def apply(self, content: Any) -> CmsRawHashes:
+        """Apply the drafted content; retain the bounded restore point."""
+        self._restore_point = self._current
+        self._current = content
+        return _hash_cms_content(content)
+
+    def readback(self) -> CmsRawHashes:
+        """Read the applied content back from the target surface."""
+        return _hash_cms_content(self._current)
+
+    def restore(self) -> CmsRawHashes:
+        """Restore the bounded baseline; hash what is now present."""
+        self._current = self._restore_point
+        return _hash_cms_content(self._current)
+
+
+@dataclass(frozen=True)
+class CmsTransaction:
+    """A ``cms-transaction-receipt-v1`` record: a managed CMS transaction.
+
+    Driven by one transaction owner through the ordered lifecycle
+    (:data:`CMS_STAGES`) -- baseline, draft, dry-run, bounded apply, readback and
+    restore -- against a neutral capability contract.  Fail-closed invariants:
+
+    * ``schema_version`` must be supported;
+    * the transaction names its run, subject revision, adapter and baseline;
+    * ``capabilities`` must include every capability in
+      :data:`CMS_CAPABILITIES` (an adapter that cannot restore is not managed);
+    * a ``restored`` transaction must present raw semantic *and* render hashes
+      equal to the baseline's -- a restore that only matches on one dimension,
+      or that claims a restore without the hashes, is refused.
+    """
+
+    run_id: str
+    subject: str
+    subject_kind: str
+    subject_revision: str
+    adapter: str
+    baseline_hashes: CmsRawHashes
+    txn_id: str = ""
+    stage: str = CMS_STAGE_BASELINE
+    draft_digest: str = ""
+    dry_run_hashes: Optional[CmsRawHashes] = None
+    applied_hashes: Optional[CmsRawHashes] = None
+    readback_hashes: Optional[CmsRawHashes] = None
+    restored_hashes: Optional[CmsRawHashes] = None
+    capabilities: tuple[str, ...] = CMS_CAPABILITIES
+    created_at: str = field(default_factory=_now_iso)
+    schema_version: str = CMS_TXN_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version not in SUPPORTED_CMS_TXN_VERSIONS:
+            raise UnsupportedContractVersion(
+                "cms-transaction-receipt-v1", self.schema_version,
+                SUPPORTED_CMS_TXN_VERSIONS,
+            )
+        for name, value in (
+            ("run_id", self.run_id),
+            ("subject", self.subject),
+            ("subject_revision", self.subject_revision),
+            ("adapter", self.adapter),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"a CMS transaction must carry a non-empty {name}"
+                )
+        if self.subject_kind not in NON_REPOSITORY_INTEGRATION_KINDS:
+            raise SubjectMismatchError(
+                f"a CMS transaction only manages non-repository subjects "
+                f"{sorted(NON_REPOSITORY_INTEGRATION_KINDS)}, got "
+                f"{self.subject_kind!r}; a repository integrates through "
+                f"{INTEGRATION_GIT_MERGE}",
+                field="subject_kind",
+            )
+        if not isinstance(self.baseline_hashes, CmsRawHashes):
+            raise ValueError(
+                "a CMS transaction must carry baseline raw semantic/render hashes"
+            )
+        missing = tuple(c for c in CMS_CAPABILITIES if c not in self.capabilities)
+        if missing:
+            raise CmsCapabilityError(missing, self.adapter)
+        if self.stage not in CMS_STAGES:
+            raise ValueError(
+                f"CMS transaction stage {self.stage!r} is not one of "
+                f"{list(CMS_STAGES)}"
+            )
+        # A readback must reproduce what was applied; a contradictory readback
+        # is refused rather than recorded as a verified apply.
+        if self.applied_hashes is not None and self.readback_hashes is not None:
+            if not self.readback_hashes.matches(self.applied_hashes):
+                raise ValueError(
+                    "CMS transaction readback does not reproduce the applied "
+                    "content; a verified apply must be reproducible"
+                )
+        # A restore is established by raw hashes matching the baseline's.
+        if self.restored_hashes is not None:
+            if not self.restored_hashes.matches(self.baseline_hashes):
+                raise ValueError(
+                    "CMS transaction restore hashes do not reproduce the "
+                    "baseline; restoration is not established"
+                )
+            if self.stage != CMS_STAGE_RESTORED:
+                raise ValueError(
+                    "CMS transaction carries restored hashes but is not at the "
+                    f"{CMS_STAGE_RESTORED!r} stage"
+                )
+
+    def verified(self) -> bool:
+        """True when the readback reproduces the applied content."""
+        if self.applied_hashes is None or self.readback_hashes is None:
+            return False
+        return self.readback_hashes.matches(self.applied_hashes)
+
+    def restored(self) -> bool:
+        """True when the restore reproduces the baseline raw hashes."""
+        if self.restored_hashes is None:
+            return False
+        return self.restored_hashes.matches(self.baseline_hashes)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_id": CMS_TXN_SCHEMA_ID,
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "subject": self.subject,
+            "subject_kind": self.subject_kind,
+            "subject_revision": self.subject_revision,
+            "adapter": self.adapter,
+            "txn_id": self.txn_id,
+            "stage": self.stage,
+            "baseline_hashes": self.baseline_hashes.to_dict(),
+            "draft_digest": self.draft_digest,
+            "dry_run_hashes": (
+                None if self.dry_run_hashes is None else self.dry_run_hashes.to_dict()
+            ),
+            "applied_hashes": (
+                None if self.applied_hashes is None else self.applied_hashes.to_dict()
+            ),
+            "readback_hashes": (
+                None if self.readback_hashes is None else self.readback_hashes.to_dict()
+            ),
+            "restored_hashes": (
+                None if self.restored_hashes is None else self.restored_hashes.to_dict()
+            ),
+            "capabilities": list(self.capabilities),
+            "verified": self.verified(),
+            "restored": self.restored(),
+            "created_at": self.created_at,
+        }
+
+
+def _hashes_from(record: Optional[Mapping[str, Any]]) -> Optional[CmsRawHashes]:
+    if record is None:
+        return None
+    return CmsRawHashes(semantic=record.get("semantic", ""), render=record.get("render", ""))
+
+
+def validate_cms_transaction(record: Mapping[str, Any]) -> None:
+    """Refuse a CMS transaction record this owner cannot support.
+
+    An unknown version or schema id fails closed; reconstructing the frozen
+    record re-runs every fail-closed invariant, so a tampered transaction (a
+    contradictory readback or a restore that does not reproduce the baseline) is
+    refused rather than trusted.
+    """
+    version = record.get("schema_version")
+    if version not in SUPPORTED_CMS_TXN_VERSIONS:
+        raise UnsupportedContractVersion(
+            "cms-transaction-receipt-v1", version, SUPPORTED_CMS_TXN_VERSIONS
+        )
+    if record.get("schema_id") != CMS_TXN_SCHEMA_ID:
+        raise ValueError(
+            f"CMS transaction schema_id {record.get('schema_id')!r} is not "
+            f"{CMS_TXN_SCHEMA_ID!r}"
+        )
+    baseline = _hashes_from(record.get("baseline_hashes"))
+    CmsTransaction(
+        run_id=record.get("run_id", ""),
+        subject=record.get("subject", ""),
+        subject_kind=record.get("subject_kind", ""),
+        subject_revision=record.get("subject_revision", ""),
+        adapter=record.get("adapter", ""),
+        baseline_hashes=baseline,
+        txn_id=record.get("txn_id", ""),
+        stage=record.get("stage", CMS_STAGE_BASELINE),
+        draft_digest=record.get("draft_digest", ""),
+        dry_run_hashes=_hashes_from(record.get("dry_run_hashes")),
+        applied_hashes=_hashes_from(record.get("applied_hashes")),
+        readback_hashes=_hashes_from(record.get("readback_hashes")),
+        restored_hashes=_hashes_from(record.get("restored_hashes")),
+        capabilities=tuple(record.get("capabilities", ())),
+        created_at=record.get("created_at", ""),
+        schema_version=version,
+    )
+
+
+# -- Publication authorization (criterion 2) ---------------------------------
+#
+# A CMS publication is an *irreversible* action on a *content* subject.  It is
+# authorized only when the designated explicit authorization binds to the exact
+# subject revision that is being published, and the autonomy policy governing
+# the run permits the action.  A Unicorn policy auto-approves reversible work
+# but *holds* for an irreversible action or a scope expansion, so Unicorn can
+# never authorize an irreversible publication or widen the write scope -- that
+# refusal is the same :class:`~skillweave.runtime.assay.PolicyDecision` the assay
+# policy produces, surfaced here rather than re-implemented.
+
+PUBLICATION_ACTION_KIND = "publish"
+
+
+class PublicationRefused(ValueError):
+    """An irreversible publication was not authorized for its exact subject."""
+
+    def __init__(self, reason: str, *, field: str = ""):
+        self.field = field
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class PublicationAuthorization:
+    """The designated explicit authorization to publish one subject revision.
+
+    ``subject_revision`` and ``artifact_digest`` bind the authorization to the
+    *exact* revision it authorizes: an authorization for a different revision
+    (or a different artifact digest) is refused, so a change to the content
+    invalidates the authorization rather than publishing an unreviewed revision.
+    ``authorizer`` must be a designated authority distinct from the producer --
+    a self-authored authorization is refused.
+    """
+
+    authorizer: str
+    subject_revision: str
+    artifact_digest: str
+    authority: str = ""
+    designated: bool = True
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("authorizer", self.authorizer),
+            ("subject_revision", self.subject_revision),
+            ("artifact_digest", self.artifact_digest),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"a publication authorization must carry a non-empty {name}"
+                )
+
+    def binds(self, *, subject_revision: str, artifact_digest: str) -> bool:
+        """True when the authorization names exactly this revision/digest."""
+        return (
+            self.subject_revision == subject_revision
+            and self.artifact_digest == artifact_digest
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "authorizer": self.authorizer,
+            "subject_revision": self.subject_revision,
+            "artifact_digest": self.artifact_digest,
+            "authority": self.authority,
+            "designated": self.designated,
+        }
+
+
+@dataclass(frozen=True)
+class PublicationDecision:
+    """The outcome of authorizing a CMS publication.
+
+    ``approved`` is True only when a designated explicit authorization bound to
+    the exact revision *and* the governing autonomy policy approved the
+    irreversible action.  ``policy_reason`` records the policy's reason, so a
+    refusal is auditable rather than silent.
+    """
+
+    approved: bool
+    reason: str
+    policy_reason: str = ""
+    requires_human: bool = False
+
+
+def authorize_publication(
+    authorization: Optional[PublicationAuthorization],
+    *,
+    subject_revision: str,
+    artifact_digest: str,
+    producer_identity: str = "",
+    policy: Any = None,
+    scope_target: str = "",
+    permitted_scope: Any = None,
+) -> PublicationDecision:
+    """Decide whether an irreversible CMS publication may proceed.
+
+    Three fail-closed checks, in order:
+
+    1. A *designated explicit* authorization must be present
+       (:class:`PublicationRefused` otherwise) and must bind to the exact
+       ``subject_revision``/``artifact_digest``; and its authorizer must differ
+       from ``producer_identity`` (a producer cannot authorize its own
+       publication).
+    2. When a ``scope_target`` is given, it must be permitted by
+       ``permitted_scope`` (a :class:`~skillweave.dispatch.work_contract.WriteScope`
+       or anything with ``permits``); publishing outside the declared scope is a
+       scope expansion and is refused.
+    3. The governing autonomy ``policy`` (an assay policy) is consulted with an
+       :data:`~skillweave.runtime.assay.ActionType.IRREVERSIBLE_ACTION` request:
+       a policy that *holds* an irreversible action (Unicorn among them) yields
+       an unapproved decision.  No policy means the irreversible action is not
+       auto-approved.
+    """
+    if authorization is None or not authorization.designated:
+        raise PublicationRefused(
+            "irreversible CMS publication requires a designated explicit "
+            "authorization; none was presented",
+            field="authorization",
+        )
+    if not authorization.binds(
+        subject_revision=subject_revision, artifact_digest=artifact_digest
+    ):
+        raise PublicationRefused(
+            f"publication authorization binds to revision "
+            f"{authorization.subject_revision!r}/digest "
+            f"{authorization.artifact_digest!r}, not the subject's "
+            f"{subject_revision!r}/{artifact_digest!r}; a content change "
+            f"invalidates the authorization",
+            field="subject_revision",
+        )
+    if producer_identity and authorization.authorizer == producer_identity:
+        raise PublicationRefused(
+            f"publication authorizer {authorization.authorizer!r} is the "
+            f"producer; a producer cannot authorize its own publication",
+            field="authorizer",
+        )
+
+    # Scope: publishing outside the declared scope is a scope expansion.
+    if scope_target and permitted_scope is not None:
+        permits = getattr(permitted_scope, "permits", None)
+        if callable(permits) and not permits(scope_target):
+            raise PublicationRefused(
+                f"publication target {scope_target!r} is outside the declared "
+                f"scope; widening the scope is refused",
+                field="scope",
+            )
+
+    # Autonomy policy: consult it for the irreversible action.
+    if policy is None:
+        return PublicationDecision(
+            approved=False,
+            reason="no autonomy policy governs this irreversible publication",
+        )
+    from skillweave.runtime.assay import ActionRequest, ActionType, AssayState
+
+    request = ActionRequest(
+        action_type=ActionType.IRREVERSIBLE_ACTION,
+        description=f"publish {subject_revision}",
+        state=AssayState.PROBE,
+        scope=scope_target,
+    )
+    decision = policy.check(request)
+    if not decision.approved:
+        return PublicationDecision(
+            approved=False,
+            reason=(
+                f"autonomy policy {getattr(policy, 'name', 'unknown')!r} does not "
+                f"authorize the irreversible publication"
+            ),
+            policy_reason=decision.reason,
+            requires_human=bool(decision.requires_human),
+        )
+    return PublicationDecision(
+        approved=True,
+        reason="designated explicit publication authorization accepted",
+        policy_reason=decision.reason,
+    )
+
+
 # -- The compact view's header (its identity, without the changed window) -----
 #
 # An unchanged poll re-serves the *same* compact view; the cheap way to detect
@@ -2367,6 +2996,12 @@ class NativeProcessService:
         self._store = store
         self.holder = holder
         self._lease: Optional[ControllerLease] = None
+        #: One *owner-authorized sandbox binding* per managed CMS transaction:
+        #: the owner holds exactly one adapter for the transaction's lifetime, so
+        #: the retained restore point is not lost between stages.  Keyed by the
+        #: transaction id; a binding is opened with the transaction and dropped
+        #: when the transaction is loaded from durable state by a fresh owner.
+        self._cms_sandbox: dict[str, Any] = {}
 
     # -- lease -----------------------------------------------------------
 
@@ -2998,6 +3633,268 @@ class NativeProcessService:
             intent_id, INTENT_INTEGRATED, step=STEP_CONTROLLED_INTEGRATION
         )
         return txn
+
+    # -- the managed CMS transaction owner (SW-1511-CMS-TRANSACTION c1-c3) --
+    #
+    # The owner drives *one* managed CMS transaction through the ordered
+    # lifecycle over a neutral capability contract.  Every stage is a durable
+    # effect fenced by the controller lease, so a recovering controller resumes
+    # the transaction from the store rather than from a live adapter, and a
+    # transaction that cannot reach its restore is left as a *named* blocker
+    # rather than silently "completed".
+
+    def _require_leased_adapter(
+        self, adapter: Any, *, subject: Any
+    ) -> str:
+        """Refuse a managed transaction through an unusable adapter/subject.
+
+        The controller lease must be held, the subject must be a non-repository
+        kind (a repository integrates through Git), and the adapter must declare
+        the neutral capability contract with every required capability.  The
+        resolved subject identity is returned.
+        """
+        self._require_controller()
+        from skillweave.dispatch.work_contract import subject_identity
+
+        mode = resolve_integration(subject)
+        if mode != INTEGRATION_CONTENT_TRANSACTION:
+            raise WrongIntegrationModeError(subject_kind_of(subject), mode)
+        contract = getattr(adapter, "contract", None)
+        if contract is None:
+            raise CmsCapabilityError(tuple(CMS_CAPABILITIES), getattr(adapter, "name", ""))
+        missing = tuple(
+            cap for cap in CMS_CAPABILITIES
+            if cap not in getattr(contract, "capabilities", ())
+            or not callable(getattr(adapter, cap, None))
+        )
+        if missing:
+            raise CmsCapabilityError(missing, getattr(contract, "adapter", ""))
+        return subject_identity(subject)
+
+    def open_cms_transaction(
+        self,
+        intent_id: str,
+        subject: Any,
+        adapter: Any,
+        *,
+        baseline: Any,
+        txn_id: str = "",
+        now: Optional[str] = None,
+    ) -> CmsTransaction:
+        """Open a managed CMS transaction at the baseline stage (criterion 1).
+
+        The owner reads the baseline *through the adapter's neutral capability*
+        and records the ``cms-transaction-receipt-v1`` at the ``baseline`` stage,
+        durably, fenced by the controller lease.  A repository subject or an
+        adapter missing a required capability is refused before any effect.
+        """
+        identity = self._require_leased_adapter(adapter, subject=subject)
+        intent = self._store.get_dispatch_intent(intent_id)
+        if intent is None:
+            raise ValueError(f"no dispatch intent {intent_id!r} to manage")
+        baseline_hashes = adapter.read_baseline(baseline)
+        txn = CmsTransaction(
+            run_id=intent.run_id,
+            subject=identity,
+            subject_kind=subject_kind_of(subject),
+            subject_revision=getattr(subject, "revision", ""),
+            adapter=adapter.contract.adapter,
+            txn_id=txn_id or f"{intent.run_id}/{intent_id}",
+            baseline_hashes=baseline_hashes,
+            capabilities=tuple(adapter.contract.capabilities),
+            created_at=now or _now_iso(),
+        )
+        self._store.save_cms_transaction(txn)
+        # Bind the *one* owner-authorized sandbox adapter to the transaction, so
+        # every later stage drives the same retained restore point.
+        self._cms_sandbox[txn.txn_id] = adapter
+        return txn
+
+    def draft_cms_transaction(
+        self, txn: CmsTransaction, *, change: Any,
+        now: Optional[str] = None,
+    ) -> CmsTransaction:
+        """Draft a change and dry-run it (criterion 1).
+
+        The drafted content is dry-run *before* any apply: the dry-run hashes are
+        recorded (never the applied hashes), so a caller proves the transaction
+        can run without mutating the target.  Only the ``baseline -> drafted ->
+        dry_run`` transition is accepted.  The change is drafted against the
+        *bound sandbox adapter's* retained content, so no target is touched.
+        """
+        self._require_controller()
+        if txn.stage != CMS_STAGE_BASELINE:
+            raise CmsStageError(CMS_STAGE_BASELINE, txn.stage)
+        adapter = self._sandbox_adapter(txn)
+        draft_content = adapter.draft(adapter.readback(), change)
+        dry_run_hashes = adapter.dry_run(draft_content)
+        advanced = replace(
+            txn,
+            stage=CMS_STAGE_DRY_RUN,
+            draft_digest=dry_run_hashes.semantic,
+            dry_run_hashes=dry_run_hashes,
+            created_at=now or txn.created_at,
+        )
+        self._store.save_cms_transaction(advanced, upsert=True)
+        return advanced
+
+    def apply_cms_transaction(
+        self, txn: CmsTransaction, *, change: Any,
+        now: Optional[str] = None,
+    ) -> CmsTransaction:
+        """Apply the drafted change and verify it by independent readback.
+
+        The apply is the *bounded* mutation: the bound adapter retains the
+        baseline as the restore point, the change is applied, and the readback
+        must reproduce the applied hashes (a contradictory readback is refused by
+        the frozen record).  Only the ``dry_run -> applied -> readback``
+        transition is accepted, so an un-dry-run apply is refused.
+        """
+        self._require_controller()
+        if txn.stage != CMS_STAGE_DRY_RUN:
+            raise CmsStageError(CMS_STAGE_DRY_RUN, txn.stage)
+        adapter = self._sandbox_adapter(txn)
+        draft_content = adapter.draft(adapter.readback(), change)
+        applied_hashes = adapter.apply(draft_content)
+        readback_hashes = adapter.readback()
+        advanced = replace(
+            txn,
+            stage=CMS_STAGE_READBACK,
+            applied_hashes=applied_hashes,
+            readback_hashes=readback_hashes,
+            created_at=now or txn.created_at,
+        )
+        self._store.save_cms_transaction(advanced, upsert=True)
+        return advanced
+
+    def restore_cms_transaction(
+        self, txn: CmsTransaction, *, now: Optional[str] = None
+    ) -> tuple[CmsTransaction, str]:
+        """Restore the baseline and establish restoration by raw hashes.
+
+        Returns ``(txn, blocker)``.  When the restore reproduces the baseline's
+        raw semantic *and* render hashes the transaction advances to the
+        ``restored`` stage and the blocker is empty.  When it does not, the
+        transaction is left at its prior stage and a *named* blocker is returned
+        -- restoration is never claimed without the hashes proving it.  Only the
+        ``readback`` stage may be restored from.
+        """
+        self._require_controller()
+        if txn.stage != CMS_STAGE_READBACK:
+            raise CmsStageError(CMS_STAGE_READBACK, txn.stage)
+        adapter = self._sandbox_adapter(txn)
+        restored_hashes = adapter.restore()
+        if not restored_hashes.matches(txn.baseline_hashes):
+            blocker = (
+                "restore_not_established: restored raw hashes "
+                f"semantic={restored_hashes.semantic!r} render="
+                f"{restored_hashes.render!r} do not reproduce the baseline "
+                f"semantic={txn.baseline_hashes.semantic!r} render="
+                f"{txn.baseline_hashes.render!r}"
+            )
+            return txn, blocker
+        advanced = replace(
+            txn,
+            stage=CMS_STAGE_RESTORED,
+            restored_hashes=restored_hashes,
+            created_at=now or txn.created_at,
+        )
+        self._store.save_cms_transaction(advanced, upsert=True)
+        return advanced, ""
+
+    def load_cms_transaction(self, run_id: str, txn_id: str) -> Optional[CmsTransaction]:
+        """Load a persisted managed CMS transaction (a recovering controller).
+
+        A recovering controller reads the transaction from durable state rather
+        than re-driving it; an unsupported persisted version fails closed.
+        """
+        record = self._store.get_cms_transaction(run_id, txn_id)
+        if record is None:
+            return None
+        validate_cms_transaction(record)
+        return CmsTransaction(
+            run_id=record.get("run_id", ""),
+            subject=record.get("subject", ""),
+            subject_kind=record.get("subject_kind", ""),
+            subject_revision=record.get("subject_revision", ""),
+            adapter=record.get("adapter", ""),
+            baseline_hashes=_hashes_from(record.get("baseline_hashes")),
+            txn_id=record.get("txn_id", ""),
+            stage=record.get("stage", CMS_STAGE_BASELINE),
+            draft_digest=record.get("draft_digest", ""),
+            dry_run_hashes=_hashes_from(record.get("dry_run_hashes")),
+            applied_hashes=_hashes_from(record.get("applied_hashes")),
+            readback_hashes=_hashes_from(record.get("readback_hashes")),
+            restored_hashes=_hashes_from(record.get("restored_hashes")),
+            capabilities=tuple(record.get("capabilities", ())),
+            created_at=record.get("created_at", ""),
+            schema_version=record.get("schema_version", CMS_TXN_SCHEMA_VERSION),
+        )
+
+    def bind_cms_sandbox(self, txn: CmsTransaction, adapter: Any) -> None:
+        """Re-bind the one owner-authorized sandbox adapter to a *recovered* txn.
+
+        A controller that loaded a transaction from durable state (a takeover)
+        re-binds its single sandbox adapter here so the transaction can resume
+        its lifecycle.  The adapter must declare the same capabilities as the
+        transaction recorded; a mismatched adapter is refused rather than driven.
+        """
+        self._require_controller()
+        missing = tuple(
+            cap for cap in txn.capabilities
+            if not callable(getattr(adapter, cap, None))
+        )
+        if missing:
+            raise CmsCapabilityError(missing, txn.adapter)
+        self._cms_sandbox[txn.txn_id] = adapter
+
+    def _sandbox_adapter(self, txn: CmsTransaction) -> Any:
+        """The one owner-authorized sandbox adapter bound to *txn*.
+
+        The owner holds exactly one adapter per transaction, so the retained
+        restore point survives across stages.  A transaction with no bound
+        adapter (a recovered transaction that was never re-bound) is refused
+        rather than silently driven through a stateless stub.
+        """
+        adapter = self._cms_sandbox.get(txn.txn_id)
+        if adapter is None:
+            raise CmsCapabilityError(
+                tuple(CMS_CAPABILITIES),
+                f"{txn.adapter} (no sandbox binding for {txn.txn_id!r}; "
+                f"re-bind with bind_cms_sandbox before resuming)",
+            )
+        return adapter
+
+    def authorize_cms_publication(
+        self,
+        txn: CmsTransaction,
+        *,
+        authorization: Optional[PublicationAuthorization],
+        artifact_digest: str,
+        producer_identity: str = "",
+        policy: Any = None,
+        scope_target: str = "",
+        permitted_scope: Any = None,
+    ) -> PublicationDecision:
+        """Authorize an irreversible CMS publication at the controller (criterion 2).
+
+        The designated explicit authorization must bind to the transaction's
+        *exact* subject revision and the given artifact digest; the governing
+        autonomy policy is consulted for the irreversible action, so a Unicorn
+        policy holds rather than authorizing an irreversible publication, and a
+        target outside the declared scope is refused as a scope expansion.  The
+        decision is returned for the caller to record; nothing is published here.
+        """
+        self._require_controller()
+        return authorize_publication(
+            authorization,
+            subject_revision=txn.subject_revision,
+            artifact_digest=artifact_digest,
+            producer_identity=producer_identity,
+            policy=policy,
+            scope_target=scope_target,
+            permitted_scope=permitted_scope,
+        )
 
 
 class _EvidenceJournalView(Sequence):
