@@ -742,3 +742,354 @@ def test_seam_controller_acceptance_requires_independent_identity(tmp_path):
     assert receipt.accepted is True
     assert receipt.state == ACCEPTANCE_ACCEPTED
 
+
+# ── criterion 4: collected package reviews ─────────────────────────────────
+#
+# Collecting related package reviews must preserve per-criterion receipts,
+# the Ops/reviewer separation and the designated escalation/pro-review policy.
+# These exercise both the collection seam directly and the *real* controller
+# seam (``NativeProcessService.collect_package_reviews``).
+
+from skillweave.trace import (  # noqa: E402
+    OPS_ROLE,
+    REVIEW_POLICY_ESCALATED,
+    REVIEW_POLICY_STANDARD,
+    ReviewPolicyError,
+    ReviewerAuthorityPolicy,
+    PackageReview,
+    PackageReviewCollection,
+    collect_package_review,
+)
+
+
+def _package_receipt(
+    *,
+    attempt_id: str,
+    artifact: str,
+    accepted: bool = True,
+    answering: str = "verifier-1",
+    producer: str = "worker-1",
+    revision: str = "git:abc123",
+    digest: str = "sha256:deadbeef",
+) -> IndependentGateReceipt:
+    return IndependentGateReceipt(
+        attempt_id=attempt_id,
+        state=ACCEPTANCE_ACCEPTED,
+        producer_artifact=artifact,
+        binding=ReviewBinding(
+            review_id=f"rev-{attempt_id}",
+            review_criteria=(attempt_id,),
+            subject_revision=revision,
+            artifact_digest=digest,
+        ),
+        role="verifier",
+        answering_identity=answering,
+        producer_identity=producer,
+        accepted=accepted,
+    )
+
+
+def _ok_review(criterion: str, *, answering: str = "verifier-1") -> PackageReview:
+    return PackageReview(
+        criterion=criterion,
+        receipt=_package_receipt(
+            attempt_id=f"att-{criterion}", artifact=f"artifact-{criterion}"
+        ),
+        role="verifier",
+        answering_identity=answering,
+        producer_identity="worker-1",
+    )
+
+
+def test_c04_collects_related_reviews_preserving_per_criterion_receipts():
+    policy = ReviewerAuthorityPolicy()
+    review_a = _ok_review("criterion-a")
+    review_b = _ok_review("criterion-b")
+    collection = collect_package_review(
+        "package-1",
+        criteria=["criterion-a", "criterion-b"],
+        reviews=[review_b, review_a],
+        policy=policy,
+    )
+    assert isinstance(collection, PackageReviewCollection)
+    # every criterion keeps *its own* receipt, and ordered deterministically
+    assert collection.accepted_criteria == ("criterion-a", "criterion-b")
+    assert collection.accepted is True
+    assert collection.required_criteria == ()
+    assert collection.receipt_for("criterion-a") is review_a.receipt
+    assert collection.receipt_for("criterion-b") is review_b.receipt
+    assert set(collection.receipts()) == {"criterion-a", "criterion-b"}
+    # the per-criterion receipt round-trips unchanged
+    assert collection.receipt_for("criterion-a").to_dict() == review_a.receipt_dict()
+
+
+def test_c04_negative_receipt_reuse_is_refused():
+    """No two criteria may collapse into one receipt."""
+    shared = _package_receipt(attempt_id="att-shared", artifact="artifact-shared")
+    policy = ReviewerAuthorityPolicy()
+    reviews = [
+        PackageReview(
+            criterion="criterion-a",
+            receipt=shared,
+            role="verifier",
+            answering_identity="verifier-1",
+            producer_identity="worker-1",
+        ),
+        PackageReview(
+            criterion="criterion-b",
+            receipt=shared,
+            role="verifier",
+            answering_identity="verifier-1",
+            producer_identity="worker-1",
+        ),
+    ]
+    try:
+        collect_package_review(
+            "package-1",
+            criteria=["criterion-a", "criterion-b"],
+            reviews=reviews,
+            policy=policy,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a reused per-criterion receipt was collected")
+
+
+def test_c04_negative_unsupported_receipt_version_fails_closed():
+    """A tampered per-criterion receipt is re-validated, never coerced."""
+    good = _package_receipt(attempt_id="att-a", artifact="artifact-a")
+    raw = good.to_dict()
+    raw["schema_version"] = "9.9.9"
+    # Reconstructing a tampered version is refused fail-closed.
+    try:
+        IndependentGateReceipt.from_dict(raw)
+    except UnsupportedContractVersion:
+        pass
+    else:
+        raise AssertionError("from_dict coerced an unsupported version")
+    # The consumer's own validation refuses it too.
+    try:
+        validate_independent_gate_receipt(raw)
+    except UnsupportedContractVersion:
+        pass
+    else:
+        raise AssertionError("an unsupported per-criterion receipt was coerced")
+
+
+def test_c04_negative_ops_role_reviewer_is_refused():
+    """Ops/reviewer separation: the producer role may never answer."""
+    policy = ReviewerAuthorityPolicy()
+    review = PackageReview(
+        criterion="criterion-a",
+        receipt=_package_receipt(attempt_id="att-a", artifact="artifact-a"),
+        role=OPS_ROLE,
+        answering_identity="ops-1",
+        producer_identity="worker-1",
+    )
+    try:
+        collect_package_review(
+            "package-1", criteria=["criterion-a"], reviews=[review], policy=policy
+        )
+    except ReviewPolicyError as exc:
+        assert exc.criterion == "criterion-a"
+    else:
+        raise AssertionError("an Ops-role review was collected as independent")
+
+    # A review answered by the producer identity is likewise not independent.
+    self_answered = PackageReview(
+        criterion="criterion-a",
+        receipt=_package_receipt(attempt_id="att-a", artifact="artifact-a"),
+        role="verifier",
+        answering_identity="worker-1",
+        producer_identity="worker-1",
+    )
+    try:
+        collect_package_review(
+            "package-1",
+            criteria=["criterion-a"],
+            reviews=[self_answered],
+            policy=policy,
+        )
+    except ReviewPolicyError:
+        pass
+    else:
+        raise AssertionError("a producer-answered review was collected as independent")
+
+
+def test_c04_negative_escalated_criterion_needs_designated_pro_review():
+    """A designated escalation is not quietly taken by the ordinary reviewer."""
+    policy = ReviewerAuthorityPolicy(
+        escalation_policy=REVIEW_POLICY_ESCALATED,
+        pro_review_identity="pro-verifier-9",
+        pro_reviewer_role="verifier",
+    )
+    ordinary = _ok_review("criterion-a", answering="verifier-1")
+    try:
+        collect_package_review(
+            "package-1", criteria=["criterion-a"], reviews=[ordinary], policy=policy
+        )
+    except ReviewPolicyError as exc:
+        assert "designated" in exc.reason or "pro" in exc.reason
+    else:
+        raise AssertionError("an escalated criterion was answered by the cold reviewer")
+
+    # The designated pro reviewer — by role *and* identity — collects.
+    pro_review = PackageReview(
+        criterion="criterion-a",
+        receipt=_package_receipt(
+            attempt_id="att-a", artifact="artifact-a", answering="pro-verifier-9"
+        ),
+        role="verifier",
+        answering_identity="pro-verifier-9",
+        producer_identity="worker-1",
+    )
+    collection = collect_package_review(
+        "package-1", criteria=["criterion-a"], reviews=[pro_review], policy=policy
+    )
+    assert collection.escalations() == ("criterion-a",)
+    assert collection.accepted is True
+
+
+def test_c04_negative_partial_package_is_not_accepted():
+    """A package without an accepted receipt for every criterion is required."""
+    policy = ReviewerAuthorityPolicy()
+    failed = PackageReview(
+        criterion="criterion-b",
+        receipt=_package_receipt(
+            attempt_id="att-b", artifact="artifact-b", accepted=False
+        ),
+        role="verifier",
+        answering_identity="verifier-1",
+        producer_identity="worker-1",
+    )
+    collection = collect_package_review(
+        "package-1",
+        criteria=["criterion-a", "criterion-b"],
+        reviews=[_ok_review("criterion-a"), failed],
+        policy=policy,
+    )
+    assert collection.accepted is False
+    assert collection.accepted_criteria == ("criterion-a",)
+    assert collection.required_criteria == ("criterion-b",)
+
+
+def test_c04_backward_compat_criteria_1_3_reviews_collect_unchanged():
+    """A standard package of criteria-1-3 receipts is additive; nothing changes."""
+    policy = ReviewerAuthorityPolicy(escalation_policy=REVIEW_POLICY_STANDARD)
+    collection = collect_package_review(
+        "package-1",
+        criteria=["c1", "c2", "c3"],
+        reviews=[_ok_review("c1"), _ok_review("c2"), _ok_review("c3")],
+        policy=policy,
+    )
+    assert collection.accepted is True
+    assert collection.escalations() == ()
+    # v1 records round-trip verbatim (backward compatibility of the contract).
+    for criterion in ("c1", "c2", "c3"):
+        record = collection.receipt_for(criterion).to_dict()
+        assert record["schema_version"] == GATE_RECEIPT_SCHEMA_VERSION
+        validate_independent_gate_receipt(record)
+
+
+def test_c04_negative_unknown_criterion_review_is_refused():
+    policy = ReviewerAuthorityPolicy()
+    try:
+        collect_package_review(
+            "package-1",
+            criteria=["criterion-a"],
+            reviews=[_ok_review("criterion-a"), _ok_review("criterion-z")],
+            policy=policy,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a review for an undeclared criterion was collected")
+
+
+# ── criterion 4 through the real controller seam ───────────────────────────
+
+def test_c04_seam_controller_collects_package_reviews(tmp_path):
+    """Criterion 4 through the controller: a package collects at the lease."""
+    service = _controller_service(tmp_path)
+    policy = ReviewerAuthorityPolicy()
+    collection = service.collect_package_reviews(
+        "package-1",
+        criteria=["criterion-a", "criterion-b"],
+        reviews=[_ok_review("criterion-a"), _ok_review("criterion-b")],
+        policy=policy,
+    )
+    assert collection.accepted is True
+    assert collection.accepted_criteria == ("criterion-a", "criterion-b")
+
+
+def test_c04_seam_controller_refuses_policy_violating_package(tmp_path):
+    """The controller refuses a package that reuses a receipt or leaks Ops."""
+    service = _controller_service(tmp_path)
+    policy = ReviewerAuthorityPolicy()
+
+    shared = _package_receipt(attempt_id="att-shared", artifact="artifact-shared")
+    reused = [
+        PackageReview(
+            criterion="criterion-a",
+            receipt=shared,
+            role="verifier",
+            answering_identity="verifier-1",
+            producer_identity="worker-1",
+        ),
+        PackageReview(
+            criterion="criterion-b",
+            receipt=shared,
+            role="verifier",
+            answering_identity="verifier-1",
+            producer_identity="worker-1",
+        ),
+    ]
+    try:
+        service.collect_package_reviews(
+            "package-1",
+            criteria=["criterion-a", "criterion-b"],
+            reviews=reused,
+            policy=policy,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("the controller collected a reused-receipt package")
+
+    ops_review = PackageReview(
+        criterion="criterion-a",
+        receipt=_package_receipt(attempt_id="att-a", artifact="artifact-a"),
+        role=OPS_ROLE,
+        answering_identity="ops-1",
+        producer_identity="worker-1",
+    )
+    try:
+        service.collect_package_reviews(
+            "package-1", criteria=["criterion-a"], reviews=[ops_review], policy=policy
+        )
+    except ReviewPolicyError:
+        pass
+    else:
+        raise AssertionError("the controller collected an Ops-role package")
+
+
+def test_c04_seam_controller_requires_controller_lease(tmp_path):
+    """The collection seam is gated by the controller lease, like acceptance."""
+    from skillweave.runtime.store import SQLiteRunStore
+    from skillweave.runtime.native_process import NotControllerError
+
+    store = SQLiteRunStore(db_path=str(tmp_path / "store.db"))
+    other = NativeProcessService(store, holder="controller-2")
+    try:
+        other.collect_package_reviews(
+            "package-1",
+            criteria=["criterion-a"],
+            reviews=[_ok_review("criterion-a")],
+            policy=ReviewerAuthorityPolicy(),
+        )
+    except NotControllerError:
+        pass
+    else:
+        raise AssertionError("a non-controller collected a package review")
+

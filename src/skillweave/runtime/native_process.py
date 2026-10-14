@@ -73,6 +73,7 @@ from ..trace.gate_receipt import (
     ACCEPTANCE_STATES,
     IndependentGateReceipt,
     MissingProducerArtifact,
+    collect_package_review,
     release_dependents,
 )
 
@@ -1896,6 +1897,38 @@ class NativeProcessService:
         """
         self._require_controller()
         return release_dependents(attempt)
+
+    # -- collected package reviews (SW-1511-REVIEW criterion 4) -----------
+
+    def collect_package_reviews(
+        self,
+        package_id: str,
+        *,
+        criteria: Any,
+        reviews: Any,
+        policy: Any,
+    ) -> Any:
+        """Collect a package's related per-criterion reviews at the controller.
+
+        This is criterion 4's consumer/controller seam: the same controller
+        lease that owns acceptance (:meth:`record_acceptance`) owns the
+        collection, so a package review cannot be assembled outside the
+        controlled path.  It delegates to
+        :func:`skillweave.trace.gate_receipt.collect_package_review`, which
+        re-validates each criterion's own ``independent-gate-receipt-v1`` record
+        and enforces the designated Ops/reviewer-separation and escalation
+        policy — the controller refuses to collect a package whose per-criterion
+        receipts were reused, answered by the producer, or answered by the wrong
+        role for a designated escalation.  The collection is *additive*: a
+        standard package of criteria-1-3 receipts collects unchanged.
+        """
+        self._require_controller()
+        return collect_package_review(
+            package_id,
+            criteria=criteria,
+            reviews=reviews,
+            policy=policy,
+        )
 
     def record_failure(self, intent_id: str) -> DispatchIntent:
         """Record a resolved (failed) outcome; the execution scope is freed.

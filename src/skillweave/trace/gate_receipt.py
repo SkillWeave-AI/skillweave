@@ -24,6 +24,14 @@ them:
   auto-accept.  Only an actual independent verifier receipt, whose verifier
   identity differs from the producer, can decide the gate
   (:func:`evaluate_gate`).
+* **criterion 4** -- related package reviews are *collected* while every
+  criterion keeps its own receipt.  :class:`PackageReview` gathers the
+  per-criterion receipts of one package **without** collapsing them into a
+  single opaque blob; :class:`ReviewerAuthorityPolicy` keeps Ops (producer) and
+  reviewer separate and designates the escalation / pro-review policy; and
+  :func:`collect_package_review` (:class:`PackageReviewCollection`) is the real
+  collection seam that refuses a package whose per-criterion acceptance was
+  answered under a role the policy does not grant that criterion.
 
 Boundary contract
 -----------------
@@ -33,7 +41,10 @@ next to the record that implements it.  It is **additive and opt-in**: a
 record is only ever validated when a caller hands one over, existing v1
 records remain valid, and a record carrying any version this consumer does not
 support fails closed (:class:`UnsupportedContractVersion`) rather than being
-coerced.
+coerced.  Criterion 4 extends the same contract *additively*: every per-gate
+``IndependentGateReceipt`` is returned unchanged inside a
+:class:`PackageReview`, so each criterion keeps its own receipt and an existing
+v1 record round-trips untouched.
 """
 
 from __future__ import annotations
@@ -84,6 +95,16 @@ __all__ = [
     "MULTIPLE_TERMINALS_REASON",
     "NARRATIVE_RECEIPT_REASON",
     "evaluate_gate",
+    # criterion 4: collect related package reviews, per-criterion receipts
+    "OPS_ROLE",
+    "REVIEW_POLICY_STANDARD",
+    "REVIEW_POLICY_ESCALATED",
+    "REVIEW_POLICIES",
+    "ReviewPolicyError",
+    "ReviewerAuthorityPolicy",
+    "PackageReview",
+    "collect_package_review",
+    "PackageReviewCollection",
     # helpers
     "acceptance_rank",
 ]
@@ -767,6 +788,39 @@ class IndependentGateReceipt:
             "captured_at": self.captured_at,
         }
 
+    @classmethod
+    def from_dict(cls, record: Mapping[str, Any]) -> "IndependentGateReceipt":
+        """Reconstruct a receipt from its serialized record, fail-closed.
+
+        The inverse of :meth:`to_dict`: every fail-closed invariant is re-run
+        at construction, so an unsupported version is refused
+        (:class:`UnsupportedContractVersion`) and a tampered acceptance is
+        refused rather than trusted.  Additive: an untouched v1 record
+        round-trips.
+        """
+        version = record.get("schema_version", GATE_RECEIPT_SCHEMA_VERSION)
+        raw_binding = record.get("binding")
+        binding: Optional[ReviewBinding] = None
+        if isinstance(raw_binding, Mapping):
+            binding = ReviewBinding(
+                review_id=raw_binding.get("review_id", ""),
+                review_criteria=tuple(raw_binding.get("review_criteria") or ()),
+                subject_revision=raw_binding.get("subject_revision", ""),
+                artifact_digest=raw_binding.get("artifact_digest", ""),
+            )
+        return cls(
+            attempt_id=record.get("attempt_id", ""),
+            state=record.get("state", ""),
+            producer_artifact=record.get("producer_artifact", ""),
+            binding=binding,
+            role=record.get("role", ""),
+            answering_identity=record.get("answering_identity", ""),
+            producer_identity=record.get("producer_identity", ""),
+            accepted=bool(record.get("accepted", False)),
+            captured_at=record.get("captured_at", ""),
+            schema_version=version,
+        )
+
 
 def validate_independent_gate_receipt(record: Mapping[str, Any]) -> None:
     """Refuse a gate receipt this consumer cannot support.
@@ -807,3 +861,387 @@ def validate_independent_gate_receipt(record: Mapping[str, Any]) -> None:
         captured_at=record.get("captured_at", ""),
         schema_version=version,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Criterion 4: collect related package reviews, per-criterion receipts
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A "package" is several acceptance criteria reviewed together.  Collecting
+# their reviews must not flatten them: each criterion keeps its *own*
+# independent-gate-receipt, the producer (Ops) role stays separate from every
+# reviewing role, and the policy decides which role may answer which criterion
+# and which reviews must be escalated to the designated pro review.  The
+# collection seam below re-validates every receipt under that policy, so a
+# package cannot be collected by quietly reusing one role's answer for a
+# criterion the policy assigned to a different, separate role.
+
+#: The producer role.  Ops produces the artifact under review and is therefore
+#: never the identity that answers a criterion's independent review.
+OPS_ROLE = "ops"
+
+#: The escalation policy is *designated*, not inferred: ``standard`` is answered
+#: by the ordinary (cold) reviewer and ``escalated`` must be answered by the
+#: designated pro reviewer.  A package may name either; nothing here invents a
+#: policy or silently downgrades an escalated criterion.
+REVIEW_POLICY_STANDARD = "standard"
+REVIEW_POLICY_ESCALATED = "escalated"
+REVIEW_POLICIES: tuple[str, ...] = (
+    REVIEW_POLICY_STANDARD,
+    REVIEW_POLICY_ESCALATED,
+)
+
+
+class ReviewPolicyError(ValueError):
+    """A review violates the designated Ops/reviewer-separation policy.
+
+    Raised when a criterion's review was answered under a role the policy does
+    not grant (for example the Ops/producer role, or an escalated criterion
+    answered by the non-designated role), or when the escalation policy itself
+    is malformed.  It names the criterion so a consumer can key on the exact
+    overlap.
+    """
+
+    def __init__(self, criterion: str, reason: str):
+        self.criterion = criterion
+        self.reason = reason
+        super().__init__(f"criterion {criterion!r} review is refused: {reason}")
+
+
+class ReviewerAuthorityPolicy:
+    """The designated escalation / Ops-reviewer-separation policy.
+
+    The host designates the *escalation policy* per package (and may designate
+    a specific criterion as escalated), and names the pro-reviewer identity the
+    pro route must use.  Two invariants are enforced by :meth:`role_for`:
+
+    * Ops (the producer role) is never a reviewing role -- Ops/reviewer
+      separation is structural, not a request the model may ignore;
+    * an *escalated* criterion must be answered by the designated pro reviewer
+      role and identity, so an escalated review is never quietly taken by the
+      ordinary cold reviewer.
+
+    The policy is *additive*: when no escalation is designated the package is
+    ``standard`` and only the second invariant is inert.
+    """
+
+    def __init__(
+        self,
+        *,
+        escalation_policy: str = REVIEW_POLICY_STANDARD,
+        escalated_criteria: Sequence[str] = (),
+        pro_review_identity: str = "",
+        pro_reviewer_role: str = VERIFIER_ROLE,
+    ) -> None:
+        if escalation_policy not in REVIEW_POLICIES:
+            raise ValueError(
+                f"unknown escalation policy {escalation_policy!r}; expected one "
+                f"of {list(REVIEW_POLICIES)}"
+            )
+        self.escalation_policy = escalation_policy
+        self.escalated_criteria = frozenset(escalated_criteria)
+        self.pro_review_identity = pro_review_identity
+        self.pro_reviewer_role = pro_reviewer_role
+
+    def requires_escalation(self, criterion: str) -> bool:
+        """True when *criterion* must be answered by the designated pro review."""
+        if self.escalation_policy == REVIEW_POLICY_ESCALATED:
+            return True
+        return criterion in self.escalated_criteria
+
+    def role_for(self, criterion: str, review: AttemptReview) -> str:
+        """The role *review* must have for *criterion*, or raise.
+
+        Refuses the Ops/producer role outright (Ops/reviewer separation).  For
+        an escalated criterion it requires the designated pro reviewer role and
+        identity; for a standard criterion any non-Ops reviewing role is
+        admitted unchanged (backward compatible with criteria 1-3's reviews).
+        """
+        if review.role == OPS_ROLE:
+            raise ReviewPolicyError(
+                criterion,
+                f"role {OPS_ROLE!r} is the producer role; Ops and reviewer must "
+                f"stay separate",
+            )
+        if not review.role:
+            raise ReviewPolicyError(criterion, "review names no reviewing role")
+        if self.requires_escalation(criterion):
+            if review.role != self.pro_reviewer_role:
+                raise ReviewPolicyError(
+                    criterion,
+                    f"designated escalation policy {self.escalation_policy!r} "
+                    f"requires the pro reviewer role {self.pro_reviewer_role!r}, "
+                    f"got {review.role!r}",
+                )
+            if (
+                self.pro_review_identity
+                and review.answering_identity != self.pro_review_identity
+            ):
+                raise ReviewPolicyError(
+                    criterion,
+                    f"designated pro review must be answered by "
+                    f"{self.pro_review_identity!r}, got "
+                    f"{review.answering_identity!r}",
+                )
+        return review.role
+
+
+@dataclass(frozen=True)
+class PackageReview:
+    """One criterion's review inside a collected package -- with its *own* receipt.
+
+    Collecting a package must preserve per-criterion receipts: this record
+    binds the criterion to the exact ``independent-gate-receipt-v1`` its review
+    produced, plus the review's role and actual answering identity.  The
+    receipt is carried verbatim (:meth:`receipt_dict` returns it unchanged), so
+    different criteria never collapse into one receipt and an existing v1
+    record round-trips untouched.
+    """
+
+    criterion: str
+    receipt: IndependentGateReceipt
+    role: str
+    answering_identity: str
+    producer_identity: str
+    escalated: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.criterion:
+            raise ValueError("package review must name its criterion")
+        if not isinstance(self.receipt, IndependentGateReceipt):
+            raise ValueError(
+                "package review must carry an independent-gate-receipt-v1 record"
+            )
+        if not self.role:
+            raise ValueError("package review must state the reviewing role")
+        if not self.answering_identity:
+            raise ValueError("package review must name the actual answering identity")
+
+    @property
+    def accepted(self) -> bool:
+        """True only when this criterion's own receipt records acceptance."""
+        return bool(self.receipt.accepted)
+
+    @property
+    def independent(self) -> bool:
+        """True when the answering identity differs from the producer's."""
+        return self.answering_identity != self.producer_identity
+
+    def receipt_dict(self) -> dict[str, Any]:
+        """The per-criterion receipt, returned unchanged (round-trips)."""
+        return self.receipt.to_dict()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "criterion": self.criterion,
+            "role": self.role,
+            "answering_identity": self.answering_identity,
+            "producer_identity": self.producer_identity,
+            "escalated": self.escalated,
+            "accepted": self.accepted,
+            "receipt": self.receipt.to_dict(),
+            "receipt_fingerprint": _receipt_fingerprint(self.receipt),
+        }
+
+
+def _receipt_fingerprint(receipt: IndependentGateReceipt) -> str:
+    """A stable sha256 over the receipt's decisive fields.
+
+    The fingerprint is content-addressed over the acceptance state, the
+    producer artifact and the review binding, so two criteria with different
+    receipts are always distinguishable.
+    """
+    payload = receipt.to_dict()
+    blob = json.dumps(
+        {
+            "attempt_id": payload["attempt_id"],
+            "state": payload["state"],
+            "producer_artifact": payload["producer_artifact"],
+            "accepted": payload["accepted"],
+            "binding": payload["binding"],
+            "role": payload["role"],
+            "answering_identity": payload["answering_identity"],
+            "producer_identity": payload["producer_identity"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class PackageReviewCollection:
+    """The collected related reviews of one package, per criterion.
+
+    ``accepted_criteria`` and ``required_criteria`` partition the package's
+    criteria exactly (disjoint, and contiguous over the declared criteria), so
+    the gate denominator is never ambiguous.  ``receipts`` carries every
+    per-criterion receipt; ``escalations`` names the criteria answered under
+    designated escalation.  The package is accepted only when *every* criterion
+    carries its own accepted, independent, policy-valid receipt.
+    """
+
+    package_id: str
+    criteria: tuple[str, ...]
+    policy: ReviewerAuthorityPolicy
+    reviews: tuple[PackageReview, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.package_id:
+            raise ValueError("package review collection must name its package_id")
+        if len(set(self.criteria)) != len(self.criteria):
+            raise ValueError(f"package {self.package_id!r} repeats a criterion")
+        seen = [r.criterion for r in self.reviews]
+        if len(set(seen)) != len(seen):
+            raise ValueError(
+                f"package {self.package_id!r} carries more than one review for a "
+                f"criterion; per-criterion receipts must be unambiguous"
+            )
+        unknown = sorted(set(seen) - set(self.criteria))
+        if unknown:
+            raise ValueError(
+                f"package {self.package_id!r} carries reviews for undeclared "
+                f"criteria {unknown}"
+            )
+
+    def _by_criterion(self) -> Mapping[str, PackageReview]:
+        return {r.criterion: r for r in self.reviews}
+
+    @property
+    def accepted_criteria(self) -> tuple[str, ...]:
+        return tuple(sorted(r.criterion for r in self.reviews if r.accepted))
+
+    @property
+    def required_criteria(self) -> tuple[str, ...]:
+        accepted = set(self.accepted_criteria)
+        return tuple(c for c in self.criteria if c not in accepted)
+
+    @property
+    def accepted(self) -> bool:
+        return not self.required_criteria
+
+    def escalations(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(r.criterion for r in self.reviews if r.escalated)
+        )
+
+    def receipt_for(self, criterion: str) -> IndependentGateReceipt:
+        """This criterion's own receipt (never another criterion's)."""
+        review = self._by_criterion().get(criterion)
+        if review is None:
+            raise KeyError(f"package review has no receipt for criterion {criterion!r}")
+        return review.receipt
+
+    def receipts(self) -> Mapping[str, dict[str, Any]]:
+        """Every per-criterion receipt, keyed by criterion, unchanged."""
+        return {r.criterion: r.receipt.to_dict() for r in self.reviews}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "package_id": self.package_id,
+            "criteria": list(self.criteria),
+            "escalation_policy": self.policy.escalation_policy,
+            "accepted": self.accepted,
+            "accepted_criteria": list(self.accepted_criteria),
+            "required_criteria": list(self.required_criteria),
+            "escalations": list(self.escalations()),
+            "reviews": [r.to_dict() for r in self.reviews],
+        }
+
+
+def collect_package_review(
+    package_id: str,
+    *,
+    criteria: Sequence[str],
+    reviews: Sequence[PackageReview],
+    policy: ReviewerAuthorityPolicy,
+) -> PackageReviewCollection:
+    """Collect related package reviews, preserving per-criterion receipts.
+
+    This is criterion 4's collection seam.  It gathers the reviews of one
+    package's criteria into a single :class:`PackageReviewCollection` while
+    enforcing, per criterion and deterministically:
+
+    * **per-criterion receipts** -- each criterion must carry its *own*
+      ``independent-gate-receipt-v1`` record, re-validated here (an unsupported
+      version or a tampered acceptance is refused with
+      :class:`UnsupportedContractVersion` / the frozen invariants, never
+      coerced), and no two criteria may share one receipt;
+    * **Ops/reviewer separation** -- the review's role must satisfy the policy;
+      the Ops (producer) role is refused outright, and the review must be
+      *independent* (its answering identity differs from the producer's);
+    * **designated escalation / pro-review** -- a criterion the policy marks as
+      escalated must have been answered by the designated pro reviewer role and
+      identity (:meth:`ReviewerAuthorityPolicy.role_for`).
+
+    A policy violation is refused (:class:`ReviewPolicyError`) rather than
+    collected, so a package never claims to have collected an escalated review
+    that was actually answered by the ordinary reviewer.  The collection is
+    *additive*: criteria that satisfy the standard policy collect unchanged.
+    """
+    receipt_fingerprints: dict[str, str] = {}
+    collected: list[PackageReview] = []
+
+    seen_criteria: set[str] = set()
+    for review in reviews:
+        if review.criterion in seen_criteria:
+            raise ValueError(
+                f"package {package_id!r} carries more than one review for "
+                f"criterion {review.criterion!r}"
+            )
+        seen_criteria.add(review.criterion)
+
+        # Per-criterion receipt: re-validate the record as a consumer would and
+        # require it to be this criterion's own, distinct receipt.
+        receipt_record = review.receipt.to_dict()
+        validate_independent_gate_receipt(receipt_record)
+        fingerprint = _receipt_fingerprint(review.receipt)
+        if fingerprint in receipt_fingerprints:
+            raise ValueError(
+                f"package {package_id!r} reuses one receipt for criteria "
+                f"{receipt_fingerprints[fingerprint]!r} and {review.criterion!r}; "
+                f"every criterion must keep its own receipt"
+            )
+        receipt_fingerprints[fingerprint] = review.criterion
+
+        # Ops/reviewer separation + designated escalation policy.
+        escalated = policy.requires_escalation(review.criterion)
+        policy.role_for(review.criterion, AttemptReview(
+            attempt_id=review.receipt.attempt_id,
+            binding=review.receipt.binding or ReviewBinding(
+                review_id=f"collected:{review.criterion}",
+                review_criteria=(review.criterion,),
+                subject_revision=review.receipt.state,
+                artifact_digest=review.receipt.producer_artifact,
+            ),
+            role=review.role,
+            answering_identity=review.answering_identity,
+            producer_identity=review.producer_identity,
+        ))
+        if not review.independent:
+            raise ReviewPolicyError(
+                review.criterion,
+                f"answering identity {review.answering_identity!r} is the "
+                f"producer; an independent reviewer must answer",
+            )
+
+        collected.append(PackageReview(
+            criterion=review.criterion,
+            receipt=review.receipt,
+            role=review.role,
+            answering_identity=review.answering_identity,
+            producer_identity=review.producer_identity,
+            escalated=escalated,
+        ))
+
+    ordered = tuple(
+        sorted(collected, key=lambda r: r.criterion)
+    )
+    return PackageReviewCollection(
+        package_id=package_id,
+        criteria=tuple(criteria),
+        policy=policy,
+        reviews=ordered,
+    )
+
