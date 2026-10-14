@@ -93,6 +93,7 @@ MCP_AGENT_TOOLS: tuple[str, ...] = (
     "mailbox_replay",
     "mailbox_ack",
     "agent_capabilities",
+    "harness_session_grant",
 )
 
 
@@ -762,6 +763,73 @@ def artifact_evidence_list(artifact_evidence: str):
     raise ValueError("artifact_evidence must be a JSON object or a list of objects")
 
 
+def service_for_binding(
+    db_path: str = ".skillweave/store.db",
+    *,
+    mailbox_path: str = "",
+    artifacts_path: str = ".skillweave/artifacts",
+    stream_root: Optional[str] = None,
+    authority: str = "skillweave-process-service",
+) -> Any:
+    """The :class:`HarnessProcessService` the *real* serving seam resolves to.
+
+    This is the composition of the single durable process service the scoped
+    HTTP server and the dispatch adapter both drive: the run store, the durable
+    mailbox, the artifacts store and the stream root. It is derived from the
+    same inputs ``get_run_service`` uses, so a caller can prove that a local
+    path and a scoped HTTP path reach the *same* authority/state service rather
+    than an isolated default store.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    if not mailbox_path:
+        mailbox_path = default_mailbox_path()
+    if stream_root is None:
+        stream_root = default_stream_root(db_path)
+    return _bootstrap.HarnessProcessService(
+        authority=authority,
+        db_path=db_path,
+        mailbox_path=mailbox_path,
+        artifacts_path=artifacts_path,
+        stream_root=stream_root,
+    )
+
+
+def verify_serving_reaches_same_service(
+    *,
+    db_path: str = ".skillweave/store.db",
+    mailbox_path: str = "",
+    artifacts_path: str = ".skillweave/artifacts",
+    stream_root: Optional[str] = None,
+    expected_service: Any,
+) -> None:
+    """Refuse a binding that names an isolated controller/default store.
+
+    Criterion 3: the supported multi-client deployment (scoped HTTP with a
+    loopback default) and the local stdio path must *demonstrably* reach the
+    same authority/state service. This resolves the serving seam's actual
+    service and refuses by identity when it is a different store -- so an
+    independently initialized per-harness controller or an isolated default
+    store is never silently admitted as the shared service.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    observed = service_for_binding(
+        db_path,
+        mailbox_path=mailbox_path,
+        artifacts_path=artifacts_path,
+        stream_root=stream_root,
+    )
+    _bootstrap.refuse_isolated_controller(expected_service, observed)
+
+
+def default_mailbox_path() -> str:
+    """The durable mailbox the single process service owns by default."""
+    from skillweave.mcp import server as _server
+
+    return _server.default_mailbox_path()
+
+
 def source_binding(source_root: str, subject_commit: str):
     if not source_root:
         return None
@@ -1420,6 +1488,7 @@ def mcp_agent_tool_specs() -> list[ToolSpec]:
         "mailbox_replay": _server.mailbox_replay,
         "mailbox_ack": _server.mailbox_ack,
         "agent_capabilities": _server.agent_capabilities,
+        "harness_session_grant": _server.harness_session_grant,
     }
     return [
         ToolSpec(name=n, version="agents", description=n, handler=names[n])
@@ -1466,6 +1535,7 @@ __all__ = [
     "create_run_payload",
     "current_http_principal",
     "current_http_token",
+    "default_mailbox_path",
     "default_stream_root",
     "get_run_service",
     "http_authority",
@@ -1480,6 +1550,7 @@ __all__ = [
     "serve_legacy_stdio",
     "serve_scoped_http",
     "server_capabilities",
+    "service_for_binding",
     "snapshot_v1",
     "source_binding",
     "strip_bearer_scheme",
@@ -1488,4 +1559,5 @@ __all__ = [
     "tool_schema",
     "transport_profile",
     "unavailable_payload",
+    "verify_serving_reaches_same_service",
 ]

@@ -311,6 +311,9 @@ class TestServerToolsAreScoped:
             "mailbox_replay": lambda: mcp_server.mailbox_replay(recipient="worker-1"),
             "mailbox_ack": lambda: mcp_server.mailbox_ack("m-1"),
             "agent_capabilities": lambda: mcp_server.agent_capabilities(),
+            # SW-1511-MCP-BOOTSTRAP: minting a scoped session grant is gated at
+            # the same seam -- no credential, no grant.
+            "harness_session_grant": lambda: mcp_server.harness_session_grant(),
         }
         assert set(calls) == set(mcp_control.MCP_AGENT_TOOLS)
         for name, call in calls.items():

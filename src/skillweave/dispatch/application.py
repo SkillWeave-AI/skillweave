@@ -686,6 +686,8 @@ def _default_inline_seam(
     artifact_store: Optional[Any] = None,
     on_child_lifecycle: Optional[Callable[..., None]] = None,
     env: Optional[dict[str, str]] = None,
+    env_allowlist: Optional[Sequence[str]] = None,
+    mcp_grant: Optional[Any] = None,
 ) -> Any:
     """Run a single lane through the single-process seam, never the fan-out path.
 
@@ -707,7 +709,20 @@ def _default_inline_seam(
 
     ``env`` (optional) is forwarded to ``start_process`` so the subprocess
     inherits extra environment variables (e.g. the message channel path).
+
+    ``env_allowlist`` (optional) constrains the child environment to exactly
+    those keys, so an ambient provider credential can never leak into the
+    child. ``mcp_grant`` (optional) is a
+    :class:`skillweave.mcp.bootstrap.HarnessMcpSessionGrant`: when supplied the
+    adapter provisions the effective MCP configuration (server-issued session
+    token + the one process service's store/mailbox/artifacts/stream roots)
+    *inside the actual child launch* and then verifies the child genuinely
+    resolved that same authority/state service. A child that lands on a
+    different (isolated) store is refused — the grant never degrades to the
+    interactive harness profile alone. Both parameters are additive: omitting
+    them preserves the historical launch exactly.
     """
+    from skillweave.mcp import bootstrap as _mcp_bootstrap
     from skillweave.routing.modelspec import from_value
     from skillweave.routing.faigate_adapter import resolve_model_spec
     from skillweave.fanout.dispatch import (
@@ -722,6 +737,16 @@ def _default_inline_seam(
 
     child_run_id = f"{run_id}-0"
     resolved_model = resolve_model_spec(from_value(model))
+
+    extra_env: Optional[dict[str, str]] = dict(env) if env else None
+    allowlist = list(env_allowlist) if env_allowlist is not None else None
+    if mcp_grant is not None:
+        grant_env = _mcp_bootstrap.grant_child_env(mcp_grant)
+        _mcp_bootstrap.assert_no_ambient_credentials(grant_env)
+        extra_env = dict(extra_env or {})
+        extra_env.update(grant_env)
+        # the provisioned keys must be permitted into the child.
+        allowlist = list(set(allowlist or ()) | set(grant_env))
 
     def _notify(phase: str, handle: Any) -> None:
         if on_child_lifecycle is None:
@@ -741,8 +766,11 @@ def _default_inline_seam(
         tool=tool,
         model=resolved_model,
         cwd=cwd,
-        env=env,
+        env=extra_env,
+        env_allowlist=allowlist,
     )
+    if mcp_grant is not None:
+        handle = _mcp_bootstrap.verify_child_launch(mcp_grant, handle)
     _notify("started", handle)
     try:
         result = handle.wait(timeout=timeout)

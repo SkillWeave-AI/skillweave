@@ -406,6 +406,10 @@ class TestEveryToolIsGated:
             "mailbox_replay": lambda: mcp_server.mailbox_replay(recipient="worker-1"),
             "mailbox_ack": lambda: mcp_server.mailbox_ack("m-1"),
             "agent_capabilities": lambda: mcp_server.agent_capabilities(),
+            # SW-1511-MCP-BOOTSTRAP: the scoped session-grant minting tool is
+            # gated at the same seam -- an unauthenticated principal is refused
+            # before any process service is resolved or token minted.
+            "harness_session_grant": lambda: mcp_server.harness_session_grant(),
         }
         assert set(calls) == set(_control.LEGACY_TOOLS) | set(_control.MCP_AGENT_TOOLS)
         for name, call in calls.items():

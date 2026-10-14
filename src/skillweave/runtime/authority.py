@@ -1191,6 +1191,44 @@ class MCPPrincipalAuthority:
             extra={"requested_role": requested_role, "actual_role": principal.role},
         )
 
+    def refuse_child_role_escalation(
+        self, principal: MCPPrincipal, child_role: str
+    ) -> None:
+        """Refuse attaching a child whose authority is broader than the parent's.
+
+        Unlike :meth:`refuse_role_escalation` (which compares a *demand* for the
+        caller's own role), this governs what a principal may **mint**: the
+        roles are distinct capability sets, so a child is admitted only when the
+        child's operations are a subset of the principal's. A controller can
+        attach a worker; a worker can never attach a reviewer or controller --
+        the child carries no authority the parent did not hold.
+        """
+        if child_role not in MCP_ROLE_SCOPES:
+            raise RoleEscalationRefused(
+                f"unknown child role {child_role!r}; expected one of "
+                f"{sorted(MCP_ROLE_SCOPES)}",
+                role=principal.role,
+                action="attach",
+                extra={"child_role": child_role},
+            )
+        # The controller owns dispatch, so it may attach a child of any role.
+        if principal.role == "controller":
+            return
+        parent_ops = MCP_ROLE_SCOPES[principal.role]["operations"]
+        child_ops = MCP_ROLE_SCOPES[child_role]["operations"]
+        if not child_ops <= parent_ops:
+            raise RoleEscalationRefused(
+                f"principal {principal.principal!r} is role {principal.role!r} "
+                f"and cannot attach a {child_role!r} child with broader "
+                f"authority",
+                role=principal.role,
+                action="attach",
+                extra={
+                    "child_role": child_role,
+                    "extra_operations": sorted(child_ops - parent_ops),
+                },
+            )
+
 
 def _record_fields(record: _MCPSessionRecord) -> dict[str, Any]:
     return {

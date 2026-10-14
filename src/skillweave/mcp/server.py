@@ -35,6 +35,7 @@ unapproved provider.
 import json
 import os
 import sys
+from typing import Sequence
 
 from skillweave.mcp import control
 
@@ -242,6 +243,76 @@ def start_scope_for(*, task_id: str, attempt: int, run_id: str = "") -> str:
     """
     effective = task_id or run_id
     return f"{effective}/attempt-{attempt}"
+
+
+def issue_harness_session_grant(
+    *,
+    authority: "MCPPrincipalAuthority",
+    role: str,
+    client_id: str,
+    transport: str,
+    run_id: str,
+    service: "object",
+    task_id: str = "",
+    attempt: int = 0,
+    allowed_roots: Sequence[str] = (),
+    allowed_argv0: Sequence[str] = (),
+    allowed_routes: Sequence[str] = (),
+    ttl_seconds: "int | None" = None,
+) -> "object":
+    """Issue a ``harness-mcp-session-grant-v1`` bound to run/task/attempt.
+
+    The **server** mints the token and the caller supplies no role string that
+    is trusted -- ``role`` is validated against the server-owned registry by
+    :meth:`MCPPrincipalAuthority.issue_session` (an unknown role is refused).
+    The returned grant is the one the dispatch adapter provisions into the
+    *actual* child launch, so a child reaches this same authority/state service
+    rather than an isolated harness profile.
+
+    ``service`` is the :class:`skillweave.mcp.bootstrap.HarnessProcessService`
+    describing the one logical durable process service; it is recorded by
+    identity so a reconnect or a stdio admission can be refused when it lands
+    on a different store.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    token = authority.issue_session(
+        role=role,
+        client_id=client_id,
+        transport=transport,
+        run_ids=(run_id,) if run_id else (),
+        allowed_roots=tuple(allowed_roots),
+        allowed_argv0=tuple(allowed_argv0),
+        allowed_routes=tuple(allowed_routes),
+        ttl_seconds=ttl_seconds,
+    )
+    return _bootstrap.HarnessMcpSessionGrant(
+        schema_id=_bootstrap.HARNESS_MCP_SESSION_GRANT_SCHEMA_ID,
+        schema_version=_bootstrap.HARNESS_MCP_SESSION_GRANT_SCHEMA_VERSION,
+        run_id=run_id,
+        task_id=task_id,
+        attempt=attempt,
+        transport=transport,
+        session_token=token,
+        service=service,
+        start_scope=start_scope_for(task_id=task_id, attempt=attempt, run_id=run_id),
+        role=role,
+    )
+
+
+def admit_stdio_same_authority(
+    grant: "object", local_service: "object"
+) -> None:
+    """Admit a local stdio harness only when it reaches the same service.
+
+    Criterion 3: a stdio path is admitted only if it demonstrably reaches the
+    same authority/state service. An independently-initialized per-harness
+    controller or an isolated default store is refused by identity, so a stdio
+    harness can never operate on a second, silently-diverging store.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    _bootstrap.refuse_isolated_controller(grant.service, local_service)
 
 
 def resolve_session_token(presented: str = "") -> str:
@@ -877,6 +948,87 @@ def mailbox_ack(message_id: str, note: str = "", run_id: str = "", principal: st
 
 
 @mcp.tool()
+def harness_session_grant(
+    role: str = "controller",
+    client_id: str = "",
+    transport: str = "stdio",
+    run_id: str = "",
+    task_id: str = "",
+    attempt: int = 0,
+    requested_role: str = "",
+    db_path: str = ".skillweave/store.db",
+    artifacts_path: str = ".skillweave/artifacts",
+    stream_root: str = "",
+    mailbox_path: str = "",
+    session_token: str = "",
+) -> str:
+    """Mint a ``harness-mcp-session-grant-v1`` bound to run/task/attempt.
+
+    This is the **real consumer/controller seam** for criterion 1: the caller is
+    authorized first (so only an already-authenticated controller may attach a
+    child), and the resulting grant carries a *server-issued* token scoped to
+    the actual run. The authority the grant mints is ``role``; the gate refuses
+    a client asking for a stronger role than its authenticated principal holds
+    (never granted), whether it names that role directly or via
+    ``requested_role``. A principal may only attach a child whose authority is
+    **no broader than its own** -- so a controller can attach a worker, but a
+    worker can never mint a reviewer/controller child.
+
+    The grant is bound to the one logical durable process service composed from
+    ``db_path``/``mailbox_path``/``artifacts_path``/``stream_root``; a caller
+    whose binding resolves to a different store is refused, so a child can never
+    attach to an isolated per-harness controller.
+    """
+    gate_principal, refusal = gate_operation(
+        "start_run" if not run_id else "write_run_state",
+        session_token,
+        requested_role=requested_role,
+        run_id=run_id,
+        db_path=db_path,
+        artifacts_path=artifacts_path,
+    )
+    if refusal is not None:
+        return refusal
+    try:
+        from skillweave.mcp import bootstrap as _bootstrap
+
+        # The *minted* authority is gated too: a child may never carry authority
+        # broader than the authenticated principal's own (criterion 1).
+        if gate_principal is not None:
+            _bound_authority().refuse_child_role_escalation(gate_principal, role)
+
+        service = control.service_for_binding(
+            db_path,
+            mailbox_path=mailbox_path or default_mailbox_path(),
+            artifacts_path=artifacts_path,
+            stream_root=stream_root or None,
+        )
+        principal = gate_principal
+        authority = _bound_authority()
+        grant = issue_harness_session_grant(
+            authority=authority,
+            role=role,
+            client_id=client_id or (principal.client_id if principal else "controller"),
+            transport=transport,
+            run_id=run_id,
+            task_id=task_id,
+            attempt=attempt,
+            service=service,
+        )
+        payload = grant.to_dict()
+        payload["status"] = "ok"
+        payload["env"] = grant.env()
+        return json.dumps(payload)
+    except _authority_module().MCPAuthError as exc:
+        return _auth_error_payload(exc)
+    except _bootstrap.ProcessServiceMismatchRefused as exc:
+        return json.dumps(
+            {"status": "refused", "code": "process_service_mismatch",
+             "message": str(exc)}
+        )
+
+
+@mcp.tool()
 def agent_capabilities(clients: str = "", session_token: str = "") -> str:
     """Detect, per client, which transports it supports and the adapter chosen.
 
@@ -915,6 +1067,7 @@ def startup_and_bind_stdio(
     *,
     authority: "MCPPrincipalAuthority | None" = None,
     supervisor: str = "",
+    process_service: "object | None" = None,
 ) -> str:
     """Production issuance point: bind the authority and mint the stdio session.
 
@@ -926,6 +1079,14 @@ def startup_and_bind_stdio(
     memory (:data:`_READY_SESSION_TOKEN`) so the protected tools resolve the
     local operator without a wire credential -- it is never written to the
     environment or logged, and no client can mint it.
+
+    ``process_service`` (optional) is the
+    :class:`skillweave.mcp.bootstrap.HarnessProcessService` this stdio session
+    operates against. When supplied, the minted session is a
+    ``harness-mcp-session-grant-v1`` scoped to that one durable process service,
+    so a local stdio path is admitted only when it demonstrably reaches the same
+    authority/state service (criterion 3). Omitting it preserves the historical
+    unscoped ``controller`` session exactly.
 
     An HTTP deployment does not use this path: the host binds its own authority
     and each HTTP client presents its own issued token.
@@ -939,9 +1100,21 @@ def startup_and_bind_stdio(
         )
     auth = authority if authority is not None else _authority_module().MCPPrincipalAuthority()
     bind_authority(auth)
-    _READY_SESSION_TOKEN = auth.issue_session(
-        role="controller", client_id=identity, transport="stdio"
-    )
+    if process_service is not None:
+        grant = issue_harness_session_grant(
+            authority=auth,
+            role="controller",
+            client_id=identity,
+            transport="stdio",
+            run_id="",
+            service=process_service,
+        )
+        token = grant.session_token
+    else:
+        token = auth.issue_session(
+            role="controller", client_id=identity, transport="stdio"
+        )
+    _READY_SESSION_TOKEN = token
     return _READY_SESSION_TOKEN
 
 
