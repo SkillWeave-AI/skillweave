@@ -835,6 +835,7 @@ def _run_state_driven(
     # Git; any other subject kind integrates through a controlled content
     # transaction. Integration is guarded from the reviewed state.
     if execution.integration_subject is not None:
+        svc.content_integration_advance(intent_id)
         svc.record_content_integration(
             intent_id,
             execution.integration_subject,

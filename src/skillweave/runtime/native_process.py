@@ -4371,6 +4371,20 @@ class NativeProcessService:
         )
         return txn
 
+    def content_integration_advance(self, intent_id: str) -> DispatchIntent:
+        """Advance a reviewed intent into controlled content integration (guarded).
+
+        This is the additive guarded counterpart for the non-repository path:
+        the controller calls it before :meth:`record_content_integration` so
+        the CAS from :data:`INTENT_REVIEWED` refuses an out-of-order, repeated
+        or verdict-inconsistent content integration.  Legacy callers of
+        ``record_content_integration`` keep their unguarded behaviour.
+        """
+        return self._guarded_advance(
+            intent_id, INTENT_INTEGRATED, expected=INTENT_REVIEWED,
+            step=STEP_CONTROLLED_INTEGRATION,
+        )
+
     # -- the managed CMS transaction owner (SW-1511-CMS-TRANSACTION c1-c3) --
     #
     # The owner drives *one* managed CMS transaction through the ordered

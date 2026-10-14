@@ -21,9 +21,16 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from skillweave.cli import native_controller as nc
 from skillweave.cli.main import main as router_main
 from skillweave.runtime.native_process import (
+    INTENT_FAILED,
+    INTENT_INTEGRATED,
+    INTENT_LAUNCHED,
+    INTENT_REVIEWED,
+    IntentStateConflictError,
     NativeProcessService,
     STEP_CONTROLLED_INTEGRATION,
     STEP_DEPENDENT_WAVE,
@@ -439,7 +446,187 @@ def test_non_repository_subject_integrates_via_content_transaction(tmp_path, cap
     store.close()
 
 
-# ── 13. Stale-lease takeover with a strictly higher fencing token ──────────
+# ── 13. Content integration guarded: out-of-order attempt refused ──────────
+
+def test_content_integration_out_of_order_refused(tmp_path):
+    """Calling content_integration_advance when the intent is still at
+    INTENT_LAUNCHED (before review) is refused by the guarded CAS.
+
+    This exercises the bug fixed in SW-SCOPE-010: on 1f5cd17 the non-repo
+    integration path called record_content_integration (unguarded) directly,
+    so the intent silently moved to INTEGRATED from any state — this test
+    fails (no exception raised).  After the fix the guarded
+    content_integration_advance (CAS from INTENT_REVIEWED) raises
+    IntentStateConflictError when the intent is not at INTENT_REVIEWED.
+    """
+    db = _db(tmp_path)
+    store = SQLiteRunStore(db)
+    _seed_run(store, "run-1")
+
+    # Create the intent at LAUNCHED — the state before review.
+    intent = store.record_dispatch_intent(
+        "run-1", "task-a", 1, "run-1/task-a/1",
+        step=STEP_READY_DISPATCH, state=INTENT_LAUNCHED,
+    )
+
+    svc = NativeProcessService(store, "test-holder-13")
+    svc.acquire(ttl_seconds=60)
+    try:
+        with pytest.raises(IntentStateConflictError):
+            svc.content_integration_advance(intent.intent_id)
+    finally:
+        svc.release()
+    store.close()
+
+
+# ── 14. Content integration guarded: repeat after success refused ──────────
+
+def test_content_integration_repeat_after_success_is_refused(tmp_path, capsys):
+    """After a successful content-transaction drive through main(),
+    re-advancing the same intent (now at INTEGRATED) is refused.
+
+    On 1f5cd17 the unguarded record_content_integration accepts the repeat
+    silently — this test fails (no exception raised).  After the fix the
+    guarded content_integration_advance (CAS from INTENT_REVIEWED) refuses
+    because the intent is at INTEGRATED, not INTENT_REVIEWED.
+    """
+    from skillweave.dispatch.work_contract import ConfigurationSubject
+
+    db = _db(tmp_path)
+    store = SQLiteRunStore(db)
+    _seed_run(store, "run-1")
+    _seed_review_record(store, "run-1", "pass")
+
+    subject = ConfigurationSubject(config_id="cfg-1", environment="prod", version="v1")
+
+    class ContentWorker:
+        def execute(self, dispatch):
+            return nc.AttemptExecution(
+                producer_artifact="artifact:content",
+                integration_subject=subject,
+                baseline_digest="baseline:c",
+                applied_digest="applied:c",
+            )
+
+    # First drive succeeds through main() — intent is now at INTEGRATED.
+    exit_code = nc.main(
+        ["--run-id", "run-1", "--task-id", "task-a", "--db-path", db],
+        worker=ContentWorker(),
+        reviewer=FakeReviewer(store, "run-1", ["pass"], [_PASS_EVIDENCE]),
+        store=store,
+    )
+    assert exit_code == nc.EXIT_OK
+    result = _result(capsys)
+    assert result["integration"] == "content_transaction"
+
+    # The intent is at INTEGRATED; a repeat advance must be refused.
+    intent = store.list_dispatch_intents(run_id="run-1")[0]
+    assert intent.state == INTENT_INTEGRATED
+    svc = NativeProcessService(store, "test-holder-14")
+    svc.acquire(ttl_seconds=60)
+    try:
+        with pytest.raises(IntentStateConflictError):
+            svc.content_integration_advance(intent.intent_id)
+    finally:
+        svc.release()
+    store.close()
+
+
+# ── 15. Content integration guarded: refused after failing re-review ───────
+
+def test_content_integration_after_failing_re_review_is_refused(tmp_path, capsys):
+    """After a failing re-review through main(), the intent is at FAILED;
+    attempting content_integration_advance must be refused.
+
+    On 1f5cd17 the unguarded record_content_integration accepts the
+    integration silently even though the attempt was terminally stopped —
+    this test fails (no exception raised).  After the fix the guarded
+    content_integration_advance (CAS from INTENT_REVIEWED) refuses because
+    the intent is at FAILED, not INTENT_REVIEWED.
+    """
+    from skillweave.dispatch.work_contract import ConfigurationSubject
+
+    db = _db(tmp_path)
+    store = SQLiteRunStore(db)
+    _seed_run(store, "run-1")
+    _seed_review_record(store, "run-1", "fail", "needs repair")
+
+    subject = ConfigurationSubject(config_id="cfg-1", environment="prod", version="v1")
+
+    class ContentWorker:
+        def execute(self, dispatch):
+            return nc.AttemptExecution(
+                producer_artifact="artifact:content",
+                integration_subject=subject,
+                baseline_digest="baseline:c",
+                applied_digest="applied:c",
+            )
+
+    # Fail→fail drive: terminal stop, intent at FAILED.
+    exit_code = nc.main(
+        ["--run-id", "run-1", "--task-id", "task-a", "--db-path", db],
+        worker=ContentWorker(),
+        reviewer=FakeReviewer(
+            store, "run-1", verdicts=["fail", "fail"],
+            evidence_list=[_FAIL_EVIDENCE, _FAIL_EVIDENCE],
+        ),
+        store=store,
+    )
+    assert exit_code == nc.EXIT_OK
+    result = _result(capsys)
+    assert result["accepted"] is False
+    assert result["integration"] == "none"
+
+    # Intent at FAILED; a content integration advance must be refused.
+    intent = store.list_dispatch_intents(run_id="run-1")[0]
+    assert intent.state == INTENT_FAILED
+    svc = NativeProcessService(store, "test-holder-15")
+    svc.acquire(ttl_seconds=60)
+    try:
+        with pytest.raises(IntentStateConflictError):
+            svc.content_integration_advance(intent.intent_id)
+    finally:
+        svc.release()
+    store.close()
+
+
+# ── 16. Content integration guarded: correct order succeeds ────────────────
+
+def test_content_integration_guarded_correct_order_succeeds(tmp_path, capsys):
+    """The guarded CAS advance from INTENT_REVIEWED succeeds when the
+    intent is at the correct state — the happy path through main()."""
+    from skillweave.dispatch.work_contract import ConfigurationSubject
+
+    db = _db(tmp_path)
+    store = SQLiteRunStore(db)
+    _seed_run(store, "run-1")
+    _seed_review_record(store, "run-1", "pass")
+
+    subject = ConfigurationSubject(config_id="cfg-1", environment="prod", version="v1")
+
+    class ContentWorker:
+        def execute(self, dispatch):
+            return nc.AttemptExecution(
+                producer_artifact="artifact:content",
+                integration_subject=subject,
+                baseline_digest="baseline:c",
+                applied_digest="applied:c",
+            )
+
+    exit_code = nc.main(
+        ["--run-id", "run-1", "--task-id", "task-a", "--db-path", db],
+        worker=ContentWorker(),
+        reviewer=FakeReviewer(store, "run-1", ["pass"], [_PASS_EVIDENCE]),
+        store=store,
+    )
+    assert exit_code == nc.EXIT_OK
+    result = _result(capsys)
+    assert result["integration"] == "content_transaction"
+    assert result["accepted"] is True
+    store.close()
+
+
+# ── 17. Stale-lease takeover with a strictly higher fencing token ──────────
 
 def test_stale_lease_takeover_with_higher_token(tmp_path, capsys):
     db = _db(tmp_path)
