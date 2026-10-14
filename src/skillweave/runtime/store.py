@@ -17,6 +17,7 @@ from .native_process import (
     ControllerLease,
     DispatchIntent,
     DuplicateDispatchError,
+    IntentStateConflictError,
     LeaseNotHeldError,
     LeaseRefusedError,
     # SW-1511-RECOVERY criterion 1: the resumed-controller seam.  A controller
@@ -1610,9 +1611,109 @@ class SQLiteRunStore(RunStore):
             raise KeyError(f"dispatch intent {intent_id!r} does not exist")
         return self.get_dispatch_intent(intent_id)
 
+    def advance_dispatch_intent_from(
+        self,
+        intent_id: str,
+        to_state: str,
+        *,
+        expected_state: str,
+        step: Optional[str] = None,
+    ) -> DispatchIntent:
+        """Advance an intent to ``to_state`` **only** from ``expected_state``.
+
+        This is the guarded counterpart to :meth:`advance_dispatch_intent`,
+        added additively and opt-in for the state-driven controller loop: unlike
+        the legacy unguarded update, the transition is a compare-and-set
+        (``WHERE state = expected_state``), so an out-of-order or
+        verdict-inconsistent advance of an intent that is not exactly in
+        ``expected_state`` is *refused* rather than silently applied.  Legacy
+        callers of :meth:`advance_dispatch_intent` keep their behaviour
+        unchanged.
+
+        Raises :class:`IntentStateConflictError` when the intent is missing or
+        its stored state is not ``expected_state``; nothing is written in that
+        case, so a stale or skipping advance cannot corrupt the loop.
+        """
+        if to_state not in INTENT_STATES:
+            raise ValueError(
+                f"dispatch intent state {to_state!r} is not one of "
+                f"{sorted(INTENT_STATES)}"
+            )
+        if expected_state not in INTENT_STATES:
+            raise ValueError(
+                f"dispatch intent expected state {expected_state!r} is not one "
+                f"of {sorted(INTENT_STATES)}"
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        if step is None:
+            cur = self._conn.execute(
+                "UPDATE dispatch_intents SET state = ?, updated_at = ? "
+                "WHERE intent_id = ? AND state = ?",
+                (to_state, now, intent_id, expected_state),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE dispatch_intents SET state = ?, step = ?, updated_at = ? "
+                "WHERE intent_id = ? AND state = ?",
+                (to_state, step, now, intent_id, expected_state),
+            )
+        self._conn.commit()
+        if cur.rowcount == 0:
+            current = self.get_dispatch_intent(intent_id)
+            actual = None if current is None else current.state
+            raise IntentStateConflictError(intent_id, expected_state, actual)
+        return self.get_dispatch_intent(intent_id)
+
     def fail_dispatch_intent(self, intent_id: str) -> DispatchIntent:
         """Mark an intent failed (a resolved, terminal outcome)."""
         return self.advance_dispatch_intent(intent_id, INTENT_FAILED)
+
+    def latest_run_transition(self, run_id: str) -> Optional[dict[str, Any]]:
+        """Return the most recent ``transitions_log`` row for *run_id*.
+
+        The durable *review record* the controller reads its verdict from: the
+        MCP ``review_run`` tool writes this row (via :meth:`transition`) with
+        ``to_state='advance_or_stop'``, ``reason='Review verdict {verdict}: ...'``
+        and the authenticated reviewer ``role``.  Reading the record here -- not
+        a value the controller makes up -- is what makes the loop verdict-driven.
+        Returns ``None`` when the run has no transition yet.
+        """
+        row = self._conn.execute(
+            "SELECT run_id, from_state, to_state, reason, version, timestamp, role "
+            "FROM transitions_log WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "run_id": row["run_id"],
+            "from_state": row["from_state"],
+            "to_state": row["to_state"],
+            "reason": row["reason"],
+            "version": row["version"],
+            "timestamp": row["timestamp"],
+            "role": row["role"],
+        }
+
+    def list_run_transitions(self, run_id: str) -> list[dict[str, Any]]:
+        """Return every ``transitions_log`` row for *run_id*, oldest first."""
+        rows = self._conn.execute(
+            "SELECT run_id, from_state, to_state, reason, version, timestamp, role "
+            "FROM transitions_log WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ).fetchall()
+        return [
+            {
+                "run_id": r["run_id"],
+                "from_state": r["from_state"],
+                "to_state": r["to_state"],
+                "reason": r["reason"],
+                "version": r["version"],
+                "timestamp": r["timestamp"],
+                "role": r["role"],
+            }
+            for r in rows
+        ]
 
     def get_dispatch_intent(self, intent_id: str) -> Optional[DispatchIntent]:
         row = self._conn.execute(

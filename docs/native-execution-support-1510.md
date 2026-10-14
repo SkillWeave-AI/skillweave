@@ -142,6 +142,7 @@ which speaks the `run-snapshot-v1` public contract. The rows below are the table
 | `kill` | operate | supported | `skillweave.runlifecycle.cli:main_kill` |
 | `cancel` | operate | supported | `skillweave.runlifecycle.cli:main_cancel` |
 | `resume` | operate | supported | `skillweave.runlifecycle.cli:main_resume` |
+| `native-controller` | execute | supported | `skillweave.cli.native_controller:main` |
 | `mcp` | operate | supported | `skillweave.mcp.server` |
 | `dispatch` | legacy | legacy | `skillweave.dispatch.cli:main` |
 

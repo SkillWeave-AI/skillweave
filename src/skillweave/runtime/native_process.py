@@ -217,6 +217,10 @@ __all__ = [
     "INTENT_TERMINAL",
     "INTENT_STATES",
     "INTENT_CLAIMING_STATES",
+    # verdict-driven guarded loop (SW-SCOPE-010 unit A1)
+    "REVIEW_PASS",
+    "REVIEW_FAIL",
+    "REVIEW_VERDICTS",
     # lease
     "LEASE_KEY",
     "ControllerLease",
@@ -226,6 +230,7 @@ __all__ = [
     # dispatch intents
     "DispatchIntent",
     "DuplicateDispatchError",
+    "IntentStateConflictError",
     # readiness
     "ReadinessPlan",
     "plan_readiness",
@@ -774,6 +779,34 @@ _RESUME_DECISIONS: frozenset[str] = frozenset({
     RESUME_REFUSED_NO_OWNED_ATTEMPT,
 })
 
+#: The only review verdicts the loop accepts.  A verdict is the durable review
+#: record's outcome (``pass``/``fail``); anything else is refused rather than
+#: coerced, so an unknown verdict can never be mistaken for a pass.
+REVIEW_PASS = "pass"
+REVIEW_FAIL = "fail"
+REVIEW_VERDICTS: frozenset[str] = frozenset({REVIEW_PASS, REVIEW_FAIL})
+
+
+def _review_target_state(verdict: str, *, failing: str = INTENT_REPAIRING) -> str:
+    """Map a recorded review *verdict* to the intent state it advances to.
+
+    A ``pass`` always advances to :data:`INTENT_REVIEWED` (ready to integrate).
+    A ``fail`` advances to *failing* -- :data:`INTENT_REPAIRING` for a first
+    review (a repair round must follow) or :data:`INTENT_FAILED` for a
+    re-review (the attempt stops, terminal, and can never integrate).  Any
+    value outside :data:`REVIEW_VERDICTS` is refused: the loop is driven by the
+    recorded verdict, so an unrecognised value must never be treated as a pass.
+    """
+    normalized = verdict.strip().lower() if isinstance(verdict, str) else verdict
+    if normalized == REVIEW_PASS:
+        return INTENT_REVIEWED
+    if normalized == REVIEW_FAIL:
+        return failing
+    raise ValueError(
+        f"{verdict!r} is not a review verdict; expected one of "
+        f"{sorted(REVIEW_VERDICTS)}"
+    )
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Criterion 2: the single controller lease with fencing
@@ -839,6 +872,27 @@ class DuplicateDispatchError(Exception):
         super().__init__(
             f"execution scope {execution_scope!r} is already claimed by intent "
             f"{intent_id!r} (run {run_id!r}); a duplicate launch is refused"
+        )
+
+
+class IntentStateConflictError(Exception):
+    """A guarded intent advance was refused: the intent was not in the expected state.
+
+    The state-driven loop advances an intent only from the exact state the
+    previous step left it in (``advance_dispatch_intent_from``).  An intent that
+    is missing, already advanced, or sitting in a state inconsistent with the
+    step about to run is refused rather than silently overwritten -- so an
+    out-of-order or verdict-inconsistent advance cannot corrupt the loop.
+    """
+
+    def __init__(self, intent_id: str, expected_state: str, actual_state: Optional[str]):
+        self.intent_id = intent_id
+        self.expected_state = expected_state
+        self.actual_state = actual_state
+        super().__init__(
+            f"dispatch intent {intent_id!r} is not in expected state "
+            f"{expected_state!r} (actual: {actual_state!r}); the guarded "
+            f"advance is refused"
         )
 
 
@@ -3730,6 +3784,68 @@ class NativeProcessService:
     def record_dependent_wave(self, intent_id: str) -> DispatchIntent:
         """A dependent wave was released after this attempt integrated."""
         return self.advance(intent_id, INTENT_INTEGRATED, step=STEP_DEPENDENT_WAVE)
+
+    # -- verdict-driven, guarded loop (SW-SCOPE-010 unit A1) --------------
+    #
+    # The methods above are the legacy, unguarded step records: they keep their
+    # exact public behaviour for existing callers.  The methods below are the
+    # *additive and opt-in* state-driven counterparts the production controller
+    # uses.  Each one (a) is guarded -- it advances only from the exact state
+    # the previous step left the intent in, refusing an out-of-order or
+    # verdict-inconsistent advance; and (b) is *verdict-aware* -- the review and
+    # re-review outcome, read from the durable review record (never invented by
+    # the controller), decides which state the intent advances to.  A failing
+    # review leads to repair; a failing re-review stops the intent (terminal
+    # failure) and can never integrate.
+
+    def reviewed_advance(self, intent_id: str, verdict: str) -> DispatchIntent:
+        """Advance a launched intent from independent review according to *verdict*.
+
+        Guarded from :data:`INTENT_LAUNCHED`.  A ``pass`` advances to
+        :data:`INTENT_REVIEWED` (ready to integrate); a ``fail`` advances to
+        :data:`INTENT_REPAIRING` (a repair round must follow).  Any other value
+        is refused -- the loop is driven by the recorded verdict, not a script.
+        """
+        target = _review_target_state(verdict)
+        return self._guarded_advance(
+            intent_id, target, expected=INTENT_LAUNCHED, step=STEP_INDEPENDENT_REVIEW
+        )
+
+    def rereviewed_advance(self, intent_id: str, verdict: str) -> DispatchIntent:
+        """Advance a repairing intent from re-review according to *verdict*.
+
+        Guarded from :data:`INTENT_REPAIRING`.  A ``pass`` advances to
+        :data:`INTENT_REVIEWED`; a ``fail`` advances to :data:`INTENT_FAILED`
+        (terminal) -- a failing re-review *stops* the run and can never reach
+        integration.  The returned intent's state is the durable causal record.
+        """
+        target = _review_target_state(verdict, failing=INTENT_FAILED)
+        return self._guarded_advance(
+            intent_id, target, expected=INTENT_REPAIRING, step=STEP_RE_REVIEW
+        )
+
+    def integration_advance(self, intent_id: str) -> DispatchIntent:
+        """Advance a reviewed intent into controlled integration (guarded)."""
+        return self._guarded_advance(
+            intent_id, INTENT_INTEGRATED, expected=INTENT_REVIEWED,
+            step=STEP_CONTROLLED_INTEGRATION,
+        )
+
+    def dependent_wave_advance(self, intent_id: str) -> DispatchIntent:
+        """Advance an integrated intent through the dependent wave (guarded)."""
+        return self._guarded_advance(
+            intent_id, INTENT_INTEGRATED, expected=INTENT_INTEGRATED,
+            step=STEP_DEPENDENT_WAVE,
+        )
+
+    def _guarded_advance(
+        self, intent_id: str, to_state: str, *, expected: str, step: str
+    ) -> DispatchIntent:
+        """Fence-check and advance one intent from ``expected`` to ``to_state``."""
+        self._require_controller()
+        return self._store.advance_dispatch_intent_from(
+            intent_id, to_state, expected_state=expected, step=step
+        )
 
     # -- controller acceptance (SW-1511-REVIEW criteria 1 and 3) ----------
 
