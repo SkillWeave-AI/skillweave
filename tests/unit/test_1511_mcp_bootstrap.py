@@ -2230,3 +2230,398 @@ class TestCriterionFourToSixBackwardCompatibility:
             artifacts_path=svc.artifacts_path,
         )
         assert out["code"] == "not_found", out
+
+
+# ===========================================================================
+# Criterion 4 (independent Review round trip through the real tools)
+# ===========================================================================
+
+
+class TestIndependentReviewRoundTripThroughTheRealTools:
+    """Criterion 4: a *distinct Review principal* drives the real tools.
+
+    The reviewer scope deliberately excludes general ``write_run_state`` (that
+    is what keeps Review independent), so the general ``mailbox_post``/``ack``
+    tools refuse it. The dedicated :func:`skillweave.mcp.server.review_action`
+    tool is the real seam that admits the reviewer's *own* source-bound result
+    on its own addressed channel, with the role still read from the
+    server-owned session registry -- never the wire.
+    """
+
+    def _mailbox_path(self, tmp_path, monkeypatch) -> Path:
+        path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(path))
+        return path
+
+    def test_reviewer_cannot_drive_the_general_mailbox_tools(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """The general tools refuse a reviewer (it may not write run state)."""
+        self._mailbox_path(tmp_path, monkeypatch)
+        reviewer = authority.issue_session(
+            role="reviewer", client_id="rev", transport="http",
+            run_ids=["run-1"],
+        )
+        refused = json.loads(
+            mcp_server.mailbox_post(
+                kind="status", recipient="rev", body="x", run_id="run-1",
+                message_id="rev-general", session_token=reviewer,
+            )
+        )
+        assert refused["status"] == "refused", refused
+        # A reviewer holds no ``write_run_state``; the general post is refused
+        # by the operation scope, not by an ad-hoc role string.
+        assert refused["code"] in ("operation_not_permitted", "role_not_permitted"), refused
+
+    def test_review_action_round_trip_is_source_bound_and_scoped(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """assignment -> write result -> read -> replay -> ack, at the tool seam.
+
+        The reviewer's result carries the *actual* run/task/attempt it answers,
+        is read back and replayed byte-identically (a reconnect loses nothing),
+        and is acknowledged only by the reviewer's own addressed principal --
+        idempotently.
+        """
+        self._mailbox_path(tmp_path, monkeypatch)
+        reviewer = authority.issue_session(
+            role="reviewer", client_id="rev", transport="http",
+            run_ids=["run-1"],
+        )
+        # -- the reviewer posts its own source-bound result.
+        written = json.loads(
+            mcp_server.review_action(
+                action="write", recipient="rev", body="independently verified",
+                run_id="run-1", task_id="task-1", attempt=1,
+                message_id="review-result-1", session_token=reviewer,
+            )
+        )
+        assert written["status"] == "ok", written
+        body = written["message"]["body"]
+        assert body["assignment"] == "independently verified"
+        # The result is bound to the exact subject scope it answers.
+        assert body["run_id"] == "run-1"
+        assert body["task_id"] == "task-1"
+        assert body["attempt"] == 1
+        # And addressed under the *authenticated* reviewer principal.
+        assert written["message"]["principal"] == "mcp:reviewer:rev"
+
+        # -- read back on the reviewer's own channel.
+        read = json.loads(
+            mcp_server.review_action(
+                action="read", recipient="rev", run_id="run-1",
+                session_token=reviewer,
+            )
+        )
+        assert read["status"] == "ok", read
+        assert [m["message_id"] for m in read["messages"]] == ["review-result-1"]
+
+        # -- replay is byte-identical durable history (reconnect loses nothing).
+        replayed = json.loads(
+            mcp_server.review_action(
+                action="replay", recipient="rev", run_id="run-1",
+                session_token=reviewer,
+            )
+        )
+        assert replayed["messages"] == read["messages"]
+
+        # -- ack of the reviewer's own addressed message, idempotently.
+        acked = json.loads(
+            mcp_server.review_action(
+                action="ack", recipient="rev", message_id="review-result-1",
+                run_id="run-1", session_token=reviewer,
+            )
+        )
+        assert acked["status"] == "ok", acked
+        assert acked["message"]["kind"] == "ack"
+        again = json.loads(
+            mcp_server.review_action(
+                action="ack", recipient="rev", message_id="review-result-1",
+                run_id="run-1", session_token=reviewer,
+            )
+        )
+        assert again["message"]["message_id"] == acked["message"]["message_id"]
+
+    def test_review_action_refuses_a_non_review_principal(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A worker cannot drive the Review seam (scope, not a role string)."""
+        self._mailbox_path(tmp_path, monkeypatch)
+        worker = authority.issue_session(
+            role="worker", client_id="ops", transport="http",
+            run_ids=["run-1"],
+        )
+        refused = json.loads(
+            mcp_server.review_action(
+                action="write", recipient="ops", body="fake review",
+                run_id="run-1", session_token=worker,
+            )
+        )
+        assert refused["status"] == "refused", refused
+        assert refused["code"] in ("operation_not_permitted", "role_not_permitted"), refused
+
+
+# ===========================================================================
+# Criterion 5 (the real adapter-selection seam, never a silent downgrade)
+# ===========================================================================
+
+
+class TestHandoffAdapterSelectionSeam:
+    """Criterion 5 through the *production selection path*, not a bare helper.
+
+    The ``handoff_adapter`` MCP tool is the seam that actually *selects* the
+    adapter: a client without MCP-notification support is handed a qualified
+    CLI/file polling adapter carrying the *same* authority contract, and an
+    explicitly-requested unsupported transport is a named
+    ``TRANSPORT_NOT_SUPPORTED`` HOLD -- never a coerced transport and never a
+    fabricated MCP success.
+    """
+
+    def _mailbox_path(self, tmp_path, monkeypatch) -> Path:
+        path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(path))
+        return path
+
+    def test_handoff_adapter_tool_selects_the_polling_adapter_with_contract(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A non-notification client gets the file adapter + same contract."""
+        self._mailbox_path(tmp_path, monkeypatch)
+        controller = authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            run_ids=["run-1"],
+        )
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="legacy-harness",
+                recipients="ops,rev",
+                session_token=controller,
+            )
+        )
+        assert out["status"] == "ok", out
+        # The *qualified* polling adapter, selected by detected capability.
+        assert out["adapter"]["kind"] == handoff_mod.TRANSPORT_FILE_POLL
+        assert out["adapter"]["capability"]["detected"] is False
+        # The same authority contract every transport carries: bound to the
+        # authenticated principal, never a caller field.
+        assert out["authority_contract"]["principal"] == "mcp:controller:main"
+        assert out["authority_contract"]["recipients"] == ["ops", "rev"]
+        assert out["adapter"]["authority_contract"] == out["authority_contract"]
+        # The frozen contract version is reported so the client can attest it.
+        assert out["contract"]["artifact"] == "agent-message-v1"
+
+    def test_handoff_adapter_tool_holds_on_an_unsupported_transport(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """An explicitly-requested unsupported transport is a *named* HOLD."""
+        self._mailbox_path(tmp_path, monkeypatch)
+        controller = authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            run_ids=["run-1"],
+        )
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="legacy-harness",
+                recipients="ops",
+                transport=handoff_mod.TRANSPORT_MCP_NOTIFICATIONS,
+                session_token=controller,
+            )
+        )
+        # Never a silent downgrade, never a fabricated MCP success: the refusal
+        # is named and actionable, and it lists the transports the surface
+        # supports -- so the caller knows what to ask for instead.
+        assert out["status"] == "hold", out
+        assert out["code"] == "TRANSPORT_NOT_SUPPORTED", out
+        assert out["client_id"] == "legacy-harness"
+        assert handoff_mod.TRANSPORT_FILE_POLL in out["supported_transports"]
+        # The client's own reason names *why* the request could not be honored.
+        assert out["reason"]
+
+    def test_selected_adapter_enforces_the_authority_contract(self, tmp_path):
+        """A transport switch never broadens what the client may read/write.
+
+        The selected polling adapter carries a real contract: a read under a
+        principal other than the contract's is a ``scope_escape`` and a read of
+        an un-addressed recipient is refused -- so the adapter is *qualified*,
+        not merely named.
+        """
+        mailbox = AgentMailbox(str(tmp_path / "mb.jsonl"))
+        capability = handoff_mod.detect_client_capability(
+            "legacy-harness",
+            attestation={"detected": True, "transports": [], "features": []},
+        )
+        contract = handoff_mod.HandoffAuthorityContract(
+            principal="mcp:controller:main", recipients=frozenset({"ops"}),
+        )
+        adapter = handoff_mod.select_handoff_adapter(
+            capability, mailbox, authority_contract=contract
+        )
+        assert isinstance(adapter, handoff_mod.PollingTransportAdapter)
+        with pytest.raises(handoff_mod.HandoffError) as exc:
+            adapter.read(principal="mcp:worker:ops", recipient="ops")
+        assert exc.value.code == "scope_escape"
+        with pytest.raises(handoff_mod.HandoffError) as exc2:
+            adapter.read(principal="mcp:controller:main", recipient="nobody")
+        assert exc2.value.code == "recipient_not_addressed"
+
+    def test_selection_never_hands_notification_adapter_to_unsupported_client(
+        self, tmp_path
+    ):
+        """The selection path cannot be coerced into a fabricated MCP success."""
+        mailbox = AgentMailbox(str(tmp_path / "mb.jsonl"))
+        capability = handoff_mod.detect_client_capability(
+            "legacy-harness",
+            attestation={"detected": True, "transports": [], "features": []},
+        )
+        with pytest.raises(handoff_mod.HandoffError) as exc:
+            handoff_mod.select_handoff_adapter(
+                capability, mailbox,
+                requested_transport=handoff_mod.TRANSPORT_MCP_NOTIFICATIONS,
+            )
+        assert exc.value.code == "TRANSPORT_NOT_SUPPORTED"
+
+
+# ===========================================================================
+# Criterion 6 (restart survival of the service+child; credentials never logged)
+# ===========================================================================
+
+
+class TestRestartSurvivalAndCredentialLogBoundary:
+    """Criterion 6: restarting the interactive session leaves the work running.
+
+    The interactive session is a *view*; the durable service and the child are
+    owned by the process service. A restart is ready exactly when the granted
+    service identity is still reachable *and* the child attempt is verifiably
+    alive (re-verified against the live OS facts), so quota waiting stays
+    functional across the restart -- and a worker's credential never becomes
+    observable in a log.
+    """
+
+    def _grant(self, tmp_path, *, token="tok-c6"):
+        svc = _service(tmp_path)
+        return boot.HarnessMcpSessionGrant(
+            schema_id=boot.HARNESS_MCP_SESSION_GRANT_SCHEMA_ID,
+            schema_version="1.0.0",
+            run_id="run-1",
+            task_id="task-1",
+            attempt=1,
+            transport="stdio",
+            session_token=token,
+            service=svc,
+            start_scope="task-1/attempt-1",
+        )
+
+    def test_restart_ready_is_ready_while_the_child_is_alive(self, tmp_path):
+        """A live child keeps a restart safe: service reachable, child alive."""
+        import subprocess
+        import time
+
+        from skillweave.runtime import process_identity as _pi
+
+        grant = self._grant(tmp_path)
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            time.sleep(0.1)
+            record = _pi.capture(proc.pid).to_dict()
+
+            class _LiveHandle:
+                pid = proc.pid
+                _sw_process_identity = record
+
+            out = boot.restart_ready(grant, _LiveHandle())
+            assert out["status"] == "ready", out
+            assert out["service_reachable"] is True
+            assert out["service_identity"] == grant.service.identity()
+            assert out["child_alive"] is True
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_restart_ready_holds_when_the_child_is_gone(self, tmp_path):
+        """A restart is *not* ready when the child cannot be verified alive.
+
+        The recorded identity outlives the child here: after the child exits its
+        identity is unobservable, so the seam fails closed (``hold``) rather
+        than assuming a survivor.
+        """
+        import subprocess
+        import time
+
+        from skillweave.runtime import process_identity as _pi
+
+        grant = self._grant(tmp_path)
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        time.sleep(0.05)
+        record = _pi.capture(proc.pid)
+        stale = record.to_dict() if record is not None else {
+            "pid": proc.pid, "start_time": "", "identity_token": "stale"
+        }
+
+        class _StaleHandle:
+            pid = proc.pid
+            _sw_process_identity = stale
+
+        out = boot.restart_ready(grant, _StaleHandle())
+        assert out["status"] == "hold", out
+        assert out["child_alive"] is False
+
+    def test_child_attempt_alive_rejects_a_recycled_pid(self, tmp_path):
+        """A recorded identity that no longer matches the live pid is not alive."""
+        class _RecycledHandle:
+            pid = os.getpid()
+            _sw_process_identity = {
+                "pid": os.getpid(),
+                "start_time": "not-the-real-start-time",
+                "identity_token": "mismatched",
+            }
+
+        assert boot.child_attempt_alive(_RecycledHandle()) is False
+
+    def test_credential_shaped_values_are_redacted_from_logs(self):
+        """A worker credential value is redacted before it can be logged."""
+        environ = {
+            "ANTHROPIC_API_KEY": "sk-super-secret",
+            "OPENAI_API_KEY": "sk-openai-secret",
+            "SKILLWEAVE_MCP_SESSION_TOKEN": "tok-not-redacted",
+        }
+        line = "provider call failed key=sk-super-secret other=sk-openai-secret"
+        redacted = boot.redact_worker_credentials(line, environ)
+        assert "sk-super-secret" not in redacted
+        assert "sk-openai-secret" not in redacted
+        assert redacted.count("<redacted-credential>") == 2
+
+    def test_assert_worker_credentials_not_in_logs_fails_closed(self):
+        """The log guard refuses when a credential value is observable."""
+        environ = {"ANTHROPIC_API_KEY": "sk-leaky"}
+        with pytest.raises(ValueError) as exc:
+            boot.assert_worker_credentials_not_in_logs(
+                ["starting run", "auth header Bearer sk-leaky"], environ
+            )
+        assert "ANTHROPIC_API_KEY" in str(exc.value)
+        # A clean log passes: the guard is a real check, not a blanket refusal.
+        boot.assert_worker_credentials_not_in_logs(["starting run"], environ)
+
+    def test_restart_ready_never_stops_the_service_or_child(self, tmp_path):
+        """Verifying a restart is observational: the child survives the check."""
+        import subprocess
+        import time
+
+        from skillweave.runtime import process_identity as _pi
+
+        grant = self._grant(tmp_path)
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            time.sleep(0.1)
+            record = _pi.capture(proc.pid).to_dict()
+
+            class _LiveHandle:
+                pid = proc.pid
+                _sw_process_identity = record
+
+            boot.restart_ready(grant, _LiveHandle())
+            # The check did not signal the child: it is still running.
+            assert proc.poll() is None
+        finally:
+            proc.terminate()
+            proc.wait()

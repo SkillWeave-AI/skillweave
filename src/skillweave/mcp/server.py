@@ -1079,11 +1079,226 @@ def agent_capabilities(clients: str = "", session_token: str = "") -> str:
     })
 
 
+@mcp.tool()
+def handoff_adapter(
+    client_id: str = "",
+    recipients: str = "",
+    transport: str = "",
+    run_id: str = "",
+    session_token: str = "",
+) -> str:
+    """Select and return the qualified transport adapter for *client_id*.
+
+    This is the **real production selection path** for criterion 5 (the seam
+    ``agent_capabilities`` reports *about* but does not itself select): a caller
+    asks for a harness's handoff transport and the server (1) authorizes the
+    read at this boundary, (2) detects the client's capability (explicit
+    attestation or a positive, file-backed presence signal -- never assumed),
+    and (3) selects the adapter the *capability* dictates through a real call
+    into :func:`~skillweave.runtime.handoff.select_handoff_adapter`. A client
+    without MCP-notification support gets the qualified file/CLI polling
+    adapter; an *explicitly requested* transport that the client does not
+    support, or one that is not a supported transport at all, is a named
+    ``TRANSPORT_NOT_SUPPORTED`` **HOLD** -- never a silent downgrade and never a
+    fabricated MCP success.
+
+    The returned adapter carries the **same authority contract** as every other
+    transport: a server-owned :class:`~skillweave.runtime.handoff.
+    HandoffAuthorityContract` bound to the authenticated principal and the
+    addressed recipients the caller named. Under a bound authority the principal
+    is the authenticated one (never a caller field); a direct in-process caller
+    with no bound authority names its own principal, exactly as the mailbox
+    tools do.
+    """
+    gate_principal, refusal = gate_operation("read_run", session_token, run_id=run_id)
+    if refusal is not None:
+        return refusal
+    from skillweave.dispatch import messaging as _messaging
+    from skillweave.runtime import handoff as _handoff
+
+    try:
+        principal = (
+            _message_principal(gate_principal, "") if gate_principal is not None
+            else "in-process"
+        )
+    except _authority_module().MCPAuthError as exc:
+        return _auth_error_payload(exc)
+
+    requested = [r.strip() for r in recipients.split(",") if r.strip()]
+    if not requested:
+        requested = [client_id or principal]
+    contract = _handoff.HandoffAuthorityContract(
+        principal=principal, recipients=frozenset(requested)
+    )
+    capability = _handoff.detect_client_capability(client_id or principal)
+    try:
+        adapter = _handoff.select_handoff_adapter(
+            capability,
+            _messaging.AgentMailbox(default_mailbox_path()),
+            authority_contract=contract,
+            requested_transport=transport,
+        )
+    except _handoff.HandoffError as exc:
+        # A named, actionable HOLD: the caller is told *why* and what is
+        # supported, never handed a downgraded transport.
+        return json.dumps({
+            "status": "hold",
+            "code": exc.code,
+            "error": str(exc),
+            "client_id": capability.client_id,
+            "reason": capability.reason,
+            "supported_transports": sorted(
+                _handoff.SUPPORTED_HANDOFF_TRANSPORTS
+            ),
+        })
+    return json.dumps({
+        "status": "ok",
+        "client_id": capability.client_id,
+        "contract": {
+            "artifact": _messaging.AGENT_MESSAGE_ARTIFACT,
+            "schema_version": _messaging.AGENT_MESSAGE_SCHEMA_VERSION,
+            "namespace": _messaging.AGENT_MESSAGE_NAMESPACE,
+            "schema_digest": _messaging.AGENT_MESSAGE_SCHEMA_DIGEST,
+        },
+        "adapter": adapter.to_dict(),
+        "authority_contract": contract.to_dict(),
+    })
+
+
+#: The mailbox operations a first-class principal may drive on its own channel.
+#: The default (empty) is the historical set, so an existing call that names no
+#: action is byte-compatible. ``write`` is admitted for a *reviewer* through the
+#: dedicated :func:`review_action` operation -- a reviewer may not write general
+#: run state (that is what makes it distinct), but it may post the durable
+#: Review result on its own addressed channel.
+REVIEW_MAILBOX_OPERATIONS = frozenset({"read", "replay", "ack", "write"})
+
+
+def _review_assignment_body(run_id: str, task_id: str, attempt: int, subject: str) -> dict[str, object]:
+    """The durable body of an assignment: it names the *actual* subject scope.
+
+    The result a reviewer returns is then source-bound to the same
+    ``run_id``/``task_id``/``attempt`` the assignment carried, so a replayed
+    assignment is verifiable against the work it assigned.
+    """
+    return {
+        "assignment": subject,
+        "run_id": run_id,
+        "task_id": task_id,
+        "attempt": attempt,
+    }
+
+
+@mcp.tool()
+def review_action(
+    action: str,
+    recipient: str = "",
+    message_id: str = "",
+    body: str = "",
+    run_id: str = "",
+    task_id: str = "",
+    attempt: int = 0,
+    resume_token: str = "",
+    in_reply_to: str = "",
+    correlation_id: str = "",
+    session_token: str = "",
+) -> str:
+    """Drive the independent-Review round trip over the real durable tools.
+
+    This is the criterion-4 seam that lets a **distinct Review principal** --
+    not only Main -- take part in the assignment round trip. A reviewer's scope
+    deliberately excludes general ``write_run_state`` (that is what keeps Review
+    independent), so the general ``mailbox_post``/``mailbox_ack`` tools refuse
+    it. Here the authority-bearing operation is the *review* itself:
+    ``action`` is one of ``read``/``replay``/``ack`` (admitted under
+    ``review_run``) or ``write`` (the reviewer's own source-bound result,
+    admitted under ``review_run`` -- never ``write_run_state``). The role is
+    still read from the server-owned session registry, never the wire, and a
+    non-review-capable principal is refused by that same operation check.
+
+    A ``read``/``replay``/``ack`` is always on the authenticated principal's own
+    addressed channel; a ``write`` is a durable ``status`` result whose body is
+    bound to the actual ``run_id``/``task_id``/``attempt`` of the assignment it
+    answers.
+    """
+    from skillweave.dispatch import messaging as _messaging
+    from skillweave.runtime import handoff as _handoff
+
+    normalized = (action or "").strip().lower()
+    if normalized == "write":
+        operation = "review_run"
+    elif normalized in ("read", "replay", "ack", "result"):
+        operation = "review_run"
+    else:
+        return json.dumps({
+            "status": "refused", "code": "unknown_action",
+            "error": f"unknown review action {action!r}",
+        })
+    # Every action is authorized on the authenticated reviewer's ``review_run``
+    # scope: a non-reviewer principal is refused here (operation_not_permitted),
+    # so this seam never widens a worker/observer's authority.
+    gate_principal, refusal = gate_operation(operation, session_token, run_id=run_id)
+    if refusal is not None:
+        return refusal
+
+    _messaging_mod, mailbox = _open_mailbox()
+    try:
+        principal = _message_principal(gate_principal, "")
+        own = principal
+        if normalized in ("read", "result"):
+            messages = mailbox.read(
+                recipient=(recipient or own), principal=own,
+                resume_token=resume_token,
+            )
+            return json.dumps({
+                "status": "ok", "action": "read",
+                "recipient": recipient or own, "messages": messages,
+            })
+        if normalized == "replay":
+            messages = mailbox.replay(
+                recipient=(recipient or own), principal=own,
+            )
+            return json.dumps({
+                "status": "ok", "action": "replay",
+                "recipient": recipient or own, "messages": messages,
+            })
+        if normalized == "ack":
+            record = mailbox.ack(
+                message_id, recipient=(recipient or own), principal=own,
+                note=body,
+            )
+            return json.dumps({
+                "status": "ok", "action": "ack", "message": record,
+            })
+        # normalized == "write": the reviewer's own source-bound result.
+        kwargs = {"message_id": message_id} if message_id else {}
+        message = _messaging.AgentMessage(
+            kind="status",
+            sender=own,
+            recipient=recipient or own,
+            principal=own,
+            run_id=run_id,
+            task_id=task_id,
+            attempt=attempt,
+            in_reply_to=in_reply_to,
+            correlation_id=correlation_id,
+            body=_review_assignment_body(run_id, task_id, attempt, body),
+            **kwargs,
+        )
+        record = mailbox.post(message)
+        return json.dumps({
+            "status": "ok", "action": "write", "message": record,
+        })
+    except _messaging_mod.MessageChannelError as exc:
+        return json.dumps({"status": "refused", **exc.to_dict()})
+    except _authority_module().MCPAuthError as exc:
+        return _auth_error_payload(exc)
+
+
 def startup_and_bind_stdio(
-    *,
-    authority: "MCPPrincipalAuthority | None" = None,
     supervisor: str = "",
     process_service: "object | None" = None,
+    authority: "MCPPrincipalAuthority | None" = None,
 ) -> str:
     """Production issuance point: bind the authority and mint the stdio session.
 

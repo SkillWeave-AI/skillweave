@@ -470,12 +470,26 @@ class HandoffTransportAdapter:
     and an addressed ``recipient`` -- so switching a client between the live
     notification transport and the polling fallback never broadens what the
     client may see. The capability, not the transport, is what varies.
+
+    The *scope* an adapter enforces is not the adapter's own: it is an explicit
+    ``authority_contract`` supplied by the server-owned selection seam (see
+    :func:`select_handoff_adapter`). Every adapter therefore fails closed on a
+    read/write whose ``principal``/``recipient`` is outside that contract, so a
+    transport can never carry a principal other than the one the server
+    authenticated. A direct-caller adapter built without a contract carries no
+    scope (the historical in-process contract) and enforces only the
+    underlying mailbox's own ``(recipient, principal)`` addressing.
     """
 
     kind = ""
 
-    def __init__(self, capability: HarnessClientCapability) -> None:
+    def __init__(
+        self,
+        capability: HarnessClientCapability,
+        authority_contract: Any = None,
+    ) -> None:
         self.capability = capability
+        self.authority_contract = authority_contract
 
     @property
     def principal(self) -> str:
@@ -490,6 +504,31 @@ class HandoffTransportAdapter:
             code="ADAPTER_IS_NOT_AUTHORITY",
         )
 
+    def _enforce_contract(self, *, principal: str, recipient: str, action: str) -> None:
+        """Fail closed on a scope the server-owned contract did not grant.
+
+        The authoritative (non-None) contract comes from the authenticated
+        session, so a client can never read or send outside it: a differing
+        ``principal`` is a scope_escape (the same refusal the messaging seam
+        raises for a forged principal) and an un-addressed ``recipient`` is a
+        named refusal, never a silent wildcard.
+        """
+        contract = self.authority_contract
+        if contract is None:
+            return
+        if principal != contract.principal:
+            raise HandoffError(
+                f"principal {principal!r} is outside the {self.kind!r} "
+                f"adapter's authority contract ({contract.principal!r})",
+                code="scope_escape",
+            )
+        if recipient and recipient not in contract.recipients:
+            raise HandoffError(
+                f"recipient {recipient!r} is not addressed by the "
+                f"{self.kind!r} adapter's authority contract",
+                code="recipient_not_addressed",
+            )
+
     def read(self, *, principal: str, recipient: str, resume_token: str = "") -> list[dict[str, Any]]:
         raise NotImplementedError
 
@@ -497,7 +536,10 @@ class HandoffTransportAdapter:
         raise NotImplementedError
 
     def to_dict(self) -> dict[str, Any]:
-        return {"kind": self.kind, "capability": self.capability.to_dict()}
+        out = {"kind": self.kind, "capability": self.capability.to_dict()}
+        if self.authority_contract is not None:
+            out["authority_contract"] = self.authority_contract.to_dict()
+        return out
 
 
 class NotificationTransportAdapter(HandoffTransportAdapter):
@@ -511,8 +553,13 @@ class NotificationTransportAdapter(HandoffTransportAdapter):
 
     kind = TRANSPORT_MCP_NOTIFICATIONS
 
-    def __init__(self, capability: HarnessClientCapability, mailbox: Any) -> None:
-        super().__init__(capability)
+    def __init__(
+        self,
+        capability: HarnessClientCapability,
+        mailbox: Any,
+        authority_contract: Any = None,
+    ) -> None:
+        super().__init__(capability, authority_contract)
         if not capability.supports_notifications:
             raise HandoffError(
                 f"client {capability.client_id!r} does not support MCP "
@@ -523,11 +570,17 @@ class NotificationTransportAdapter(HandoffTransportAdapter):
         self._notified: list[str] = []
 
     def read(self, *, principal: str, recipient: str, resume_token: str = "") -> list[dict[str, Any]]:
+        self._enforce_contract(principal=principal, recipient=recipient, action="read")
         return self._mailbox.read(
             recipient=recipient, principal=principal, resume_token=resume_token
         )
 
     def send(self, message: Any) -> dict[str, Any]:
+        self._enforce_contract(
+            principal=getattr(message, "principal", ""),
+            recipient=getattr(message, "recipient", ""),
+            action="send",
+        )
         record = self._mailbox.post(message)
         self._notified.append(str(record.get("message_id")))
         return {"transport": self.kind, "delivered": True, "record": record}
@@ -549,21 +602,104 @@ class PollingTransportAdapter(HandoffTransportAdapter):
 
     kind = TRANSPORT_FILE_POLL
 
-    def __init__(self, capability: HarnessClientCapability, mailbox: Any) -> None:
-        super().__init__(capability)
+    def __init__(
+        self,
+        capability: HarnessClientCapability,
+        mailbox: Any,
+        authority_contract: Any = None,
+    ) -> None:
+        super().__init__(capability, authority_contract)
         self._mailbox = mailbox
 
     def read(self, *, principal: str, recipient: str, resume_token: str = "") -> list[dict[str, Any]]:
+        self._enforce_contract(principal=principal, recipient=recipient, action="read")
         return self._mailbox.read(
             recipient=recipient, principal=principal, resume_token=resume_token
         )
 
     def send(self, message: Any) -> dict[str, Any]:
+        self._enforce_contract(
+            principal=getattr(message, "principal", ""),
+            recipient=getattr(message, "recipient", ""),
+            action="send",
+        )
         record = self._mailbox.post(message)
         return {"transport": self.kind, "delivered": True, "record": record}
 
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()
+
+
+#: The transports an adapter may be selected for. A transport outside this set
+#: is a *named unsupported HOLD* -- never coerced to stdio/polling.
+SUPPORTED_HANDOFF_TRANSPORTS = frozenset(
+    {TRANSPORT_MCP_NOTIFICATIONS, TRANSPORT_FILE_POLL, TRANSPORT_CLI_POLL}
+)
+
+
+@dataclass(frozen=True)
+class HandoffAuthorityContract:
+    """The scope a selected transport adapter must enforce.
+
+    The *same* authority contract every adapter carries: the authenticated
+    ``principal`` (server-owned, never a caller field) and the ``recipients``
+    that principal may address. It is built by the server-owned selection seam
+    from the authenticated session, so a transport switch can never broaden
+    what a client may read or write.
+    """
+
+    principal: str
+    recipients: frozenset[str]
+
+    def allows(self, *, recipient: str) -> bool:
+        return recipient in self.recipients
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "principal": self.principal,
+            "recipients": sorted(self.recipients),
+        }
+
+
+def select_handoff_adapter(
+    capability: HarnessClientCapability,
+    mailbox: Any,
+    *,
+    authority_contract: Any = None,
+    requested_transport: str = "",
+) -> HandoffTransportAdapter:
+    """The real production selection path: capability -> qualified adapter.
+
+    An *explicit* ``requested_transport`` is honored only when it is a supported
+    transport (a client that demands a transport it does not attest is a named
+    ``TRANSPORT_NOT_SUPPORTED`` HOLD -- never a silent coerce). The default,
+    capability-driven path selects the notification adapter only for a client
+    that attested/detected notification support, and the file/CLI polling
+    adapter for every other client (including an undetected one). Every selected
+    adapter carries the same ``authority_contract``.
+    """
+    if not capability.supports_notifications:
+        # A client that cannot receive MCP notifications must never be handed
+        # the notification adapter: the fallback is the qualified polling
+        # adapter, which carries the same authority contract.
+        if requested_transport == TRANSPORT_MCP_NOTIFICATIONS:
+            raise HandoffError(
+                f"client {capability.client_id!r} does not support MCP "
+                f"notifications; use the polling adapter",
+                code="TRANSPORT_NOT_SUPPORTED",
+            )
+        return PollingTransportAdapter(
+            capability, mailbox, authority_contract
+        )
+    if requested_transport and requested_transport not in SUPPORTED_HANDOFF_TRANSPORTS:
+        raise HandoffError(
+            f"unsupported handoff transport {requested_transport!r}; supported "
+            f"transports are {sorted(SUPPORTED_HANDOFF_TRANSPORTS)}",
+            code="TRANSPORT_NOT_SUPPORTED",
+        )
+    return NotificationTransportAdapter(
+        capability, mailbox, authority_contract
+    )
 
 
 def adapter_for_capability(

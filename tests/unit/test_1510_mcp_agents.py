@@ -314,6 +314,10 @@ class TestServerToolsAreScoped:
             # SW-1511-MCP-BOOTSTRAP: minting a scoped session grant is gated at
             # the same seam -- no credential, no grant.
             "harness_session_grant": lambda: mcp_server.harness_session_grant(),
+            # ...as are the two SW-1511 seams: the transport-adapter selection
+            # (criterion 5) and the independent-Review round trip (criterion 4).
+            "handoff_adapter": lambda: mcp_server.handoff_adapter(),
+            "review_action": lambda: mcp_server.review_action("read"),
         }
         assert set(calls) == set(mcp_control.MCP_AGENT_TOOLS)
         for name, call in calls.items():

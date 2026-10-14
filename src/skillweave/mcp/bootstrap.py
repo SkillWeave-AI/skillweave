@@ -572,6 +572,120 @@ def verify_child_launch(grant: HarnessMcpSessionGrant, handle: Any) -> Any:
     return handle
 
 
+# --------------------------------------------------------------------------
+# SW-1511-MCP-BOOTSTRAP C6: quota wait across an interactive-session restart
+# --------------------------------------------------------------------------
+#
+# Restarting the *interactive* session must not disturb the single durable
+# process service or a child attempt that is mid-flight (for example waiting on
+# a provider quota window).  The service and the child are owned by the process
+# service, not by the interactive session -- so a reconnect after a restart
+# verifies, rather than re-launches, them: the grant's service identity must
+# still match and the child's recorded process identity must still be alive.
+
+def child_attempt_alive(handle: Any) -> bool:
+    """True only when the child's *recorded* process identity is still alive.
+
+    An unobservable handle is reported as *not verified* (``False``), never as
+    alive: the reconnect detects a genuinely live child, it does not assume one.
+    The identity is re-verified against the live OS facts through the same
+    ``process_identity`` seam the cancel path uses -- a recorded identity whose
+    live facts no longer match (a recycled PID, a replaced command) is *not*
+    alive, so a stale handle is never reported as a surviving child.
+    """
+    from skillweave.runtime import process_identity as _pi
+
+    record = getattr(handle, "_sw_process_identity", None)
+    if record is None:
+        record = dict(getattr(handle, "process_identity", {}) or {})
+    if not record:
+        return False
+    recorded_pid = getattr(handle, "pid", None)
+    if not recorded_pid:
+        recorded_pid = record.get("pid")
+    if not recorded_pid:
+        return False
+    verified = _pi.verify(record, int(recorded_pid))
+    return bool(getattr(verified, "ok", False))
+
+
+def restart_ready(grant: HarnessMcpSessionGrant, handle: Any) -> dict[str, Any]:
+    """Whether the interactive session may restart without disturbing the work.
+
+    The interactive session is a *view*; the durable service and the child are
+    owned by the process service.  A restart is therefore ready (safe) exactly
+    when (a) the granted service identity is still reachable and (b) the child
+    attempt is verifiably alive -- so quota waiting stays functional across the
+    restart.  This never *stops* the service or the child and never launches a
+    replacement: it only verifies the invariants a restart relies on, and it
+    fails closed (``False``) when the child cannot be verified.
+    """
+    service_ok = bool(grant.service.identity())
+    child_ok = child_attempt_alive(handle)
+    return {
+        "status": "ready" if (service_ok and child_ok) else "hold",
+        "service_identity": grant.service.identity(),
+        "service_reachable": service_ok,
+        "child_alive": child_ok,
+    }
+
+
+# --------------------------------------------------------------------------
+# worker credentials never reach logs
+# --------------------------------------------------------------------------
+
+#: A worker's provider credential must never be observable in a log.  This is
+#: the minimal set of well-known credential variable names that the ambient
+#: guard already refuses to *provision*; the log guard symmetrically refuses to
+#: *emit* their values.
+WORKER_CREDENTIAL_ENV_MARKERS = _CREDENTIAL_ENV_MARKERS
+
+
+def redact_worker_credentials(text: str, environ: Mapping[str, str]) -> str:
+    """Redact any ambient worker credential value from *text*.
+
+    The log boundary is the *last* chance to keep a worker credential out of a
+    log line.  Every value of a credential-shaped variable in *environ* is
+    replaced with an explicit redaction marker before the text is emitted, so a
+    credential that somehow reached a curated message is still never observable.
+    """
+    redacted = text
+    for key, value in environ.items():
+        if not value:
+            continue
+        if key in (ENV_MCP_SESSION_TOKEN,):
+            continue
+        if any(marker in key.upper() for marker in WORKER_CREDENTIAL_ENV_MARKERS):
+            redacted = redacted.replace(str(value), "<redacted-credential>")
+    return redacted
+
+
+def assert_worker_credentials_not_in_logs(
+    logs: Any, environ: Mapping[str, str]
+) -> None:
+    """Fail closed if any worker credential value is observable in *logs*.
+
+    *logs* is a string or an iterable of log lines.  The check is exact: it
+    refuses when a credential-shaped env value appears verbatim in the emitted
+    log, so "the credential was not supposed to be logged" is a proven fact
+    rather than an assumption.
+    """
+    if isinstance(logs, str):
+        blob = logs
+    else:
+        blob = "\n".join(str(line) for line in logs)
+    for key, value in environ.items():
+        if not value:
+            continue
+        if key in (ENV_MCP_SESSION_TOKEN,):
+            continue
+        if any(marker in key.upper() for marker in WORKER_CREDENTIAL_ENV_MARKERS):
+            if str(value) in blob:
+                raise ValueError(
+                    f"worker credential {key!r} is observable in the log output"
+                )
+
+
 __all__ = [
     "ENV_MCP_ARTIFACTS_PATH",
     "ENV_MCP_AUTHORITY",
@@ -598,8 +712,13 @@ __all__ = [
     "SharedProcessMailboxBinding",
     "UnsupportedContractVersion",
     "VALID_TRANSPORTS",
+    "WORKER_CREDENTIAL_ENV_MARKERS",
     "assert_no_ambient_credentials",
+    "assert_worker_credentials_not_in_logs",
+    "child_attempt_alive",
     "grant_child_env",
+    "redact_worker_credentials",
+    "restart_ready",
     "mailbox_binding_for_grant",
     "refuse_isolated_controller",
     "same_authority",

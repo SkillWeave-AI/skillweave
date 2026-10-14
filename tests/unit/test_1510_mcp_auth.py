@@ -410,6 +410,10 @@ class TestEveryToolIsGated:
             # gated at the same seam -- an unauthenticated principal is refused
             # before any process service is resolved or token minted.
             "harness_session_grant": lambda: mcp_server.harness_session_grant(),
+            # ...as are the two SW-1511 seams: transport-adapter selection
+            # (criterion 5) and the independent-Review round trip (criterion 4).
+            "handoff_adapter": lambda: mcp_server.handoff_adapter(),
+            "review_action": lambda: mcp_server.review_action("read"),
         }
         assert set(calls) == set(_control.LEGACY_TOOLS) | set(_control.MCP_AGENT_TOOLS)
         for name, call in calls.items():
