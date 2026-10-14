@@ -715,47 +715,123 @@ def restart_ready(grant: HarnessMcpSessionGrant, handle: Any) -> dict[str, Any]:
 #: *emit* their values.
 WORKER_CREDENTIAL_ENV_MARKERS = _CREDENTIAL_ENV_MARKERS
 
+#: The marker substituted for a redacted credential value.
+_REDACTION_MARKER = "<redacted-credential>"
 
-def redact_worker_credentials(text: str, environ: Mapping[str, str]) -> str:
-    """Redact any ambient worker credential value from *text*.
+#: The shortest value that is treated as a redactable credential.  A provider
+#: credential is a long opaque token; requiring a minimum length means a short
+#: *placeholder* value (``"1"``, ``"a,b"``, ``"us:"``) is never treated as a
+#: credential-shaped value, so an unbounded replace can never corrupt an
+#: otherwise-valid evidence line with such a value (defect B1).
+_WORKER_CREDENTIAL_MIN_LEN = 8
 
-    The log boundary is the *last* chance to keep a worker credential out of a
-    log line.  Every value of a credential-shaped variable in *environ* is
-    replaced with an explicit redaction marker before the text is emitted, so a
-    credential that somehow reached a curated message is still never observable.
+#: The character class a real provider credential is expected to occupy.  The
+#: redactor only rewrites runs that are already credential-shaped, so it is
+#: length- and boundary-anchored: a short config value embedded in a larger
+#: token is untouched, and a genuine long secret is still caught.
+_WORKER_CREDENTIAL_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-."
+)
+
+
+def _credential_values(environ: Mapping[str, str]) -> list[tuple[str, str]]:
+    """Return the credential-shaped ``(key, value)`` pairs in *environ*.
+
+    Only values of credential-meaningful keys (the ambient credential markers)
+    with a real credential *shape* are returned.  The shape test is a *minimum
+    length* and a *minimum count of token characters* -- not "all characters
+    are token characters" -- so a genuine credential that happens to contain a
+    quote, backslash or control character is still recognised (and caught in
+    its escaped form), while a short placeholder such as ``"1"``, ``"a,b"`` or
+    ``"us:"`` is never mistaken for a credential (defect B1).
     """
-    redacted = text
+    values: list[tuple[str, str]] = []
     for key, value in environ.items():
         if not value:
             continue
         if key in (ENV_MCP_SESSION_TOKEN,):
             continue
-        if any(marker in key.upper() for marker in WORKER_CREDENTIAL_ENV_MARKERS):
-            redacted = redacted.replace(str(value), "<redacted-credential>")
+        if not any(marker in key.upper() for marker in WORKER_CREDENTIAL_ENV_MARKERS):
+            continue
+        text = str(value)
+        token_chars = sum(1 for ch in text if ch in _WORKER_CREDENTIAL_TOKEN_CHARS)
+        if token_chars >= _WORKER_CREDENTIAL_MIN_LEN:
+            values.append((key, text))
+    return values
+
+
+def _redact_token_anchored(text: str, value: str) -> str:
+    """Replace *value* in *text* only when it is token-anchored.
+
+    A match counts only when the occurrence is not flanked by another token
+    character, i.e. the whole credential is present rather than a substring of
+    a larger word.  This keeps the rewrite structure-preserving (it never
+    splits a JSON string into invalid JSON) while still catching a credential
+    that appears as its own token.
+    """
+    needle = value
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    m = len(needle)
+    while True:
+        j = text.find(needle, i)
+        if j == -1:
+            out.append(text[i:])
+            break
+        before = text[j - 1] if j > 0 else ""
+        after = text[j + m] if j + m < n else ""
+        if before in _WORKER_CREDENTIAL_TOKEN_CHARS or after in _WORKER_CREDENTIAL_TOKEN_CHARS:
+            # Not a standalone token: keep the character and keep scanning.
+            out.append(text[i : j + 1])
+            i = j + 1
+        else:
+            out.append(text[i:j])
+            out.append(_REDACTION_MARKER)
+            i = j + m
+    return "".join(out)
+
+
+def redact_worker_credentials(text: str, environ: Mapping[str, str]) -> str:
+    """Redact credential-shaped worker values from *text*, structure-preserving.
+
+    The log boundary is the *last* chance to keep a worker credential out of a
+    log line.  Only *credential-shaped* values -- long, token-character strings
+    from credential-meaningful keys -- are redacted, so a short placeholder
+    (``"1"``, ``"a,b"``, ``"us:"``) can never corrupt output (defect B1).  Both
+    the plain value and its JSON-escaped form (the form it takes inside a
+    serialized JSONL line when it contains a quote, backslash or control
+    character) are replaced, so a credential is caught whether it reached the
+    text verbatim or serialized.
+    """
+    redacted = text
+    for _key, value in _credential_values(environ):
+        escaped = json.dumps(value)[1:-1]
+        for form in (value, escaped):
+            if form:
+                redacted = _redact_token_anchored(redacted, form)
     return redacted
 
 
 def assert_worker_credentials_not_in_logs(
     logs: Any, environ: Mapping[str, str]
 ) -> None:
-    """Fail closed if any worker credential value is observable in *logs*.
+    """Fail closed if a credential-shaped value is observable in *logs*.
 
-    *logs* is a string or an iterable of log lines.  The check is exact: it
-    refuses when a credential-shaped env value appears verbatim in the emitted
-    log, so "the credential was not supposed to be logged" is a proven fact
-    rather than an assumption.
+    *logs* is a string or an iterable of log lines.  The check is independent
+    of the redactor's skipping rules: it tests the genuine credential-shaped
+    values, in both their plain and JSON-escaped forms, so it is non-vacuous --
+    a credential that survives redaction (in either form) is a hard failure
+    rather than a silent leak.
     """
     if isinstance(logs, str):
         blob = logs
     else:
         blob = "\n".join(str(line) for line in logs)
-    for key, value in environ.items():
-        if not value:
-            continue
-        if key in (ENV_MCP_SESSION_TOKEN,):
-            continue
-        if any(marker in key.upper() for marker in WORKER_CREDENTIAL_ENV_MARKERS):
-            if str(value) in blob:
+    for key, value in _credential_values(environ):
+        escaped = json.dumps(value)[1:-1]
+        for form in {value, escaped}:
+            if form and form in blob:
                 raise ValueError(
                     f"worker credential {key!r} is observable in the log output"
                 )

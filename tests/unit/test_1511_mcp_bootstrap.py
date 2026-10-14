@@ -3085,3 +3085,155 @@ class TestWorkerCredentialGuardOnRealOutputPaths:
         assert "sk-dispatch-secret" not in forwarded, forwarded
         assert "<redacted-credential>" in forwarded, forwarded
         assert all("sk-dispatch-secret" not in line for line in tee.lines)
+
+    # -- defect B1: short placeholder values never corrupt evidence ----------
+
+    def test_dispatch_line_stays_valid_json_when_a_placeholder_is_short(
+        self, tmp_path, monkeypatch
+    ):
+        """A short credential-ish value never corrupts the durable JSONL line.
+
+        The guard only redacts *credential-shaped* (long, token-character)
+        values, so a placeholder such as ``"1"``, ``"a,b"`` or ``"us:"`` is
+        never rewritten.  The emitted evidence line stays valid JSON and the
+        short value passes through unchanged.
+        """
+        from skillweave.dispatch import events as _events
+
+        environ = {
+            "WORKER_API_KEY": "1",
+            "WORKER_TOKEN": "a,b",
+            "WORKER_SECRET": "us:",
+        }
+        monkeypatch.setattr(os, "environ", environ, raising=False)
+        sink_path = tmp_path / "placeholder.jsonl"
+        with open(sink_path, "w", encoding="utf-8") as sink:
+            stream = _events.DispatchEventStream("run-1", sink)
+            stream.emit(
+                wave="w1",
+                lane_id="1",
+                dispatch_id="a,b",
+                event_type=_events.EventType.LANE_STARTED,
+                process_status=_events.ProcessStatus.RUNNING,
+                task_status=_events.TaskStatus.IN_PROGRESS,
+                payload={"note": "region us:"},
+            )
+        written = sink_path.read_text(encoding="utf-8")
+        # The line must still parse: an unbounded replace of "1"/"a,b"/"us:"
+        # would have rewritten JSON structure (numbers, punctuation) and left
+        # invalid JSON behind.
+        parsed = json.loads(written)
+        assert parsed["lane_id"] == "1", written
+        assert parsed["dispatch_id"] == "a,b", written
+        assert parsed["note"] == "region us:", written
+        assert "<redacted-credential>" not in written, written
+
+    def test_tee_sink_leaves_short_placeholders_unchanged(self, monkeypatch):
+        """The teed child-launch path never rewrites a short placeholder."""
+        from skillweave.dispatch import application as _app
+
+        environ = {"WORKER_API_KEY": "1", "WORKER_TOKEN": "a,b"}
+        monkeypatch.setattr(os, "environ", environ, raising=False)
+        import io
+
+        caller = io.StringIO()
+        tee = _app._TeeSink(caller)
+        line = '{"region": "us:", "n": 1}\n'
+        tee.write(line)
+        assert caller.getvalue() == line, caller.getvalue()
+
+    # -- defect B1/B2: a genuine secret is never observable -----------------
+
+    def test_dispatch_line_redacts_a_plain_long_credential(self, tmp_path, monkeypatch):
+        """A genuine long credential is redacted from the durable evidence line."""
+        from skillweave.dispatch import events as _events
+
+        secret = "sk-ant-" + "A1b2C3d4E5f6G7h8I9j0" * 3
+        environ = {"ANTHROPIC_API_KEY": secret}
+        monkeypatch.setattr(os, "environ", environ, raising=False)
+        sink_path = tmp_path / "secret.jsonl"
+        with open(sink_path, "w", encoding="utf-8") as sink:
+            stream = _events.DispatchEventStream("run-1", sink)
+            stream.emit(
+                wave="w1",
+                lane_id="lane-1",
+                dispatch_id="d1",
+                event_type=_events.EventType.LANE_STARTED,
+                process_status=_events.ProcessStatus.RUNNING,
+                task_status=_events.TaskStatus.IN_PROGRESS,
+                payload={"note": f"used {secret}"},
+            )
+        written = sink_path.read_text(encoding="utf-8")
+        assert secret not in written, written
+        assert "<redacted-credential>" in written, written
+        # The durable line is still valid JSON -- redaction is structure-preserving.
+        json.loads(written)
+
+    def test_dispatch_line_redacts_a_json_escaped_credential(self, tmp_path, monkeypatch):
+        """A secret whose JSON-escaped form appears in the line is still caught.
+
+        A credential containing a quote, backslash or control character is
+        serialized in its escaped form inside the JSONL line; a verbatim match
+        would miss it.  The guard redacts the escaped form too.
+        """
+        from skillweave.dispatch import events as _events
+
+        secret = 'sk-ant-"QUOTED\\SLASH\x07' + "X9y8Z7w6V5u4T3s2" * 2
+        environ = {"ANTHROPIC_API_KEY": secret}
+        monkeypatch.setattr(os, "environ", environ, raising=False)
+        sink_path = tmp_path / "escaped.jsonl"
+        with open(sink_path, "w", encoding="utf-8") as sink:
+            stream = _events.DispatchEventStream("run-1", sink)
+            stream.emit(
+                wave="w1",
+                lane_id="lane-1",
+                dispatch_id="d1",
+                event_type=_events.EventType.LANE_STARTED,
+                process_status=_events.ProcessStatus.RUNNING,
+                task_status=_events.TaskStatus.IN_PROGRESS,
+                payload={"note": f"used {secret}"},
+            )
+        written = sink_path.read_text(encoding="utf-8")
+        # Neither the plain nor the JSON-escaped form is observable.
+        assert secret not in written, written
+        assert json.dumps(secret)[1:-1] not in written, written
+        json.loads(written)
+
+    def test_tee_sink_redacts_a_json_escaped_credential(self, monkeypatch):
+        """The teed path redacts the escaped form of a genuine credential."""
+        from skillweave.dispatch import application as _app
+
+        secret = 'sk-ant-"QUOTED\\SLASH\x07' + "X9y8Z7w6V5u4T3s2" * 2
+        environ = {"ANTHROPIC_API_KEY": secret}
+        monkeypatch.setattr(os, "environ", environ, raising=False)
+        import io
+
+        caller = io.StringIO()
+        tee = _app._TeeSink(caller)
+        tee.write(json.dumps({"note": f"used {secret}"}) + "\n")
+        forwarded = caller.getvalue()
+        assert secret not in forwarded, forwarded
+        assert json.dumps(secret)[1:-1] not in forwarded, forwarded
+        assert "<redacted-credential>" in forwarded, forwarded
+
+    def test_residual_assertion_fails_closed_on_a_surviving_credential(self):
+        """The residual check is non-vacuous: a surviving credential refuses.
+
+        Checked directly (defect B2): the assertion tests the genuine
+        credential-shaped values in both plain and JSON-escaped form, so a
+        value that survives redaction cannot pass as "clean".
+        """
+        secret = "sk-ant-" + "A1b2C3d4E5f6G7h8I9j0" * 3
+        environ = {"ANTHROPIC_API_KEY": secret}
+        # Plain form survives -> refused.
+        with pytest.raises(ValueError):
+            boot.assert_worker_credentials_not_in_logs(f"leak {secret}", environ)
+        # JSON-escaped form survives -> refused (a verbatim-only check misses it).
+        escaped_secret = 'sk-ant-"q\\u0007' + "A1b2C3d4E5f6G7h8" * 3
+        with pytest.raises(ValueError):
+            boot.assert_worker_credentials_not_in_logs(
+                f"leak {json.dumps(escaped_secret)[1:-1]}",
+                {"ANTHROPIC_API_KEY": escaped_secret},
+            )
+        # A clean line with only a short placeholder passes.
+        boot.assert_worker_credentials_not_in_logs("region us: n=1", {"WORKER_API_KEY": "1"})
