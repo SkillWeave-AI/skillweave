@@ -96,6 +96,7 @@ MCP_AGENT_TOOLS: tuple[str, ...] = (
     "agent_capabilities",
     "harness_session_grant",
     "handoff_adapter",
+    "read_continuation_decision",
     "review_action",
 )
 
@@ -1511,6 +1512,7 @@ def mcp_agent_tool_specs() -> list[ToolSpec]:
         "agent_capabilities": _server.agent_capabilities,
         "harness_session_grant": _server.harness_session_grant,
         "handoff_adapter": _server.handoff_adapter,
+        "read_continuation_decision": _server.read_continuation_decision,
         "review_action": _server.review_action,
     }
     return [

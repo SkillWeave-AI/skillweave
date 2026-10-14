@@ -244,13 +244,13 @@ an empty name, never mistaken for a declaration. The four canonical names are
 MCP is an **optional extra** (`skillweave[mcp]`), never a base dependency; the
 base install runs without it and reports an actionable hint when it is
 requested while absent (`python -m skillweave.scripts.check_optional_capability
-mcp`). The server exposes exactly these **15** tools (read from the live
+mcp`). The server exposes exactly these **16** tools (read from the live
 `@mcp.tool()` registry in `src/skillweave/mcp/server.py`):
 
 `create_run`, `status_run`, `cancel_run`, `resume_run`, `restart_session`,
 `get_evidence`, `review_run`, `mailbox_post`, `mailbox_read`, `mailbox_replay`,
 `mailbox_ack`, `agent_capabilities`, `harness_session_grant`, `handoff_adapter`,
-`review_action`.
+`read_continuation_decision`, `review_action`.
 
 The six control tools keep their names/signatures and delegate to
 `skillweave.mcp.control`, which composes the *same* `RunApplicationService` the

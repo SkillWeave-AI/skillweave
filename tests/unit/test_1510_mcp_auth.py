@@ -419,6 +419,9 @@ class TestEveryToolIsGated:
             # ...as are the two SW-1511 seams: transport-adapter selection
             # (criterion 5) and the independent-Review round trip (criterion 4).
             "handoff_adapter": lambda: mcp_server.handoff_adapter(),
+            # ...as is the SW-1511 recovered-controller reader (criterion 2's C
+            # fix): the persisted decision is refused before the mailbox opens.
+            "read_continuation_decision": lambda: mcp_server.read_continuation_decision(),
             "review_action": lambda: mcp_server.review_action("read"),
         }
         assert set(calls) == set(_control.LEGACY_TOOLS) | set(_control.MCP_AGENT_TOOLS)

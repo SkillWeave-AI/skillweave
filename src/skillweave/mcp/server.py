@@ -1292,15 +1292,24 @@ def handoff_adapter(
     continuing, the response also carries the ``harness-continuation-v1``
     **continuation decision** for that run, derived from the client's
     *attested* capability and the *durably recorded* prior session identity of
-    the run's owned attempt -- actual session resume only when the client
-    attested it **and** a prior session identity is recorded for that attempt;
-    otherwise a named ``checkpoint_continuation`` limitation. The prior session
-    id is read from the durable dispatch record (never a caller field and never
-    invented), and the decision is persisted durably to the run's mailbox so a
-    recovered controller reads the *same* decision. This is the production seam
-    a recovered controller reaches; it never fabricates session-UUID continuity.
+    the run's in-flight owned attempt -- actual session resume only when the
+    client attested it **and** the single in-flight attempt's recorded identity
+    still verifies **and** that attempt recorded a session id; otherwise a named
+    ``checkpoint_continuation`` limitation. The prior session id is read from
+    the durable dispatch record (never a caller field and never invented), and
+    the decision is persisted durably to the run's mailbox, where the reader
+    :func:`read_continuation_decision` returns the *same* decision to a
+    recovered controller. This is the production seam a recovered controller
+    reaches; it never fabricates session-UUID continuity.
+
+    The caller-supplied ``db_path`` is authorized **with** the read (exactly as
+    :func:`restart_session` does), so a store outside the authenticated
+    principal's bound roots is refused by the authority roots guard *before* the
+    tool opens it -- never read and then trusted.
     """
-    gate_principal, refusal = gate_operation("read_run", session_token, run_id=run_id)
+    gate_principal, refusal = gate_operation(
+        "read_run", session_token, run_id=run_id, db_path=db_path,
+    )
     if refusal is not None:
         return refusal
     from skillweave.dispatch import messaging as _messaging
@@ -1378,19 +1387,28 @@ def handoff_adapter(
 
 
 def _recorded_session_for_run(db_path: str, run_id: str) -> tuple[str, str]:
-    """The owned attempt's durably recorded ``(intent_id, session_id)``.
+    """The *verified* in-flight attempt's recorded ``(intent_id, session_id)``.
 
     Reads the durable dispatch record for ``run_id`` -- the same record a launch
     wrote -- so a session resume is bound to an *observed* session, never a
-    caller-supplied or invented one.  A run with no recorded intent, or an
-    intent that recorded no session, yields ``("", "")`` and the continuation
-    falls closed to the named checkpoint.  A store that cannot be opened is a
-    fail-closed ``("", "")`` -- the reader never guesses an id.
+    caller-supplied or invented one.  Only the run's **in-flight** attempt
+    (state in the claiming frontier: ``launched``/``reviewing``/``repairing``/
+    ``integrating``) whose recorded process identity still verifies against the
+    live OS may be adopted -- mirroring the native controller's own
+    ``_resume_decision``/``verify_owned_attempt``.  A superseded, failed or
+    terminal attempt is never selected, and an attempt whose identity no longer
+    verifies (recycled pid, stale command, foreign worker, unobservable) is a
+    fail-closed ``("", "")`` -- the continuation then falls to the named
+    checkpoint rather than naming a session whose owner is unverified.  A store
+    that cannot be opened is likewise a fail-closed ``("", "")``.
     """
     store = None
     try:
         store = _get_store(db_path)
-        intents = store.list_dispatch_intents(run_id)
+        # Only the in-flight frontier carries a resumable owned attempt; a
+        # reviewed/integrated/failed intent is a superseded record, not the one
+        # a recovered controller continues.
+        intents = store.list_dispatch_intents(run_id, claiming_only=True)
     except Exception:
         return "", ""
     finally:
@@ -1399,13 +1417,33 @@ def _recorded_session_for_run(db_path: str, run_id: str) -> tuple[str, str]:
                 store.close()
             except Exception:
                 pass
-    if not intents:
-        return "", ""
-    # The *latest* recorded attempt is the one a recovered controller continues
-    # (the predecessor's most recent launch); its recorded session id is the
-    # only session a resume may name.
-    chosen = intents[-1]
-    return chosen.intent_id, chosen.session_id
+    # The claiming frontier names at most one owned attempt per scope; adopt it
+    # only when its recorded identity still verifies as the live process.
+    for intent in intents:
+        if _intent_identity_verified(intent):
+            return intent.intent_id, intent.session_id
+    return "", ""
+
+
+def _intent_identity_verified(intent) -> bool:
+    """Whether *intent*'s recorded process identity still verifies on the OS.
+
+    Mirrors :meth:`NativeProcessService.verify_owned_attempt` without
+    instantiating the service: an intent that recorded no identity, or whose
+    recorded facts no longer match the live process, is not the owned attempt.
+    """
+    from skillweave.runtime import process_identity
+
+    recorded = getattr(intent, "process_identity", None)
+    if not recorded:
+        return False
+    try:
+        pid = int(recorded.get("pid", 0))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    return bool(process_identity.verify(recorded, pid).ok)
 
 
 def _persist_continuation_decision(decision, *, run_id: str, principal: str) -> dict:
@@ -1435,6 +1473,66 @@ def _persist_continuation_decision(decision, *, run_id: str, principal: str) -> 
     except _messaging.MessageChannelError as exc:
         return {"status": "refused", **exc.to_dict()}
     return {"status": "persisted", "message_id": record.get("message_id"), "seq": record.get("seq")}
+
+
+@mcp.tool()
+def read_continuation_decision(
+    run_id: str = "",
+    principal: str = "",
+    session_token: str = "",
+) -> str:
+    """Read back the persisted ``harness-continuation-v1`` decision for a run.
+
+    This is the **production reader** a recovered controller uses to reach the
+    *same* continuation decision :func:`handoff_adapter` persisted: the durable
+    ``status`` ``agent-message-v1`` record addressed to the authenticated
+    scoped principal, carrying the decision body. It reads the server-owned
+    mailbox only (never instantiating the native process service) and is
+    authorized at this boundary under ``read_run``, scoped to the authenticated
+    principal -- a caller cannot read another principal's decision.
+
+    Returns ``found: true`` with the stored decision when one is present, and a
+    fail-closed ``found: false`` (never a fabricated decision) when no decision
+    has been persisted for the run or the read is refused.
+    """
+    gate_principal, refusal = gate_operation("read_run", session_token, run_id=run_id)
+    if refusal is not None:
+        return refusal
+    _messaging, mailbox = _open_mailbox()
+    try:
+        scope_principal = _message_principal(gate_principal, principal)
+        messages = mailbox.read(
+            recipient=scope_principal, principal=scope_principal, kinds=["status"],
+        )
+    except _messaging.MessageChannelError as exc:
+        return json.dumps({"status": "refused", "found": False, **exc.to_dict()})
+    except _authority_module().MCPAuthError as exc:
+        return _auth_error_payload(exc)
+    for record in reversed(messages):
+        body = record.get("body")
+        if (
+            isinstance(body, dict)
+            and body.get("schema_id") == _continuation_schema_id()
+        ):
+            return json.dumps({
+                "status": "ok",
+                "found": True,
+                "run_id": run_id or record.get("run_id", ""),
+                "message_id": record.get("message_id"),
+                "seq": record.get("seq"),
+                "decision": body,
+            })
+    return json.dumps({
+        "status": "ok", "found": False, "run_id": run_id,
+        "message": "no harness-continuation decision is persisted for this run",
+    })
+
+
+def _continuation_schema_id() -> str:
+    """The frozen ``harness-continuation-v1`` schema id (imported lazily)."""
+    from skillweave.runtime.native_process import HARNESS_CONTINUATION_SCHEMA_ID
+
+    return HARNESS_CONTINUATION_SCHEMA_ID
 
 
 #: The mailbox operations a first-class principal may drive on its own channel.

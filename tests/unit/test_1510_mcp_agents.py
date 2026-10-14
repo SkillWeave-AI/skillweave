@@ -317,6 +317,10 @@ class TestServerToolsAreScoped:
             # ...as are the two SW-1511 seams: the transport-adapter selection
             # (criterion 5) and the independent-Review round trip (criterion 4).
             "handoff_adapter": lambda: mcp_server.handoff_adapter(),
+            # ...and the SW-1511 recovered-controller reader (criterion 2's C
+            # fix): the persisted continuation decision is behind the same
+            # read_run gate, refused before the mailbox is opened.
+            "read_continuation_decision": lambda: mcp_server.read_continuation_decision(),
             "review_action": lambda: mcp_server.review_action("read"),
         }
         assert set(calls) == set(mcp_control.MCP_AGENT_TOOLS)

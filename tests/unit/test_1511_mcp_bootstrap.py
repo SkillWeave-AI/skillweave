@@ -64,6 +64,7 @@ from skillweave.runtime.authority import (  # noqa: E402
 )
 from skillweave.runtime.runner_adapter import start_process  # noqa: E402
 from skillweave.runtime.store import SQLiteRunStore  # noqa: E402
+from skillweave.runtime import process_identity  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -2568,26 +2569,29 @@ class TestHandoffAdapterSelectionSeam:
         """Write a durable dispatch record for ``run-1`` and return the db path.
 
         This is the *durable record a launch wrote*: the continuation must read
-        the prior session id from here, never from a caller field.
+        the prior session id from here, never from a caller field.  The recorded
+        identity is the *real* live process this test runs in, so it verifies
+        against the OS -- exactly as a launch's recorded owned attempt would.
         """
         from skillweave.runtime.store import SQLiteRunStore
 
         db_path = str(root / "store.db")
+        live = process_identity.capture(os.getpid())
         store = SQLiteRunStore(db_path)
         store.record_dispatch_intent(
             run_id="run-1", task_id="task-a", attempt=1,
             execution_scope="run-1/task-a/1", step="ready_dispatch",
             route="provider/model", session_id=session_id,
-            process_identity={"pid": 4242, "start_time": "1.0",
-                              "exec_path": "/bin/x", "argv": ["x"]},
+            process_identity=live.to_dict(),
         )
         store.close()
         return db_path
 
-    def _driving_token(self, authority):
+    def _driving_token(self, authority, allowed_roots=None):
         return authority.issue_session(
             role="controller", client_id="main", transport="http",
             run_ids=["run-1"],
+            allowed_roots=[str(r) for r in (allowed_roots or [])],
         )
 
     def test_handoff_tool_attested_with_recorded_session_resumes_that_session(
@@ -2607,7 +2611,7 @@ class TestHandoffAdapterSelectionSeam:
             json.dumps({"transports": [], "features": {"session-resume": True}}),
         )
         db_path = self._seed_owned_attempt(tmp_path, session_id="sess-live")
-        token = self._driving_token(authority)
+        token = self._driving_token(authority, [tmp_path])
         out = json.loads(
             mcp_server.handoff_adapter(
                 client_id="attested-harness", recipients="ops",
@@ -2650,7 +2654,7 @@ class TestHandoffAdapterSelectionSeam:
             json.dumps({"transports": [], "features": {"session-resume": True}}),
         )
         db_path = self._seed_owned_attempt(tmp_path, session_id="")
-        token = self._driving_token(authority)
+        token = self._driving_token(authority, [tmp_path])
         out = json.loads(
             mcp_server.handoff_adapter(
                 client_id="attested-harness", recipients="ops",
@@ -2676,7 +2680,7 @@ class TestHandoffAdapterSelectionSeam:
         monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
         monkeypatch.delenv(handoff_mod.CAPABILITY_ATTESTATION_ENV, raising=False)
         db_path = self._seed_owned_attempt(tmp_path, session_id="sess-live")
-        token = self._driving_token(authority)
+        token = self._driving_token(authority, [tmp_path])
         out = json.loads(
             mcp_server.handoff_adapter(
                 client_id="unattested-harness", recipients="ops",
@@ -2688,6 +2692,273 @@ class TestHandoffAdapterSelectionSeam:
         assert continuation["mode"] == "checkpoint_continuation"
         assert continuation["session_id"] == ""
         assert continuation["limitation"] == "unsupported_session_resume_capability"
+
+    # -- SW-1511-RECOVERY criterion 2 (B): the db_path roots guard, driven
+    # through the real tool. A store outside the authenticated principal's
+    # bound roots must be refused *before* any read; an in-roots store still
+    # works. ---------------------------------
+
+    def _seed_intent(
+        self,
+        db_path: str,
+        *,
+        session_id: str,
+        state: str = "launched",
+        process_identity=None,
+        attempt: int = 1,
+        scope: str = "",
+        intent_id: str = "",
+    ) -> str:
+        """Record one durable dispatch intent and return its ``intent_id``."""
+        from skillweave.runtime.store import SQLiteRunStore
+
+        store = SQLiteRunStore(db_path)
+        intent = store.record_dispatch_intent(
+            run_id="run-1", task_id="task-a", attempt=attempt,
+            execution_scope=scope or f"run-1/task-a/{attempt}",
+            step="ready_dispatch", state=state, session_id=session_id,
+            process_identity=process_identity,
+            intent_id=intent_id or None,
+        )
+        store.close()
+        return intent.intent_id
+
+    def _rooted_token(self, authority, root, *, role="controller"):
+        """A session bound to ``run-1`` with ``root`` as its one allowed root."""
+        return authority.issue_session(
+            role=role, client_id="main", transport="http",
+            run_ids=["run-1"], allowed_roots=[str(root)],
+        )
+
+    @pytest.mark.parametrize("role", ["controller", "worker", "reviewer"])
+    def test_handoff_tool_refuses_a_db_path_outside_the_bound_roots(
+        self, authority, tmp_path, monkeypatch, role
+    ):
+        """A store outside the principal's allowed roots is refused unread.
+
+        The caller is bound to one run with allowed roots in *one* directory but
+        passes a store outside them; the tool must refuse before reading -- no
+        continuation decision is fabricated from an out-of-roots store, for
+        controller, worker and reviewer alike.
+        """
+        self._mailbox_path(tmp_path, monkeypatch)
+        monkeypatch.setenv(
+            handoff_mod.CAPABILITY_ATTESTATION_ENV,
+            json.dumps({"transports": [], "features": {"session-resume": True}}),
+        )
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        # A real, seeded store the tool would happily *read* if it were not
+        # refused: proof the refusal is the roots guard, not a missing record.
+        db_path = self._seed_owned_attempt(outside, session_id="sess-leak")
+        token = self._rooted_token(authority, allowed, role=role)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert "continuation" not in out, out
+        assert out.get("code") == "path_injection_refused", out
+        assert out.get("status") not in ("ok", "persisted"), out
+
+    def test_handoff_tool_still_reads_a_db_path_inside_the_bound_roots(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """An in-roots store is still read: the guard narrows, it does not break."""
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        monkeypatch.setenv(
+            handoff_mod.CAPABILITY_ATTESTATION_ENV,
+            json.dumps({"transports": [], "features": {"session-resume": True}}),
+        )
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        live = process_identity.capture(os.getpid())
+        db_path = str(allowed / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-live", state="launched",
+            process_identity=live.to_dict(),
+        )
+        token = self._rooted_token(authority, allowed)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        assert out["continuation"]["mode"] == "session_resume"
+        assert out["continuation"]["session_id"] == "sess-live"
+
+    # -- SW-1511-RECOVERY criterion 2 (D): only the *verified* in-flight
+    # attempt's session may be named; a superseded or unverified intent falls
+    # to the named checkpoint. --------------------------------------------
+
+    def _attested(self, monkeypatch):
+        monkeypatch.setenv(
+            handoff_mod.CAPABILITY_ATTESTATION_ENV,
+            json.dumps({"transports": [], "features": {"session-resume": True}}),
+        )
+
+    def test_handoff_tool_ignores_a_superseded_attempt_session(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A superseded (terminal) attempt recorded *last* is never named.
+
+        The run carries the live in-flight attempt *and*, recorded later, a
+        terminal attempt whose session id must be ignored: selecting the
+        last-recorded intent regardless of state would name the superseded
+        record's session -- the resume must instead follow the in-flight one.
+        """
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        self._attested(monkeypatch)
+        live = process_identity.capture(os.getpid())
+        db_path = str(tmp_path / "store.db")
+        # The live in-flight attempt, recorded first.
+        self._seed_intent(
+            db_path, session_id="sess-live", state="launched",
+            process_identity=live.to_dict(),
+            attempt=2, scope="run-1/task-a/2", intent_id="intent-live",
+        )
+        # A superseded terminal attempt with its own session id, recorded
+        # *later* -- so a last-recorded selection would wrongly name it.
+        self._seed_intent(
+            db_path, session_id="sess-dead", state="failed",
+            process_identity={"pid": 999999, "start_time": "0.0",
+                              "exec_path": "/bin/dead", "argv": ["dead"]},
+            attempt=1, scope="run-1/task-a/1", intent_id="intent-dead",
+        )
+        token = self._rooted_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        assert out["continuation"]["mode"] == "session_resume", out
+        assert out["continuation"]["session_id"] == "sess-live"
+        assert out["continuation"]["intent_id"] == "intent-live"
+
+    def test_handoff_tool_unverified_in_flight_attempt_falls_to_checkpoint(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """An in-flight attempt whose identity no longer verifies is not adopted.
+
+        The only in-flight attempt recorded a recycled identity (a stale
+        ``start_time``); its session id must NOT be named -- the continuation is
+        a named checkpoint, mirroring ``verify_owned_attempt``.
+        """
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        self._attested(monkeypatch)
+        live = process_identity.capture(os.getpid())
+        forged = live.to_dict()
+        forged["start_time"] = "0.0"  # a recycled pid: never the owned attempt
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-stale", state="launched",
+            process_identity=forged, intent_id="intent-stale",
+        )
+        token = self._rooted_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        assert out["continuation"]["mode"] == "checkpoint_continuation", out
+        assert out["continuation"]["session_id"] == ""
+        assert out["continuation"]["limitation"] == "session_identity_unknown"
+
+    def test_handoff_tool_attempt_without_identity_falls_to_checkpoint(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """An in-flight attempt that recorded no process identity is not adopted."""
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        self._attested(monkeypatch)
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-noid", state="launched",
+            process_identity=None, intent_id="intent-noid",
+        )
+        token = self._rooted_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        assert out["continuation"]["mode"] == "checkpoint_continuation", out
+        assert out["continuation"]["session_id"] == ""
+
+    # -- SW-1511-RECOVERY criterion 2 (C): the persisted decision has a real
+    # production reader, without instantiating NativeProcessService. --------
+
+    def test_read_continuation_decision_returns_the_persisted_decision(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """The reader returns the *same* decision the tool persisted.
+
+        A recovered controller reaches the decision through
+        ``read_continuation_decision`` (the run's durable mailbox), not a
+        re-derivation -- and the reader itself never touches the native process
+        service.
+        """
+        mailbox_path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(mailbox_path))
+        self._attested(monkeypatch)
+        live = process_identity.capture(os.getpid())
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-live", state="launched",
+            process_identity=live.to_dict(),
+        )
+        token = self._rooted_token(authority, tmp_path)
+        written = json.loads(
+            mcp_server.handoff_adapter(
+                client_id="attested-harness", recipients="ops",
+                run_id="run-1", db_path=db_path, session_token=token,
+            )
+        )
+        assert written["continuation"]["mode"] == "session_resume", written
+        read = json.loads(
+            mcp_server.read_continuation_decision(
+                run_id="run-1", session_token=token,
+            )
+        )
+        assert read["status"] == "ok", read
+        assert read["found"] is True, read
+        assert read["decision"]["mode"] == "session_resume"
+        assert read["decision"]["session_id"] == "sess-live"
+        assert read["decision"]["schema_id"] == (
+            "https://skillweave.dev/schemas/process/harness-continuation/v1"
+        )
+        # The reader is *the same decision*: identical to what was persisted.
+        assert read["decision"] == written["continuation"]
+
+    def test_read_continuation_decision_is_fail_closed_when_absent(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """With no persisted decision the reader reports ``found: false``."""
+        monkeypatch.setenv(
+            mcp_server.MAILBOX_PATH_ENV, str(tmp_path / "empty-mb.jsonl")
+        )
+        token = self._rooted_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.read_continuation_decision(
+                run_id="run-1", session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        assert out["found"] is False, out
 
 
 # ===========================================================================
