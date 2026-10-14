@@ -171,35 +171,71 @@ def authority(tmp_path, monkeypatch):
 def _record_durable_review(
     authority, *, run_id="run-1", task_id="task-cms", attempt=1,
     subject="cms-c2", message_id="review-1", role="reviewer", client_id="rev",
+    verdict="accepted", subject_revision=_REVISION, artifact_digest="sha256:x",
+    criteria="cms-c2",
 ):
     """Record a reviewer's source-bound result through the real MCP tool.
 
-    Returns ``(ref, principal)``: a :class:`DurableReviewRef` naming the durable
-    record, and the *server-issued* principal the review was recorded under.
+    The reviewer's *own* recorded facts -- verdict, the subject revision and
+    artifact digest reviewed, and the criteria covered -- are carried in the
+    durable body (unbound by default); an honest review accepts and names the
+    exact revision/digest under publication.  Returns ``(ref, principal)``: a
+    :class:`DurableReviewRef` naming the durable record, and the *server-issued*
+    principal the review was recorded under.
     """
     auth, mailbox_path = authority
     token = auth.issue_session(
         role=role, client_id=client_id, transport="http", run_ids=[run_id],
     )
-    written = json.loads(
-        mcp_server.review_action(
-            action="write", recipient=client_id, body=subject, run_id=run_id,
-            task_id=task_id, attempt=attempt, message_id=message_id,
-            session_token=token,
-        )
+    # The reviewer's own facts are stamped by the fix's ``review_action`` (the
+    # server records verdict/revision/digest/criteria from the authenticated
+    # session).  The prior candidate's ``review_action`` accepts only the bare
+    # assignment, so on that candidate the review carries *no* recorded
+    # revision/verdict and the forgery is enacted by the publication itself.
+    import inspect
+
+    kwargs = dict(
+        action="write", recipient=client_id, body=subject, run_id=run_id,
+        task_id=task_id, attempt=attempt, message_id=message_id,
+        session_token=token,
     )
+    params = inspect.signature(mcp_server.review_action).parameters
+    if "verdict" in params:
+        kwargs.update(
+            verdict=verdict, subject_revision=subject_revision,
+            artifact_digest=artifact_digest, criteria=criteria,
+        )
+    written = json.loads(mcp_server.review_action(**kwargs))
     assert written["status"] == "ok", written
     principal = written["message"]["principal"]
     return DurableReviewRef(mailbox_path=mailbox_path, message_id=message_id), principal
 
 
+def _open_txn(service, intent, producer, *, binding=_SANDBOX, owner_sandbox=_OWNER_SANDBOX):
+    """Open a managed transaction, supplying the owner declaration.
+
+    The ``owner_sandbox`` allow-list is a *requirement the fix adds*; the prior
+    candidate's ``open_cms_transaction`` has no such parameter.  This helper
+    passes it only when the method accepts it, so an adversarial test that
+    reproduces a forgery *still opens a transaction on the prior candidate* and
+    fails there because the forgery is **accepted**, not because the signature
+    changed.
+    """
+    import inspect
+
+    kwargs = dict(
+        baseline=_BASELINE, producer_identity=producer, binding=binding,
+    )
+    params = inspect.signature(service.open_cms_transaction).parameters
+    if "owner_sandbox" in params:
+        kwargs["owner_sandbox"] = owner_sandbox
+    subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
+    return service.open_cms_transaction(intent.intent_id, subject, RawContentAdapter(), **kwargs)
+
+
 def _to_restored(service, intent, producer, *, binding=_SANDBOX):
     """Drive a managed transaction baseline -> restore; return the restored txn."""
-    subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
-    txn = service.open_cms_transaction(
-        intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
-        producer_identity=producer, binding=binding,
-    )
+    txn = _open_txn(service, intent, producer, binding=binding)
     txn = service.draft_cms_transaction(txn, change={"title": "new", "body": "hello"})
     txn = service.apply_cms_transaction(txn, change={"title": "new", "body": "hello"})
     txn, blocker = service.restore_cms_transaction(txn)
@@ -218,7 +254,7 @@ def test_c01_seam_owner_drives_baseline_draft_apply_readback_restore(tmp_path):
 
     txn = service.open_cms_transaction(
         intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
-        producer_identity=producer, binding=_SANDBOX,
+        producer_identity=producer, binding=_SANDBOX, owner_sandbox=_OWNER_SANDBOX,
     )
     assert txn.stage == CMS_STAGE_BASELINE
     assert txn.subject_kind == "content"
@@ -256,7 +292,7 @@ def test_c01_seam_owner_refuses_out_of_order_stages(tmp_path):
     subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
     txn = service.open_cms_transaction(
         intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
-        producer_identity=producer, binding=_SANDBOX,
+        producer_identity=producer, binding=_SANDBOX, owner_sandbox=_OWNER_SANDBOX,
     )
     # An apply before a dry-run is refused.
     try:
@@ -283,7 +319,7 @@ def test_c01_seam_owner_refuses_a_repository_subject(tmp_path):
     try:
         service.open_cms_transaction(
             intent.intent_id, repo, RawContentAdapter(), baseline=_BASELINE,
-            producer_identity=producer, binding=_SANDBOX,
+            producer_identity=producer, binding=_SANDBOX, owner_sandbox=_OWNER_SANDBOX,
         )
     except WrongIntegrationModeError:
         pass
@@ -340,7 +376,7 @@ def test_c01_seam_owner_refuses_an_adapter_missing_a_capability(tmp_path):
     try:
         service.open_cms_transaction(
             intent.intent_id, subject, broken, baseline=_BASELINE,
-            producer_identity=producer, binding=_SANDBOX,
+            producer_identity=producer, binding=_SANDBOX, owner_sandbox=_OWNER_SANDBOX,
         )
     except (CmsCapabilityError, ValueError):
         pass
@@ -580,7 +616,7 @@ def test_c03_restore_failure_yields_a_named_blocker_not_a_claim(tmp_path):
     adapter = _DriftingAdapter()
     txn = service.open_cms_transaction(
         intent.intent_id, subject, adapter, baseline=_BASELINE,
-        producer_identity=producer, binding=_SANDBOX,
+        producer_identity=producer, binding=_SANDBOX, owner_sandbox=_OWNER_SANDBOX,
     )
     txn = service.draft_cms_transaction(txn, change={"title": "new", "body": "hello"})
     txn = service.apply_cms_transaction(txn, change={"title": "new", "body": "hello"})
@@ -598,7 +634,7 @@ def test_c03_seam_sandbox_binding_survives_a_recovered_controller(tmp_path):
     subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
     txn = service.open_cms_transaction(
         intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
-        producer_identity=producer, binding=_SANDBOX,
+        producer_identity=producer, binding=_SANDBOX, owner_sandbox=_OWNER_SANDBOX,
     )
     txn = service.draft_cms_transaction(txn, change={"title": "new", "body": "hello"})
     txn = service.apply_cms_transaction(txn, change={"title": "new", "body": "hello"})
@@ -617,7 +653,9 @@ def test_c03_seam_sandbox_binding_survives_a_recovered_controller(tmp_path):
     else:
         raise AssertionError("a transaction without a sandbox binding was driven")
     # After re-binding its sandbox adapter, the restore proceeds.
-    service2.bind_cms_sandbox(recovered, RawContentAdapter())
+    service2.bind_cms_sandbox(
+        recovered, RawContentAdapter(), owner_sandbox=_OWNER_SANDBOX
+    )
     # The re-bound adapter has no retained restore point, so a *restore* cannot
     # be claimed -- it returns a named blocker rather than a false success.
     recovered2, blocker = service2.restore_cms_transaction(recovered)
@@ -821,11 +859,17 @@ def test_b2_seam_publication_requires_a_current_independent_review(
             txn, authorization=auth, artifact_digest="sha256:x", policy=policy,
             review_ref=other_ref,
         )
-    # (d) A review whose digest does not match the published artifact is refused.
+    # (d) A review recorded for *this* attempt but binding a *different* artifact
+    #     digest cannot authorize the published digest -- the review's own
+    #     recorded digest is compared, so the assertion below fails on the digest
+    #     binding (not the attempt scope, as the earlier vacuous step did).
+    digest_ref, _ = _record_durable_review(
+        authority, message_id="review-digest", artifact_digest="sha256:other"
+    )
     with pytest.raises(PublicationRefused):
         service.authorize_cms_publication(
-            txn, authorization=auth, artifact_digest="sha256:other", policy=policy,
-            review_ref=other_ref,
+            txn, authorization=auth, artifact_digest="sha256:x", policy=policy,
+            review_ref=digest_ref,
         )
 
     # The current, independent review recorded for *this* attempt is accepted.
@@ -998,11 +1042,12 @@ def test_f2_a_false_producer_declaration_at_open_is_refused(tmp_path):
         service.open_cms_transaction(
             intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
             producer_identity="somebody-else", binding=_SANDBOX,
+            owner_sandbox=_OWNER_SANDBOX,
         )
     # The honest declaration opens and *records the derived* producer.
     txn = service.open_cms_transaction(
         intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
-        producer_identity=producer, binding=_SANDBOX,
+        producer_identity=producer, binding=_SANDBOX, owner_sandbox=_OWNER_SANDBOX,
     )
     assert txn.producer_identity == producer
     assert txn.producer_identity.startswith("attempt:")
@@ -1017,6 +1062,7 @@ def test_f2_a_false_producer_declaration_at_open_is_refused(tmp_path):
         service.open_cms_transaction(
             bare.intent_id, subject_bare, RawContentAdapter(), baseline=_BASELINE,
             producer_identity="anything", binding=_SANDBOX,
+            owner_sandbox=_OWNER_SANDBOX,
         )
     store.close()
 
@@ -1061,12 +1107,13 @@ def test_f3_a_production_target_dressed_as_a_sandbox_is_refused(tmp_path):
     # binding that names a *different* target is refused.
     txn = service.open_cms_transaction(
         intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
-        producer_identity=producer, binding=_SANDBOX,
+        producer_identity=producer, binding=_SANDBOX, owner_sandbox=_OWNER_SANDBOX,
     )
     assert txn.sandbox_target == "sandbox/ch"
     with pytest.raises(CmsBindingRefused):
         service.bind_cms_sandbox(
-            txn, RawContentAdapter(), binding=SandboxBinding(target="sandbox/other")
+            txn, RawContentAdapter(), binding=SandboxBinding(target="sandbox/other"),
+            owner_sandbox=_OWNER_SANDBOX,
         )
     store.close()
 
@@ -1101,6 +1148,7 @@ def test_full_forgery_chain_is_refused(tmp_path, authority):
         service.open_cms_transaction(
             intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
             producer_identity="attacker-1", binding=_SANDBOX,
+            owner_sandbox=_OWNER_SANDBOX,
         )
     # The honest producer opens; then the attacker tries to publish with a
     # forged review object and a self-designated authorizer string.
@@ -1141,6 +1189,236 @@ def test_full_forgery_chain_is_refused(tmp_path, authority):
         review_ref=review_ref, policy=_OwnerPublicationPolicy(),
     )
     assert decision.approved is True
+    store.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Adversarial (fourth review): one test per caller-supplied input to
+# ``authorize_cms_publication`` / ``open_cms_transaction`` / ``bind_cms_sandbox``
+# and the durable review loading.  Each reproduces the forgery the controller
+# named and MUST fail on the prior candidate (e21a3f40).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_g1_a_review_for_another_revision_cannot_authorize(tmp_path, authority):
+    """G1 (finding d): a durable review recorded for a *different subject
+    revision* must not authorize publication of the transaction's revision.
+
+    On the prior candidate ``_durable_attempt_review`` re-stamped the review
+    binding with ``txn.subject_revision``, so a review authored for any revision
+    authorized any publication.  The binding is now read *from the review* and
+    compared with the transaction."""
+    service, store = _controller_service(tmp_path)
+    intent, producer = _open_intent(service)
+    txn = _to_restored(service, intent, producer)
+    auth = PublicationAuthorization(
+        authorizer="owner-1", subject_revision=_REVISION, artifact_digest="sha256:x"
+    )
+    # A review that reviewed rev-999 (not the transaction's rev-1).
+    wrong_rev_ref, _ = _record_durable_review(
+        authority, message_id="review-wrong-rev", subject_revision="rev-999"
+    )
+    with pytest.raises(PublicationRefused):
+        service.authorize_cms_publication(
+            txn, authorization=auth, artifact_digest="sha256:x",
+            review_ref=wrong_rev_ref, policy=_OwnerPublicationPolicy(),
+        )
+    store.close()
+
+
+def test_g2_an_unreviewed_digest_cannot_be_published(tmp_path, authority):
+    """G2 (finding d): a durable review whose recorded ``artifact_digest`` is not
+    the digest under publication must refuse -- a review of *nothing* (or of a
+    different artifact) does not authorize this digest."""
+    service, store = _controller_service(tmp_path)
+    intent, producer = _open_intent(service)
+    txn = _to_restored(service, intent, producer)
+    auth = PublicationAuthorization(
+        authorizer="owner-1", subject_revision=_REVISION, artifact_digest="sha256:x"
+    )
+    unreviewed_ref, _ = _record_durable_review(
+        authority, message_id="review-unreviewed", artifact_digest="sha256:never-reviewed"
+    )
+    with pytest.raises(PublicationRefused):
+        service.authorize_cms_publication(
+            txn, authorization=auth, artifact_digest="sha256:x",
+            review_ref=unreviewed_ref, policy=_OwnerPublicationPolicy(),
+        )
+    store.close()
+
+
+def test_g3_a_repair_verdict_review_is_not_acceptance(tmp_path, authority):
+    """G3 (finding d2): the review's *own* verdict decides.  On the prior
+    candidate ``_durable_attempt_review`` hardcoded ``verdict=ACCEPTANCE_ACCEPTED``,
+    so a durable review whose verdict was REPAIR or HOLD was read as accepted."""
+    service, store = _controller_service(tmp_path)
+    intent, producer = _open_intent(service)
+    txn = _to_restored(service, intent, producer)
+    auth = PublicationAuthorization(
+        authorizer="owner-1", subject_revision=_REVISION, artifact_digest="sha256:x"
+    )
+    for verdict in ("repair", "hold", "unknown-verdict", ""):
+        ref, _ = _record_durable_review(
+            authority, message_id=f"review-{verdict or 'missing'}", verdict=verdict
+        )
+        with pytest.raises(PublicationRefused):
+            service.authorize_cms_publication(
+                txn, authorization=auth, artifact_digest="sha256:x",
+                review_ref=ref, policy=_OwnerPublicationPolicy(),
+            )
+    store.close()
+
+
+def test_g4_an_unbound_authority_principal_is_not_an_independent_review(
+    tmp_path,
+):
+    """G4 (finding a): a durable ``status`` record posted through the *unbound*
+    general mailbox under a *caller-declared* principal must not resolve as an
+    independent review.
+
+    On the prior candidate, with no MCP authority bound, ``gate_operation``
+    returned ``(None, None)`` and ``mailbox_post`` persisted the caller-declared
+    principal; a declared ``independent-reviewer-y`` status post then authorized
+    publication.  A server-issued principal has the shape
+    ``mcp:<role>:<client_id>``; a declared string does not, so it is refused."""
+    service, store = _controller_service(tmp_path)
+    intent, producer = _open_intent(service)
+    txn = _to_restored(service, intent, producer)
+    auth = PublicationAuthorization(
+        authorizer="owner-1", subject_revision=_REVISION, artifact_digest="sha256:x"
+    )
+    mailbox = tmp_path / "agent-mailbox.jsonl"
+    # The genuine unbound state: no MCP authority is bound, so the general
+    # mailbox trusts the caller-declared principal.  (``bind_authority(None)``
+    # is itself refused by the seam -- only a live authority may be bound -- so
+    # the unbound state is set directly to its documented default.)
+    previous = mcp_server._AUTHORITY
+    previous_ready = mcp_server._READY_SESSION_TOKEN
+    previous_env = os.environ.get(mcp_server.MAILBOX_PATH_ENV)
+    mcp_server._AUTHORITY = None
+    mcp_server._READY_SESSION_TOKEN = None
+    os.environ[mcp_server.MAILBOX_PATH_ENV] = str(mailbox)
+    try:
+        declared = json.loads(
+            mcp_server.mailbox_post(
+                kind="status", recipient="independent-reviewer-y",
+                run_id=intent.run_id, task_id=intent.task_id, attempt=intent.attempt,
+                message_id="declared-review", principal="independent-reviewer-y",
+                body=json.dumps({
+                    # The declared principal itself is the whole forgery: the
+                    # general mailbox (unbound authority) persists it verbatim,
+                    # and on the prior candidate the missing role is *defaulted*
+                    # to the reviewing role, so this record authorized
+                    # publication of the exact revision under review.
+                    "assignment": "cms-c2", "verdict": "accepted",
+                    "subject_revision": _REVISION, "artifact_digest": "sha256:x",
+                }),
+            )
+        )
+        assert declared["status"] == "posted", declared
+        ref = DurableReviewRef(mailbox_path=str(mailbox), message_id="declared-review")
+        with pytest.raises(PublicationRefused):
+            service.authorize_cms_publication(
+                txn, authorization=auth, artifact_digest="sha256:x",
+                review_ref=ref, policy=_OwnerPublicationPolicy(),
+            )
+    finally:
+        mcp_server._AUTHORITY = previous
+        mcp_server._READY_SESSION_TOKEN = previous_ready
+        if previous_env is None:
+            os.environ.pop(mcp_server.MAILBOX_PATH_ENV, None)
+        else:
+            os.environ[mcp_server.MAILBOX_PATH_ENV] = previous_env
+    store.close()
+
+
+def test_g5_a_fabricated_process_identity_cannot_open_a_transaction(tmp_path):
+    """G5 (finding b): a *fabricated* process identity supplied to ``dispatch``
+    (a PID that is not alive) must be refused, and no transaction may be opened
+    on it.
+
+    On the prior candidate ``dispatch`` recorded the caller-supplied
+    ``process_identity`` without verification and ``_durable_producer_identity``
+    rebuilt the producer from it without ``verify``, so ``pid=999999`` (not
+    alive) yielded a derived producer and the transaction opened."""
+    service, store = _controller_service(tmp_path)
+    # A well-formed identity dict for a PID that is (almost certainly) not alive.
+    fabricated = {
+        "pid": 999999, "start_time": 1.0, "exec_path": "/nonexistent/proc",
+        "creation_token": "attempt:999999:1.0:/nonexistent/proc",
+        "argv": ["/nonexistent/proc"],
+    }
+    # dispatch refuses the unverifiable identity outright.
+    with pytest.raises(ValueError):
+        service.dispatch(
+            run_id="run-1", task_id="task-forged", attempt=1,
+            step=STEP_READY_DISPATCH, process_identity=fabricated,
+        )
+    # And a fabricated identity cannot yield a durable producer for a transaction.
+    bare, _ = service.dispatch(
+        run_id="run-1", task_id="task-bare2", attempt=1, step=STEP_READY_DISPATCH,
+    )
+    with pytest.raises(PublicationRefused):
+        _open_txn(
+            service, bare, f"attempt:{fabricated['creation_token']}",
+        )
+    store.close()
+
+
+@pytest.mark.parametrize("target", ["cms.example.com", "channel-7", "release-channel"])
+def test_g6_an_owner_unnamed_target_is_refused(tmp_path, target):
+    """G6 (finding c): a target the owner never *named* in its declaration must
+    be refused -- the allow-list, not only the production-marker denylist.
+
+    ``cms.example.com``, ``channel-7`` and ``release-channel`` evade the
+    substring denylist (``CMS_PRODUCTION_TARGET_MARKERS``) yet are not declared
+    by the owner, so a positive allow-list refuses them at the real call site."""
+    service, store = _controller_service(tmp_path)
+    intent, producer = _open_intent(service)
+    subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
+    # Not production-looking, so the denylist alone admits it ...
+    assert not any(
+        m in target for m in CMS_PRODUCTION_TARGET_MARKERS
+    ), "test target must evade the denylist to prove the allow-list"
+    # ... but opening through the owner's declaration refuses it.
+    with pytest.raises(CmsBindingRefused):
+        service.open_cms_transaction(
+            intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+            producer_identity=producer, binding=SandboxBinding(target=target),
+            owner_sandbox=_OWNER_SANDBOX,
+        )
+    # An *absent* declaration authorizes nothing: a target is refused even
+    # without a declaration (fail closed), and re-binding refuses it too.
+    txn = service.open_cms_transaction(
+        intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+        producer_identity=producer, binding=_SANDBOX, owner_sandbox=_OWNER_SANDBOX,
+    )
+    with pytest.raises(CmsBindingRefused):
+        service.bind_cms_sandbox(
+            txn, RawContentAdapter(), binding=SandboxBinding(target=target),
+            owner_sandbox=_OWNER_SANDBOX,
+        )
+    store.close()
+
+
+def test_g7_owner_declaration_is_required_at_open_and_bind(tmp_path):
+    """G7 (finding c): the positive declaration is *required* at the real call
+    sites -- an absent ``owner_sandbox`` authorizes nothing (a target cannot be
+    reached by omitting the declaration)."""
+    service, store = _controller_service(tmp_path)
+    intent, producer = _open_intent(service)
+    subject = ContentSubject(channel="ch", content_id="e1", revision=_REVISION)
+    with pytest.raises(CmsBindingRefused):
+        service.open_cms_transaction(
+            intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+            producer_identity=producer, binding=_SANDBOX,  # no owner_sandbox
+        )
+    txn = service.open_cms_transaction(
+        intent.intent_id, subject, RawContentAdapter(), baseline=_BASELINE,
+        producer_identity=producer, binding=_SANDBOX, owner_sandbox=_OWNER_SANDBOX,
+    )
+    with pytest.raises(CmsBindingRefused):
+        service.bind_cms_sandbox(txn, RawContentAdapter())  # no owner_sandbox
     store.close()
 
 

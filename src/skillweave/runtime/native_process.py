@@ -62,6 +62,7 @@ import os
 import signal
 
 from . import process_identity
+from . import process_identity as process_identity_module
 from .dagscheduler import (
     ReservationSnapshot,
     RouteCapacitySnapshot,
@@ -82,7 +83,6 @@ from ..trace.gate_receipt import (
     collect_package_review,
     release_dependents,
 )
-from ..trace.gate_receipt import VERIFIER_ROLE
 
 __all__ = [
     # boundary contracts
@@ -2895,6 +2895,28 @@ def resolve_owner_sandbox_target(
     return normalized
 
 
+def _require_owner_authorized_sandbox(target: str, declaration: Any) -> str:
+    """Resolve *target* as one the owner **positively named** in *declaration*.
+
+    This is the allow-list half of the sandbox discriminator, wired at the real
+    call sites: the target must appear in an actual :class:`OwnerSandboxDeclaration`
+    the owner supplied (or a mapping/list the owner supplied, coerced to one).
+    An *absent* declaration authorizes nothing -- unlike
+    :func:`resolve_owner_sandbox_target`, a missing declaration is refused here
+    rather than skipping the check -- so a caller cannot reach a surface by
+    omitting the declaration.  The production-marker denylist stays an
+    *additional* check (a target may not be declared even if the owner lists it),
+    but the primary decision is the positive, owner-named allow-list.
+    """
+    if declaration is None:
+        raise CmsBindingRefused(CMS_BINDING_SANDBOX, target=target)
+    if isinstance(declaration, OwnerSandboxDeclaration):
+        authorized = declaration
+    else:
+        authorized = OwnerSandboxDeclaration(declaration)
+    return resolve_owner_sandbox_target(target, authorized=authorized)
+
+
 def _hashes_from(record: Optional[Mapping[str, Any]]) -> Optional[CmsRawHashes]:
     if record is None:
         return None
@@ -3027,10 +3049,14 @@ class PublicationDecision:
     requires_human: bool = False
 
 
-#: The reviewing role that decides a gate.  A producer answering its own
-#: publication review is never independent, so this is the only role the
-#: publication path admits.
-PUBLICATION_REVIEW_ROLE = VERIFIER_ROLE
+#: The MCP reviewing role that may decide a publication gate.  A publication
+#: review is only ever admitted from a durable ``review_action`` record whose
+#: *server-issued* principal carries this role -- the MCP role that owns
+#: ``review_run`` (:data:`skillweave.runtime.authority.MCP_ROLE_SCOPES`).  A
+#: producer answering its own publication review is never independent, so no
+#: other role is admitted; a record with no server-stamped role is refused,
+#: never defaulted to this value.
+PUBLICATION_REVIEW_ROLE = "reviewer"
 
 #: The durable kind of the MCP ``review_action`` result record
 #: (:func:`skillweave.mcp.server.review_action` posts a ``status`` message whose
@@ -3083,16 +3109,47 @@ class DurableReviewRef:
         return ResolvedReview.from_record(record)
 
 
+def _server_issued_principal_role(principal: str) -> Optional[str]:
+    """The MCP role of a *server-issued* principal, or ``None``.
+
+    A principal the MCP authority mints has the exact shape
+    ``mcp:<role>:<client_id>`` where ``<role>`` is one of
+    :data:`~skillweave.runtime.authority.MCP_ROLE_SCOPES` (the server-owned
+    registry) and ``<client_id>`` is a non-empty token.  Anything else -- a
+    caller-declared principal string, an unbound-authority principal, or a
+    ``role`` that is not a real registry role -- is *not* server-issued and
+    returns ``None``.  This is the structural test that keeps a
+    caller-declared principal/role from resolving as an independent review.
+    """
+    if not isinstance(principal, str):
+        return None
+    parts = principal.split(":")
+    if len(parts) != 3:
+        return None
+    prefix, role, client_id = parts
+    if prefix != "mcp" or not role or not client_id:
+        return None
+    from skillweave.runtime.authority import MCP_ROLE_SCOPES
+
+    if role not in MCP_ROLE_SCOPES:
+        return None
+    return role
+
+
 @dataclass(frozen=True)
 class ResolvedReview:
     """A review projected from its *durable* record.
 
     Every field is *loaded* from the record the MCP server wrote, never supplied
     by a caller: ``principal`` is the server-issued principal the review was
-    recorded under, ``role`` is the reviewing role, and ``run_id``/``task_id``/
-    ``attempt`` are the scope the review answered.  Independence is decided
-    against the server-recorded ``principal``, so a producer that names itself
-    the reviewer is refused even though it controls its own arguments.
+    recorded under, ``role`` is the reviewing role the server stamped from that
+    session, and ``run_id``/``task_id``/``attempt`` are the scope the review
+    answered.  The review's own ``verdict`` and the exact ``subject_revision``/
+    ``artifact_digest``/``criteria`` it reviewed are read from the durable body
+    too -- the publication binds to *those* facts, never to a value a caller
+    supplies at authorization time.  Independence is decided against the
+    server-recorded ``principal``, so a producer that names itself the reviewer
+    is refused even though it controls its own arguments.
     """
 
     message_id: str
@@ -3103,6 +3160,10 @@ class ResolvedReview:
     attempt: int
     subject: str
     digest: str
+    verdict: str
+    subject_revision: str
+    artifact_digest: str
+    criteria: tuple[str, ...]
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> "ResolvedReview":
@@ -3110,7 +3171,13 @@ class ResolvedReview:
 
         A record that is not a ``status`` result whose body names the review's
         run/task/attempt is refused by name: only a genuine review result carries
-        the durable scope a publication must bind to.
+        the durable scope a publication must bind to.  The principal must be the
+        *server-issued* principal shape (``mcp:<role>:<client_id>``) and the
+        body must carry the reviewing role the server stamped -- an unbound
+        authority or a caller-declared principal/role is refused, never
+        resolving as an independent review.  The review's verdict, subject
+        revision, artifact digest and criteria are read from the *body* (which
+        the record digest covers), so a later caller cannot substitute them.
         """
         kind = str(record.get("kind") or "")
         if kind != DURABLE_REVIEW_MESSAGE_KIND:
@@ -3134,7 +3201,40 @@ class ResolvedReview:
                 f"no principal; there is no accountable reviewer",
                 field="review",
             )
-        role = str(body.get("role") or record.get("role") or "").strip()
+        # The reviewing role is stamped by the server from the *server-issued*
+        # session.  A record whose body carries no role (an unbound-authority
+        # write, or a caller that declared its own role) is refused: there is no
+        # authenticated reviewer role to trust.
+        role = str(body.get("role") or "").strip()
+        if not role:
+            raise PublicationRefused(
+                f"durable review {record.get('message_id')!r} carries no "
+                f"server-stamped reviewing role; a caller-declared role is not an "
+                f"independent review",
+                field="role",
+            )
+        # The principal must be the *server-issued* shape and must agree with
+        # the stamped role -- a caller-declared principal (or a status record
+        # posted through the unbound general mailbox) is not server-issued and
+        # cannot resolve as an independent review.
+        issued_role = _server_issued_principal_role(principal)
+        if issued_role is None or issued_role != role:
+            raise PublicationRefused(
+                f"durable review {record.get('message_id')!r} was recorded under "
+                f"principal {principal!r}, which is not a server-issued "
+                f"principal matching the stamped role {role!r}; a caller-declared "
+                f"principal/role is not an independent review",
+                field="principal",
+            )
+        raw_criteria = body.get("criteria")
+        if isinstance(raw_criteria, (list, tuple)):
+            criteria = tuple(str(c) for c in raw_criteria if str(c).strip())
+        elif isinstance(raw_criteria, str) and raw_criteria.strip():
+            criteria = tuple(
+                part.strip() for part in raw_criteria.split(",") if part.strip()
+            )
+        else:
+            criteria = ()
         return cls(
             message_id=str(record.get("message_id") or ""),
             principal=principal,
@@ -3144,11 +3244,15 @@ class ResolvedReview:
             attempt=int(record.get("attempt") or body.get("attempt") or 0),
             subject=str(body.get("assignment") or ""),
             digest=str(record.get("digest") or ""),
+            verdict=str(body.get("verdict") or "").strip(),
+            subject_revision=str(body.get("subject_revision") or "").strip(),
+            artifact_digest=str(body.get("artifact_digest") or "").strip(),
+            criteria=criteria,
         )
 
 
 def _durable_producer_identity(intent: Any) -> str:
-    """The producer identity *derived* from an owned attempt's durable record.
+    """The producer identity *derived from and verified against* an owned attempt.
 
     The producer of a managed CMS transaction is the identity the dispatch
     intent recorded for the owned attempt, never a string the caller declares at
@@ -3156,15 +3260,22 @@ def _durable_producer_identity(intent: Any) -> str:
     fingerprint of the recorded :class:`~skillweave.runtime.process_identity.ProcessIdentity`
     -- its immutable ``creation_token`` (PID + start instant + image), which a
     caller cannot forge and which binds the producer to the exact owned process.
-    A legacy attempt that recorded no process identity has no *verifiable*
-    producer, so the empty string is returned and the publication is refused
-    fail-closed rather than trusting a caller-declared name.
+
+    The recorded identity must also be **verified against live OS facts** with
+    :func:`skillweave.runtime.process_identity.verify`: an identity that merely
+    *names* a PID (a fabricated dict, a recycled PID, a stale command or a
+    foreign process) is not the owned attempt's producer and yields the empty
+    string, so the transaction is refused fail-closed rather than trusting a
+    caller-supplied identity that was never alive under this owner.
     """
     identity = getattr(intent, "process_identity", None)
     if not isinstance(identity, Mapping):
         return ""
     record = process_identity.ProcessIdentity.from_dict(dict(identity))
     if record is None:
+        return ""
+    verification = process_identity.verify(dict(identity), record.pid)
+    if not verification.ok:
         return ""
     return f"attempt:{record.creation_token}"
 
@@ -3210,6 +3321,17 @@ def _require_current_independent_review(
         raise PublicationRefused(
             f"publication review role {review.role!r} is not the independent "
             f"reviewing role {PUBLICATION_REVIEW_ROLE!r}",
+            field="review",
+        )
+    # The review's *own* verdict must be the accepting verdict.  A review that
+    # reached REPAIR/HOLD (or carries no verdict yet) does not authorize an
+    # irreversible publication -- the accepting verdict is read from the review,
+    # never assumed.
+    if review.verdict != ACCEPTANCE_ACCEPTED:
+        raise PublicationRefused(
+            f"the publication review reached verdict "
+            f"{review.verdict or '<missing>'!r}, not {ACCEPTANCE_ACCEPTED!r}; only "
+            f"an accepting independent review authorizes irreversible publication",
             field="review",
         )
     if review.answering_identity == producer_identity:
@@ -3537,10 +3659,36 @@ class NativeProcessService:
         when the execution scope already carries a claiming intent (a duplicate
         launch).  The returned ``owned-attempt-dispatch-v1`` record is produced
         by this native process service for the harness adapter.
+
+        A supplied ``process_identity`` is **verified against live OS facts**
+        before it is recorded: it must be a well-formed identity for a process
+        this controller can observe, so a fabricated, recycled, not-alive or
+        foreign identity is refused rather than durably recorded as an owned
+        attempt.  (The dispatch itself is a *declaration*; the producer a CMS
+        transaction derives from the intent is independently re-derived and
+        re-verified when the transaction is opened.)
         """
         self._require_controller()
         if step not in STEPS:
             raise ValueError(f"{step!r} is not one of the driven steps {STEPS}")
+        if process_identity is not None:
+            record = process_identity if isinstance(process_identity, Mapping) else None
+            parsed = (
+                process_identity_module.ProcessIdentity.from_dict(dict(record))
+                if record is not None
+                else None
+            )
+            if parsed is None:
+                raise ValueError(
+                    "a dispatch process_identity must be a well-formed recorded "
+                    "process identity; an unparseable identity is refused"
+                )
+            if not process_identity_module.verify(dict(record), parsed.pid).ok:
+                raise ValueError(
+                    f"the dispatch process identity {parsed.creation_token!r} could "
+                    f"not be verified against live OS facts; a fabricated, "
+                    f"recycled, not-alive or foreign identity is refused"
+                )
         scope = execution_scope or f"{run_id}/{task_id}/{attempt}"
         token = self._lease.fencing_token
         intent = self._store.record_dispatch_intent(
@@ -4153,6 +4301,7 @@ class NativeProcessService:
         baseline: Any,
         producer_identity: str,
         binding: Any = None,
+        owner_sandbox: Any = None,
         txn_id: str = "",
         now: Optional[str] = None,
     ) -> CmsTransaction:
@@ -4175,13 +4324,22 @@ class NativeProcessService:
         declared sandbox* ``binding`` -- an undeclared/unknown binding (the
         default) or a ``production``-declared one is refused fail-closed, so the
         sandbox is structural, not a name.
+
+        The target is additionally resolved against ``owner_sandbox``, the
+        owner's positive :class:`OwnerSandboxDeclaration` of the sandbox targets
+        it actually authorized: a target the owner did not *name* is refused
+        fail-closed (an absent declaration authorizes nothing), so
+        ``kind == "sandbox"`` is not sufficient to reach an unauthorized surface.
+        The production-marker denylist remains an *additional* check.
         """
         if not isinstance(producer_identity, str) or not producer_identity.strip():
             raise ValueError(
                 "a managed CMS transaction must carry the producer attempt's "
                 "identity; an unknown producer is refused"
             )
-        sandbox_target = resolve_cms_sandbox_binding(binding)
+        sandbox_target = _require_owner_authorized_sandbox(
+            resolve_cms_sandbox_binding(binding), owner_sandbox
+        )
         identity = self._require_leased_adapter(adapter, subject=subject)
         intent = self._store.get_dispatch_intent(intent_id)
         if intent is None:
@@ -4351,7 +4509,12 @@ class NativeProcessService:
         )
 
     def bind_cms_sandbox(
-        self, txn: CmsTransaction, adapter: Any, *, binding: Any = None
+        self,
+        txn: CmsTransaction,
+        adapter: Any,
+        *,
+        binding: Any = None,
+        owner_sandbox: Any = None,
     ) -> None:
         """Re-bind the one owner-authorized sandbox adapter to a *recovered* txn.
 
@@ -4362,6 +4525,12 @@ class NativeProcessService:
         An explicit sandbox ``binding`` may be supplied and is resolved through
         the same structural discriminator as :meth:`open_cms_transaction`, so a
         ``production``-declared or unknown binding is refused here too.
+
+        The recorded target and any fresh binding are additionally resolved
+        against the owner's positive ``owner_sandbox`` declaration: a target the
+        owner did not name is refused fail-closed (an absent declaration
+        authorizes nothing), so a takeover cannot re-point the restore point at
+        an unauthorized surface the owner never declared.
         """
         self._require_controller()
         # A recovered transaction carries the sandbox target it was opened
@@ -4369,9 +4538,13 @@ class NativeProcessService:
         # recorded target) and, when a fresh binding is given, require that it
         # names the *same* target, so a takeover cannot re-point the restore
         # point at an undeclared or production-looking surface.
-        recorded_target = resolve_owner_sandbox_target(txn.sandbox_target)
+        recorded_target = _require_owner_authorized_sandbox(
+            txn.sandbox_target, owner_sandbox
+        )
         if binding is not None:
-            bound_target = resolve_cms_sandbox_binding(binding)
+            bound_target = _require_owner_authorized_sandbox(
+                resolve_cms_sandbox_binding(binding), owner_sandbox
+            )
             if bound_target != recorded_target:
                 raise CmsBindingRefused(
                     CMS_BINDING_SANDBOX, target=bound_target
@@ -4401,6 +4574,54 @@ class NativeProcessService:
             )
         return adapter
 
+    # -- authorization trust model (SW-1511-CMS-TRANSACTION c2) --
+    #
+    # Every input the CMS authorization path consumes, who supplies it, and how
+    # it is derived or verified from durable, server-owned facts.  No
+    # authorization decision may depend on a value the caller can freely choose:
+    # each caller-supplied argument below is either *re-derived* from durable
+    # state or *compared* against a durable fact, never trusted as-is.
+    #
+    #   input                      | caller-supplied? | derived/verified from
+    #   ---------------------------+------------------+-------------------------------------------
+    #   producer_identity          | declared         | derived from the owned intent's durable
+    #                              |                  |   process_identity via process_identity.verify
+    #                              |                  |   (alive + image + start_time match); a
+    #                              |                  |   mismatched/blank declaration is refused
+    #   txn.subject_revision       | no (recorded)    | saved on the transaction at open time; the
+    #                              |                  |   review is compared against it
+    #   artifact_digest            | declared         | compared against the *review's recorded*
+    #                              |                  |   artifact_digest; a mismatch refuses
+    #   review verdict             | no (recorded)    | read from the durable review body; only
+    #                              |                  |   ACCEPTANCE_ACCEPTED authorizes
+    #   review subject_revision    | no (recorded)    | read from the durable body; must equal the
+    #                              |                  |   transaction's revision
+    #   review artifact_digest     | no (recorded)    | read from the durable body; must equal the
+    #                              |                  |   asserted digest
+    #   review principal           | no (recorded)    | server-issued shape mcp:<role>:<client_id>
+    #                              |                  |   with role in MCP_ROLE_SCOPES; must match
+    #                              |                  |   the server-stamped body role
+    #   review role                | no (recorded)    | server-stamped from the issuing session;
+    #                              |                  |   must be the independent reviewer role
+    #   review run/task/attempt    | no (recorded)    | compared against the owned intent's
+    #                              |                  |   run/task/attempt
+    #   authorization (PublicationAuthorization) | declared | must be designated and bind to the
+    #                              |                  |   exact revision/digest; authorizer !=
+    #                              |                  |   producer
+    #   scope_target/permitted_scope | declared       | scope expansion refused via permitted_scope
+    #   sandbox target (open/bind) | declared         | resolved against the owner's positive
+    #                              |                  |   OwnerSandboxDeclaration allow-list AND the
+    #                              |                  |   production-marker denylist; an unlisted or
+    #                              |                  |   absent-declaration target refuses
+    #
+    # `open_cms_transaction` / `bind_cms_sandbox` consume: producer_identity
+    # (declared -> verified/derived as above) and the sandbox target (declared ->
+    # owner allow-list + denylist).  The durable review loading
+    # (`ResolvedReview.from_record`, `_require_review_answers_transaction`,
+    # `_durable_attempt_review`) consumes only recorded facts: message_id,
+    # principal, role, run/task/attempt, and the review's verdict/revision/digest/
+    # criteria -- all read from the digest-covered durable body, never from a
+    # caller argument.
     def authorize_cms_publication(
         self,
         txn: CmsTransaction,
@@ -4512,14 +4733,56 @@ class NativeProcessService:
         subject is carried as its criteria, so an ``expected_review_criteria``
         request that the durable review does not name is refused.
         """
-        criteria = tuple(expected_review_criteria) or (
-            (resolved.subject,) if resolved.subject else (PUBLICATION_REVIEW_ROLE,)
-        )
+        # Every fact this review is checked against is taken FROM the durable
+        # record (``resolved``); none is copied from the caller's asserted
+        # ``artifact_digest`` or the transaction.  A review recorded for another
+        # revision or a different digest therefore fails the currentness check
+        # rather than being re-stamped with the caller's values.
+        recorded_revision = resolved.subject_revision
+        recorded_digest = resolved.artifact_digest
+        if not recorded_revision:
+            raise PublicationRefused(
+                "the durable review names no subject revision to bind to",
+                field="review",
+            )
+        if not recorded_digest:
+            raise PublicationRefused(
+                "the durable review names no reviewed artifact digest to bind to",
+                field="review",
+            )
+        # Requirement 2: the review's *own* verdict decides.  Only an accepting
+        # verdict counts; REPAIR, HOLD, an unknown token or a missing verdict
+        # refuse -- never re-stamped as accepted.
+        if resolved.verdict != ACCEPTANCE_ACCEPTED:
+            raise PublicationRefused(
+                f"the durable review reached verdict {resolved.verdict or '<missing>'!r}, "
+                f"not {ACCEPTANCE_ACCEPTED!r}; only an accepting independent review "
+                f"authorizes irreversible publication",
+                field="review",
+            )
+        # The review must bind the *exact* subject revision and artifact digest the
+        # publication asserts (the caller's asserted digest is compared, never
+        # written into the binding), so a review for another revision or an
+        # unreviewed digest cannot authorize this publication.
+        if recorded_revision != txn.subject_revision:
+            raise PublicationRefused(
+                f"the durable review is bound to subject revision "
+                f"{recorded_revision!r}, not the transaction's "
+                f"{txn.subject_revision!r}",
+                field="review",
+            )
+        if recorded_digest != artifact_digest:
+            raise PublicationRefused(
+                f"the durable review is bound to artifact digest "
+                f"{recorded_digest!r}, not the asserted {artifact_digest!r}",
+                field="review",
+            )
+        criteria = tuple(resolved.criteria) or tuple(expected_review_criteria)
         binding = ReviewBinding(
             review_id=resolved.message_id,
             review_criteria=criteria,
-            subject_revision=txn.subject_revision,
-            artifact_digest=artifact_digest,
+            subject_revision=recorded_revision,
+            artifact_digest=recorded_digest,
         )
         return AttemptReview(
             attempt_id=f"{resolved.run_id}/{resolved.task_id}/{resolved.attempt}",
@@ -4527,9 +4790,9 @@ class NativeProcessService:
             role=resolved.role or PUBLICATION_REVIEW_ROLE,
             answering_identity=resolved.principal,
             producer_identity=txn.producer_identity,
-            verdict=ACCEPTANCE_ACCEPTED,
-            accepted_revision=txn.subject_revision,
-            accepted_digest=artifact_digest,
+            verdict=resolved.verdict,
+            accepted_revision=recorded_revision,
+            accepted_digest=recorded_digest,
         )
 
 

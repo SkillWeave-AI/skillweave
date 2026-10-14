@@ -1560,18 +1560,42 @@ def _continuation_schema_id() -> str:
 REVIEW_MAILBOX_OPERATIONS = frozenset({"read", "replay", "ack", "write"})
 
 
-def _review_assignment_body(run_id: str, task_id: str, attempt: int, subject: str) -> dict[str, object]:
-    """The durable body of an assignment: it names the *actual* subject scope.
+def _review_assignment_body(
+    run_id: str,
+    task_id: str,
+    attempt: int,
+    subject: str,
+    *,
+    role: str = "",
+    verdict: str = "",
+    subject_revision: str = "",
+    artifact_digest: str = "",
+    criteria: Sequence[str] = (),
+    authority: str = "",
+) -> dict[str, object]:
+    """The durable body of a review result: it names the *actual* subject scope.
 
-    The result a reviewer returns is then source-bound to the same
+    The result a reviewer returns is source-bound to the same
     ``run_id``/``task_id``/``attempt`` the assignment carried, so a replayed
-    assignment is verifiable against the work it assigned.
+    result is verifiable against the work it assigned.  The reviewing ``role``
+    is stamped from the *server-issued* session (never a wire value), and the
+    review's own verdict/revision/digest/criteria are recorded *here, by the
+    server*, so publication reads them from the durable record instead of
+    trusting anything a caller supplies later.  A missing verdict/revision/
+    digest is recorded empty and is refused at publication, never defaulted to
+    an accepting value.
     """
     return {
         "assignment": subject,
         "run_id": run_id,
         "task_id": task_id,
         "attempt": attempt,
+        "role": role,
+        "verdict": verdict,
+        "subject_revision": subject_revision,
+        "artifact_digest": artifact_digest,
+        "criteria": list(criteria),
+        "authority": authority,
     }
 
 
@@ -1587,6 +1611,11 @@ def review_action(
     resume_token: str = "",
     in_reply_to: str = "",
     correlation_id: str = "",
+    verdict: str = "",
+    subject_revision: str = "",
+    artifact_digest: str = "",
+    criteria: str = "",
+    authority: str = "",
     session_token: str = "",
 ) -> str:
     """Drive the independent-Review round trip over the real durable tools.
@@ -1605,7 +1634,12 @@ def review_action(
     A ``read``/``replay``/``ack`` is always on the authenticated principal's own
     addressed channel; a ``write`` is a durable ``status`` result whose body is
     bound to the actual ``run_id``/``task_id``/``attempt`` of the assignment it
-    answers.
+    answers -- and, for a publication review, to the reviewed ``verdict`` and
+    the exact ``subject_revision``/``artifact_digest``/``criteria``.  The
+    reviewing **role is never taken from the wire**: it is read from the
+    server-issued session that drives the write, and an unbound authority (no
+    server-issued session) cannot record a review at all, so a caller-declared
+    principal/role can never resolve as an independent review.
     """
     from skillweave.dispatch import messaging as _messaging
     from skillweave.runtime import handoff as _handoff
@@ -1626,11 +1660,24 @@ def review_action(
     gate_principal, refusal = gate_operation(operation, session_token, run_id=run_id)
     if refusal is not None:
         return refusal
+    if normalized == "write" and gate_principal is None:
+        # A durable review is only ever recorded under a *server-issued*
+        # session: with no authority bound the seam has no authenticated role
+        # to stamp, so the write is refused fail-closed rather than recording
+        # a review under a caller-declared (untrusted) principal/role.
+        return json.dumps({
+            "status": "refused", "code": "unauthenticated_principal",
+            "error": (
+                "an independent review must be recorded under a server-issued "
+                "session; the review role is never taken from the wire"
+            ),
+        })
 
     _messaging_mod, mailbox = _open_mailbox()
     try:
         principal = _message_principal(gate_principal, "")
         own = principal
+
         if normalized in ("read", "result"):
             messages = mailbox.read(
                 recipient=(recipient or own), principal=own,
@@ -1657,6 +1704,12 @@ def review_action(
                 "status": "ok", "action": "ack", "message": record,
             })
         # normalized == "write": the reviewer's own source-bound result.
+        review_role = str(getattr(gate_principal, "role", "") or "")
+        if review_role:
+            authority = authority or own
+        criteria_list = [
+            part.strip() for part in str(criteria or "").split(",") if part.strip()
+        ]
         kwargs = {"message_id": message_id} if message_id else {}
         message = _messaging.AgentMessage(
             kind="status",
@@ -1668,7 +1721,13 @@ def review_action(
             attempt=attempt,
             in_reply_to=in_reply_to,
             correlation_id=correlation_id,
-            body=_review_assignment_body(run_id, task_id, attempt, body),
+            body=_review_assignment_body(
+                run_id, task_id, attempt, body,
+                role=review_role, verdict=verdict,
+                subject_revision=subject_revision,
+                artifact_digest=artifact_digest,
+                criteria=criteria_list, authority=authority,
+            ),
             **kwargs,
         )
         record = mailbox.post(message)
