@@ -423,6 +423,14 @@ class TestEveryToolIsGated:
             # fix): the persisted decision is refused before the mailbox opens.
             "read_continuation_decision": lambda: mcp_server.read_continuation_decision(),
             "review_action": lambda: mcp_server.review_action("read"),
+            # SW-1511-RECOVERY: the two-harness qualification, the child-
+            # capability recording and the one recovered owned attempt are
+            # gated at the same seam.
+            "register_child_harness_capability": lambda: mcp_server.register_child_harness_capability(),
+            "qualified_harness_continuation": lambda: mcp_server.qualified_harness_continuation(),
+            "recover_owned_attempt": lambda: mcp_server.recover_owned_attempt(
+                "recover", run_id="run-1", db_path=db,
+            ),
         }
         assert set(calls) == set(_control.LEGACY_TOOLS) | set(_control.MCP_AGENT_TOOLS)
         for name, call in calls.items():

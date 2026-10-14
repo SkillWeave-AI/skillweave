@@ -322,6 +322,12 @@ class TestServerToolsAreScoped:
             # read_run gate, refused before the mailbox is opened.
             "read_continuation_decision": lambda: mcp_server.read_continuation_decision(),
             "review_action": lambda: mcp_server.review_action("read"),
+            # SW-1511-RECOVERY: the two-harness qualification (criterion 4), the
+            # child-capability recording (criterion 5) and the one recovered
+            # owned attempt (criterion 6) are gated at the same seam too.
+            "register_child_harness_capability": lambda: mcp_server.register_child_harness_capability(),
+            "qualified_harness_continuation": lambda: mcp_server.qualified_harness_continuation(),
+            "recover_owned_attempt": lambda: mcp_server.recover_owned_attempt("replay"),
         }
         assert set(calls) == set(mcp_control.MCP_AGENT_TOOLS)
         for name, call in calls.items():

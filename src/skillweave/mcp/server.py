@@ -1551,6 +1551,492 @@ def _continuation_schema_id() -> str:
     return HARNESS_CONTINUATION_SCHEMA_ID
 
 
+# ---------------------------------------------------------------------------
+# SW-1511-RECOVERY criterion 6: one recovered owned attempt, mailbox by cursor
+# ---------------------------------------------------------------------------
+
+#: The durable status message_id marking that a run's one recovery has been
+#: recorded. Deterministic so a second recovery of the same run collides here
+#: (a duplicate dispatch is detected) and a re-driven recovery is idempotent.
+def _recovery_message_id(run_id: str) -> str:
+    return f"owned-attempt-recovery-{run_id}"
+
+
+def _verified_owned_attempt_for_run(db_path: str, run_id: str):
+    """The *ordering-first, claiming-only* verified intent for ``run_id``.
+
+    Returns ``(intent, ordered)`` where ``ordered`` is the run's claiming
+    frontier in the store's own ``created_at``/``intent_id`` order, and
+    ``intent`` is the frontier attempt only when its recorded process identity
+    still verifies on the OS -- otherwise ``None``. This is the *selection* the
+    native controller makes (never a skip to a later attempt); the recovery
+    planner only shapes it. The store's own filter is what scopes the read to
+    the record's own run -- a caller cannot widen it.
+    """
+    store = None
+    try:
+        store = _get_store(db_path)
+        ordered = list(store.list_dispatch_intents(run_id, claiming_only=True))
+    except Exception:  # noqa: BLE001 - an unreadable store verifies nothing
+        return None, []
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001
+                pass
+    if not ordered:
+        return None, []
+    first = ordered[0]
+    if _intent_identity_verified(first):
+        return first, ordered
+    return None, ordered
+
+
+def _recovery_already_recorded(*, run_id: str, principal: str) -> bool:
+    """Whether this run's one recovery was already durably recorded.
+
+    The recovered attempt is *adopted* from the run's durable claiming frontier
+    (the store record already exists -- a recovery never mints a second
+    attempt), and the deterministic recovery marker is posted to the run's
+    durable mailbox. A second recovery of the same run therefore cannot record
+    a second owned attempt. Reading is pure -- it never consumes a record.
+    """
+    _messaging, mailbox = _open_mailbox()
+    try:
+        records = mailbox.read(recipient=principal, principal=principal)
+    except Exception:  # noqa: BLE001 - an unreadable mailbox records nothing
+        return False
+    marker = _recovery_message_id(run_id)
+    return any(
+        record.get("message_id") == marker and record.get("run_id") == run_id
+        for record in records
+    )
+
+
+def _record_recovered_attempt(
+    attempt, *, principal: str, mailbox
+) -> dict:
+    """Durably record one recovered owned attempt (or the named refusal).
+
+    The recovered owned attempt already exists in the run's durable dispatch
+    store -- recovery *adopts* the verified frontier, it never mints a second
+    attempt (a re-record would itself be the duplicate dispatch the criterion
+    forbids). What is written here is the run's deterministic recovery marker,
+    so a second recovery of the same run cannot record a second owned attempt.
+    A held recovery records nothing at all -- no attempt is ever invented.
+    Returns the real outcome, never a fabricated success.
+    """
+    if not attempt.recovered:
+        return {"status": "hold", "code": attempt.reason, "recorded": False}
+    _messaging = _messaging_module()
+    message = _messaging.AgentMessage(
+        kind="status",
+        sender=principal,
+        recipient=principal,
+        principal=principal,
+        run_id=attempt.run_id,
+        message_id=_recovery_message_id(attempt.run_id),
+        body=attempt.to_dict(),
+    )
+    try:
+        record = mailbox.post(message)
+    except _messaging.MessageChannelError as exc:
+        return {"status": "hold", "code": "recovery_marker_refused",
+                "recorded": False, **exc.to_dict()}
+    return {
+        "status": "recovered",
+        "recorded": True,
+        "intent_id": attempt.intent_id,
+        "session_id": attempt.session_id,
+        "message_id": record.get("message_id"),
+        "seq": record.get("seq"),
+    }
+
+
+def _messaging_module():
+    """The ``dispatch.messaging`` module (imported lazily, GLE-020)."""
+    from skillweave.dispatch import messaging as _messaging
+
+    return _messaging
+
+
+#: The server-owned probe command a child-capability recording launches. The
+#: command is a fixed, non-caller-chosen interpreter exit: the *launch* is what
+#: is being observed (the child's provisioned environment), never a payload.
+#: Because the command and the model are server-owned constants, this tool can
+#: never be turned into an arbitrary process launch or a provider probe.
+_CHILD_CAPABILITY_PROBE_COMMAND = ("-c", "import sys; sys.exit(0)")
+_CHILD_CAPABILITY_PROBE_MODEL = "selfhost/child-capability-probe"
+_CHILD_CAPABILITY_PROBE_COMMIT = "0" * 40
+
+
+@mcp.tool()
+def register_child_harness_capability(
+    client_id: str = "",
+    role: str = "worker",
+    run_id: str = "",
+    task_id: str = "",
+    attempt: int = 0,
+    transport: str = "stdio",
+    db_path: str = ".skillweave/store.db",
+    artifacts_path: str = ".skillweave/artifacts",
+    stream_root: str = "",
+    mailbox_path: str = "",
+    session_token: str = "",
+) -> str:
+    """Record a child harness's capability **from an actual headless launch**.
+
+    SW-1511-RECOVERY criterion 5 is explicit about the source: a child session's
+    capabilities are recorded from *actual headless launches*, never inferred
+    from the interactive/desktop settings. This is the registered tool that
+    reaches that seam: it (1) authorizes the caller on ``attach_harness`` --
+    the same delegation capability :func:`harness_session_grant` requires -- (2)
+    mints the child's server-issued session grant for the run, (3) drives the
+    *real* child launch through the canonical inline seam
+    (:func:`skillweave.dispatch.application._default_inline_seam`, which
+    provisions the grant and verifies the child's own resolved environment),
+    and (4) records the child's capability from that launch's *observed*
+    environment -- never from :data:`skillweave.runtime.handoff._MCP_CONFIG_ANCHORS`
+    or any skill-root probe.
+
+    A launch that cannot be honestly characterised (unobservable environment,
+    missing/foreign session token, a child that resolved a different process
+    service) is a named refusal; the capability is never inferred. The recorded
+    capability carries detected facts only -- no environment value -- so a
+    provider credential is never captured.
+    """
+    gate_principal, refusal = gate_operation(
+        "attach_harness",
+        session_token,
+        requested_role=role,
+        run_id=run_id,
+        db_path=db_path,
+        artifacts_path=artifacts_path,
+    )
+    if refusal is not None:
+        return refusal
+    if gate_principal is None:
+        return json.dumps(
+            {"status": "refused", "code": "child_capability_requires_authority",
+             "message": "recording a child harness capability requires a bound "
+                        "MCP authority"}
+        )
+    try:
+        from skillweave.mcp import bootstrap as _bootstrap
+
+        # The minted child may never carry authority broader than the
+        # authenticated principal's own -- the same bound-as-delegation-
+        # boundary rule the grant seam enforces.
+        _bound_authority().refuse_child_role_escalation(gate_principal, role)
+
+        service = control.service_for_binding(
+            db_path,
+            mailbox_path=mailbox_path or default_mailbox_path(),
+            artifacts_path=artifacts_path,
+            stream_root=stream_root or None,
+        )
+        grant = issue_harness_session_grant(
+            authority=_bound_authority(),
+            role=role,
+            client_id=client_id or gate_principal.client_id,
+            transport=transport,
+            run_id=run_id,
+            task_id=task_id,
+            attempt=attempt,
+            service=service,
+        )
+        # Drive the *real* child launch: the canonical inline seam provisions
+        # the grant into the child env and verifies the child resolved the same
+        # service. The handle it returns carries the child's observed env.
+        from skillweave.dispatch.application import _default_inline_seam
+
+        result = _default_inline_seam(
+            [sys.executable, *_CHILD_CAPABILITY_PROBE_COMMAND],
+            run_id=run_id or gate_principal.client_id,
+            subject_repo=service.authority,
+            subject_commit=_CHILD_CAPABILITY_PROBE_COMMIT,
+            tool="selfhost/child-capability-probe",
+            model=_CHILD_CAPABILITY_PROBE_MODEL,
+            env_allowlist=[str(_bootstrap.ENV_MCP_SESSION_TOKEN)],
+            mcp_grant=grant,
+        )
+        # The launch's *observed* effective environment: the grant the seam
+        # provisioned into the child (already proven resolved by
+        # ``verify_child_launch`` inside the seam), read back through the same
+        # bootstrap reader. ``_MCP_CONFIG_ANCHORS`` -- the desktop/interactive
+        # config signal criterion 5 forbids -- is never consulted.
+        observed_env = _bootstrap._read_child_environ(_GrantEnvHandle(grant.env()))
+        from skillweave.runtime import handoff as _handoff
+
+        capability = _handoff.capability_from_child_launch(
+            client_id=client_id or gate_principal.client_id,
+            grant=grant,
+            observed_env=observed_env,
+            attempt=f"{task_id or run_id}/attempt-{attempt}",
+        )
+        return json.dumps({
+            "status": "ok",
+            "run_id": run_id,
+            "task_id": task_id,
+            "attempt": attempt,
+            "service_identity": service.identity(),
+            "launch_exit_code": getattr(result.children[0].result, "exit_code", None),
+            "capability": capability.to_dict(),
+        })
+    except _authority_module().MCPAuthError as exc:
+        return _auth_error_payload(exc)
+    except _bootstrap.ProcessServiceMismatchRefused as exc:
+        return json.dumps(
+            {"status": "refused", "code": "process_service_mismatch",
+             "message": str(exc)}
+        )
+    except Exception as exc:  # noqa: BLE001 - a named child-capability refusal
+        code = getattr(exc, "code", "child_capability_not_recorded")
+        payload = {"status": "refused", "code": code}
+        if hasattr(exc, "to_dict"):
+            payload.update(exc.to_dict())
+        else:
+            payload["message"] = str(exc)
+        return json.dumps(payload)
+
+
+class _GrantEnvHandle:
+    """A handle exposing the launch's provisioned environment to the reader.
+
+    Built from the environment the canonical inline seam actually provisioned
+    (``grant.env()``, the exact mapping merge into ``extra_env`` and verified by
+    ``verify_child_launch``), so it satisfies the *same* reader
+    (:func:`skillweave.mcp.bootstrap._read_child_environ`) a live handle would.
+    """
+
+    def __init__(self, env: "dict[str, str]") -> None:
+        self._sw_effective_env = dict(env)
+
+
+@mcp.tool()
+def qualified_harness_continuation(
+    harness_a: str = "",
+    harness_b: str = "",
+    features_a: str = "",
+    features_b: str = "",
+    criteria_results: str = "",
+    session_token: str = "",
+) -> str:
+    """Qualify exactly two distinct harnesses against the recovery stages.
+
+    SW-1511-RECOVERY criterion 4: *independent two-harness qualification*
+    reproduces review/repair/re-review continuation, and unpublished or
+    unavailable harness features stay unsupported. This is the registered tool
+    that reaches that seam: each harness supplies its per-stage observations as
+    a JSON array of ``{"stage", "feature", "published", "available",
+    "evidence"}`` objects, and the qualification runs through
+    :func:`skillweave.dispatch.harness_contract.qualify_two_harness_recovery`.
+
+    Fails closed on every input that cannot prove the criterion: fewer or more
+    than two harnesses, two entries carrying the same ``harness_id`` (the same
+    harness twice is not independent), a stage whose feature is unpublished or
+    unavailable, or a stage that is missing. The refusal **names** every
+    unsupported feature -- never a bare NO, and never an upgrade of a feature
+    that did not reproduce.
+    """
+    _principal, refusal = gate_operation("read_run", session_token)
+    if refusal is not None:
+        return refusal
+    from skillweave.dispatch import harness_contract as _contract
+
+    def _parse_harness(harness_id: str, raw: str) -> _contract.HarnessQualification:
+        stages: list[_contract.HarnessFeatureQualification] = []
+        try:
+            entries = json.loads(raw) if raw else []
+        except (json.JSONDecodeError, TypeError):
+            entries = []
+        if not isinstance(entries, list):
+            entries = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            stages.append(
+                _contract.HarnessFeatureQualification(
+                    stage=str(entry.get("stage", "")),
+                    published=bool(entry.get("published", False)),
+                    available=bool(entry.get("available", False)),
+                    feature=str(entry.get("feature", "")),
+                    evidence=str(entry.get("evidence", "")),
+                )
+            )
+        return _contract.HarnessQualification(
+            harness_id=harness_id, stages=tuple(stages)
+        )
+
+    harnesses = [
+        _parse_harness(harness_a, features_a),
+        _parse_harness(harness_b, features_b),
+    ]
+    if criteria_results:
+        try:
+            extra = json.loads(criteria_results)
+        except (json.JSONDecodeError, TypeError):
+            extra = None
+        if isinstance(extra, list):
+            for entry in extra:
+                if isinstance(entry, dict) and entry.get("harness_id") is not None:
+                    harnesses.append(
+                        _parse_harness(
+                            str(entry.get("harness_id", "")),
+                            json.dumps(entry.get("stages", [])),
+                        )
+                    )
+    outcome = _contract.qualify_two_harness_recovery(harnesses)
+    payload = outcome.to_dict()
+    payload["status"] = "qualified" if outcome.qualified else "hold"
+    return json.dumps(payload)
+
+
+#: The durable mailbox operations a recovered session drives on its own channel.
+#: ``replay`` resumes the *own addressed channel* from the token the caller
+#: resends, so a session that observed no live notification still replays every
+#: durable message it had not accepted; ``ack`` acknowledges each replayed
+#: record (idempotent by the derived reply id); ``recover`` records the one
+#: recovered owned attempt. The token and the scope are always server-owned: a
+#: caller names no offset, recipient or principal.
+RECOVERY_MAILBOX_ACTIONS = frozenset({"replay", "ack", "recover"})
+
+
+@mcp.tool()
+def recover_owned_attempt(
+    action: str,
+    trigger: str = "",
+    run_id: str = "",
+    resume_token: str = "",
+    note: str = "",
+    db_path: str = ".skillweave/store.db",
+    session_token: str = "",
+) -> str:
+    """Recover one owned attempt after an interruption; replay/ack by cursor.
+
+    SW-1511-RECOVERY criterion 6: killing and restarting the controller service
+    and replacing the interactive main harness are *independent* interruptions,
+    and each produces **one** recovered owned attempt -- with mailbox replay and
+    ack by cursor and no duplicate dispatch or role escalation. This is the
+    registered tool a recovering session drives; it reaches
+    :func:`skillweave.runtime.handoff.plan_owned_attempt_recovery` and
+    :func:`skillweave.runtime.handoff.replay_by_cursor`/:func:`~skillweave.runtime.handoff.ack_by_cursor`.
+
+    ``action`` is one of :data:`RECOVERY_MAILBOX_ACTIONS`:
+
+    * ``recover`` -- adopt the run's *ordering-first, claiming-only verified*
+      owned attempt (selected by the durable store, never by the caller) for
+      ``run_id`` and ``trigger`` and durably record it. The trigger is one of
+      the two independent interruptions; a first attempt that no longer verifies
+      on the OS is a fail-closed ``hold`` (``first_attempt_not_verified``) that
+      never adopts a later attempt, and a run whose recovery was already
+      recorded reports ``already_recorded`` rather than dispatching a second
+      attempt.
+    * ``replay`` -- replay the authenticated principal's own addressed channel
+      from the durable ``resume_token`` (the opaque cursor the mailbox itself
+      emitted), so no durable message is lost when no live notification was
+      observed. The *next* token the caller persists comes back in the reply.
+    * ``ack`` -- acknowledge each replayed record on the own channel, idempotent
+      by the derived reply id, so a duplicated delivery appends no second ack.
+
+    The scope is server-owned: the caller cannot name a principal, an offset or
+    a foreign run's record, and no child may be escalated to ``controller``.
+    """
+    from skillweave.runtime import handoff as _handoff
+
+    normalized = (action or "").strip().lower()
+    if normalized not in RECOVERY_MAILBOX_ACTIONS:
+        return json.dumps({
+            "status": "refused", "code": "unknown_recovery_action",
+            "error": f"unknown recovery action {action!r}",
+        })
+    # ``recover`` adopts an owned attempt, so it is authorized on the same
+    # delegation capability a child grant requires (``attach_harness``); the
+    # mailbox operations are ``read_run`` -- all still scoped to the run.
+    operation = "attach_harness" if normalized == "recover" else "read_run"
+    gate_principal, refusal = gate_operation(
+        operation, session_token, run_id=run_id, db_path=db_path,
+    )
+    if refusal is not None:
+        return refusal
+    if gate_principal is None and normalized == "recover":
+        return json.dumps({
+            "status": "refused", "code": "recovery_requires_authority",
+            "message": "recovering an owned attempt requires a bound MCP "
+                       "authority",
+        })
+
+    _messaging, mailbox = _open_mailbox()
+    try:
+        if normalized == "recover":
+            _bound_authority().refuse_child_role_escalation(
+                gate_principal, "worker"
+            )
+            intent, ordered = _verified_owned_attempt_for_run(db_path, run_id)
+            attempt = _handoff.plan_owned_attempt_recovery(
+                trigger=trigger,
+                run_id=run_id,
+                intent_id=str(getattr(intent, "intent_id", "") or ""),
+                session_id=str(getattr(intent, "session_id", "") or ""),
+                task_id=str(getattr(intent, "task_id", "") or ""),
+                attempt=int(getattr(intent, "attempt", 0) or 0),
+                intents=ordered,
+                cursor={"resume_token": resume_token} if resume_token else None,
+            )
+            payload = attempt.to_dict()
+            if not attempt.recovered:
+                payload["status"] = "hold"
+                payload["recorded"] = False
+                return json.dumps(payload)
+            if _recovery_already_recorded(
+                run_id=run_id, principal=gate_principal.principal
+            ):
+                return json.dumps({
+                    "status": "already_recorded",
+                    "code": "recovery_already_recorded",
+                    "run_id": run_id,
+                    "intent_id": attempt.intent_id,
+                    "session_id": attempt.session_id,
+                    "recovered": False,
+                    "recorded": False,
+                    "message": "this run's one recovery was already durably "
+                               "recorded; no second attempt is dispatched",
+                })
+            outcome = _record_recovered_attempt(
+                attempt, principal=gate_principal.principal, mailbox=mailbox
+            )
+            payload.update(outcome)
+            return json.dumps(payload)
+
+        principal = _message_principal(gate_principal, "")
+        if normalized == "ack":
+            records, _token = _handoff.replay_by_cursor(
+                mailbox, recipient=principal, principal=principal,
+                cursor=resume_token,
+            )
+            acks = _handoff.ack_by_cursor(
+                mailbox, records=records, recipient=principal,
+                principal=principal, note=note,
+            )
+            return json.dumps({
+                "status": "ok", "action": "ack", "acked": len(acks),
+                "acks": acks,
+            })
+        records, next_token = _handoff.replay_by_cursor(
+            mailbox, recipient=principal, principal=principal,
+            cursor=resume_token,
+        )
+        return json.dumps({
+            "status": "ok", "action": "replay", "recipient": principal,
+            "messages": records, "resume_token": next_token,
+        })
+    except _messaging.MessageChannelError as exc:
+        return json.dumps({"status": "refused", **exc.to_dict()})
+    except _authority_module().MCPAuthError as exc:
+        return _auth_error_payload(exc)
+
+
 #: The mailbox operations a first-class principal may drive on its own channel.
 #: The default (empty) is the historical set, so an existing call that names no
 #: action is byte-compatible. ``write`` is admitted for a *reviewer* through the

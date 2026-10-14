@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 import hashlib
 import json
 import uuid
@@ -514,6 +514,384 @@ def detect_capabilities(
     """
     ids = client_ids or ["codex", "antigravity", "openclaude"]
     return {cid: detect_client_capability(cid, **kwargs) for cid in ids}
+
+
+# ---------------------------------------------------------------------------
+# SW-1511-RECOVERY criterion 5: a child's capability, recorded from an actual
+# headless launch -- never inferred from the interactive/desktop settings
+# ---------------------------------------------------------------------------
+
+#: Why a child capability could not be recorded from a real launch.
+CHILD_CAPABILITY_UNOBSERVABLE = "child_launch_unobservable"
+CHILD_CAPABILITY_UNKNOWN_HARNESS = "unknown_child_harness"
+CHILD_CAPABILITY_TOKEN_MISMATCH = "child_session_token_mismatch"
+CHILD_CAPABILITY_NO_SERVICE_BINDING = "child_no_process_service_binding"
+CHILD_CAPABILITY_FOREIGN_SERVICE = "child_resolved_a_foreign_service"
+
+
+class ChildCapabilityError(ValueError):
+    """A child capability could not be honestly recorded from a real launch.
+
+    Every refusal names a stable ``code`` so an operator reads *why* the child
+    capability was not recorded -- an unobservable launch, an unattached child,
+    a child that resolved a foreign service. It is never upgraded to a pass.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"status": "refused", "code": self.code, "message": str(self)}
+
+
+def _attested_transports(observed_env: Mapping[str, str]) -> frozenset[str]:
+    """The transports the *observed child environment* attests, never the host.
+
+    The declared attestation is the only transport signal here: the child's own
+    ``SKILLWEAVE_CLIENT_CAPABILITY`` (if any). No config-file anchor, no
+    skill-root probe, and above all no desktop/interactive setting is consulted
+    -- criterion 5 requires the child's capability to come from the actual
+    headless launch. A child that attests nothing falls closed to the file-poll
+    adapter.
+    """
+    parsed = _parse_attestation(observed_env.get(CAPABILITY_ATTESTATION_ENV, ""))
+    if not parsed:
+        return frozenset({TRANSPORT_FILE_POLL})
+    raw = parsed.get("transports") or []
+    transports = frozenset(str(t) for t in raw)
+    return transports or frozenset({TRANSPORT_FILE_POLL})
+
+
+def capability_from_child_launch(
+    *,
+    client_id: str,
+    grant: Any,
+    observed_env: Optional[Mapping[str, str]],
+    attempt: str = "",
+) -> HarnessClientCapability:
+    """Record a child client's capability from its *actual* headless launch.
+
+    Criterion 5 is precise about the source: a child session's capabilities are
+    recorded **from an actual headless launch**, not inferred from the
+    interactive/desktop settings. So this reads only the child's own *observed*
+    environment -- the effective MCP configuration the launch provisioned -- and
+    never :data:`_MCP_CONFIG_ANCHORS` (the desktop anchors) or any skill-root
+    probe. Fails closed with a named :class:`ChildCapabilityError` when the
+    launch cannot be honestly characterised:
+
+    * the child's effective environment is unobservable;
+    * the child did not carry the server-issued session token (it never attached
+      to this controller), or resolved no process-service binding;
+    * the child resolved a *different* process service than the one the grant
+      names (an isolated per-harness controller), refused through the same
+      :func:`refuse_isolated_controller` seam the launch verification uses.
+
+    The recorded capability carries **no environment value** -- only detected
+    facts -- so a provider credential can never be captured into it.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    if not client_id:
+        raise ChildCapabilityError(
+            CHILD_CAPABILITY_UNKNOWN_HARNESS,
+            "a child capability requires the child harness's client id",
+        )
+    if observed_env is None:
+        raise ChildCapabilityError(
+            CHILD_CAPABILITY_UNOBSERVABLE,
+            "the child launch did not expose its resolved environment, so its "
+            "capabilities cannot be recorded from the actual launch",
+        )
+    token = observed_env.get(str(_bootstrap.ENV_MCP_SESSION_TOKEN), "")
+    if not token or token != getattr(grant, "session_token", ""):
+        raise ChildCapabilityError(
+            CHILD_CAPABILITY_TOKEN_MISMATCH,
+            "the child launch did not carry the granted session token; it did "
+            "not attach to this controller",
+        )
+    observed_service = _bootstrap.service_from_environment(observed_env)
+    if observed_service is None:
+        raise ChildCapabilityError(
+            CHILD_CAPABILITY_NO_SERVICE_BINDING,
+            "the child launch carried no observable process-service binding",
+        )
+    try:
+        _bootstrap.refuse_isolated_controller(grant.service, observed_service)
+    except _bootstrap.ProcessServiceMismatchRefused as exc:
+        raise ChildCapabilityError(CHILD_CAPABILITY_FOREIGN_SERVICE, str(exc))
+
+    parsed = _parse_attestation(observed_env.get(CAPABILITY_ATTESTATION_ENV, ""))
+    features = dict((parsed or {}).get("features") or {})
+    resume = bool(
+        (parsed or {}).get(HARNESS_SESSION_RESUME_CAPABILITY)
+        or features.get(HARNESS_SESSION_RESUME_CAPABILITY)
+    )
+    return HarnessClientCapability(
+        client_id=client_id,
+        detected=True,
+        transports=_attested_transports(observed_env),
+        features={
+            # Facts, never values: no credential, no path from the host.
+            "recorded_from": "headless-launch",
+            "session_token_present": True,
+            "service_bound": True,
+            "attempt": attempt,
+        },
+        reason="recorded from an actual headless child launch",
+        resume_capability_attested=resume,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SW-1511-RECOVERY criterion 6: one recovered owned attempt per independent
+# interruption, mailbox replay/ack by cursor, no duplicate dispatch
+# ---------------------------------------------------------------------------
+
+#: The two interruptions the criterion names, *independently*: the durable
+#: controller service is killed and restarted, or the interactive main harness
+#: is replaced. Each must produce exactly one recovered owned attempt.
+RECOVERY_TRIGGER_CONTROLLER_RESTART = "controller_restart"
+RECOVERY_TRIGGER_HARNESS_REPLACEMENT = "harness_replacement"
+RECOVERY_TRIGGERS: tuple[str, ...] = (
+    RECOVERY_TRIGGER_CONTROLLER_RESTART,
+    RECOVERY_TRIGGER_HARNESS_REPLACEMENT,
+)
+
+#: Why no owned attempt was recovered.
+RECOVERY_NO_OWNED_ATTEMPT = "no_owned_attempt"
+RECOVERY_FIRST_ATTEMPT_NOT_VERIFIED = "first_attempt_not_verified"
+RECOVERY_UNKNOWN_TRIGGER = "unknown_recovery_trigger"
+RECOVERY_SCOPE_NOT_BOUND = "recovery_scope_not_bound"
+
+
+@dataclass(frozen=True)
+class RecoveredOwnedAttempt:
+    """The single owned attempt an independent interruption recovers.
+
+    ``recovered`` is ``True`` only when the *ordering-first* in-flight attempt's
+    recorded identity still verifies. A first attempt that no longer verifies is
+    a fail-closed refusal that never adopts a later attempt, so one interruption
+    can never recover two attempts and a stolen frontier is never adopted. The
+    ``scope`` records the record's own run/task/attempt, never a relabel of the
+    caller's request.
+    """
+
+    trigger: str
+    run_id: str
+    task_id: str
+    attempt: int
+    intent_id: str
+    session_id: str
+    recovered: bool
+    reason: str = ""
+    cursor: Optional[dict[str, Any]] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "recovered-owned-attempt-v1",
+            "trigger": self.trigger,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "attempt": self.attempt,
+            "intent_id": self.intent_id,
+            "session_id": self.session_id,
+            "recovered": self.recovered,
+            "reason": self.reason,
+            "cursor": self.cursor,
+        }
+
+
+def _intent_scope(intent: Any) -> tuple[str, str, int]:
+    return (
+        str(getattr(intent, "run_id", "") or ""),
+        str(getattr(intent, "task_id", "") or ""),
+        int(getattr(intent, "attempt", 0) or 0),
+    )
+
+
+def plan_owned_attempt_recovery(
+    *,
+    trigger: str,
+    run_id: str,
+    intent_id: str,
+    session_id: str,
+    task_id: str = "",
+    attempt: int = 0,
+    intents: Optional[Sequence[Any]] = None,
+    cursor: Optional[dict[str, Any]] = None,
+) -> RecoveredOwnedAttempt:
+    """Resolve exactly one recovered owned attempt for an interruption.
+
+    The caller supplies the *already ordering-first, claiming-only* durable
+    intents for the run (the frontier ``created_at``/``intent_id`` order the
+    store returns) and the identity-verified first attempt it selected -- the
+    same selection :func:`skillweave.runtime.native_process.plan_harness_continuation`
+    and the controller's ``_resume_decision`` make. This resolver enforces the
+    criterion's shape on that selection:
+
+    * the ``trigger`` must be one of :data:`RECOVERY_TRIGGERS` -- controller
+      restart and harness replacement are the only two admissions;
+    * a ``run_id`` is required (an unbound recovery has no scope to recover);
+    * the selected attempt's *own* run/task/attempt must match the requested
+      scope -- a record that belongs to a different run/task/attempt is never
+      relabelled and never adopted;
+    * recovery is granted only when the frontier carried a verified owned
+      attempt (``intent_id``/``session_id`` non-empty). A frontier with no
+      attempt, or whose first attempt did not verify, is a named fail-closed
+      refusal that adopts nothing else.
+    """
+    if trigger not in RECOVERY_TRIGGERS:
+        return RecoveredOwnedAttempt(
+            trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+            intent_id="", session_id="", recovered=False,
+            reason=RECOVERY_UNKNOWN_TRIGGER,
+        )
+    if not run_id:
+        return RecoveredOwnedAttempt(
+            trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+            intent_id="", session_id="", recovered=False,
+            reason=RECOVERY_SCOPE_NOT_BOUND,
+        )
+    ordered = list(intents or ())
+    if not ordered or not intent_id or not session_id:
+        return RecoveredOwnedAttempt(
+            trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+            intent_id="", session_id="", recovered=False,
+            reason=RECOVERY_NO_OWNED_ATTEMPT,
+            cursor=cursor,
+        )
+    # The adopted record must be the frontier and must carry its *own* scope
+    # equal to the requested scope: never a relabel of a foreign record.
+    first = ordered[0]
+    if str(getattr(first, "intent_id", "") or "") != intent_id:
+        return RecoveredOwnedAttempt(
+            trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+            intent_id="", session_id="", recovered=False,
+            reason=RECOVERY_FIRST_ATTEMPT_NOT_VERIFIED,
+            cursor=cursor,
+        )
+    rec_run, rec_task, rec_attempt = _intent_scope(first)
+    scope_ok = rec_run == run_id and (
+        (not task_id and not rec_task) or rec_task == task_id
+    ) and (not attempt or rec_attempt == attempt)
+    if not scope_ok:
+        return RecoveredOwnedAttempt(
+            trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+            intent_id="", session_id="", recovered=False,
+            reason=RECOVERY_FIRST_ATTEMPT_NOT_VERIFIED,
+            cursor=cursor,
+        )
+    return RecoveredOwnedAttempt(
+        trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+        intent_id=intent_id, session_id=session_id, recovered=True,
+        reason="", cursor=cursor,
+    )
+
+
+def mailbox_cursor_binding(
+    *,
+    after_seq: int = 0,
+    last_digest: str = "",
+) -> Any:
+    """The durable ``shared-process-mailbox-binding-v1`` cursor value type.
+
+    Built through the same bootstrap seam the child grant uses, so the cursor a
+    recovered session resends is the *exact* schema the mailbox verifies against
+    -- a cursor from a different mailbox or a rewritten/truncated channel is
+    refused by :meth:`SharedProcessMailboxBinding.verify_against` / the mailbox
+    read, never silently accepted.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    return _bootstrap.MailboxCursorBinding(
+        after_seq=int(after_seq), last_digest=last_digest
+    )
+
+
+def cursor_token(cursor: Any) -> tuple[int, str]:
+    """``(after_seq, last_digest)`` decoded from a durable cursor token.
+
+    A recovered session resends the **opaque token** a prior read emitted (the
+    mailbox's own ``MailboxCursor`` encoding), never a caller-chosen offset: the
+    token is decoded through :meth:`MailboxCursor.decode`, so a rewritten or
+    foreign token is a :class:`MessageChannelError`, not an accepted position.
+    An absent token is the empty position ``(0, "")``.
+    """
+    from skillweave.dispatch.messaging import MailboxCursor
+
+    if not cursor or not isinstance(cursor, str):
+        return 0, ""
+    decoded = MailboxCursor.decode(cursor)
+    if decoded is None:
+        return 0, ""
+    return int(decoded.after_seq), str(decoded.last_digest)
+
+
+def replay_by_cursor(
+    mailbox: Any,
+    *,
+    recipient: str,
+    principal: str,
+    cursor: Any = None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Replay a mailbox from a durable cursor token, returning ``(records, token)``.
+
+    This is criterion 6's *mailbox replay by cursor*: the read starts exactly
+    after the position the prior session persisted, so a session that never
+    observed the live notification still replays every durable message it had
+    not yet accepted, in append order. The ``cursor`` is the **opaque token the
+    mailbox itself emitted** (decoded via :meth:`MailboxCursor.decode`); the
+    mailbox verifies the pinned digest against the record it names, so a
+    truncated or rewritten channel is refused (:class:`MessageChannelError`)
+    rather than silently resumed past lost work. The returned token is the
+    mailbox's own next-cursor encoding, ready to persist.
+    """
+    from skillweave.dispatch.messaging import MailboxCursor
+
+    after_seq, _last_digest = cursor_token(cursor)
+    token = cursor if isinstance(cursor, str) else ""
+    records = mailbox.read(
+        recipient=recipient,
+        principal=principal,
+        resume_token=token,
+        after_seq=after_seq,
+    )
+    if records:
+        next_token = MailboxCursor(
+            after_seq=int(records[-1].get("seq", 0)),
+            last_digest=str(records[-1].get("digest", "")),
+        ).encode()
+    else:
+        next_token = token
+    return list(records), next_token
+
+
+def ack_by_cursor(
+    mailbox: Any,
+    *,
+    records: Sequence[Mapping[str, Any]],
+    recipient: str,
+    principal: str,
+    note: str = "",
+) -> list[dict[str, Any]]:
+    """Acknowledge each replayed record through the durable ``ack`` reply.
+
+    An ack is addressed to the message's *own* recipient under its *own* scoped
+    principal, and is idempotent by a derived reply id -- so a replayed ack
+    (a duplicate delivery after a second interruption) appends no second
+    acknowledgement. A record addressed to a different recipient/principal is
+    refused by the mailbox, never acknowledged on another's behalf.
+    """
+    acks: list[dict[str, Any]] = []
+    for record in records:
+        message_id = str(record.get("message_id", "") or "")
+        if not message_id:
+            continue
+        acks.append(
+            mailbox.ack(message_id, recipient=recipient, principal=principal, note=note)
+        )
+    return acks
 
 
 # ---------------------------------------------------------------------------

@@ -3892,3 +3892,889 @@ class TestWorkerCredentialGuardOnRealOutputPaths:
             )
         # A clean line with only a short placeholder passes.
         boot.assert_worker_credentials_not_in_logs("region us: n=1", {"WORKER_API_KEY": "1"})
+
+
+# ===========================================================================
+# SW-1511-RECOVERY criterion 4: independent two-harness qualification
+# reproduces review/repair/re-review continuation; unpublished or unavailable
+# harness features stay unsupported.
+# ===========================================================================
+
+
+def _stage_entries(*, missing=(), unpublished=(), unavailable=()):
+    """Per-stage observations for the four recovery stages, each overridable."""
+    from skillweave.dispatch import harness_contract as _contract
+
+    entries = []
+    for name in _contract.RECOVERY_STAGES:
+        if name in missing:
+            continue
+        entries.append({
+            "stage": name,
+            "feature": f"{name}-feature",
+            "published": name not in unpublished,
+            "available": name not in unavailable,
+            "evidence": f"observed-{name}",
+        })
+    return json.dumps(entries)
+
+
+class TestTwoHarnessRecoveryQualification:
+    """Criterion 4 through the registered ``qualified_harness_continuation``.
+
+    The tool is the real production caller of
+    ``qualify_two_harness_recovery``: each harness supplies its own per-stage
+    observations, and the qualification fails closed on every input that cannot
+    prove the criterion. An unpublished or unavailable feature is never
+    upgraded -- it stays unsupported, named.
+    """
+
+    def _token(self, authority):
+        return authority.issue_session(
+            role="controller", client_id="main", transport="http", run_ids=["run-1"]
+        )
+
+    def _qualify(self, authority, *, a, b, extra=""):
+        return json.loads(
+            mcp_server.qualified_harness_continuation(
+                harness_a="harness-a", harness_b="harness-b",
+                features_a=a, features_b=b, criteria_results=extra,
+                session_token=self._token(authority),
+            )
+        )
+
+    def test_two_supported_distinct_harnesses_qualify(self, authority):
+        """Two distinct harnesses reproducing every stage are qualified."""
+        out = self._qualify(
+            authority, a=_stage_entries(), b=_stage_entries(),
+        )
+        assert out["status"] == "qualified", out
+        assert out["qualified"] is True, out
+        assert out["schema"] == "two-harness-qualification-v1"
+        assert out["harness_ids"] == ["harness-a", "harness-b"]
+        assert out["unsupported"] == [], out
+        assert out["reason"] == "", out
+
+    def test_an_unpublished_feature_stays_unsupported_by_name(self, authority):
+        """An unpublished feature is named unsupported -- never upgraded."""
+        out = self._qualify(
+            authority,
+            a=_stage_entries(unpublished={"repair"}),
+            b=_stage_entries(),
+        )
+        assert out["status"] == "hold", out
+        assert out["qualified"] is False, out
+        assert "harness-a:repair:unpublished" in out["unsupported"], out
+        # The other harness's fully supported stages are not relabelled.
+        assert all(
+            not entry.startswith("harness-b:") for entry in out["unsupported"]
+        ), out
+
+    def test_an_unavailable_feature_stays_unsupported_by_name(self, authority):
+        """A published-but-unavailable feature stays unsupported, named."""
+        out = self._qualify(
+            authority,
+            a=_stage_entries(),
+            b=_stage_entries(unavailable={"re-review"}),
+        )
+        assert out["status"] == "hold", out
+        assert out["qualified"] is False, out
+        assert "harness-b:re-review:unavailable" in out["unsupported"], out
+
+    def test_a_missing_recovery_stage_is_unsupported_by_name(self, authority):
+        """A stage the harness never reported is ``missing``, never skipped."""
+        out = self._qualify(
+            authority,
+            a=_stage_entries(missing={"continuation"}),
+            b=_stage_entries(),
+        )
+        assert out["status"] == "hold", out
+        assert "harness-a:continuation:missing" in out["unsupported"], out
+
+    def test_the_same_harness_twice_is_not_an_independent_qualification(
+        self, authority
+    ):
+        """Two entries carrying one ``harness_id`` are refused by name."""
+        out = json.loads(
+            mcp_server.qualified_harness_continuation(
+                harness_a="harness-a", harness_b="harness-a",
+                features_a=_stage_entries(), features_b=_stage_entries(),
+                session_token=self._token(authority),
+            )
+        )
+        assert out["status"] == "hold", out
+        assert out["qualified"] is False, out
+        assert "distinct" in out["reason"], out
+
+    def test_a_third_harness_is_refused_not_absorbed(self, authority):
+        """A third harness through ``criteria_results`` is refused, not merged."""
+        extra = json.dumps([
+            {"harness_id": "harness-c", "stages": json.loads(_stage_entries())}
+        ])
+        out = self._qualify(
+            authority, a=_stage_entries(), b=_stage_entries(), extra=extra,
+        )
+        assert out["status"] == "hold", out
+        assert out["qualified"] is False, out
+        assert "exactly two harnesses are required, got 3" in out["reason"], out
+
+    def test_a_forged_stage_observation_cannot_be_read_as_supported(
+        self, authority
+    ):
+        """A stage declared only in prose (no published/available) is unsupported.
+
+        The refuted forgery: a caller asserting support in a free-text field.
+        Support is derived only from the boolean facts the observation carries,
+        so a stage that omits them is unsupported -- never inferred from the
+        neighbouring evidence string.
+        """
+        forged = json.dumps([
+            {"stage": name, "feature": "looks-supported", "evidence": "PASS"}
+            for name in ("review", "repair", "re-review", "continuation")
+        ])
+        out = self._qualify(authority, a=forged, b=_stage_entries())
+        assert out["status"] == "hold", out
+        assert out["qualified"] is False, out
+        for stage in ("review", "repair", "re-review", "continuation"):
+            assert f"harness-a:{stage}:unpublished" in out["unsupported"], out
+
+    def test_the_qualification_tool_requires_a_bound_authority(
+        self, authority
+    ):
+        """Without a resolvable credential the tool refuses, never qualifies."""
+        out = json.loads(
+            mcp_server.qualified_harness_continuation(
+                harness_a="harness-a", harness_b="harness-b",
+                features_a=_stage_entries(), features_b=_stage_entries(),
+                session_token="not-a-real-token",
+            )
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "unauthenticated", out
+
+
+# ===========================================================================
+# SW-1511-RECOVERY criterion 5: two real distinct supported harnesses attached
+# to the same service; a child session's capability is recorded from an
+# *actual headless launch*, never inferred from desktop/interactive settings.
+# ===========================================================================
+
+
+class TestChildCapabilityRecordedFromHeadlessLaunch:
+    """Criterion 5 through the registered ``register_child_harness_capability``.
+
+    The tool is the production caller: it authorizes on ``attach_harness``,
+    mints the child's grant, drives the **real** canonical inline seam
+    (``dispatch.application._default_inline_seam``, which provisions and then
+    verifies the child's own resolved environment) and records the capability
+    from that launch. An unobservable, wrongly-tokened or foreign-service child
+    is a named refusal reached through the seam's own verification.
+    """
+
+    def _worker_token(self, authority, root, *, client_id="ops-child",
+                      run_ids=("run-1",)):
+        return authority.issue_session(
+            role="worker", client_id=client_id, transport="http",
+            run_ids=list(run_ids), allowed_roots=[str(root)],
+        )
+
+    def _bind_mailbox(self, tmp_path, monkeypatch) -> Path:
+        path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(path))
+        return path
+
+    def test_capability_is_recorded_from_the_real_child_launch(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """The real seam launches the child and the capability comes from it."""
+        self._bind_mailbox(tmp_path, monkeypatch)
+        token = self._worker_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.register_child_harness_capability(
+                client_id="ops-child", role="worker", run_id="run-1",
+                task_id="task-a", attempt=3,
+                db_path=str(tmp_path / "store.db"),
+                artifacts_path=str(tmp_path / "artifacts"),
+                session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        # The launch really happened (a real interpreter child, exit 0).
+        assert out["launch_exit_code"] == 0, out
+        capability = out["capability"]
+        assert capability["detected"] is True, out
+        assert capability["features"]["recorded_from"] == "headless-launch", out
+        assert capability["features"]["session_token_present"] is True, out
+        assert capability["features"]["service_bound"] is True, out
+        assert capability["features"]["attempt"] == "task-a/attempt-3", out
+        # Detected facts only: no environment value rides in the record.
+        assert mcp_server.default_mailbox_path() not in json.dumps(capability), out
+        assert str(tmp_path) not in json.dumps(capability), out
+
+    def test_two_distinct_harnesses_record_against_the_same_service(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """Two distinct child harnesses both resolve the one durable service."""
+        self._bind_mailbox(tmp_path, monkeypatch)
+        db_path = str(tmp_path / "store.db")
+        artifacts_path = str(tmp_path / "artifacts")
+        recorded = {}
+        for client_id in ("ops-child-a", "ops-child-b"):
+            token = self._worker_token(authority, tmp_path, client_id=client_id)
+            out = json.loads(
+                mcp_server.register_child_harness_capability(
+                    client_id=client_id, role="worker", run_id="run-1",
+                    attempt=1, db_path=db_path, artifacts_path=artifacts_path,
+                    session_token=token,
+                )
+            )
+            assert out["status"] == "ok", out
+            recorded[client_id] = out
+        identities = {o["service_identity"] for o in recorded.values()}
+        assert len(identities) == 1, recorded
+        # Both are distinct harnesses on that one identity, never one relabelled.
+        assert recorded["ops-child-a"]["capability"]["client_id"] == "ops-child-a"
+        assert recorded["ops-child-b"]["capability"]["client_id"] == "ops-child-b"
+        for out in recorded.values():
+            assert out["capability"]["features"]["recorded_from"] == "headless-launch"
+
+    def test_desktop_anchors_cannot_substitute_for_the_launch(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A positive desktop/MCP config signal never infers the child's capability.
+
+        The forgery: the interactive/desktop settings (``_MCP_CONFIG_ANCHORS``)
+        claim the harness speaks MCP notifications. The capability must still be
+        the *launch's* observation -- least-capable file-poll transports, since
+        the child attested nothing -- so the desktop signal cannot upgrade it.
+        """
+        self._bind_mailbox(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            handoff_mod, "_default_config_resolver",
+            lambda client_id: True, raising=False,
+        )
+        monkeypatch.setattr(
+            handoff_mod, "_default_skill_root_resolver",
+            lambda client_id: "/opt/skill-root-that-claims-mcp", raising=False,
+        )
+        token = self._worker_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.register_child_harness_capability(
+                client_id="ops-child", role="worker", run_id="run-1", attempt=1,
+                db_path=str(tmp_path / "store.db"),
+                artifacts_path=str(tmp_path / "artifacts"),
+                session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        capability = out["capability"]
+        assert capability["features"]["recorded_from"] == "headless-launch", out
+        assert capability["transports"] == [handoff_mod.TRANSPORT_FILE_POLL], out
+        assert "/opt/skill-root-that-claims-mcp" not in json.dumps(capability), out
+
+    def test_a_forged_attestation_in_the_child_env_is_not_adopted(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A child-injected attestation is not the recorded capability surface.
+
+        The forgery: the child's own env advertises the MCP-notification
+        transport and session resume. The recorded capability is derived from
+        the *verified grant environment* (the server-owned 7-key grant), never
+        from whatever the child adds to its own env -- so the forged/ambient
+        attestation cannot upgrade the record. The recorded surface stays the
+        least-capable file-poll transport and no resume is attested.
+        """
+        self._bind_mailbox(tmp_path, monkeypatch)
+        from skillweave.dispatch.application import _default_inline_seam as _seam
+
+        def _seam_with_attestation(command, **kwargs):
+            env = dict(kwargs.get("env") or {})
+            env[handoff_mod.CAPABILITY_ATTESTATION_ENV] = json.dumps(
+                {"transports": [handoff_mod.TRANSPORT_MCP_NOTIFICATIONS],
+                 "features": {"session-resume": True}}
+            )
+            return _seam(command, **dict(kwargs, env=env))
+
+        monkeypatch.setattr(
+            dispatch_app, "_default_inline_seam", _seam_with_attestation
+        )
+        token = self._worker_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.register_child_harness_capability(
+                client_id="ops-child", role="worker", run_id="run-1", attempt=1,
+                db_path=str(tmp_path / "store.db"),
+                artifacts_path=str(tmp_path / "artifacts"),
+                session_token=token,
+            )
+        )
+        assert out["status"] == "ok", out
+        capability = out["capability"]
+        assert capability["features"]["recorded_from"] == "headless-launch", out
+        # The forged child env never reaches the recorded surface: the grant
+        # env carries no attestation, so the transport stays least-capable and
+        # resume is unattested.
+        assert capability["transports"] == [handoff_mod.TRANSPORT_FILE_POLL], out
+        assert capability["resume_capability_attested"] is False, out
+
+    def test_an_unobservable_child_launch_is_a_named_refusal(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A child whose effective env is unobservable refuses -- never a pass."""
+        self._bind_mailbox(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "skillweave.runtime.runner_adapter.start_process",
+            lambda *a, **k: _FakeHandle(effective_env=None),
+        )
+        token = self._worker_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.register_child_harness_capability(
+                client_id="ops-child", role="worker", run_id="run-1", attempt=1,
+                db_path=str(tmp_path / "store.db"),
+                artifacts_path=str(tmp_path / "artifacts"),
+                session_token=token,
+            )
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "process_service_mismatch", out
+        assert "capability" not in out, out
+
+    def test_a_child_without_the_granted_token_is_refused(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A child that never carried the granted token is refused by name."""
+        self._bind_mailbox(tmp_path, monkeypatch)
+
+        def _foreign_token_handle(command, **kwargs):
+            env = dict(kwargs.get("env") or {})
+            env[boot.ENV_MCP_SESSION_TOKEN] = "not-the-granted-token"
+            return _FakeHandle(effective_env=env)
+
+        monkeypatch.setattr(
+            "skillweave.runtime.runner_adapter.start_process", _foreign_token_handle
+        )
+        token = self._worker_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.register_child_harness_capability(
+                client_id="ops-child", role="worker", run_id="run-1", attempt=1,
+                db_path=str(tmp_path / "store.db"),
+                artifacts_path=str(tmp_path / "artifacts"),
+                session_token=token,
+            )
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "process_service_mismatch", out
+
+    def test_a_child_resolving_a_foreign_service_is_refused(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A child that resolved an isolated per-harness store is refused.
+
+        The child keeps the granted token but resolves a *different* store -- an
+        independently-initialized controller. The seam's identity check refuses
+        it, so a foreign-service capability is never recorded.
+        """
+        self._bind_mailbox(tmp_path, monkeypatch)
+
+        def _foreign_service_handle(command, **kwargs):
+            env = dict(kwargs.get("env") or {})
+            env[boot.ENV_MCP_DB_PATH] = str(tmp_path / "elsewhere" / "store.db")
+            return _FakeHandle(effective_env=env)
+
+        monkeypatch.setattr(
+            "skillweave.runtime.runner_adapter.start_process",
+            _foreign_service_handle,
+        )
+        token = self._worker_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.register_child_harness_capability(
+                client_id="ops-child", role="worker", run_id="run-1", attempt=1,
+                db_path=str(tmp_path / "store.db"),
+                artifacts_path=str(tmp_path / "artifacts"),
+                session_token=token,
+            )
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "process_service_mismatch", out
+
+    def test_a_store_outside_the_bound_roots_never_reaches_a_launch(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A db_path outside the principal's roots is refused before any launch."""
+        self._bind_mailbox(tmp_path, monkeypatch)
+        launched = []
+        monkeypatch.setattr(
+            "skillweave.runtime.runner_adapter.start_process",
+            lambda *a, **k: launched.append(k) or _FakeHandle(effective_env=k.get("env")),
+        )
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        root = tmp_path / "bound"
+        root.mkdir()
+        token = self._worker_token(authority, root)
+        out = json.loads(
+            mcp_server.register_child_harness_capability(
+                client_id="ops-child", role="worker", run_id="run-1", attempt=1,
+                db_path=str(outside / "store.db"),
+                artifacts_path=str(outside / "artifacts"),
+                session_token=token,
+            )
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "path_injection_refused", out
+        assert launched == [], launched
+
+    def test_a_controller_cannot_reach_this_tool_with_a_child_role(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """The requested role is checked against the authenticated role.
+
+        A controller presenting the default child role ``worker`` is refused as
+        a role escalation -- the child role is derived from the *authenticated*
+        principal, never chosen by the caller.
+        """
+        self._bind_mailbox(tmp_path, monkeypatch)
+        token = authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            run_ids=["run-1"], allowed_roots=[str(tmp_path)],
+        )
+        out = json.loads(
+            mcp_server.register_child_harness_capability(
+                client_id="ops-child", role="worker", run_id="run-1", attempt=1,
+                db_path=str(tmp_path / "store.db"),
+                artifacts_path=str(tmp_path / "artifacts"),
+                session_token=token,
+            )
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "role_escalation_refused", out
+
+    def test_no_child_role_may_be_minted_as_controller(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """Even a controller cannot mint a second controller child."""
+        self._bind_mailbox(tmp_path, monkeypatch)
+        token = authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            run_ids=["run-1"], allowed_roots=[str(tmp_path)],
+        )
+        out = json.loads(
+            mcp_server.register_child_harness_capability(
+                client_id="second-controller", role="controller", run_id="run-1",
+                attempt=1, db_path=str(tmp_path / "store.db"),
+                artifacts_path=str(tmp_path / "artifacts"),
+                session_token=token,
+            )
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "role_escalation_refused", out
+
+    def test_a_worker_cannot_mint_a_reviewer_child(self, authority, tmp_path, monkeypatch):
+        """A worker may attach only a peer worker, never a reviewer child."""
+        self._bind_mailbox(tmp_path, monkeypatch)
+        token = self._worker_token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.register_child_harness_capability(
+                client_id="rev-child", role="reviewer", run_id="run-1", attempt=1,
+                db_path=str(tmp_path / "store.db"),
+                artifacts_path=str(tmp_path / "artifacts"),
+                session_token=token,
+            )
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "role_escalation_refused", out
+
+    def test_recording_a_capability_requires_a_bound_authority(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """An unresolvable credential refuses; no capability is ever inferred."""
+        self._bind_mailbox(tmp_path, monkeypatch)
+        out = json.loads(
+            mcp_server.register_child_harness_capability(
+                client_id="ops-child", role="worker", run_id="run-1", attempt=1,
+                db_path=str(tmp_path / "store.db"),
+                artifacts_path=str(tmp_path / "artifacts"),
+                session_token="bogus-token",
+            )
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "unauthenticated", out
+
+
+# ===========================================================================
+# SW-1511-RECOVERY criterion 6: each independent interruption (killed and
+# restarted controller service; replaced interactive main harness) produces
+# exactly one recovered owned attempt -- with mailbox replay/ack by cursor and
+# no duplicate dispatch or role escalation.
+# ===========================================================================
+
+
+class TestRecoverOwnedAttemptAcrossInterruptions:
+    """Criterion 6 through the registered ``recover_owned_attempt`` tool.
+
+    The tool is the production caller: ``recover`` adopts the run's
+    *ordering-first, claiming-only verified* owned attempt from the durable
+    store (never a caller field) and records exactly one durable recovery
+    marker; ``replay``/``ack`` drive the durable mailbox by cursor. Every
+    forgery -- a stolen frontier, a relabelled record, a second controller
+    minted as a child, a re-driven recovery -- is refused by name.
+    """
+
+    def _mailbox_path(self, tmp_path, monkeypatch) -> Path:
+        path = tmp_path / "mb.jsonl"
+        monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, str(path))
+        return path
+
+    def _token(self, authority, root, *, role="controller", client_id="main"):
+        return authority.issue_session(
+            role=role, client_id=client_id, transport="http",
+            run_ids=["run-1"], allowed_roots=[str(root)],
+        )
+
+    def _seed_intent(
+        self, db_path, *, session_id, process_identity, intent_id,
+        state="launched", attempt=1,
+    ) -> None:
+        from skillweave.runtime.store import SQLiteRunStore
+
+        store = SQLiteRunStore(db_path)
+        store.record_dispatch_intent(
+            run_id="run-1", task_id="task-a", attempt=attempt,
+            execution_scope=f"run-1/task-a/{attempt}", step="ready_dispatch",
+            state=state, session_id=session_id,
+            process_identity=process_identity, intent_id=intent_id,
+        )
+        store.close()
+
+    def _live_identity(self):
+        return process_identity.capture(os.getpid()).to_dict()
+
+    def _forged_identity(self):
+        forged = process_identity.capture(os.getpid()).to_dict()
+        forged["start_time"] = "0.0"  # a recycled pid: never the owned attempt
+        return forged
+
+    def _recover(self, token, db_path, *, trigger, run_id="run-1"):
+        return json.loads(
+            mcp_server.recover_owned_attempt(
+                "recover", trigger=trigger, run_id=run_id,
+                db_path=db_path, session_token=token,
+            )
+        )
+
+    def test_controller_restart_recovers_exactly_one_owned_attempt(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """The killed-and-restarted controller adopts the one frontier attempt."""
+        mailbox_path = self._mailbox_path(tmp_path, monkeypatch)
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-live", process_identity=self._live_identity(),
+            intent_id="intent-live",
+        )
+        token = self._token(authority, tmp_path)
+        out = self._recover(
+            token, db_path,
+            trigger=handoff_mod.RECOVERY_TRIGGER_CONTROLLER_RESTART,
+        )
+        assert out["status"] == "recovered", out
+        assert out["recovered"] is True, out
+        assert out["recorded"] is True, out
+        assert out["intent_id"] == "intent-live", out
+        assert out["session_id"] == "sess-live", out
+        assert out["schema"] == "recovered-owned-attempt-v1", out
+        assert out["trigger"] == handoff_mod.RECOVERY_TRIGGER_CONTROLLER_RESTART
+        # Exactly one durable recovery marker on the run's own channel.
+        marker = mcp_server._recovery_message_id("run-1")
+        assert out["message_id"] == marker, out
+        records = AgentMailbox(str(mailbox_path)).read(
+            recipient="mcp:controller:main", principal="mcp:controller:main",
+        )
+        markers = [r for r in records if r.get("message_id") == marker]
+        assert len(markers) == 1, records
+        assert markers[0]["run_id"] == "run-1"
+
+    def test_a_second_recovery_records_nothing_and_dispatches_nothing(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A re-driven recovery reports ``already_recorded``; no second attempt."""
+        self._mailbox_path(tmp_path, monkeypatch)
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-live", process_identity=self._live_identity(),
+            intent_id="intent-live",
+        )
+        token = self._token(authority, tmp_path)
+        first = self._recover(
+            token, db_path,
+            trigger=handoff_mod.RECOVERY_TRIGGER_CONTROLLER_RESTART,
+        )
+        assert first["status"] == "recovered", first
+        # A second, independently-triggered recovery of the same run.
+        second = self._recover(
+            token, db_path,
+            trigger=handoff_mod.RECOVERY_TRIGGER_HARNESS_REPLACEMENT,
+        )
+        assert second["status"] == "already_recorded", second
+        assert second["recorded"] is False, second
+        assert second["recovered"] is False, second
+        assert second["code"] == "recovery_already_recorded", second
+        # No duplicate dispatch: the store gained no second claiming intent.
+        store = SQLiteRunStore(db_path)
+        intents = store.list_dispatch_intents("run-1", claiming_only=True)
+        store.close()
+        assert len(intents) == 1, [i.intent_id for i in intents]
+
+    def test_the_two_interruptions_are_each_recoverable(self, tmp_path, monkeypatch):
+        """Controller restart and harness replacement are independent admissions.
+
+        Each trigger is driven against its *own* run, so the two interruptions
+        produce one recovered owned attempt apiece -- and any other trigger
+        string is refused rather than coerced to one of the two.
+        """
+        self._mailbox_path(tmp_path, monkeypatch)
+        from skillweave.runtime.authority import MCPPrincipalAuthority
+
+        previous = mcp_server.get_authority()
+        try:
+            for trigger, run_id in (
+                (handoff_mod.RECOVERY_TRIGGER_CONTROLLER_RESTART, "run-1"),
+                (handoff_mod.RECOVERY_TRIGGER_HARNESS_REPLACEMENT, "run-2"),
+            ):
+                auth = MCPPrincipalAuthority()
+                mcp_server.bind_authority(auth)
+                root = tmp_path / trigger
+                root.mkdir()
+                db_path = str(root / "store.db")
+                store = SQLiteRunStore(db_path)
+                store.record_dispatch_intent(
+                    run_id=run_id, task_id="task-a", attempt=1,
+                    execution_scope=f"{run_id}/task-a/1", step="ready_dispatch",
+                    state="launched", session_id="sess-live",
+                    process_identity=self._live_identity(), intent_id="intent-live",
+                )
+                store.close()
+                token = auth.issue_session(
+                    role="controller", client_id="main", transport="http",
+                    run_ids=[run_id], allowed_roots=[str(root)],
+                )
+                out = self._recover(token, db_path, trigger=trigger, run_id=run_id)
+                assert out["status"] == "recovered", out
+                assert out["trigger"] == trigger, out
+                assert out["run_id"] == run_id, out
+        finally:
+            mcp_server._AUTHORITY = previous
+        # An unknown trigger is a named refusal, never one of the two admissions.
+        auth = MCPPrincipalAuthority()
+        mcp_server.bind_authority(auth)
+        try:
+            root = tmp_path / "unknown"
+            root.mkdir()
+            db_path = str(root / "store.db")
+            store = SQLiteRunStore(db_path)
+            store.record_dispatch_intent(
+                run_id="run-1", task_id="task-a", attempt=1,
+                execution_scope="run-1/task-a/1", step="ready_dispatch",
+                state="launched", session_id="sess-live",
+                process_identity=self._live_identity(), intent_id="intent-live",
+            )
+            store.close()
+            token = auth.issue_session(
+                role="controller", client_id="main", transport="http",
+                run_ids=["run-1"], allowed_roots=[str(root)],
+            )
+            out = self._recover(token, db_path, trigger="power_cycle")
+        finally:
+            mcp_server._AUTHORITY = previous
+        assert out["status"] == "hold", out
+        assert out["recorded"] is False, out
+        assert out["reason"] == handoff_mod.RECOVERY_UNKNOWN_TRIGGER, out
+
+    def test_a_non_verifying_ordering_first_intent_is_not_skipped(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A stale ordering-first intent refuses; a later live one is not adopted.
+
+        The frontier's first record (by ``created_at``/``intent_id``) carries a
+        recycled identity and a live intent is recorded after it. The native
+        decision refuses on the frontier -- so the recovery must be the named
+        ``no_owned_attempt`` hold, never the later intent reached by skipping.
+        """
+        mailbox_path = self._mailbox_path(tmp_path, monkeypatch)
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-stale", process_identity=self._forged_identity(),
+            intent_id="intent-a-stale", attempt=1,
+        )
+        self._seed_intent(
+            db_path, session_id="sess-live", process_identity=self._live_identity(),
+            intent_id="intent-b-live", attempt=2,
+        )
+        token = self._token(authority, tmp_path)
+        out = self._recover(
+            token, db_path,
+            trigger=handoff_mod.RECOVERY_TRIGGER_CONTROLLER_RESTART,
+        )
+        assert out["status"] == "hold", out
+        assert out["recorded"] is False, out
+        assert out["reason"] == handoff_mod.RECOVERY_NO_OWNED_ATTEMPT, out
+        assert out["session_id"] == "", out
+        # Nothing was recorded durably: the frontier was never adopted.
+        records = AgentMailbox(str(mailbox_path)).read(
+            recipient="mcp:controller:main", principal="mcp:controller:main",
+        )
+        assert not [
+            r for r in records
+            if r.get("message_id") == mcp_server._recovery_message_id("run-1")
+        ], records
+
+    def test_a_record_belonging_to_another_run_is_never_relabelled(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A run with no claiming intent of its own recovers nothing of another's.
+
+        ``run-1`` has a live claiming intent; the caller recovers ``run-2`` on
+        the same store. The store's own run filter means run-2's frontier is
+        empty -- the recovery must hold with ``no_owned_attempt``, never adopt
+        (and never relabel) run-1's intent.
+        """
+        self._mailbox_path(tmp_path, monkeypatch)
+        token = authority.issue_session(
+            role="controller", client_id="main", transport="http",
+            run_ids=["run-1", "run-2"], allowed_roots=[str(tmp_path)],
+        )
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-live", process_identity=self._live_identity(),
+            intent_id="intent-live",
+        )
+        out = self._recover(
+            token, db_path,
+            trigger=handoff_mod.RECOVERY_TRIGGER_CONTROLLER_RESTART, run_id="run-2",
+        )
+        assert out["status"] == "hold", out
+        assert out["reason"] == handoff_mod.RECOVERY_NO_OWNED_ATTEMPT, out
+        assert out["run_id"] == "run-2", out
+        assert out["intent_id"] == "", out
+
+    def test_a_reviewer_token_cannot_recover_an_owned_attempt(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A reviewer may not mint a worker child: the recovery is refused.
+
+        ``recover`` adopts an owned attempt (a worker delegation), and a
+        reviewer is not permitted to attach a worker child -- so a reviewer's
+        recovery is a named role-escalation refusal, never a granted attempt.
+        """
+        self._mailbox_path(tmp_path, monkeypatch)
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-live", process_identity=self._live_identity(),
+            intent_id="intent-live",
+        )
+        token = self._token(authority, tmp_path, role="reviewer", client_id="rev")
+        out = self._recover(
+            token, db_path,
+            trigger=handoff_mod.RECOVERY_TRIGGER_CONTROLLER_RESTART,
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "role_escalation_refused", out
+
+    def test_recovery_without_a_bound_authority_is_refused(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """An unresolvable credential refuses; nothing is recovered."""
+        self._mailbox_path(tmp_path, monkeypatch)
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-live", process_identity=self._live_identity(),
+            intent_id="intent-live",
+        )
+        out = self._recover(
+            "not-a-real-token", db_path,
+            trigger=handoff_mod.RECOVERY_TRIGGER_CONTROLLER_RESTART,
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "unauthenticated", out
+
+    def test_an_unknown_recovery_action_is_refused(self, authority, tmp_path, monkeypatch):
+        """An action outside the three admissions is refused, never coerced."""
+        self._mailbox_path(tmp_path, monkeypatch)
+        token = self._token(authority, tmp_path)
+        out = json.loads(
+            mcp_server.recover_owned_attempt(
+                "purge", run_id="run-1", session_token=token,
+            )
+        )
+        assert out["status"] == "refused", out
+        assert out["code"] == "unknown_recovery_action", out
+
+    def test_replay_resumes_from_the_durable_cursor(self, authority, tmp_path, monkeypatch):
+        """Replay returns every unaccepted record and the next cursor to persist."""
+        self._mailbox_path(tmp_path, monkeypatch)
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-live", process_identity=self._live_identity(),
+            intent_id="intent-live",
+        )
+        token = self._token(authority, tmp_path)
+        recovered = self._recover(
+            token, db_path,
+            trigger=handoff_mod.RECOVERY_TRIGGER_CONTROLLER_RESTART,
+        )
+        assert recovered["status"] == "recovered", recovered
+        first = json.loads(
+            mcp_server.recover_owned_attempt(
+                "replay", run_id="run-1", session_token=token,
+            )
+        )
+        assert first["status"] == "ok", first
+        assert first["action"] == "replay", first
+        assert first["recipient"] == "mcp:controller:main", first
+        assert first["resume_token"], first
+        assert any(
+            m.get("message_id") == mcp_server._recovery_message_id("run-1")
+            for m in first["messages"]
+        ), first["messages"]
+        # Resuming from the token the mailbox itself emitted yields nothing new.
+        second = json.loads(
+            mcp_server.recover_owned_attempt(
+                "replay", run_id="run-1", resume_token=first["resume_token"],
+                session_token=token,
+            )
+        )
+        assert second["status"] == "ok", second
+        assert second["messages"] == [], second
+
+    def test_ack_is_idempotent_by_the_derived_reply_id(
+        self, authority, tmp_path, monkeypatch
+    ):
+        """A replayed ack appends no second acknowledgement."""
+        mailbox_path = self._mailbox_path(tmp_path, monkeypatch)
+        db_path = str(tmp_path / "store.db")
+        self._seed_intent(
+            db_path, session_id="sess-live", process_identity=self._live_identity(),
+            intent_id="intent-live",
+        )
+        token = self._token(authority, tmp_path)
+        self._recover(
+            token, db_path,
+            trigger=handoff_mod.RECOVERY_TRIGGER_CONTROLLER_RESTART,
+        )
+        first = json.loads(
+            mcp_server.recover_owned_attempt("ack", run_id="run-1", session_token=token)
+        )
+        assert first["status"] == "ok", first
+        assert first["action"] == "ack", first
+        assert first["acked"] >= 1, first
+        marker = mcp_server._recovery_message_id("run-1")
+        reply_id = f"{marker}:ack:mcp:controller:main"
+        # A second ack of the same records: idempotent, no duplicate reply.
+        second = json.loads(
+            mcp_server.recover_owned_attempt("ack", run_id="run-1", session_token=token)
+        )
+        assert second["status"] == "ok", second
+        records = AgentMailbox(str(mailbox_path)).read(
+            recipient="mcp:controller:main", principal="mcp:controller:main",
+        )
+        acks = [r for r in records if r.get("message_id") == reply_id]
+        assert len(acks) == 1, [r.get("message_id") for r in records]

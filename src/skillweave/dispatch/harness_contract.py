@@ -479,6 +479,200 @@ class StrictController:
             )
 
 
+# ── Two-harness recovery qualification (SW-1511-RECOVERY criterion 4) ───────
+
+#: The recovery stages an independent two-harness qualification must reproduce.
+#: ``continuation`` is the resume seam itself; ``review``/``repair``/``re-review``
+#: are the gates a recovered attempt is carried back through.
+RECOVERY_STAGES: tuple[str, ...] = ("review", "repair", "re-review", "continuation")
+
+#: A feature that is not published is not a feature at all -- it stays
+#: unsupported by name, never inferred from a neighbouring capability.
+FEATURE_UNPUBLISHED = "unpublished"
+
+#: A published feature the harness cannot actually reach on this host is
+#: unavailable; it too stays unsupported, never upgraded to a proven pass.
+FEATURE_UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class HarnessFeatureQualification:
+    """One harness's qualification of one recovery stage.
+
+    ``feature`` names the harness feature the stage exercises. Support is only
+    granted when the feature is *both* published and available: an unpublished
+    or unavailable feature stays unsupported, named, and is never upgraded. This
+    is the fail-closed rule of the criterion -- a feature that does not exist
+    cannot be reported as reproduced.
+    """
+
+    stage: str
+    published: bool
+    available: bool
+    feature: str = ""
+    evidence: str = ""
+
+    @property
+    def supported(self) -> bool:
+        """Whether this stage reproduced on a genuinely present feature."""
+        return bool(self.published and self.available)
+
+    @property
+    def unsupported_reason(self) -> str:
+        """``""`` when supported, else the named reason it stays unsupported."""
+        if self.published and self.available:
+            return ""
+        return FEATURE_UNPUBLISHED if not self.published else FEATURE_UNAVAILABLE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "feature": self.feature,
+            "published": bool(self.published),
+            "available": bool(self.available),
+            "supported": self.supported,
+            "unsupported_reason": self.unsupported_reason,
+            "evidence": self.evidence,
+        }
+
+
+@dataclass(frozen=True)
+class HarnessQualification:
+    """One harness's independently observed recovery qualification.
+
+    ``harness_id`` is the harness identity the observation was recorded under
+    (a server-owned fact, never a caller-chosen label). ``stages`` are the
+    per-stage observations; a missing stage is treated as unsupported and is
+    named, never silently skipped.
+    """
+
+    harness_id: str
+    stages: tuple[HarnessFeatureQualification, ...]
+
+    def stage(self, name: str) -> Optional[HarnessFeatureQualification]:
+        for entry in self.stages:
+            if entry.stage == name:
+                return entry
+        return None
+
+    @property
+    def qualifies(self) -> bool:
+        """Whether every recovery stage is present and supported."""
+        return all(
+            (entry := self.stage(name)) is not None and entry.supported
+            for name in RECOVERY_STAGES
+        )
+
+    @property
+    def unsupported(self) -> list[str]:
+        """Named unsupported features for this harness, missing stages included."""
+        out: list[str] = []
+        for name in RECOVERY_STAGES:
+            entry = self.stage(name)
+            if entry is None:
+                out.append(f"{self.harness_id}:{name}:missing")
+            elif not entry.supported:
+                out.append(f"{self.harness_id}:{name}:{entry.unsupported_reason}")
+        return out
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "harness_id": self.harness_id,
+            "qualifies": self.qualifies,
+            "unsupported": self.unsupported,
+            "stages": [entry.to_dict() for entry in self.stages],
+        }
+
+
+@dataclass(frozen=True)
+class TwoHarnessQualification:
+    """The outcome of qualifying exactly two distinct supported harnesses.
+
+    ``qualified`` is True only when two *distinct* harnesses each reproduced
+    every recovery stage. ``unsupported`` names every feature that stayed
+    unsupported (unpublished, unavailable, or missing), so an operator reads
+    exactly which capability did not reproduce -- never a bare NO.
+    """
+
+    harnesses: tuple[HarnessQualification, ...]
+    qualified: bool
+    reason: str = ""
+    unsupported: tuple[str, ...] = ()
+
+    @property
+    def harness_ids(self) -> tuple[str, ...]:
+        return tuple(h.harness_id for h in self.harnesses)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "two-harness-qualification-v1",
+            "qualified": self.qualified,
+            "reason": self.reason,
+            "harness_ids": list(self.harness_ids),
+            "unsupported": list(self.unsupported),
+            "harnesses": [h.to_dict() for h in self.harnesses],
+        }
+
+
+def qualify_two_harness_recovery(
+    harnesses: Sequence[HarnessQualification],
+) -> TwoHarnessQualification:
+    """Qualify exactly two distinct harnesses against the recovery stages.
+
+    Fails closed on every input that cannot prove the criterion:
+
+    * fewer or more than two harnesses -- two *independent* harnesses are the
+      criterion, so one or three is refused by name;
+    * two entries carrying the same ``harness_id`` -- the same harness twice is
+      not an independent qualification, and the duplicated id is named;
+    * a harness missing a recovery stage, or whose feature is unpublished or
+      unavailable -- the stage stays unsupported and is named.
+
+    No input upgrades an unsupported feature: ``published and available`` is the
+    only path to support, and the result is never relabelled.
+    """
+    entries = list(harnesses)
+    if len(entries) != 2:
+        return TwoHarnessQualification(
+            harnesses=tuple(entries),
+            qualified=False,
+            reason=f"exactly two harnesses are required, got {len(entries)}",
+            unsupported=tuple(
+                f"{h.harness_id}:{name}:missing"
+                for h in entries
+                for name in RECOVERY_STAGES
+                if h.stage(name) is None
+            ),
+        )
+    first, second = entries
+    if first.harness_id == second.harness_id:
+        return TwoHarnessQualification(
+            harnesses=tuple(entries),
+            qualified=False,
+            reason=(
+                "the two harnesses must be distinct; both report "
+                f"'{first.harness_id}'"
+            ),
+            unsupported=tuple(first.unsupported),
+        )
+    unsupported = tuple(
+        name for h in entries for name in h.unsupported
+    )
+    if unsupported:
+        return TwoHarnessQualification(
+            harnesses=tuple(entries),
+            qualified=False,
+            reason="one or more recovery stages did not reproduce",
+            unsupported=unsupported,
+        )
+    return TwoHarnessQualification(
+        harnesses=tuple(entries),
+        qualified=True,
+        reason="",
+        unsupported=(),
+    )
+
+
 # ── Assembly / loading helpers (data-driven) ───────────────────────────────
 
 def load_adapter_profiles(
@@ -527,4 +721,11 @@ __all__ = [
     "StrictController",
     "assert_statuses_honest",
     "load_adapter_profiles",
+    "RECOVERY_STAGES",
+    "FEATURE_UNPUBLISHED",
+    "FEATURE_UNAVAILABLE",
+    "HarnessFeatureQualification",
+    "HarnessQualification",
+    "TwoHarnessQualification",
+    "qualify_two_harness_recovery",
 ]
