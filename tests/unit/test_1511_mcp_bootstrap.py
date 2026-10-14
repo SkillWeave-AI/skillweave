@@ -98,10 +98,15 @@ class _FakeHandle:
         class _Result:
             exit_code = 0
             signal = None
+            termination = "exited"
             stdout = self._stdout
             stderr = self._stderr
             stdout_receipt = None
             stderr_receipt = None
+
+            @property
+            def succeeded(self):
+                return True
 
         _Result.stdout = self._stdout
         _Result.stderr = self._stderr
@@ -228,10 +233,11 @@ class TestOneProcessServiceScopedPrincipals:
         A worker asking for a reviewer child grant is refused -- the worker
         legitimately reaches the delegation operation ``attach_harness`` (every
         first-class principal does), so the *only* thing that bounds the minted
-        child is the subset rule: reviewer authority is not a subset of worker
-        authority. The refusal is typed and no token is issued; the caller gains
+        child is the delegation model: a worker may attach only a peer of its
+        own role. The refusal is typed and no token is issued; the caller gains
         no authority by naming a stronger ``role``. (A controller *may* attach a
-        worker child -- proven by the scoped-grant test above.)
+        reviewer child -- proven by
+        ``test_controller_attaches_the_distinct_reviewer_child``.)
         """
         svc = _service(tmp_path)
         worker = authority.issue_session(
@@ -262,10 +268,10 @@ class TestOneProcessServiceScopedPrincipals:
         """Ops (worker) is a first-class attaching principal, not a bypass.
 
         The delegation operation ``attach_harness`` is held by Main, Ops and
-        Reviewer alike, so the worker is admitted *to the seam* and the subset
-        rule -- not an operation gate that only a controller could pass -- is
-        what decides the minted child. A worker may attach a child of its own
-        (no broader) authority.
+        Reviewer alike, so the worker is admitted *to the seam* and the
+        delegation model -- not an operation gate that only a controller could
+        pass -- is what decides the minted child. A worker may attach a child of
+        its own (peer) role.
         """
         svc = _service(tmp_path)
         worker = authority.issue_session(
@@ -296,11 +302,13 @@ class TestOneProcessServiceScopedPrincipals:
         """The minted-role check itself refuses, independent of the operation.
 
         A *reviewer* holds ``review_run``/``approve_gate`` but is not the
-        controller (it lacks ``start_run``/``write_run_state``), and a
-        reviewer's authority is not a subset of its own -- so even a reviewer
-        that reached the mint path cannot attach a controller child. This pins
-        the subset rule on :meth:`refuse_child_role_escalation` directly, so its
-        removal cannot pass silently behind the operation gate.
+        controller (it lacks ``start_run``/``write_run_state``). Under the
+        delegation model a reviewer may attach only a peer of its own role, so a
+        reviewer that reached the mint path still cannot attach a controller or
+        a worker child -- and ``controller`` is attachable by *no* role (one
+        dispatch root). This pins the rule on
+        :meth:`refuse_child_role_escalation` directly, so its removal cannot
+        pass silently behind the operation gate.
         """
         reviewer = authority.issue_session(
             role="reviewer", client_id="rev", transport="http", run_ids=["run-1"]
@@ -310,8 +318,129 @@ class TestOneProcessServiceScopedPrincipals:
             authority.refuse_child_role_escalation(principal, "controller")
         with pytest.raises(RoleEscalationRefused):
             authority.refuse_child_role_escalation(principal, "worker")
-        # Only authority no broader than the reviewer's own is admitted.
+        # Only a peer of the reviewer's own role is admitted.
         authority.refuse_child_role_escalation(principal, "reviewer")
+
+    def test_controller_attaches_the_distinct_reviewer_child(
+        self, authority, tmp_path
+    ):
+        """Main (controller) MAY attach the distinct Reviewer (the B1 fix).
+
+        Main is deliberately forbidden to embody the reviewer's operations --
+        ``review_run``/``approve_gate`` are *not* in ``MCP_ROLE_SCOPES`` for
+        ``controller`` -- so an operations-subset rule wrongly refused
+        ``controller -> reviewer``. The delegation model admits it: Main is the
+        one principal that attaches the distinct Ops and Reviewer peers, and the
+        child's authority is read from its own role definition. The minted child
+        carries no authority beyond what ``reviewer`` defines.
+        """
+        svc = _service(tmp_path)
+        controller = authority.issue_session(
+            role="controller", client_id="main", transport="stdio",
+            allowed_roots=[str(tmp_path)],
+        )
+        out = mcp_server.harness_session_grant(
+            role="reviewer",
+            client_id="reviewer",
+            transport="http",
+            run_id="run-1",
+            task_id="task-1",
+            attempt=1,
+            db_path=svc.db_path,
+            artifacts_path=svc.artifacts_path,
+            stream_root=svc.stream_root,
+            mailbox_path=svc.mailbox_path,
+            session_token=controller,
+        )
+        record = json.loads(out)
+        assert record["status"] == "ok", record
+        issued = authority.verify_session(record["env"][boot.ENV_MCP_SESSION_TOKEN])
+        assert issued.role == "reviewer"
+        # The child's authority is exactly its own role's -- never the parent's.
+        from skillweave.runtime.authority import MCP_ROLE_SCOPES
+
+        child_ops = set(MCP_ROLE_SCOPES["reviewer"]["operations"])
+        parent_ops = set(MCP_ROLE_SCOPES["controller"]["operations"])
+        assert child_ops <= child_ops  # its own definition, by construction
+        assert "start_run" not in child_ops
+        assert "write_run_state" not in child_ops
+        assert parent_ops  # sanity: the two role sets are distinct
+
+    def test_controller_attaches_a_worker_child_but_no_second_controller(
+        self, authority, tmp_path
+    ):
+        """The full parent/child role matrix through the real ``attach_harness``.
+
+        Every decision the delegation model makes is exercised at the *real
+        tool seam*:
+
+        * ``controller -> {worker, reviewer, observer}`` is admitted (the
+          distinct peers Main is forbidden to embody itself);
+        * ``worker -> worker`` and ``reviewer -> reviewer`` are admitted (a peer
+          of the caller's own role only) -- neither may attach the other;
+        * ``worker -> reviewer``, ``worker -> controller``, ``reviewer -> worker``
+          and ``reviewer -> controller`` are refused;
+        * ``controller`` is attachable by no principal (exactly one dispatch
+          root / controller lease).
+
+        A refusal is a typed ``role_escalation_refused`` with no ``env``; an
+        admission mints a server-issued token whose role equals the requested
+        role, never the caller's.
+        """
+        svc = _service(tmp_path)
+
+        def attach(session_token, child_role):
+            return json.loads(
+                mcp_server.harness_session_grant(
+                    role=child_role,
+                    client_id="caller",
+                    transport="stdio",
+                    run_id="run-1",
+                    task_id="task-1",
+                    attempt=1,
+                    db_path=svc.db_path,
+                    artifacts_path=svc.artifacts_path,
+                    stream_root=svc.stream_root,
+                    mailbox_path=svc.mailbox_path,
+                    session_token=session_token,
+                )
+            )
+
+        sessions = {
+            r: authority.issue_session(
+                role=r, client_id=f"{r}-caller", transport="stdio",
+                run_ids=["run-1"], allowed_roots=[str(tmp_path)],
+            )
+            for r in ("controller", "worker", "reviewer")
+        }
+
+        # (parent, child, admitted?)
+        matrix = [
+            ("controller", "worker", True),
+            ("controller", "reviewer", True),
+            ("controller", "observer", True),
+            ("worker", "worker", True),
+            ("reviewer", "reviewer", True),
+            ("worker", "reviewer", False),
+            ("worker", "controller", False),
+            ("reviewer", "worker", False),
+            ("reviewer", "controller", False),
+            ("controller", "controller", False),
+        ]
+        for parent, child, admitted in matrix:
+            record = attach(sessions[parent], child)
+            if admitted:
+                assert record["status"] == "ok", (parent, child, record)
+                issued = authority.verify_session(
+                    record["env"][boot.ENV_MCP_SESSION_TOKEN]
+                )
+                assert issued.role == child, (parent, child, issued.role)
+            else:
+                assert record["status"] == "refused", (parent, child, record)
+                assert record["code"] == "role_escalation_refused", (
+                    parent, child, record
+                )
+                assert "env" not in record, (parent, child)
 
     def test_harness_session_grant_tool_issues_a_scoped_grant(
         self, authority, tmp_path
@@ -668,7 +797,13 @@ def _main_stubs(monkeypatch, server_mod):
     """
     monkeypatch.setattr(server_mod.control, "require_mcp", lambda: None)
     minted: dict = {}
-    real_startup = server_mod.startup_and_bind_stdio
+    # Idempotent across repeated calls in one test: never wrap a wrapper (which
+    # would make the second call's ``real_startup`` the first wrapper, writing
+    # into the first ``minted``). The pristine function is pinned on the wrapper.
+    real_startup = getattr(
+        server_mod.startup_and_bind_stdio, "__sw_real_startup__",
+        server_mod.startup_and_bind_stdio,
+    )
 
     def _record_startup(*, process_service=None):
         minted["service"] = process_service
@@ -676,6 +811,7 @@ def _main_stubs(monkeypatch, server_mod):
         minted["bound"] = server_mod._bound_authority()
         return token
 
+    _record_startup.__sw_real_startup__ = real_startup
     monkeypatch.setattr(server_mod, "startup_and_bind_stdio", _record_startup)
 
     def _capture():
@@ -933,13 +1069,23 @@ class TestProductionEntryPointsWireTheGrantAndTheService:
         principal = auth.verify_session(minted["token"])
         assert principal.role == "controller"
 
-    def test_main_without_opt_in_keeps_the_historical_unscoped_start(
+    def test_main_default_start_binds_the_one_service_criterion_3(
         self, tmp_path, monkeypatch
     ):
-        """Default ``main()`` preserves the historical unscoped session."""
+        """A bare ``main()`` is admitted onto the one service (the B2 fix).
+
+        Criterion 3 requires a stdio start be admitted *only* when it
+        demonstrably reaches the same authority/state service. The production
+        default (no opt-in flag) must therefore compose and bind that one
+        service itself -- an unscoped controller session behind an opt-in would
+        leave the flagship start unscoped. This drives the real ``main()`` with
+        no flag at all and asserts the minted session is scoped to a composed
+        ``HarnessProcessService``.
+        """
         import skillweave.mcp.server as server_mod
 
         monkeypatch.setenv(server_mod.SUPERVISOR_ENV, "local-main")
+        monkeypatch.setenv(server_mod.MAILBOX_PATH_ENV, str(tmp_path / "mb.jsonl"))
         monkeypatch.chdir(tmp_path)
         previous = server_mod._AUTHORITY
         previous_ready = server_mod._READY_SESSION_TOKEN
@@ -950,11 +1096,223 @@ class TestProductionEntryPointsWireTheGrantAndTheService:
             server_mod._AUTHORITY = previous
             server_mod._READY_SESSION_TOKEN = previous_ready
 
-        # Additive: the default start binds no process service at all.
-        assert minted["service"] is None
+        # Criterion 3: the default start is scoped to the one composed service.
+        assert minted["service"] is not None
+        assert isinstance(minted["service"], boot.HarnessProcessService)
         auth = minted["bound"]
+        assert auth is not None
         principal = auth.verify_session(minted["token"])
         assert principal.role == "controller"
+
+    def test_main_default_start_uses_the_same_service_as_the_argument(
+        self, tmp_path, monkeypatch
+    ):
+        """Default binding, an explicit service and the escape hatch agree.
+
+        ``main()`` (default), ``main(process_service=svc)`` and
+        ``main(bind_service=False)`` are three distinct production start paths
+        that must not disagree about the binding: the first two bind a service,
+        the third is the documented escape hatch that keeps the historical
+        unscoped session for a host supplying its own authority.
+        """
+        import skillweave.mcp.server as server_mod
+
+        monkeypatch.setenv(server_mod.SUPERVISOR_ENV, "local-main")
+        monkeypatch.setenv(server_mod.MAILBOX_PATH_ENV, str(tmp_path / "mb.jsonl"))
+        monkeypatch.chdir(tmp_path)
+        previous = server_mod._AUTHORITY
+        previous_ready = server_mod._READY_SESSION_TOKEN
+
+        svc = _service(tmp_path)
+        try:
+            # Each ``main()`` performs startup only when no authority is yet
+            # bound, so the bound authority is cleared between the three
+            # production start paths; each path is otherwise untouched.
+            server_mod._AUTHORITY = previous
+            default_minted = _main_stubs(monkeypatch, server_mod)
+            server_mod.main()
+            assert default_minted["service"] is not None
+
+            server_mod._AUTHORITY = previous
+            explicit_minted = _main_stubs(monkeypatch, server_mod)
+            server_mod.main(process_service=svc)
+            assert explicit_minted["service"] is svc
+
+            server_mod._AUTHORITY = previous
+            escape_minted = _main_stubs(monkeypatch, server_mod)
+            server_mod.main(bind_service=False)
+            assert escape_minted["service"] is None
+        finally:
+            server_mod._AUTHORITY = previous
+            server_mod._READY_SESSION_TOKEN = previous_ready
+
+
+class _CapturingFanOutStart:
+    """Capture each fan-out child's launch kwargs, with a verifiable env.
+
+    ``fan_out_dispatch`` verifies each started child from its *own* resolved
+    environment when a grant is provisioned, so the fake handle must expose the
+    granted env it was actually started with. Returning the same captured env is
+    exactly what a correctly-provisioned real child would report.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def __call__(self, command, **kwargs):
+        self.calls.append({"command": list(command), **kwargs})
+        return _FakeHandle(
+            effective_env=kwargs.get("env"), stdout=b"OPS_READY " + b"a" * 40
+        )
+
+
+class TestProductionDispatchMintsTheGrant:
+    """Criterion 2 through the *production* fan-out callers (the B3 fix).
+
+    Before the fix no production caller supplied ``mcp_grant``: the routing
+    fan-out seam (``routing.dispatch.fan_out``) and the self-host runner's ops
+    fan-out (``selfhost.runner._real_fan_out``) both called ``fan_out_dispatch``
+    bare, so the provision-then-verify discipline only held at the interactive
+    path. These tests drive the real callers with a configured process service
+    and prove the granted MCP configuration reaches the *actual* child launch
+    under an explicit allowlist -- and that omitting the service preserves the
+    legacy pass-through byte-for-byte.
+    """
+
+    def test_routing_fan_out_mints_and_provisions_the_grant(
+        self, authority, tmp_path, monkeypatch
+    ):
+        from skillweave.routing import dispatch as routing_dispatch
+
+        svc = _service(tmp_path)
+        captured = _CapturingFanOutStart()
+        monkeypatch.setattr(
+            "skillweave.runtime.runner_adapter.start_process",
+            captured,
+            raising=False,
+        )
+
+        routing_dispatch.fan_out(
+            [["echo", "a"], ["echo", "b"]],
+            run_id="run-1",
+            subject_repo="skillweave",
+            subject_commit="deadbeef",
+            tool="opencode",
+            model="faigate/deepseek-v4-pro",
+            process_service=svc,
+            db_path=svc.db_path,
+            artifacts_path=svc.artifacts_path,
+            stream_root=svc.stream_root,
+            mailbox_path=svc.mailbox_path,
+        )
+
+        assert len(captured.calls) == 2
+        for call in captured.calls:
+            env = call["env"]
+            # The granted session token reached the *actual* child launch ...
+            assert env[boot.ENV_MCP_SESSION_TOKEN]
+            # ... under an explicit allowlist (no ambient credential can leak).
+            allowlist = call["env_allowlist"]
+            assert allowlist is not None
+            assert boot.ENV_MCP_SESSION_TOKEN in allowlist
+            # The token is server-issued for the controller role, not authored
+            # by the caller.
+            principal = authority.verify_session(env[boot.ENV_MCP_SESSION_TOKEN])
+            assert principal.role == "controller"
+
+    def test_routing_fan_out_without_a_service_keeps_the_legacy_launch(
+        self, authority, tmp_path, monkeypatch
+    ):
+        from skillweave.routing import dispatch as routing_dispatch
+
+        captured = _CapturingFanOutStart()
+        monkeypatch.setattr(
+            "skillweave.runtime.runner_adapter.start_process",
+            captured,
+            raising=False,
+        )
+        routing_dispatch.fan_out(
+            [["echo", "a"]],
+            run_id="run-1",
+            subject_repo="skillweave",
+            subject_commit="deadbeef",
+            tool="opencode",
+            model="faigate/deepseek-v4-pro",
+        )
+        assert len(captured.calls) == 1
+        # Additive: with no configured service there is no grant, no allowlist.
+        assert captured.calls[0]["env"] is None
+        assert captured.calls[0].get("env_allowlist") is None
+
+    def test_selfhost_ops_fanout_mints_and_provisions_the_grant(
+        self, authority, tmp_path, monkeypatch
+    ):
+        from skillweave.selfhost.runner import SelfHostRunner, SelfHostFixture, LaneSpec
+        from skillweave.coordinator import Coordinator
+
+        captured = _CapturingFanOutStart()
+        monkeypatch.setattr(
+            "skillweave.runtime.runner_adapter.start_process",
+            captured,
+            raising=False,
+        )
+
+        svc = _service(tmp_path)
+        coordinator = Coordinator(SQLiteRunStore(str(tmp_path / "store.db")))
+        runner = SelfHostRunner(coordinator, process_service=svc)
+
+        lane_ids = ["ops-a", "ops-b"]
+        fixture = SelfHostFixture(
+            sequence_id="seq-1",
+            wave="w1",
+            base_sha="a" * 40,
+            ops_lanes=[LaneSpec(lane_id=lid) for lid in lane_ids],
+            reviews=[],
+            dependent_lane=LaneSpec(lane_id="dep"),
+        )
+        runner._real_fan_out(fixture, lane_ids)
+
+        assert len(captured.calls) == 2
+        for call in captured.calls:
+            env = call["env"]
+            assert env[boot.ENV_MCP_SESSION_TOKEN]
+            allowlist = call["env_allowlist"]
+            assert allowlist is not None
+            assert boot.ENV_MCP_SESSION_TOKEN in allowlist
+            principal = authority.verify_session(env[boot.ENV_MCP_SESSION_TOKEN])
+            assert principal.role == "controller"
+
+    def test_selfhost_ops_fanout_without_a_service_keeps_the_legacy_launch(
+        self, authority, tmp_path, monkeypatch
+    ):
+        from skillweave.selfhost.runner import SelfHostRunner, SelfHostFixture, LaneSpec
+        from skillweave.coordinator import Coordinator
+
+        captured = _CapturingFanOutStart()
+        monkeypatch.setattr(
+            "skillweave.runtime.runner_adapter.start_process",
+            captured,
+            raising=False,
+        )
+        coordinator = Coordinator(SQLiteRunStore(str(tmp_path / "store.db")))
+        runner = SelfHostRunner(coordinator)  # no process service configured
+
+        lane_ids = ["ops-a", "ops-b"]
+        fixture = SelfHostFixture(
+            sequence_id="seq-1",
+            wave="w1",
+            base_sha="a" * 40,
+            ops_lanes=[LaneSpec(lane_id=lid) for lid in lane_ids],
+            reviews=[],
+            dependent_lane=LaneSpec(lane_id="dep"),
+        )
+        runner._real_fan_out(fixture, lane_ids)
+
+        assert len(captured.calls) == 2
+        for call in captured.calls:
+            # Legacy pass-through: no grant env, no allowlist.
+            assert call["env"] is None
+            assert call.get("env_allowlist") is None
 
 
 class _McpStub:

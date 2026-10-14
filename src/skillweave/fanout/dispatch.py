@@ -34,6 +34,64 @@ def _start_process():
     return importlib.import_module("skillweave.runtime.runner_adapter").start_process
 
 
+def mint_fanout_grant(
+    *,
+    run_id: str,
+    task_id: str = "",
+    attempt: int = 0,
+    client_id: str = "",
+    db_path: Optional[str] = None,
+    mailbox_path: Optional[str] = None,
+    artifacts_path: Optional[str] = None,
+    stream_root: Optional[str] = None,
+    authority: Optional[Any] = None,
+) -> Any:
+    """Mint a controller session grant for a production fan-out (criterion 2).
+
+    A *production* dispatch that has configured a process service must drive
+    the same provision-then-verify seam the interactive path uses, rather than
+    calling :func:`fan_out_dispatch` bare. This composes the one durable
+    process service from the binding inputs (the caller's explicit paths, or
+    the server-owned defaults) and mints a ``harness-mcp-session-grant-v1``
+    scoped to the fan-out's run/task/attempt, so every child of the group is
+    launched with the granted MCP configuration and verified from its own
+    resolved environment.
+
+    The service is read from the *server-owned* binding
+    (``skillweave.mcp.control.service_for_binding``), so a caller cannot name an
+    isolated default store as the shared service; the token is minted by
+    ``issue_harness_session_grant`` against a bound authority, never authored by
+    the caller.
+    """
+    from skillweave.mcp import control as _control
+    from skillweave.mcp import server as _server
+
+    if authority is None:
+        authority = _server._bound_authority()
+    if authority is None:
+        raise RuntimeError(
+            "mint_fanout_grant requires a bound MCP authority: configure a "
+            "process service before driving production dispatch provisioning"
+        )
+    default_db, default_artifacts = _server.server_default_paths()
+    service = _control.service_for_binding(
+        db_path or default_db,
+        mailbox_path=mailbox_path or _control.default_mailbox_path(),
+        artifacts_path=artifacts_path or default_artifacts,
+        stream_root=stream_root,
+    )
+    return _server.issue_harness_session_grant(
+        authority=authority,
+        role="controller",
+        client_id=client_id or "fanout",
+        transport="stdio",
+        run_id=run_id,
+        task_id=task_id,
+        attempt=attempt,
+        service=service,
+    )
+
+
 #: The four machine outcomes a terminal child reports. Exactly one is set per
 #: child; a result that resolves to none (or more than one) is rejected.
 OUTCOME_EXIT_CODE = "exit_code"

@@ -972,12 +972,12 @@ def harness_session_grant(
     token scoped to the actual run. The authority the grant mints is ``role``;
     the gate refuses a client asking for a stronger role than its authenticated
     principal holds (never granted), whether it names that role directly or via
-    ``requested_role``. A principal may only attach a child whose authority is
-    **no broader than its own** -- so a controller can attach a worker or a
-    reviewer, but a worker can never mint a reviewer/controller child (the
-    subset rule above decides, by capability, for every non-controller; the
-    controller is the dispatch root and already *holds* every attachable role's
-    operations, so the same subset rule admits it too).
+    ``requested_role``. A principal may only attach a child under the explicit
+    delegation model: Main may attach the distinct Ops (``worker``) and Reviewer
+    (``reviewer``) principals it is *forbidden to embody itself*, every other
+    role may attach only a peer of its own role, and no one attaches a second
+    ``controller``. The child's authority is read from its own role definition,
+    so it never exceeds what that role carries.
 
     The grant is bound to the one logical durable process service composed from
     ``db_path``/``mailbox_path``/``artifacts_path``/``stream_root``; a caller
@@ -1009,8 +1009,8 @@ def harness_session_grant(
         # broader than the authenticated principal's own (criterion 1). This is
         # load-bearing for every first-class principal because the operation
         # above already admitted Main/Ops/Reviewer (a stronger role demand is
-        # refused by ``refuse_role_escalation``), so the subset rule -- not an
-        # unreachable short-circuit -- is what bounds the minted child.
+        # refused by ``refuse_role_escalation``), so the delegation model -- not
+        # an unreachable short-circuit -- is what bounds the minted child.
         _bound_authority().refuse_child_role_escalation(gate_principal, role)
 
         service = control.service_for_binding(
@@ -1134,7 +1134,11 @@ def startup_and_bind_stdio(
     return _READY_SESSION_TOKEN
 
 
-def main(*, process_service: "object | None" = None, bind_service: bool = False) -> None:
+def main(
+    *,
+    process_service: "object | None" = None,
+    bind_service: "bool | None" = None,
+) -> None:
     """Serve the command server, or refuse with an explicit unavailable state.
 
     This is the only entry the module exposes as a *server*. With no ``mcp``
@@ -1152,14 +1156,26 @@ def main(*, process_service: "object | None" = None, bind_service: bool = False)
     ``process_service`` (optional) is the
     :class:`skillweave.mcp.bootstrap.HarnessProcessService` the started stdio
     session operates against; when supplied, the minted controller session is
-    scoped to it (criterion 3). ``bind_service`` (optional, default ``False``)
-    is the opt-in that makes the *production* start compose that one service
-    itself from the server-owned binding (``SKILLWEAVE_AGENT_MAILBOX`` +
-    :func:`default_mailbox_path`) and pass it to the startup seam, so a real
-    ``python -m skillweave.mcp.server`` / ``skillweave-mcp`` start is admitted
-    onto the same authority/state service rather than an unscoped session. With
-    the default ``False`` (or a host that already bound an authority) the
-    historical unscoped start is preserved exactly, so this remains additive.
+    scoped to it (criterion 3).
+
+    ``bind_service`` controls the **default** production start (criterion 3
+    requires a stdio start be admitted *only* when it demonstrably reaches the
+    same authority/state service):
+
+    * ``None`` (the default): the production start composes the one durable
+      process service itself from the server-owned binding
+      (``SKILLWEAVE_AGENT_MAILBOX`` + :func:`default_mailbox_path`) and passes
+      it to the startup seam, so a real ``python -m skillweave.mcp.server`` /
+      ``skillweave-mcp`` start is admitted onto the same authority/state
+      service rather than an unscoped session -- the criterion holds without a
+      caller passsing an opt-in flag.
+    * ``False``: the documented escape hatch for an in-process caller that
+      provides its *own* authority and deliberately wants the historical
+      unscoped controller session; it is not a production start.
+    * ``True``: same as ``None`` (kept so an explicit opt-in reads naturally).
+
+    A host that already bound an authority is untouched: this only governs the
+    startup issuance the server performs for itself.
     """
     # A *documented* non-zero exit for either refusal: the server never starts
     # without its dependency or an explicit, authenticated supervisor identity.
@@ -1176,11 +1192,14 @@ def main(*, process_service: "object | None" = None, bind_service: bool = False)
             # The host process did not bind an authority: perform the production
             # issuance at startup, so a reachable server is authorized rather
             # than trusted for merely being reachable.
-            if process_service is None and bind_service:
-                # Opt-in production binding: compose the one durable process
-                # service from the server-owned inputs and scope the minted
-                # controller stdio session to it (criterion 3). The default
-                # (``bind_service=False``) keeps the historical unscoped start.
+            if process_service is None and bind_service is not False:
+                # Criterion 3: the default production start composes the one
+                # durable process service from the server-owned inputs and
+                # scopes the minted controller stdio session to it, so a bare
+                # ``main()`` is admitted onto the same authority/state service.
+                # ``bind_service=False`` is the documented escape hatch that
+                # keeps the historical unscoped session for a caller supplying
+                # its own authority.
                 default_db, default_artifacts = server_default_paths()
                 process_service = control.service_for_binding(
                     default_db,
