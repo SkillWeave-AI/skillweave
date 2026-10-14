@@ -55,6 +55,9 @@ from skillweave.runtime.native_process import (
     INTENT_INTEGRATED,
     INTENT_LAUNCHED,
     INTENT_REVIEWED,
+    RESUME_ADOPTED,
+    RESUME_DECISION_SCHEMA_ID,
+    RESUME_REFUSED_NO_OWNED_ATTEMPT,
     STEPS,
     STEP_CONTROLLED_INTEGRATION,
     STEP_DEPENDENT_WAVE,
@@ -101,6 +104,7 @@ from skillweave.dispatch.work_contract import (
     RepositorySubject,
 )
 from skillweave.runtime.journal import EventJournal
+from skillweave.runtime.store import NativeProcessService as StoreReexportedService
 from skillweave.runtime.store import SQLiteRunStore
 from skillweave.runtime.write_scope import ScopeConflictError
 
@@ -195,6 +199,168 @@ def test_loop_state_survives_a_controller_restart_without_live_memory():
         assert checkpoint.fencing_token == 2
         assert checkpoint.journal_offset == 0
         assert checkpoint.in_flight == (("run-1/task-a/1", STEP_REPAIR),)
+        reopened.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SW-1511-RECOVERY criterion 1: a recovered controller resumes exactly one
+# owned attempt and never replays a pending launch intent.
+#
+# These exercise the seam a real controller operation reaches: the recovering
+# controller takes over the lease through the durable store (the store
+# *re-exports* the native process service) and reads its checkpoint.  The
+# decision is produced by ``resume()``/``checkpoint()`` -- the same call a
+# takeover drives -- not by a helper invoked directly in isolation.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _live_identity_record() -> dict:
+    """The recorded identity of a process that is *live right now*.
+
+    Captured from the OS so ``verify`` observes the same facts at resume; no
+    provider is probed and no wall-clock race is used -- the process recorded is
+    the test interpreter itself, whose identity is stable for the whole test.
+    """
+    import os as _os
+    from skillweave.runtime import process_identity as _pi
+
+    ident = _pi.capture(_os.getpid())
+    assert ident is not None, "the current process must be observable"
+    return ident.to_dict()
+
+
+def test_takeover_reaches_the_store_reexported_resume_seam():
+    # The recovered controller resumes through the durable store's re-export,
+    # not a direct import of the module -- this is the production seam a
+    # controller takeover actually reaches.
+    assert StoreReexportedService is NativeProcessService
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        svc = StoreReexportedService(store, "controller-a")
+        svc.acquire(ttl_seconds=0)  # expired: the successor takes over
+        svc.dispatch(run_id="run-1", task_id="task-a", attempt=1)
+        lease, checkpoint = svc.resume(ttl_seconds=3600)
+        assert lease.fencing_token == 2
+        # The reconciled resume is reached by the real 'resume' operation and
+        # carries the criterion-1 decision the checkpoint exists to publish.
+        assert checkpoint.resume_decision_event is not None
+        assert checkpoint.resume_decision_event["schema_id"] == RESUME_DECISION_SCHEMA_ID
+        store.close()
+
+
+def test_recovered_controller_adopts_one_verified_owned_attempt():
+    # Positive path: the predecessor left exactly one in-flight attempt whose
+    # recorded process identity still verifies, so the recovered controller
+    # ADOPTS it by name -- it resumes that attempt rather than replaying the
+    # predecessor's pending launch intent.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = NativeProcessService(store, "controller-a")
+        first.acquire(ttl_seconds=0)  # expired: forcible takeover by the successor
+        intent, _ = first.dispatch(
+            run_id="run-1", task_id="task-a", attempt=1,
+            process_identity=_live_identity_record(),
+            route="provider/model", session_id="sess-1",
+        )
+        store.close()
+
+        reopened = _store(tmp)
+        recovered = NativeProcessService(reopened, "controller-b")
+        lease, checkpoint = recovered.resume(ttl_seconds=3600)
+        assert lease.fencing_token == 2
+        decision = checkpoint.resume_decision_event
+        assert decision["decision"] == RESUME_ADOPTED
+        assert decision["verified"] is True
+        assert decision["intent_id"] == intent.intent_id
+        assert decision["execution_scope"] == "run-1/task-a/1"
+        # It adopted the *same* one attempt; it did not launch a second one.
+        live = reopened.list_dispatch_intents(run_id="run-1", claiming_only=True)
+        assert len(live) == 1
+        assert live[0].intent_id == intent.intent_id
+        reopened.close()
+
+
+def test_recovered_controller_refuses_when_nothing_is_in_flight():
+    # Negative path: nothing is in flight (the predecessor had drained its
+    # work), so the recovered controller refuses by name instead of replaying
+    # any launch intent.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = NativeProcessService(store, "controller-a")
+        first.acquire(ttl_seconds=0)
+        first.dispatch(run_id="run-1", task_id="task-a", attempt=1)
+        # Drain it: a reviewed attempt is terminal and no longer claiming.
+        intent_id = store.list_dispatch_intents()[0].intent_id
+        first.record_review(intent_id)
+        store.close()
+
+        reopened = _store(tmp)
+        recovered = NativeProcessService(reopened, "controller-b")
+        _, checkpoint = recovered.resume(ttl_seconds=3600)
+        decision = checkpoint.resume_decision_event
+        assert decision["decision"] == RESUME_REFUSED_NO_OWNED_ATTEMPT
+        assert decision["reason"] == "no_in_flight_attempt"
+        assert decision["verified"] is False
+        assert checkpoint.in_flight == ()
+        reopened.close()
+
+
+def test_recovered_controller_refuses_an_unverifiable_owned_attempt():
+    # Negative path: an in-flight attempt whose recorded process identity can
+    # no longer be observed (the recorded PID is not live) is NOT adopted --
+    # the recovered controller refuses by name; it never re-dispatches (that
+    # would be a duplicate launch) and never trusts a stale record.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = NativeProcessService(store, "controller-a")
+        first.acquire(ttl_seconds=0)
+        # A record whose pid is dead on arrival and whose start_time cannot
+        # match any live process.
+        first.dispatch(
+            run_id="run-1", task_id="task-a", attempt=1,
+            process_identity={
+                "pid": 1, "start_time": "0.0", "exec_path": "/nonexistent",
+                "argv": ["nonexistent"],
+            },
+        )
+        store.close()
+
+        reopened = _store(tmp)
+        recovered = NativeProcessService(reopened, "controller-b")
+        _, checkpoint = recovered.resume(ttl_seconds=3600)
+        decision = checkpoint.resume_decision_event
+        assert decision["decision"] == RESUME_REFUSED_NO_OWNED_ATTEMPT
+        assert decision["verified"] is False
+        assert decision["reason"]  # a named reason, never a bare False
+        # The refusal did NOT replay a launch: still exactly the one intent.
+        assert len(reopened.list_dispatch_intents(run_id="run-1")) == 1
+        reopened.close()
+
+
+def test_recovered_controller_never_replays_a_pending_launch_intent():
+    # Criterion 1: 'without replaying a pending launch intent'.  After a
+    # takeover, an attempt to re-launch the predecessor's scope is refused as a
+    # duplicate -- the only admissible disposition of the pending intent is to
+    # resume (adopt) it, which the checkpoint decision records.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = NativeProcessService(store, "controller-a")
+        first.acquire(ttl_seconds=0)
+        first.dispatch(run_id="run-1", task_id="task-a", attempt=1)
+        store.close()
+
+        reopened = _store(tmp)
+        recovered = NativeProcessService(reopened, "controller-b")
+        _, checkpoint = recovered.resume(ttl_seconds=3600)
+        assert checkpoint.resume_decision_event["decision"] in (
+            RESUME_ADOPTED, RESUME_REFUSED_NO_OWNED_ATTEMPT,
+        )
+        # The replayed launch is refused: the pending intent is resumed, never
+        # launched a second time.
+        try:
+            recovered.dispatch(run_id="run-1", task_id="task-a", attempt=1)
+            assert False, "a pending launch intent must not be replayed"
+        except DuplicateDispatchError:
+            pass
         reopened.close()
 
 
@@ -550,6 +716,58 @@ def test_existing_v1_checkpoint_round_trips_unchanged():
     assert record["schema_version"] == CHECKPOINT_SCHEMA_VERSION
     # A v1 consumer accepts the existing record unchanged (additive/opt-in).
     validate_native_process_checkpoint(record)
+
+
+def test_v1_checkpoint_without_a_resume_decision_round_trips():
+    # Backward compatibility (criterion 1 is additive): a v1 record written
+    # *before* the resume decision existed carries no ``resume_decision_event``;
+    # it validates unchanged and reports the field as absent (None).
+    record = NativeProcessCheckpoint(run_id="run-1", fencing_token=7).to_dict()
+    assert record["resume_decision_event"] is None
+    validate_native_process_checkpoint(record)
+    # And an old record dict without the key at all still validates.
+    record.pop("resume_decision_event")
+    validate_native_process_checkpoint(record)
+
+
+def test_resume_decision_with_an_unknown_decision_is_refused():
+    # Fail closed: only the two declared decisions are admissible.  Both the
+    # record constructor and the validator refuse an undeclared decision.
+    event = {
+        "schema_id": RESUME_DECISION_SCHEMA_ID,
+        "decision": "fabricated_continuity",
+        "verified": True,
+    }
+    try:
+        NativeProcessCheckpoint(
+            run_id="run-1", fencing_token=1, resume_decision_event=event,
+        )
+        assert False, "an undeclared resume decision must be refused"
+    except ValueError:
+        pass
+    record = NativeProcessCheckpoint(run_id="run-1", fencing_token=1).to_dict()
+    record["resume_decision_event"] = event
+    try:
+        validate_native_process_checkpoint(record)
+        assert False, "an undeclared resume decision must be refused"
+    except ValueError:
+        pass
+
+
+def test_resume_adoption_must_name_the_owned_attempt():
+    # Fail closed: an *adoption* with no named intent/scope is refused, so a
+    # decision can never claim to resume a nameless attempt.
+    try:
+        NativeProcessCheckpoint(
+            run_id="run-1", fencing_token=1,
+            resume_decision_event={
+                "schema_id": RESUME_DECISION_SCHEMA_ID,
+                "decision": RESUME_ADOPTED, "verified": True,
+            },
+        )
+        assert False, "an adoption must name the owned intent it resumes"
+    except ValueError:
+        pass
 
 
 def test_existing_v1_dispatch_round_trips_unchanged():
