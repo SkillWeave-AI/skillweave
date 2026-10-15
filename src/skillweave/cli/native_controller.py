@@ -55,6 +55,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import sys
 from dataclasses import dataclass, field
@@ -72,6 +73,16 @@ __all__ = [
     "ReviewVerdict",
     "DriveResult",
     "HOLD_SUBJECT_KIND_UNKNOWN",
+    "HOLD_SANDBOX_TARGET_UNLISTED",
+    "HOLD_SANDBOX_UNDECLARED",
+    "HOLD_SANDBOX_PRODUCTION_LOOKING",
+    "HOLD_SANDBOX_DECLARATION_CHANGED",
+    "OWNER_SANDBOX_DECLARATION_FILENAME",
+    "SandboxDeclarationRefused",
+    "OwnerSandboxTarget",
+    "OwnerSandboxDeclaration",
+    "load_owner_sandbox_declaration",
+    "resolve_sandbox_admission",
     "build_production_ports",
     "build_production_reviewer_port",
     "build_parser",
@@ -306,6 +317,48 @@ HOLD_SUBJECT_KIND_UNKNOWN = (
     "non-repository subject through the guarded content transaction, and an "
     "unknown kind is never inferred to be either (named hold)"
 )
+
+#: The four names an owner **sandbox declaration** is refused under
+#: (SW-SCOPE-010 S10-C criterion 2).  The declaration is durable *owner-authored*
+#: state -- ``owner-sandbox.yaml`` in the planning repository -- that the
+#: production caller reads from a path it resolves itself.  It is never supplied
+#: through any tool, MCP argument or CLI argument, so a target can only be
+#: admitted by a declaration the owner actually wrote; every other outcome is a
+#: *named* hold and nothing is applied.
+HOLD_SANDBOX_TARGET_UNLISTED = (
+    "native-controller refused: the sandbox target is not listed in the owner "
+    "sandbox declaration, so the tool never invents a target the owner did not "
+    "declare (named sandbox hold)"
+)
+HOLD_SANDBOX_UNDECLARED = (
+    "native-controller refused: no owner sandbox declaration exists at the "
+    "durable owner-authored path, so the controller never assumes an implicit "
+    "or default sandbox target (named sandbox hold)"
+)
+HOLD_SANDBOX_PRODUCTION_LOOKING = (
+    "native-controller refused: the sandbox target names a production-looking "
+    "surface (a production, live or main-domain marker); the declaration is "
+    "never a licence to reach production (named sandbox hold)"
+)
+HOLD_SANDBOX_DECLARATION_CHANGED = (
+    "native-controller refused: the owner sandbox declaration changed between "
+    "load and apply -- its recorded SHA-256 no longer matches the file bytes -- "
+    "so the target is never applied against a declaration the owner did not "
+    "author (named sandbox hold)"
+)
+
+#: Whole-segment markers of a *production-looking* sandbox target.  The owner
+#: decision names ``prod``, ``live`` and the main domain.  A marker is matched as
+#: a delimited segment (``prod-eu``, ``live.example.dev``, ``main``), never as a
+#: bare substring, so an innocuous name such as ``product-preview`` or a hostname
+#: containing ``domain`` is not misread as production -- the refusal is a fact
+#: about the declaration, not a guess about a deployment.
+_SANDBOX_PRODUCTION_MARKERS = frozenset({"prod", "production", "live", "main"})
+
+#: The owner-authored declaration file name the owner decision pins.  The
+#: *directory* is the production caller's own durable state location, resolved by
+#: the caller -- never an argument.
+OWNER_SANDBOX_DECLARATION_FILENAME = "owner-sandbox.yaml"
 
 #: The principal a recovered controller reads its continuation decision under
 #: when the caller names none.  It mirrors the handoff tool's own direct-caller
@@ -2015,6 +2068,277 @@ def _integration_mode_for_subject(subject: Any) -> str:
         return integration_mode_for(subject)
     except UnknownSubjectKind as exc:
         raise _RefusedError(f"{HOLD_SUBJECT_KIND_UNKNOWN}: {exc}") from exc
+
+
+# ── Owner sandbox declaration (SW-SCOPE-010 S10-C criterion 2) ─────────────
+#
+# Additive and opt-in, and deliberately **outside the argv surface**.  The owner
+# decision (`owner-decision-sandbox-declaration.md`, decided 2026-10-16) fixes
+# the form: a list of allowed sandbox targets in `owner-sandbox.yaml` under the
+# planning repository's initiative folder, never supplied through any tool, MCP
+# argument or CLI argument.  The production caller resolves the owner-state
+# *directory* itself; below, the loader appends only the pinned file name,
+# records the SHA-256 of the bytes it read, and refuses by name when the target
+# is unlisted, the declaration is absent, the target looks production, or the
+# bytes changed between load and apply.
+
+
+class SandboxDeclarationRefused(Exception):
+    """The owner sandbox declaration does not admit this target.
+
+    ``hold`` is the named hold (one of the ``HOLD_SANDBOX_*`` names) the refusal
+    reports, so a caller never has to parse prose to learn why nothing was
+    applied.  The refusal carries the digest of the declaration it was decided
+    against, so a rejected apply is bound to the exact bytes that rejected it.
+    """
+
+    def __init__(self, hold: str, *, digest: str = "") -> None:
+        super().__init__(hold)
+        self.hold = hold
+        self.digest = digest
+
+
+@dataclass(frozen=True)
+class OwnerSandboxTarget:
+    """One allowed sandbox target, exactly as the owner declared it."""
+
+    name: str
+    adapter: str
+    match: str
+    production: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "adapter": self.adapter,
+            "match": self.match,
+            "production": self.production,
+        }
+
+
+def _is_production_looking(*fields: str) -> bool:
+    """Whether any of ``fields`` names a production-looking surface.
+
+    Each field is split on the delimiters a target name or adapter uses
+    (``-``, ``_``, ``.``, ``/``, ``:``, ``@``, whitespace) and a marker matches
+    only a whole segment, so ``prod-eu`` and ``live.example.dev`` refuse while
+    ``product-preview`` does not.  The comparison is case-insensitive.
+    """
+    for field in fields:
+        if not field:
+            continue
+        for segment in re.split(r"[-_./:@\s]+", field.lower()):
+            if segment in _SANDBOX_PRODUCTION_MARKERS:
+                return True
+    return False
+
+
+def _sandbox_target_from(entry: Any) -> OwnerSandboxTarget:
+    """Build one :class:`OwnerSandboxTarget` from a declaration entry.
+
+    A malformed entry declares nothing: it is refused under
+    :data:`HOLD_SANDBOX_UNDECLARED` rather than read as a half-populated target.
+    """
+    if not isinstance(entry, Mapping):
+        raise SandboxDeclarationRefused(HOLD_SANDBOX_UNDECLARED)
+    name = entry.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise SandboxDeclarationRefused(HOLD_SANDBOX_UNDECLARED)
+    adapter = entry.get("adapter", "")
+    match = entry.get("match", "")
+    if not isinstance(adapter, str) or not isinstance(match, str):
+        raise SandboxDeclarationRefused(HOLD_SANDBOX_UNDECLARED)
+    # The owner decision requires an *explicit* `production: false`: an omitted
+    # or non-False value is not a declaration that the target is a sandbox, so
+    # it is refused rather than defaulted.
+    production = entry.get("production")
+    if production is not False:
+        raise SandboxDeclarationRefused(HOLD_SANDBOX_PRODUCTION_LOOKING)
+    return OwnerSandboxTarget(
+        name=name.strip(), adapter=adapter, match=match, production=False
+    )
+
+
+@dataclass(frozen=True)
+class OwnerSandboxDeclaration:
+    """A loaded owner sandbox declaration and the digest of the bytes read.
+
+    ``declaration_path`` is the path the **loader** resolved from the caller's
+    owner-state directory (never an argument), ``digest`` the SHA-256 of the
+    exact bytes read, and ``targets`` the declared allow-list.  Every admission
+    records the digest, so a later apply is bound to the declaration it was
+    decided against.
+    """
+
+    declaration_path: str
+    digest: str
+    targets: tuple[OwnerSandboxTarget, ...]
+
+    def resolve_target(
+        self, target_name: str, *, adapter: str = ""
+    ) -> OwnerSandboxTarget:
+        """Admit ``target_name`` (optionally pinned to ``adapter``), or refuse.
+
+        Refusals are named, never silent and never skipped:
+
+        * a name (or adapter) the declaration does not list is refused under
+          :data:`HOLD_SANDBOX_TARGET_UNLISTED` -- the tool never invents a
+          target the owner did not declare.  The listing check comes first: an
+          unlisted target is simply not declared, so it is never reported as a
+          production surface the declaration licenses;
+        * a *listed* target whose name, adapter or match pattern is
+          production-looking is refused under
+          :data:`HOLD_SANDBOX_PRODUCTION_LOOKING` -- the declaration is never a
+          licence to reach production.
+        """
+        if not isinstance(target_name, str) or not target_name.strip():
+            raise SandboxDeclarationRefused(
+                HOLD_SANDBOX_TARGET_UNLISTED, digest=self.digest
+            )
+        declared = [t for t in self.targets if t.name == target_name]
+        if adapter:
+            declared = [t for t in declared if t.adapter == adapter]
+        if not declared:
+            raise SandboxDeclarationRefused(
+                HOLD_SANDBOX_TARGET_UNLISTED, digest=self.digest
+            )
+        if _is_production_looking(target_name, adapter) or any(
+            _is_production_looking(t.name, t.adapter, t.match) for t in declared
+        ):
+            raise SandboxDeclarationRefused(
+                HOLD_SANDBOX_PRODUCTION_LOOKING, digest=self.digest
+            )
+        return declared[0]
+
+    def recheck_digest(self) -> str:
+        """Re-read the declaration and refuse if its bytes changed since load.
+
+        The owner decision: "if the file changes between load and apply, the
+        controller refuses".  A declaration that has been deleted since load is
+        no longer the declaration that was recorded, so it is refused under the
+        same named hold; the returned digest is the one *both* reads agreed on.
+        """
+        try:
+            with open(self.declaration_path, "rb") as fh:
+                current = fh.read()
+        except OSError as exc:
+            raise SandboxDeclarationRefused(
+                HOLD_SANDBOX_DECLARATION_CHANGED, digest=self.digest
+            ) from exc
+        if hashlib.sha256(current).hexdigest() != self.digest:
+            raise SandboxDeclarationRefused(
+                HOLD_SANDBOX_DECLARATION_CHANGED, digest=self.digest
+            )
+        return self.digest
+
+    def receipt_for(self, target_name: str, *, adapter: str = "") -> dict[str, Any]:
+        """Resolve ``target_name`` and return the admission receipt to record.
+
+        The digest is the *loaded* declaration's, re-checked against the bytes
+        on disk as they are at admission time -- so the receipt a caller records
+        is bound to the declaration the owner actually authored, not to one that
+        was swapped underneath it.
+        """
+        target = self.resolve_target(target_name, adapter=adapter)
+        digest = self.recheck_digest()
+        return {
+            "declaration_path": self.declaration_path,
+            "declaration_digest": digest,
+            "target": target.to_dict(),
+        }
+
+
+def load_owner_sandbox_declaration(owner_state_dir: Any) -> OwnerSandboxDeclaration:
+    """Load the owner-authored sandbox declaration from durable owner state.
+
+    ``owner_state_dir`` is a directory the **production caller resolves itself**
+    from durable owner-authored state (the planning repository's initiative
+    folder, ``skillweave-planning/.skillweave/planning/prds/<initiative>/``).  It
+    is never an argv, tool or MCP argument, and no argument can name the
+    declaration *file*: the loader appends only the pinned
+    :data:`OWNER_SANDBOX_DECLARATION_FILENAME`, so a caller can name a directory
+    of owner state but cannot point the loader at arbitrary bytes.  The SHA-256
+    of the bytes actually read is returned with the parsed targets.
+
+    Fail closed with a named hold: an absent or unreadable declaration is
+    :data:`HOLD_SANDBOX_UNDECLARED` (a file that is not a declaration declares
+    nothing); a target entry that is not an explicit ``production: false``
+    sandbox target is :data:`HOLD_SANDBOX_PRODUCTION_LOOKING`.
+    """
+    import yaml
+
+    declaration_path = os.path.join(
+        os.fspath(owner_state_dir), OWNER_SANDBOX_DECLARATION_FILENAME
+    )
+    try:
+        with open(declaration_path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        raise SandboxDeclarationRefused(HOLD_SANDBOX_UNDECLARED) from exc
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        document = yaml.safe_load(data.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise SandboxDeclarationRefused(HOLD_SANDBOX_UNDECLARED) from exc
+    if not isinstance(document, Mapping):
+        raise SandboxDeclarationRefused(HOLD_SANDBOX_UNDECLARED)
+    raw_targets = document.get("sandbox_targets")
+    if not isinstance(raw_targets, list):
+        raise SandboxDeclarationRefused(HOLD_SANDBOX_UNDECLARED)
+    targets = tuple(_sandbox_target_from(entry) for entry in raw_targets)
+    return OwnerSandboxDeclaration(
+        declaration_path=declaration_path, digest=digest, targets=targets
+    )
+
+
+#: The environment variable naming the durable *owner-state directory* the
+#: production caller resolves the sandbox declaration in.  It names a directory,
+#: never the declaration file itself: the loader appends the pinned file name, so
+#: no value can point the loader at arbitrary bytes.  This is the caller's own
+#: durable-state configuration (like ``SKILLWEAVE_REVIEWER_ROUTE``), not a
+#: capability argument a task can supply.
+_ENV_OWNER_STATE_DIR = "SKILLWEAVE_OWNER_STATE_DIR"
+
+#: The planning-repository directory layout the owner decision pins, joined from
+#: the repository root when the explicit owner-state directory is not set.  The
+#: initiative folder is resolved under it, so no caller ever names a file.
+_OWNER_STATE_ROOT_RELPATH = (".skillweave", "planning", "prds")
+
+
+def _owner_state_root(project_root: Any) -> str:
+    """The owner-state directory: the configured one, else the planning tree."""
+    configured = os.environ.get(_ENV_OWNER_STATE_DIR, "").strip()
+    if configured:
+        return configured
+    return os.path.join(os.fspath(project_root), *_OWNER_STATE_ROOT_RELPATH)
+
+
+def resolve_sandbox_admission(
+    target_name: str, *, adapter: str = "", project_root: str = ""
+) -> dict[str, Any]:
+    """Admit a sandbox target against durable owner-authored state.
+
+    This is the **production caller** of :func:`load_owner_sandbox_declaration`
+    (criterion 2's seam): it resolves the owner-state directory from its *own*
+    durable configuration -- ``SKILLWEAVE_OWNER_STATE_DIR`` if set, else the
+    planning tree under ``project_root`` (the repository root by default) --
+    loads ``owner-sandbox.yaml``, records the SHA-256 of the bytes it read, and
+    returns the admission receipt a caller binds to the sandboxed dispatch.
+    Neither the declaration file nor a target is taken from an argument a task
+    could set: only the target *name* to admit is passed, and it is checked
+    against the owner's declaration.
+
+    Every failure to admit is a named :class:`SandboxDeclarationRefused`:
+    unlisted, undeclared, production-looking or changed.
+    """
+    if not project_root:
+        from skillweave import __file__ as _pkg_file
+
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(_pkg_file), os.pardir)
+        )
+    declaration = load_owner_sandbox_declaration(_owner_state_root(project_root))
+    return declaration.receipt_for(target_name, adapter=adapter)
 
 
 def _run_state_driven(
