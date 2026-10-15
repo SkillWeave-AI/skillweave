@@ -183,6 +183,78 @@ HOLD_REVIEW_VERDICT_UNOBSERVED = (
     "verdict; the controller never invents the reviewer's verdict (named hold)"
 )
 
+#: Named holds for the controller *restart* (SW-SCOPE-010 S10-B c2).  A
+#: restarted controller reads the written checkpoint and the durable dispatch
+#: intents and adopts exactly the ordering-first in-flight intent whose recorded
+#: owned identity still verifies.  Every other outcome is a *named* checkpoint
+#: hold -- and in none of them is the predecessor's launch intent replayed.
+HOLD_CHECKPOINT_UNWRITTEN = (
+    "native-controller refused: no run-keyed transition checkpoint is written "
+    "for the run, so a restart has no durable statement to resume from; the "
+    "predecessor's launch intent is never replayed (named checkpoint hold)"
+)
+HOLD_CHECKPOINT_INTENT_MISMATCH = (
+    "native-controller refused: the written checkpoint does not name the "
+    "ordering-first in-flight dispatch intent, so it is not the statement of "
+    "the state the restart must adopt; the launch intent is never replayed "
+    "(named checkpoint hold)"
+)
+HOLD_CHECKPOINT_NO_OWNED_IDENTITY = (
+    "native-controller refused: the ordering-first in-flight dispatch intent "
+    "carries no recorded owned process identity, so it cannot be adopted as the "
+    "owned attempt; the launch intent is never replayed (named checkpoint hold)"
+)
+HOLD_CHECKPOINT_IDENTITY_UNVERIFIED = (
+    "native-controller refused: the ordering-first in-flight dispatch intent's "
+    "recorded owned identity no longer verifies against the live OS, so the "
+    "restart adopts nothing rather than re-owning an unverified attempt; the "
+    "launch intent is never replayed (named checkpoint hold)"
+)
+HOLD_CHECKPOINT_IDENTITY_RECYCLED = (
+    "native-controller refused: the ordering-first in-flight dispatch intent's "
+    "recorded PID has been recycled -- the recorded creation instant no longer "
+    "matches the live process -- so the restart adopts nothing; the launch "
+    "intent is never replayed (named checkpoint hold)"
+)
+HOLD_CHECKPOINT_IDENTITY_STALE = (
+    "native-controller refused: the ordering-first in-flight dispatch intent's "
+    "recorded command no longer matches the live process argument vector, so "
+    "the restart adopts nothing; the launch intent is never replayed (named "
+    "checkpoint hold)"
+)
+HOLD_CHECKPOINT_IDENTITY_FOREIGN = (
+    "native-controller refused: the ordering-first in-flight dispatch intent's "
+    "recorded image is not the image the PID now runs, so the restart adopts "
+    "nothing; the launch intent is never replayed (named checkpoint hold)"
+)
+HOLD_CHECKPOINT_IDENTITY_NOT_ALIVE = (
+    "native-controller refused: the ordering-first in-flight dispatch intent's "
+    "recorded process is no longer observable, so its state is unknown -- not "
+    "confirmed terminated -- and the restart adopts nothing; the launch intent "
+    "is never replayed (named checkpoint hold)"
+)
+
+#: The named checkpoint hold each re-verification failure maps to, keyed by the
+#: declared :mod:`skillweave.runtime.process_identity` reason.  A fresh
+#: controller never re-owns an attempt it cannot still verify.
+_CHECKPOINT_HOLD_BY_REASON = {
+    "no_recorded_identity": HOLD_CHECKPOINT_NO_OWNED_IDENTITY,
+    "recycled_pid": HOLD_CHECKPOINT_IDENTITY_RECYCLED,
+    "stale_command": HOLD_CHECKPOINT_IDENTITY_STALE,
+    "foreign_worker": HOLD_CHECKPOINT_IDENTITY_FOREIGN,
+    "not_alive": HOLD_CHECKPOINT_IDENTITY_NOT_ALIVE,
+}
+
+#: The named hold when a run already carries a live in-flight owned attempt and
+#: this drive was *not* asked to resume it.  Re-dispatching the scope would
+#: replay the predecessor's launch intent, which the controller never does.
+HOLD_CHECKPOINT_ALREADY_IN_FLIGHT = (
+    "native-controller refused: the run already carries a live in-flight owned "
+    "attempt, so this drive would replay the predecessor's launch intent; re-run "
+    "with resume to adopt the ordering-first in-flight attempt (named checkpoint "
+    "hold)"
+)
+
 #: The substring marking a provider-native target that is a fallback pool
 #: rather than the requested model.  Derived from the gateway's own alias table
 #: (``FAIGATE_MAP`` names exactly one fallback target, ``openrouter-fallback``),
@@ -1121,6 +1193,11 @@ class DriveResult:
     released_dependents: tuple[str, ...]
     integration: str
     reviews: tuple[str, ...] = field(default_factory=tuple)
+    #: On a restart drive that adopted an ordering-first in-flight attempt, the
+    #: derived statement of *what* was adopted (run, intent, owned identity).
+    #: ``None`` on a normal fresh drive: the field records a read, never a
+    #: caller-supplied claim.
+    adoption: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1134,6 +1211,7 @@ class DriveResult:
             "released_dependents": list(self.released_dependents),
             "integration": self.integration,
             "reviews": list(self.reviews),
+            "adoption": self.adoption,
         }
 
 
@@ -1205,6 +1283,16 @@ def build_parser(prog: str = "skillweave native-controller") -> argparse.Argumen
         dest="session_id",
         default="",
         help="Optional session id recorded on the dispatch intent.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        dest="resume",
+        help="Restart the controller: read the run-keyed checkpoint and the "
+             "durable dispatch intents and adopt the ordering-first in-flight "
+             "intent whose recorded owned identity verifies, instead of "
+             "replaying the predecessor's launch intent. Without a verifiable "
+             "owned attempt the restart refuses with a named checkpoint hold.",
     )
     parser.add_argument(
         "--json",
@@ -1308,6 +1396,7 @@ def main(
             route=args.route,
             session_id=args.session_id,
             sequence=args.sequence,
+            resume=args.resume,
             worker=worker,
             reviewer=reviewer,
             store=store,
@@ -1442,6 +1531,7 @@ def _drive(
     route: str,
     session_id: str,
     sequence: str,
+    resume: bool,
     worker: WorkerAdapter,
     reviewer: ReviewerAdapter,
     store: Any,
@@ -1452,6 +1542,13 @@ def _drive(
     passing review integrates; a failing review repairs then re-reviews; a
     failing re-review stops the attempt terminally.  The lease is signal-safe
     and released on every exit path.
+
+    With ``resume`` the drive is a **restart**: before dispatching anything it
+    reads the run-keyed checkpoint and the durable dispatch intents and adopts
+    the ordering-first in-flight intent whose recorded owned identity verifies
+    (a named checkpoint hold otherwise).  With no ``resume`` but a live
+    in-flight attempt already present the drive refuses with a named hold rather
+    than replaying the predecessor's launch intent.
     """
     # Lazy imports keep the CLI module's import closure light and mirror the
     # composition the ``run`` command uses (a durable SQLiteRunStore). This is
@@ -1487,6 +1584,7 @@ def _drive(
                     route=route,
                     session_id=session_id,
                     sequence=sequence,
+                    resume=resume,
                     holder=holder,
                     worker=worker,
                     reviewer=reviewer,
@@ -1716,6 +1814,37 @@ def _declared_dependents(sequence_path: str, task_id: str) -> tuple[str, ...]:
     return tuple(sorted(dependents))
 
 
+def _adopt_in_flight_attempt(
+    svc: Any, store: Any, *, run_id: str, resume: bool
+) -> Any:
+    """Read the checkpoint + intents and adopt the ordering-first attempt.
+
+    Returns a :class:`~skillweave.runtime.native_process.RestartAdoption` when
+    the run already carries an in-flight owned attempt, or ``None`` when the run
+    has no in-flight intent (a fresh dispatch is admitted normally).
+
+    The read is always performed -- a drive never dispatches over an existing
+    in-flight attempt -- and the *derivation* is the durable one: the run key,
+    the ordering-first intent and the owned identity all come from the store's
+    records, never from the caller's flags.  With ``resume`` a verifiable
+    adoption proceeds; an unverifiable one is a **named checkpoint hold** and
+    the predecessor's launch intent is never replayed.  Without ``resume`` a
+    live in-flight attempt is refused by name rather than replayed.
+    """
+    in_flight = tuple(store.list_dispatch_intents(run_id, claiming_only=True))
+    if not in_flight:
+        return None
+    adoption = svc.read_restart_adoption(run_id)
+    if not adoption.adopted:
+        raise _RefusedError(
+            f"{adoption.hold}: "
+            f"{_CHECKPOINT_HOLD_BY_REASON.get(adoption.reason, HOLD_CHECKPOINT_UNWRITTEN)}"
+        )
+    if not resume:
+        raise _RefusedError(HOLD_CHECKPOINT_ALREADY_IN_FLIGHT)
+    return adoption
+
+
 def _run_state_driven(
     svc: Any,
     lease: Any,
@@ -1726,6 +1855,7 @@ def _run_state_driven(
     route: str,
     session_id: str,
     sequence: str,
+    resume: bool,
     holder: str,
     worker: WorkerAdapter,
     reviewer: ReviewerAdapter,
@@ -1749,6 +1879,34 @@ def _run_state_driven(
     token = svc.fencing_token
     steps: list[str] = []
     reviews: list[str] = []
+
+    # Step 0 -- restart (criterion 2).  A restarted controller adopts the
+    # ordering-first in-flight intent whose owned identity still verifies
+    # instead of replaying the predecessor's launch intent; with no resume flag
+    # a live in-flight attempt is refused by name rather than replayed.  With no
+    # in-flight attempt this is a no-op and the fresh dispatch below proceeds.
+    adoption = _adopt_in_flight_attempt(svc, store, run_id=run_id, resume=resume)
+    if adoption is not None and adoption.adopted:
+        # The predecessor's launch intent is *adopted*, never replayed: the
+        # drive takes ownership from the durable intent and writes no second
+        # launch.  The persisted checkpoint is the durable statement of the
+        # adoption (the new fencing token re-owns the in-flight intent).
+        _persist_transition_checkpoint(
+            svc, step=adoption.intent.step, intent_id=adoption.intent.intent_id
+        )
+        return DriveResult(
+            run_id=run_id,
+            task_id=task_id,
+            attempt=adoption.intent.attempt,
+            intent_id=adoption.intent.intent_id,
+            fencing_token=int(token),
+            steps=(),
+            accepted=False,
+            released_dependents=(),
+            integration="none",
+            reviews=(),
+            adoption=adoption.to_dict(),
+        )
 
     # Step 1 -- ready dispatch: record the durable intent (state LAUNCHED) and
     # its boundary owned-attempt-dispatch record.  Guarded transitions below

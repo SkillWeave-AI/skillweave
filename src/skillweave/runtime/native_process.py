@@ -576,6 +576,45 @@ class NativeProcessCheckpoint:
         }
 
 
+@dataclass(frozen=True)
+class RestartAdoption:
+    """The restart decision a *restarted* controller reads (criterion 2).
+
+    ``checkpoint`` is the run-keyed transition checkpoint the predecessor
+    wrote; ``intent`` is the *ordering-first* in-flight dispatch intent -- the
+    first in the store's deterministic ``(created_at, intent_id)`` order, read
+    from the durable intents themselves, never from an index the caller
+    supplies.  ``adopted`` is true only when that intent's recorded owned
+    identity still verifies against the live OS, in which case
+    ``owned_identity`` repeats the *durable* identity that was verified -- a
+    restart never manufactures one.  When nothing can be adopted, ``hold``
+    names the exact refusal (a named checkpoint hold) and ``reason`` the
+    declared verification reason, and the predecessor's launch intent is never
+    replayed.
+    """
+
+    run_id: str
+    checkpoint: Any
+    intent: Optional["DispatchIntent"]
+    adopted: bool
+    hold: str = ""
+    reason: str = ""
+    owned_identity: Optional[dict] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "intent_id": "" if self.intent is None else self.intent.intent_id,
+            "execution_scope": (
+                "" if self.intent is None else self.intent.execution_scope
+            ),
+            "adopted": self.adopted,
+            "hold": self.hold,
+            "reason": self.reason,
+            "owned_identity": self.owned_identity,
+        }
+
+
 def validate_native_process_checkpoint(record: Mapping[str, Any]) -> None:
     """Refuse a checkpoint record this consumer cannot support.
 
@@ -797,6 +836,27 @@ _RESUME_DECISIONS: frozenset[str] = frozenset({
     RESUME_ADOPTED,
     RESUME_REFUSED_NO_OWNED_ATTEMPT,
 })
+
+#: The named holds a *restart* publishes when it cannot adopt the ordering-first
+#: in-flight intent (SW-SCOPE-010 S10-B criterion 2).  Each names the exact
+#: durable statement that failed, so a restart is never an anonymous refusal and
+#: never a silent replay of the predecessor's launch intent.  The identity holds
+#: are keyed by the declared :mod:`skillweave.runtime.process_identity` reason.
+RESTART_HOLD_CHECKPOINT_UNWRITTEN = "checkpoint_not_written"
+RESTART_HOLD_ORDERING_FIRST_MISMATCH = "checkpoint_ordering_first_mismatch"
+RESTART_HOLD_NO_RECORDED_IDENTITY = "checkpoint_no_recorded_identity"
+RESTART_HOLD_IDENTITY_RECYCLED = "checkpoint_identity_recycled"
+RESTART_HOLD_IDENTITY_STALE_COMMAND = "checkpoint_identity_stale_command"
+RESTART_HOLD_IDENTITY_FOREIGN = "checkpoint_identity_foreign"
+RESTART_HOLD_IDENTITY_NOT_ALIVE = "checkpoint_identity_not_alive"
+RESTART_HOLD_IDENTITY_UNVERIFIED = "checkpoint_identity_unverified"
+RESTART_HOLD_BY_REASON: Mapping[str, str] = {
+    "no_recorded_identity": RESTART_HOLD_NO_RECORDED_IDENTITY,
+    "recycled_pid": RESTART_HOLD_IDENTITY_RECYCLED,
+    "stale_command": RESTART_HOLD_IDENTITY_STALE_COMMAND,
+    "foreign_worker": RESTART_HOLD_IDENTITY_FOREIGN,
+    "not_alive": RESTART_HOLD_IDENTITY_NOT_ALIVE,
+}
 
 #: The only review verdicts the loop accepts.  A verdict is the durable review
 #: record's outcome (``pass``/``fail``); anything else is refused rather than
@@ -4235,6 +4295,107 @@ class NativeProcessService:
             },
         )
         return self._store.save_checkpoint(checkpoint)
+
+    def read_restart_adoption(self, run_id: str) -> "RestartAdoption":
+        """Read the checkpoint + intents a *restarted* controller resumes from.
+
+        The restart reads the durable ``transitions_log``-derived checkpoint the
+        predecessor wrote **and** the durable dispatch intents, and adopts
+        exactly the **ordering-first in-flight** intent -- the first in the
+        store's deterministic ``(created_at, intent_id)`` order -- but only when
+        that intent's recorded owned identity still verifies against the live OS
+        (:meth:`verify_owned_attempt`, the *same* verification the drain and the
+        resume path use).
+
+        Every other outcome is a **named** hold, and in none of them is the
+        predecessor's launch intent replayed:
+
+        * no written checkpoint for the run -> :data:`RESTART_HOLD_CHECKPOINT_UNWRITTEN`;
+        * the checkpoint does not name the ordering-first intent ->
+          :data:`RESTART_HOLD_ORDERING_FIRST_MISMATCH`;
+        * the ordering-first intent records no owned identity, or its identity no
+          longer verifies -> the reason-specific ``checkpoint_identity_*`` hold.
+
+        ``run_id`` must be the run the *durable intents* name: a caller naming
+        another run gets the checkpoint-not-written hold, never the driven run's
+        intents -- the run key is never caller-supplied.  Nothing is written and
+        nothing is dispatched here: this is a read, and it is the read that
+        decides adoption.
+        """
+        checkpoint = self._store.get_checkpoint(run_id)
+        if checkpoint is None:
+            return RestartAdoption(
+                run_id=run_id,
+                checkpoint=None,
+                intent=None,
+                adopted=False,
+                hold=RESTART_HOLD_CHECKPOINT_UNWRITTEN,
+                reason="no_checkpoint_for_run",
+            )
+        # The ordering-first in-flight intent: the first claiming intent in the
+        # store's own deterministic order.  Never the caller's index, never the
+        # newest -- a stale-first set is refused below rather than skipped.
+        in_flight = tuple(self._store.list_dispatch_intents(run_id, claiming_only=True))
+        if not in_flight:
+            return RestartAdoption(
+                run_id=checkpoint.run_id,
+                checkpoint=checkpoint,
+                intent=None,
+                adopted=False,
+                hold=RESTART_HOLD_ORDERING_FIRST_MISMATCH,
+                reason="no_in_flight_intent",
+            )
+        intent = in_flight[0]
+        # The written checkpoint must name the intent this restart adopts: a
+        # checkpoint for another state is not the statement of what to resume.
+        recorded = checkpoint.metadata.get("in_flight") or ()
+        recorded_scopes = {str(pair[0]) for pair in recorded if pair}
+        if intent.execution_scope not in recorded_scopes:
+            return RestartAdoption(
+                run_id=checkpoint.run_id,
+                checkpoint=checkpoint,
+                intent=intent,
+                adopted=False,
+                hold=RESTART_HOLD_ORDERING_FIRST_MISMATCH,
+                reason="checkpoint_does_not_name_in_flight_intent",
+            )
+        recorded_identity = intent.process_identity
+        if not recorded_identity:
+            return RestartAdoption(
+                run_id=checkpoint.run_id,
+                checkpoint=checkpoint,
+                intent=intent,
+                adopted=False,
+                hold=RESTART_HOLD_NO_RECORDED_IDENTITY,
+                reason="no_recorded_identity",
+            )
+        # Re-observe the *recorded* identity against the live OS.  Only a
+        # ``match`` adopts; the recorded identity is re-verified against the
+        # live process, never the reversed direction (the recorded facts cannot
+        # be substituted by a second record for the same PID -- a recycled PID,
+        # a stale command or a foreign image is refused by the live probe).
+        verification = self.verify_owned_attempt(intent)
+        if not bool(getattr(verification, "ok", False)):
+            reason = str(getattr(verification, "reason", "identity_unverified"))
+            return RestartAdoption(
+                run_id=checkpoint.run_id,
+                checkpoint=checkpoint,
+                intent=intent,
+                adopted=False,
+                hold=RESTART_HOLD_BY_REASON.get(
+                    reason, RESTART_HOLD_IDENTITY_UNVERIFIED
+                ),
+                reason=reason,
+            )
+        return RestartAdoption(
+            run_id=checkpoint.run_id,
+            checkpoint=checkpoint,
+            intent=intent,
+            adopted=True,
+            reason="match",
+            # The identity repeated is the *durable* one that just verified.
+            owned_identity=dict(recorded_identity),
+        )
 
     # -- recovery (native-process-checkpoint-v1) -------------------------
 
