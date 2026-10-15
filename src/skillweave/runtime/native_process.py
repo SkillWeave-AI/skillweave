@@ -4171,7 +4171,7 @@ class NativeProcessService:
         pid = int(recorded.get("pid", 0))
         return process_identity.verify(recorded, pid)
 
-    def persist_transition_checkpoint(self, step: str) -> Any:
+    def persist_transition_checkpoint(self, step: str, intent_id: str = "") -> Any:
         """Persist a run-keyed checkpoint after a controller transition.
 
         The controller's transition log is only *readable* durable state; this
@@ -4179,30 +4179,41 @@ class NativeProcessService:
         ``skillweave.runtime.checkpoint.Checkpoint`` into the store's
         ``checkpoints`` table, keyed by ``run_id``.
 
-        ``step`` names *which* transition just happened and is recorded in the
-        checkpoint metadata; it is the only argument and it is not the run key.
+        ``step`` names *which* transition just happened; ``intent_id`` names the
+        durable intent the transition was driven on.  Neither is the run key and
+        neither enters the checkpoint.
 
-        The persisted content is derived -- never caller-supplied: the run key,
-        the journal offset and the in-flight intent state all come from the
-        store's own durable records (:meth:`SQLiteRunStore.last_journal_sequence`
-        and :meth:`SQLiteRunStore.list_dispatch_intents`), and the run comes from
-        this service's own ``_run_id_label()`` (the run its durable intents name)
-        rather than from the caller's ``--run-id``.  A caller-supplied value can
-        therefore not forge or repoint the checkpoint.
+        The persisted content is derived -- never caller-supplied: the run key
+        comes from that *durable intent* (not from the caller's
+        ``--run-id``/``--holder``), and the journal offset and the in-flight set
+        come from the store's own durable records
+        (:meth:`SQLiteRunStore.last_journal_sequence` and
+        :meth:`SQLiteRunStore.list_dispatch_intents`).  A caller-supplied value
+        can therefore not forge or repoint the checkpoint.
+
+        ``step`` and ``intent_id`` are *verified* against the durable intent: the
+        intent must exist and its recorded ``step`` must equal ``step``.  A
+        caller can thus only prove *which* durable transition it is persisting,
+        never author the content.  With no matching durable intent nothing is
+        written (``None``) -- the controller refuses rather than inventing a run
+        or a transition.
         """
         from skillweave.runtime.checkpoint import Checkpoint, EnvironmentFingerprint
 
-        resolved_run = self._run_id_label()
-        # The run key comes from the service's own durable intents, not from
-        # the caller: a caller cannot repoint the checkpoint at another run.
-        if not resolved_run or resolved_run == self.holder:
+        if not intent_id:
             return None
-        intents = tuple(self._store.list_dispatch_intents(run_id=resolved_run))
+        intent = self._store.get_dispatch_intent(intent_id)
+        if intent is None or intent.step != step:
+            return None
+        # The run key comes from the durable intent, never from the caller: a
+        # caller cannot repoint the checkpoint at another run.
+        run_id = intent.run_id
+        intents = tuple(self._store.list_dispatch_intents(run_id=run_id))
         checkpoint = Checkpoint(
-            run_id=resolved_run,
-            root_run_id=resolved_run,
+            run_id=run_id,
+            root_run_id=run_id,
             parent_run_id=None,
-            journal_offset=self._store.last_journal_sequence(resolved_run),
+            journal_offset=self._store.last_journal_sequence(run_id),
             environment=EnvironmentFingerprint(
                 hostname="",
                 os_name="",

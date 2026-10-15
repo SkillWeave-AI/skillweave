@@ -1502,8 +1502,8 @@ def _drive(
             store.close()
 
 
-def _persist_transition_checkpoint(svc: Any, *, step: str) -> None:
-    """Persist the run-keyed transition checkpoint (SW-SCOPE-010 criterion 3).
+def _persist_transition_checkpoint(svc: Any, *, step: str, intent_id: str) -> None:
+    """Persist the run-keyed transition checkpoint (SW-SCOPE-010 S10-B c1).
 
     The controller is *state-driven*: every step it takes is a durable
     transition on the intent it owns.  This makes the transition log a
@@ -1514,10 +1514,12 @@ def _persist_transition_checkpoint(svc: Any, *, step: str) -> None:
     Nothing here is caller-supplied.  The run key, the in-flight set and the
     journal offset are all read from the store's durable records inside
     :meth:`NativeProcessService.persist_transition_checkpoint`; ``step`` names
-    *which* transition just happened, and a transition that did not persist its
-    checkpoint is a fail-closed refusal rather than a silent skip.
+    *which* transition just happened and ``intent_id`` the durable intent it was
+    driven on, and both are verified against that durable intent -- neither
+    enters the checkpoint.  A transition that did not persist its checkpoint is
+    a fail-closed refusal rather than a silent skip.
     """
-    if svc.persist_transition_checkpoint(step) is None:
+    if svc.persist_transition_checkpoint(step, intent_id) is None:
         raise _RefusedError(
             f"{step}: the controller transition did not persist its run-keyed "
             f"checkpoint (fail-closed)"
@@ -1763,7 +1765,7 @@ def _run_state_driven(
     intent_id = intent.intent_id
     # The transition is durable *and* recorded: persist the run-keyed
     # checkpoint derived from the store's own intents and journal cursor.
-    _persist_transition_checkpoint(svc, step=STEP_READY_DISPATCH)
+    _persist_transition_checkpoint(svc, step=STEP_READY_DISPATCH, intent_id=intent_id)
 
     # The launch seam: the production adapter runs the owned attempt here. It
     # launches nothing in tests (the fake records and returns a synthetic record).
@@ -1784,7 +1786,7 @@ def _run_state_driven(
     )
     recorded = _require_recorded_verdict(store, run_id, expected=STEP_INDEPENDENT_REVIEW)
     svc.reviewed_advance(intent_id, recorded)
-    _persist_transition_checkpoint(svc, step=STEP_INDEPENDENT_REVIEW)
+    _persist_transition_checkpoint(svc, step=STEP_INDEPENDENT_REVIEW, intent_id=intent_id)
     steps.append(STEP_INDEPENDENT_REVIEW)
     reviews.append(recorded)
 
@@ -1809,7 +1811,7 @@ def _run_state_driven(
         )
         rerecorded = _require_recorded_verdict(store, run_id, expected=STEP_RE_REVIEW)
         svc.rereviewed_advance(intent_id, rerecorded)
-        _persist_transition_checkpoint(svc, step=STEP_RE_REVIEW)
+        _persist_transition_checkpoint(svc, step=STEP_RE_REVIEW, intent_id=intent_id)
         steps.append(STEP_RE_REVIEW)
         reviews.append(rerecorded)
         accepted = redecision.verdict == gr.GATE_PASS and redecision.accepted
@@ -1878,7 +1880,7 @@ def _run_state_driven(
     else:
         svc.integration_advance(intent_id)
         integration = "git_merge"
-    _persist_transition_checkpoint(svc, step=STEP_CONTROLLED_INTEGRATION)
+    _persist_transition_checkpoint(svc, step=STEP_CONTROLLED_INTEGRATION, intent_id=intent_id)
     steps.append(STEP_CONTROLLED_INTEGRATION)
 
     # Step 6 -- dependent wave: compute by the declared dependency graph and the
@@ -1888,7 +1890,7 @@ def _run_state_driven(
         svc, gr, task_id=task_id, receipt=receipt, dependents=dependents
     )
     svc.dependent_wave_advance(intent_id)
-    _persist_transition_checkpoint(svc, step=STEP_DEPENDENT_WAVE)
+    _persist_transition_checkpoint(svc, step=STEP_DEPENDENT_WAVE, intent_id=intent_id)
     steps.append(STEP_DEPENDENT_WAVE)
 
     return DriveResult(
