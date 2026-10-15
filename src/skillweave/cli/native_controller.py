@@ -296,6 +296,16 @@ def build_parser(prog: str = "skillweave native-controller") -> argparse.Argumen
         dest="as_json",
         help="Emit the drive result as a single JSON envelope (default).",
     )
+    parser.add_argument(
+        "--qualify-cms-path",
+        dest="qualify_cms_path",
+        default="",
+        help="Qualify one declared CMS path (SW-1511-CMS-FLOWS) against the "
+             "durable store: drive its reversible lifecycle through the native "
+             "controller seam and emit the fail-closed cms-process-qualification "
+             "record. Additive and opt-in; no worker/reviewer adapter and no "
+             "provider, gateway or CMS call is made.",
+    )
     return parser
 
 
@@ -329,6 +339,38 @@ def main(
     except _UsageError as exc:
         sys.stderr.write(f"error: {exc}\n")
         return EXIT_INVALID_INPUT
+
+    # Additive, opt-in CMS path qualification (SW-1511-CMS-FLOWS): this branch
+    # drives the reversible lifecycle of one declared CMS path through the
+    # native controller seam and needs no worker/reviewer adapter -- and makes no
+    # provider, gateway or CMS call. It is checked before the worker/reviewer
+    # fail-closed holds so the two surfaces never interfere.
+    if args.qualify_cms_path:
+        try:
+            result = _qualify_cms_path(
+                path_id=args.qualify_cms_path,
+                run_id=args.run_id,
+                task_id=args.task_id,
+                attempt=args.attempt,
+                db_path=args.db_path,
+                holder=args.holder,
+                ttl_seconds=args.ttl_seconds,
+                store=store,
+            )
+        except _UsageError as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            return EXIT_INVALID_INPUT
+        except _RefusedError as exc:
+            sys.stderr.write(f"refused: {exc}\n")
+            return EXIT_REFUSED
+        except KeyboardInterrupt:
+            sys.stderr.write("interrupted\n")
+            return EXIT_FAILED
+        except Exception as exc:  # noqa: BLE001 -- a crash is exit 5, never a verdict
+            sys.stderr.write(f"error: {type(exc).__name__}: {exc}\n")
+            return EXIT_FAILED
+        sys.stdout.write(json.dumps(result.to_dict(), sort_keys=True) + "\n")
+        return EXIT_OK
 
     # Fail closed with a *named* unsupported hold before touching the store:
     # with no production adapter configured the controller substitutes nothing.
@@ -424,6 +466,53 @@ class _LeaseGuard:
             if exc_type is None:
                 raise
         return False
+
+
+def _qualify_cms_path(
+    *,
+    path_id: str,
+    run_id: str,
+    task_id: str,
+    attempt: int,
+    db_path: str,
+    holder: str,
+    ttl_seconds: int,
+    store: Any,
+) -> Any:
+    """Qualify one declared CMS path through the native controller seam.
+
+    This is the production *consumer* of the declared CMS paths
+    (SW-1511-CMS-FLOWS): the frozen declaration module shipped with no caller, so
+    this branch makes the flow reachable from the command line. It composes the
+    service on the same durable store the ``run`` command uses and delegates to
+    :func:`skillweave.runtime.cms_flow_qualification.qualify_cms_path`. No worker
+    or reviewer adapter is involved and no provider/gateway/CMS call is made.
+    """
+    from skillweave.runtime.cms_flow_qualification import (
+        CmsFlowQualificationRefused,
+        qualify_cms_path,
+    )
+    from skillweave.runtime.store import SQLiteRunStore
+
+    owns_store = store is None
+    if owns_store:
+        store = SQLiteRunStore(db_path)
+    try:
+        try:
+            return qualify_cms_path(
+                store,
+                path_id,
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                holder=holder,
+                ttl_seconds=ttl_seconds,
+            )
+        except CmsFlowQualificationRefused as exc:
+            raise _UsageError(str(exc)) from exc
+    finally:
+        if owns_store:
+            store.close()
 
 
 def _drive(
