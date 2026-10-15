@@ -670,3 +670,26 @@ jobs:
 
           asyncio.run(main())
           PUBLISH_PY
+
+      # Publication is not verification. The step above proves the engine
+      # accepted the release; it cannot prove that the release a consumer
+      # downloads carries the assets this job built. A partially uploaded
+      # attachment, an extra file, or bytes that do not match the reviewed
+      # SHA256SUMS all publish "successfully". Re-read the release object from
+      # the forge and hold the run red, by name, if the attached set is not the
+      # set SHA256SUMS declares.
+      - name: Verify the published release attachments
+        if: ${{ !cancelled() }}
+        env:
+          TAG_NAME: "${{ github.event.inputs.tag_name || github.ref_name }}"
+          FORGEJO_REPOSITORY: "${{ github.repository }}"
+          FORGEJO_BASE_URL: "${{ github.server_url }}"
+          FORGEJO_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          set -euo pipefail
+
+          python3 scripts/verify-release-attachments.py \
+            --tag "$TAG_NAME" \
+            --base-url "$FORGEJO_BASE_URL" \
+            --repository "$FORGEJO_REPOSITORY" \
+            --assets-dir release-assets
