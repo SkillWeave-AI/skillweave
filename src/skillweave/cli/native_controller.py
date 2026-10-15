@@ -255,6 +255,48 @@ HOLD_CHECKPOINT_ALREADY_IN_FLIGHT = (
     "hold)"
 )
 
+#: Named holds for the recovered controller's **continuation read**
+#: (SW-SCOPE-010 S10-B criterion 3).  A recovered controller reaches the
+#: ``harness-continuation-v1`` decision the handoff tool persisted through the
+#: run-scoped reader :func:`skillweave.mcp.server.read_continuation_decision`
+#: (the durable mailbox), never by re-deriving it.  Every outcome other than a
+#: decision recorded for *this* run is a *named* continuation hold, and in none
+#: of them is another run's decision relabelled or the launch intent replayed.
+HOLD_CONTINUATION_UNREADABLE = (
+    "native-controller refused: the harness-continuation decision persisted for "
+    "this run could not be read under the recovered controller's scope, so the "
+    "restart has no durable continuation statement to continue from; the "
+    "predecessor's launch intent is never replayed (named continuation hold)"
+)
+HOLD_CONTINUATION_NOT_PERSISTED = (
+    "native-controller refused: no harness-continuation decision is persisted "
+    "for this run under the recovered controller's scope, so there is no "
+    "durable continuation statement to read back; another run's decision is "
+    "never relabelled as this run's and the launch intent is never replayed "
+    "(named continuation hold)"
+)
+HOLD_CONTINUATION_FOREIGN_RUN = (
+    "native-controller refused: the harness-continuation decision read back "
+    "names a different run than the one being recovered, so it is not the "
+    "continuation statement of this run; a foreign run's decision is never "
+    "relabelled (named continuation hold)"
+)
+HOLD_CONTINUATION_REPLAYED = (
+    "native-controller refused: the harness-continuation decision persisted for "
+    "this run names a different owned attempt than the ordering-first in-flight "
+    "intent being adopted, so continuing from it would replay a predecessor "
+    "attempt's continuation; a decision for another attempt is never replayed "
+    "as this attempt's (named continuation hold)"
+)
+
+#: The principal a recovered controller reads its continuation decision under
+#: when the caller names none.  It mirrors the handoff tool's own direct-caller
+#: principal (``in-process``, the documented CLI-parity seam of the messaging
+#: tools), so a decision the tool persisted with no bound authority is readable
+#: by the controller with no extra input.  A principal is never invented: a
+#: caller that persists under an authenticated principal names it explicitly.
+_CONTINUATION_DEFAULT_PRINCIPAL = "in-process"
+
 #: The substring marking a provider-native target that is a fallback pool
 #: rather than the requested model.  Derived from the gateway's own alias table
 #: (``FAIGATE_MAP`` names exactly one fallback target, ``openrouter-fallback``),
@@ -1198,6 +1240,12 @@ class DriveResult:
     #: ``None`` on a normal fresh drive: the field records a read, never a
     #: caller-supplied claim.
     adoption: Optional[dict[str, Any]] = None
+    #: On a restart drive that adopted an in-flight attempt, the
+    #: ``harness-continuation-v1`` decision read back from the run's durable
+    #: mailbox through the run-scoped reader: the *same* decision the handoff
+    #: tool persisted, verbatim as the reader returned it.  ``None`` on a fresh
+    #: drive -- the controller never derives or invents the decision.
+    continuation: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1212,6 +1260,7 @@ class DriveResult:
             "integration": self.integration,
             "reviews": list(self.reviews),
             "adoption": self.adoption,
+            "continuation": self.continuation,
         }
 
 
@@ -1293,6 +1342,15 @@ def build_parser(prog: str = "skillweave native-controller") -> argparse.Argumen
              "intent whose recorded owned identity verifies, instead of "
              "replaying the predecessor's launch intent. Without a verifiable "
              "owned attempt the restart refuses with a named checkpoint hold.",
+    )
+    parser.add_argument(
+        "--principal",
+        default=_CONTINUATION_DEFAULT_PRINCIPAL,
+        help="The scoped principal the recovered controller reads the run's "
+             "persisted harness-continuation decision under (default: "
+             "in-process, the CLI-parity principal the handoff tool writes it "
+             "as). A foreign principal's mailbox is never read and no principal "
+             "is invented.",
     )
     parser.add_argument(
         "--json",
@@ -1397,6 +1455,7 @@ def main(
             session_id=args.session_id,
             sequence=args.sequence,
             resume=args.resume,
+            principal=args.principal,
             worker=worker,
             reviewer=reviewer,
             store=store,
@@ -1532,6 +1591,7 @@ def _drive(
     session_id: str,
     sequence: str,
     resume: bool,
+    principal: str,
     worker: WorkerAdapter,
     reviewer: ReviewerAdapter,
     store: Any,
@@ -1585,6 +1645,7 @@ def _drive(
                     session_id=session_id,
                     sequence=sequence,
                     resume=resume,
+                    principal=principal,
                     holder=holder,
                     worker=worker,
                     reviewer=reviewer,
@@ -1814,6 +1875,71 @@ def _declared_dependents(sequence_path: str, task_id: str) -> tuple[str, ...]:
     return tuple(sorted(dependents))
 
 
+def _read_continuation_decision(
+    *, run_id: str, principal: str, adopted_intent_id: str
+) -> dict[str, Any]:
+    """Read back the run's persisted ``harness-continuation-v1`` decision.
+
+    The recovered controller does **not** derive or invent a continuation
+    statement: it reads the *same* decision the handoff tool persisted, through
+    the run-scoped reader :func:`skillweave.mcp.server.read_continuation_decision`
+    (the reader is scoped by the record's *own* durable ``run_id``, so another
+    run's decision can never be relabelled as this run's).
+
+    Four named holds replace a silent continuation:
+
+    * ``HOLD_CONTINUATION_UNREADABLE`` -- the reader itself refused (no mailbox,
+      no scoped principal, an unauthenticated read), or its reply is not a
+      well-formed ok payload.
+    * ``HOLD_CONTINUATION_FOREIGN_RUN`` -- the reader returned a decision whose
+      own ``run_id`` is not the run being recovered.
+    * ``HOLD_CONTINUATION_NOT_PERSISTED`` -- no decision is persisted for this
+      run (``found`` is false).
+    * ``HOLD_CONTINUATION_REPLAYED`` -- a decision *is* persisted for this run
+      but it names a different owned attempt than the ordering-first in-flight
+      intent ``adopted_intent_id`` this restart is resuming.  Replaying a
+      predecessor attempt's continuation as the current attempt's would be
+      exactly the retroactive mislabelling criterion 3 forbids, so it is a
+      named hold -- never a silent continuation.
+
+    The decision is returned verbatim as the reader produced it -- never an
+    empty or synthetic decision, and the predecessor's launch intent is never
+    replayed in its place.
+    """
+    from skillweave.mcp.server import read_continuation_decision
+
+    effective = principal or _CONTINUATION_DEFAULT_PRINCIPAL
+    payload = read_continuation_decision(
+        run_id=run_id, principal=effective, session_token=""
+    )
+    try:
+        raw = json.loads(payload) if isinstance(payload, str) else payload
+    except (TypeError, ValueError):
+        raise _RefusedError(HOLD_CONTINUATION_UNREADABLE) from None
+    if not isinstance(raw, dict) or raw.get("status") != "ok":
+        raise _RefusedError(HOLD_CONTINUATION_UNREADABLE)
+    if not raw.get("found"):
+        raise _RefusedError(HOLD_CONTINUATION_NOT_PERSISTED)
+    # The record's own durable run id is what scopes the read: a decision that
+    # names a different run is a foreign statement, never this run's.
+    if raw.get("run_id") != run_id:
+        raise _RefusedError(HOLD_CONTINUATION_FOREIGN_RUN)
+    decision = raw.get("decision")
+    if not isinstance(decision, dict) or not decision:
+        raise _RefusedError(HOLD_CONTINUATION_NOT_PERSISTED)
+    if decision.get("run_id") not in (None, run_id):
+        raise _RefusedError(HOLD_CONTINUATION_FOREIGN_RUN)
+    # Bind the decision to the *adopted* attempt: a decision recorded for a
+    # different intent is a predecessor attempt's continuation and is never
+    # replayed as this attempt's.  A decision carrying no intent id is the
+    # adapter's own plan (the handoff tool records the session it saw, not
+    # always an intent) and is not itself a replay.
+    recorded_intent = decision.get("intent_id")
+    if recorded_intent and recorded_intent != adopted_intent_id:
+        raise _RefusedError(HOLD_CONTINUATION_REPLAYED)
+    return decision
+
+
 def _adopt_in_flight_attempt(
     svc: Any, store: Any, *, run_id: str, resume: bool
 ) -> Any:
@@ -1856,6 +1982,7 @@ def _run_state_driven(
     session_id: str,
     sequence: str,
     resume: bool,
+    principal: str,
     holder: str,
     worker: WorkerAdapter,
     reviewer: ReviewerAdapter,
@@ -1894,6 +2021,16 @@ def _run_state_driven(
         _persist_transition_checkpoint(
             svc, step=adoption.intent.step, intent_id=adoption.intent.intent_id
         )
+        # Criterion 3: the recovered controller reads the *persisted*
+        # harness-continuation decision through the run-scoped reader -- the
+        # same decision the handoff tool wrote -- instead of deriving its own.
+        # With no readable decision for this run the restart refuses with a
+        # named continuation hold and never replays the launch intent.
+        continuation = _read_continuation_decision(
+            run_id=run_id,
+            principal=principal,
+            adopted_intent_id=adoption.intent.intent_id,
+        )
         return DriveResult(
             run_id=run_id,
             task_id=task_id,
@@ -1906,6 +2043,7 @@ def _run_state_driven(
             integration="none",
             reviews=(),
             adoption=adoption.to_dict(),
+            continuation=continuation,
         )
 
     # Step 1 -- ready dispatch: record the durable intent (state LAUNCHED) and
