@@ -24,17 +24,19 @@ repository's dummy :class:`~skillweave.runtime.native_process.RawContentAdapter`
   :meth:`CmsProcessQualification.from_mapping
   <skillweave.blueprint.cms_path_qualification.CmsProcessQualification.from_mapping>`.
 
-The honesty of the result is the point.  This consumer genuinely *performs* the
-``success`` outcome of the path's lifecycle -- so it carries the real readback
-and restore evidence and the source-bound pins -- but it measures **only** that
-outcome.  The contract requires all six measurable outcomes
+The honesty of the result is the point.  This consumer genuinely *measures*
+three outcomes of the path's lifecycle -- ``success`` (the reversible lifecycle
+driven to ``restored``), ``failure`` (a separately owned attempt resolved and
+re-read as ``failed`` from durable state) and ``cancel`` (the run reconciled to
+its terminal cancellation state and re-read as terminal from durable state) --
+so it carries the real readback, restore and terminal-state evidence plus the
+source-bound pins.  The contract requires all six measurable outcomes
 (:data:`~skillweave.blueprint.cms_path_qualification.REQUIRED_OUTCOMES`) before a
 record may claim ``performed``, so this consumer deliberately returns a
 ``not-performed`` record with the measured evidence attached and a *named*
-limitation.  It never forges the remaining five outcomes into a prewritten
-receipt: measuring ``wait``/``failure``/``cancel``/``resume``/
-``publication-refusal`` is a later lane's job, exactly as the frozen module's
-docstring says.
+limitation.  It never forges the remaining three outcomes into a prewritten
+receipt: measuring ``wait``/``resume``/``publication-refusal`` is a later lane's
+job, exactly as the frozen module's docstring says.
 
 The seam is a **fake at the process boundary**: no provider, no gateway and no
 CMS call is made or probed.  ``RawContentAdapter`` is an in-memory dummy and the
@@ -44,6 +46,7 @@ binding is a declared sandbox; the private provider implementation stays in
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -77,17 +80,33 @@ CMS_QUALIFICATION_BASELINE: dict[str, Any] = {"title": "old", "body": "hello"}
 #: The bounded change the lifecycle applies and then restores away from.
 CMS_QUALIFICATION_CHANGE: dict[str, Any] = {"title": "new", "body": "hello"}
 
-#: The single outcome this consumer can genuinely measure through the reversible
-#: lifecycle seam.  It is deliberately a one-element set: a record that carries
-#: only this must remain ``not-performed``.
-MEASURED_SUCCESS_ONLY: tuple[str, ...] = ("success",)
+#: The outcomes this consumer genuinely measures through the *existing* native
+#: controller seam.  Each one is driven and then **read back from durable
+#: state**, never asserted from a live in-memory claim:
+#:
+#: * ``success`` -- the reversible CMS lifecycle runs to ``restored``;
+#: * ``failure`` -- a separately owned attempt for the same path is *resolved*
+#:   through the native ``record_failure`` seam and its terminal ``failed``
+#:   intent state is re-read from the durable store;
+#: * ``cancel`` -- the run is reconciled to its terminal cancellation via the
+#:   durable ``CancellationReconciler`` and re-read as a terminal run holding the
+#:   ``killed`` lifecycle state.
+#:
+#: It is deliberately a strict subset of ``REQUIRED_OUTCOMES``: a record that
+#: carries only these must remain ``not-performed``.
+MEASURED_OUTCOMES: tuple[str, ...] = ("success", "failure", "cancel")
+
+#: The outcomes that are still **not measured** by this consumer, named
+#: explicitly so the record never implies it measured them.
+UNMEASURED_OUTCOMES: tuple[str, ...] = ("wait", "resume", "publication-refusal")
 
 #: The limitation this consumer attaches to every record it produces, naming the
 #: outcomes it did *not* measure rather than implying it did.
 UNMEASURED_OUTCOME_LIMITATION = (
-    "only the 'success' outcome was measured by driving the reversible lifecycle; "
-    "'wait', 'failure', 'cancel', 'resume' and 'publication-refusal' are not "
-    "measured by this consumer, so the record stays 'not-performed' by contract"
+    "only the 'success', 'failure' and 'cancel' outcomes were measured by "
+    "driving the native CMS lifecycle and the durable attempt/cancellation "
+    "seams; 'wait', 'resume' and 'publication-refusal' are not measured by this "
+    "consumer, so the record stays 'not-performed' by contract"
 )
 
 
@@ -99,14 +118,24 @@ class CmsFlowQualificationRefused(ValueError):
     """
 
 
+#: The event type stamped on the run's cancellation transition.
+CANCELLATION_EVENT_TYPE = "process_killed"
+
+
 @dataclass(frozen=True)
 class CmsPathQualificationRun:
     """What driving one declared CMS path through the native seam produced.
 
     Carries the resolved :class:`CmsPath`, the fail-closed qualification record,
-    and the durable facts of the driven transaction (the derived producer
-    identity, the transaction id and its persisted final stage) so a caller can
-    re-read the persisted record rather than trust this object.
+    and the durable facts of every measured outcome so a caller can re-read the
+    persisted records rather than trust this object:
+
+    * ``producer_identity`` / ``txn_id`` / ``final_stage`` -- the ``success``
+      outcome's durable CMS transaction;
+    * ``failure_intent_id`` / ``failure_state`` -- the ``failure`` outcome's
+      durable dispatch intent and its persisted terminal state;
+    * ``cancel_run_state`` / ``cancel_lifecycle_state`` -- the ``cancel``
+      outcome's durable run state and lifecycle metadata.
     """
 
     path: CmsPath
@@ -115,6 +144,10 @@ class CmsPathQualificationRun:
     run_id: str
     txn_id: str
     final_stage: str
+    failure_intent_id: str = ""
+    failure_state: str = ""
+    cancel_run_state: str = ""
+    cancel_lifecycle_state: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -124,6 +157,10 @@ class CmsPathQualificationRun:
             "run_id": self.run_id,
             "txn_id": self.txn_id,
             "final_stage": self.final_stage,
+            "failure_intent_id": self.failure_intent_id,
+            "failure_state": self.failure_state,
+            "cancel_run_state": self.cancel_run_state,
+            "cancel_lifecycle_state": self.cancel_lifecycle_state,
         }
 
 
@@ -146,6 +183,92 @@ def _resolve_declared_path(path: Any) -> CmsPath:
             f"{[p.path_id for p in INITIAL_CMS_PATHS]}"
         )
     return declared
+
+
+def _durable_failure_state(store: Any, intent_id: str, run_id: str) -> str:
+    """Re-read a resolved attempt's terminal state from the durable store.
+
+    The ``failure`` outcome is only *measured* when the persisted dispatch
+    intent -- not a live return value -- shows the terminal ``failed`` state.
+    A missing intent, a foreign run id or a still-claiming state is refused,
+    so a qualification can never record a failure it did not durably observe.
+    """
+    from .native_process import INTENT_FAILED
+
+    persisted = store.get_dispatch_intent(intent_id)
+    if persisted is None:
+        raise CmsFlowQualificationRefused(
+            f"the failed attempt {intent_id!r} was not persisted; a "
+            f"qualification cannot read the 'failure' outcome back from durable "
+            f"state"
+        )
+    if getattr(persisted, "run_id", "") != run_id:
+        raise CmsFlowQualificationRefused(
+            f"the persisted intent {intent_id!r} belongs to run "
+            f"{getattr(persisted, 'run_id', '')!r}, not {run_id!r}"
+        )
+    state = getattr(persisted, "state", "")
+    if state != INTENT_FAILED:
+        raise CmsFlowQualificationRefused(
+            f"the persisted intent {intent_id!r} is {state!r}, not the terminal "
+            f"{INTENT_FAILED!r}; a live claim of failure is not a measured outcome"
+        )
+    return state
+
+
+def _drive_cancellation(store: Any, run_id: str, *, holder: str) -> tuple[str, str]:
+    """Reconcile ``run_id`` to its terminal cancellation and re-read it.
+
+    Ensures the run record exists (the CMS lifecycle does not, on its own,
+    create one), reconciles the durable cancellation intent through the native
+    :class:`~skillweave.runtime.store.CancellationReconciler` -- target state
+    ``advance_or_stop`` with the ``killed`` lifecycle state -- and then re-reads
+    the **persisted** run so the ``cancel`` outcome is read from durable state,
+    never asserted from the reconciler's return value.  Returns
+    ``(run_state, lifecycle_state)``.
+    """
+    run = store.get_run(run_id)
+    if run is None:
+        # A run exists only as durable state; the live process identity of this
+        # driver is captured so the cancellation metadata is real, not a
+        # placeholder, and never a production surface.
+        from . import process_identity as process_identity_module
+
+        captured = process_identity_module.capture(os.getpid())
+        store.create_run(
+            run_id,
+            cms_qualification_holder=holder,
+            cms_qualification_sandbox=CMS_QUALIFICATION_SANDBOX_TARGET,
+            process_identity=captured.to_dict() if captured is not None else None,
+        )
+    store.reconcile_cancellation_intent(
+        run_id,
+        event_type=CANCELLATION_EVENT_TYPE,
+        idempotency_key=f"{run_id}:{CANCELLATION_EVENT_TYPE}",
+        stop_reason="operator_halt",
+        reason="cms qualification: durable cancellation",
+    ).reconcile()
+
+    reread = store.get_run(run_id)
+    if reread is None:
+        raise CmsFlowQualificationRefused(
+            f"the cancelled run {run_id!r} is not persisted; a qualification "
+            f"cannot read the 'cancel' outcome back from durable state"
+        )
+    run_state = getattr(reread, "state", "")
+    if run_state != "advance_or_stop":
+        raise CmsFlowQualificationRefused(
+            f"the run {run_id!r} reconciled to {run_state!r}, not the terminal "
+            f"'advance_or_stop'; the 'cancel' outcome was not durably measured"
+        )
+    lifecycle = (getattr(reread, "metadata", None) or {}).get("runlifecycle") or {}
+    lifecycle_state = lifecycle.get("lifecycle_state", "")
+    if lifecycle_state != "killed":
+        raise CmsFlowQualificationRefused(
+            f"the cancelled run {run_id!r} did not record the 'killed' lifecycle "
+            f"state in durable metadata; got {lifecycle_state!r}"
+        )
+    return run_state, lifecycle_state
 
 
 def qualify_cms_path(
@@ -185,9 +308,11 @@ def qualify_cms_path(
             content_id=f"cms-flow:{declared.path_id}",
             revision="rev-1",
         )
-        # The existing native controller seam: one owned attempt (dispatched with
-        # a live process identity), then the full reversible lifecycle through the
-        # dummy in-memory adapter on an owner-authorized sandbox binding.
+        # ── success: the existing native controller seam drives the reversible
+        # lifecycle (one owned attempt dispatched with a live process identity,
+        # then baseline -> draft -> dry-run -> bounded apply -> readback ->
+        # restore) through the dummy in-memory adapter on an owner-authorized
+        # sandbox binding.
         driven = service.cms_run_no_transformer(
             run_id=run_id,
             task_id=task_id,
@@ -208,6 +333,23 @@ def qualify_cms_path(
                 f"the driven CMS transaction {txn_id!r} was not persisted; a "
                 f"qualification cannot be read back from durable state"
             )
+
+        # ── failure: drive a *separately owned* attempt for the same path and
+        # resolve it through the native ``record_failure`` seam.  A distinct
+        # attempt/scope leaves the success transaction untouched, and the
+        # resolved terminal state is re-read from the durable store -- a live
+        # return value is not evidence that the outcome was measured.
+        failure_intent, _ = service.dispatch(
+            run_id=run_id, task_id=task_id, attempt=attempt + 1,
+        )
+        service.record_failure(failure_intent.intent_id)
+        failure_state = _durable_failure_state(store, failure_intent.intent_id, run_id)
+
+        # ── cancel: reconcile the run to its terminal cancellation through the
+        # durable cancellation seam and re-read the terminal run state.
+        cancel_run_state, cancel_lifecycle_state = _drive_cancellation(
+            store, run_id, holder=holder
+        )
 
         applied = persisted.applied_hashes
         pins = {
@@ -235,7 +377,7 @@ def qualify_cms_path(
                 "pins": pins,
                 "readback_verified": persisted.verified(),
                 "restore_verified": persisted.restored(),
-                "measured_outcomes": list(MEASURED_SUCCESS_ONLY),
+                "measured_outcomes": list(MEASURED_OUTCOMES),
                 "limitations": [UNMEASURED_OUTCOME_LIMITATION],
             }
         )
@@ -250,4 +392,8 @@ def qualify_cms_path(
         run_id=run_id,
         txn_id=txn_id,
         final_stage=persisted.stage,
+        failure_intent_id=failure_intent.intent_id,
+        failure_state=failure_state,
+        cancel_run_state=cancel_run_state,
+        cancel_lifecycle_state=cancel_lifecycle_state,
     )
