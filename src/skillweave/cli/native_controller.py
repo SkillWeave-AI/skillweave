@@ -71,6 +71,7 @@ __all__ = [
     "ReviewerAdapter",
     "ReviewVerdict",
     "DriveResult",
+    "HOLD_SUBJECT_KIND_UNKNOWN",
     "build_production_ports",
     "build_production_reviewer_port",
     "build_parser",
@@ -287,6 +288,23 @@ HOLD_CONTINUATION_REPLAYED = (
     "intent being adopted, so continuing from it would replay a predecessor "
     "attempt's continuation; a decision for another attempt is never replayed "
     "as this attempt's (named continuation hold)"
+)
+
+#: Named hold for the controlled-integration **subject-kind discrimination**
+#: (SW-SCOPE-010 S10-C criterion 1).  The integration surface is a function of
+#: the subject *kind*, never of the mere presence of a subject: ``repository``
+#: integrates through Git, every non-repository kind integrates through the
+#: guarded content transaction, and a subject whose kind this controller does
+#: not discriminate is refused **by name** -- never silently inferred to be a
+#: repository (which would send it through Git) and never coerced onto the
+#: content surface.  The refusal happens *before* any durable mutation, so an
+#: undiscriminated subject leaves no partial integration behind.
+HOLD_SUBJECT_KIND_UNKNOWN = (
+    "native-controller refused: the integration subject names a kind this "
+    "controller does not discriminate, so no integration surface can be "
+    "selected for it; a repository subject integrates through Git, a "
+    "non-repository subject through the guarded content transaction, and an "
+    "unknown kind is never inferred to be either (named hold)"
 )
 
 #: The principal a recovered controller reads its continuation decision under
@@ -1971,6 +1989,34 @@ def _adopt_in_flight_attempt(
     return adoption
 
 
+def _integration_mode_for_subject(subject: Any) -> str:
+    """The controlled-integration surface this attempt's subject kind requires.
+
+    ``None`` (the attempt declared no explicit subject) keeps the legacy
+    behaviour byte-identical: the attempt integrates through the Git merge
+    record.  An explicit subject is discriminated **by kind** through the
+    service's own :func:`~skillweave.runtime.native_process.integration_mode_for`,
+    so the surface is never chosen by the caller: the ``repository`` kind
+    integrates through Git, every non-repository kind through the guarded
+    content transaction.  A subject whose kind this controller does not
+    discriminate is refused **by name** (:data:`HOLD_SUBJECT_KIND_UNKNOWN`)
+    before any durable mutation -- it is never inferred to be a repository and
+    never coerced onto the content surface.
+    """
+    from skillweave.runtime.native_process import (
+        INTEGRATION_GIT_MERGE,
+        UnknownSubjectKind,
+        integration_mode_for,
+    )
+
+    if subject is None:
+        return INTEGRATION_GIT_MERGE
+    try:
+        return integration_mode_for(subject)
+    except UnknownSubjectKind as exc:
+        raise _RefusedError(f"{HOLD_SUBJECT_KIND_UNKNOWN}: {exc}") from exc
+
+
 def _run_state_driven(
     svc: Any,
     lease: Any,
@@ -1991,6 +2037,7 @@ def _run_state_driven(
 ) -> DriveResult:
     """The state-driven, verdict-driven loop body (inside the lease guard)."""
     from skillweave.runtime.native_process import (
+        INTEGRATION_CONTENT_TRANSACTION,
         STEP_CONTROLLED_INTEGRATION,
         STEP_DEPENDENT_WAVE,
         STEP_INDEPENDENT_REVIEW,
@@ -2161,10 +2208,14 @@ def _run_state_driven(
         producer_identity=holder,
     )
 
-    # Step 5 -- controlled integration. A repository subject integrates through
-    # Git; any other subject kind integrates through a controlled content
-    # transaction. Integration is guarded from the reviewed state.
-    if execution.integration_subject is not None:
+    # Step 5 -- controlled integration.  The surface is discriminated from the
+    # subject *kind*, never from the mere presence of a subject: a repository
+    # subject integrates through Git, a non-repository subject through the
+    # guarded content transaction, and a subject of unknown kind is refused by
+    # name *before* any durable mutation (see _integration_mode_for_subject).
+    # Integration is guarded from the reviewed state.
+    integration_mode = _integration_mode_for_subject(execution.integration_subject)
+    if integration_mode == INTEGRATION_CONTENT_TRANSACTION:
         svc.content_integration_advance(intent_id)
         svc.record_content_integration(
             intent_id,
