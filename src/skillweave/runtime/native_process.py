@@ -196,6 +196,18 @@ __all__ = [
     "PublicationDecision",
     "PublicationRefused",
     "authorize_publication",
+    # criterion 4: no-text-transformer CMS run + external HOLD
+    "NO_TXT_TXN_STAGE_COMPLETED",
+    "EXTERNAL_HOLD_PROVIDER_NOT_HERE",
+    "ExternalHold",
+    # criterion 5: candidate-bound milestone receipt
+    "MILESTONE_RECEIPT_SCHEMA_ID",
+    "MILESTONE_RECEIPT_SCHEMA_VERSION",
+    "SUPPORTED_MILESTONE_RECEIPT_VERSIONS",
+    "MilestoneReceiptRefused",
+    "CmsMilestoneReceipt",
+    "validate_cms_milestone_receipt",
+    "require_cms_milestone_receipt",
     # controlled loop
     "STEP_READY_DISPATCH",
     "STEP_INDEPENDENT_REVIEW",
@@ -2399,6 +2411,31 @@ CMS_TXN_SCHEMA_ID = (
 CMS_TXN_SCHEMA_VERSION = "1.0.0"
 SUPPORTED_CMS_TXN_VERSIONS = frozenset({CMS_TXN_SCHEMA_VERSION})
 
+# ── criterion 4: no-text-transformer CMS run + external HOLD ───────────────
+
+#: The completed stages a no-text-transformer run reports: the dummy adapter
+#: drives the full reversible lifecycle baseline → dry_run → readback → restored.
+NO_TXT_TXN_STAGE_COMPLETED = "restored"
+
+#: A named external HOLD: credentials or live egress are missing and the private
+#: provider implementation stays in skillweave-packs-pro, never in this
+#: repository.  The caller receives this as a typed refusal, never a silent pass
+#: or a fabricated success.
+EXTERNAL_HOLD_PROVIDER_NOT_HERE = (
+    "external_hold: private CMS provider implementation and live-egress "
+    "credentials stay in skillweave-packs-pro; this repository carries only "
+    "the dummy sandbox adapter (RawContentAdapter).  No live provider is "
+    "probed and no credential/e-gress path is opened."
+)
+
+# ── criterion 5: candidate-bound milestone receipt ─────────────────────────
+
+MILESTONE_RECEIPT_SCHEMA_ID = (
+    "https://skillweave.dev/schemas/content/cms-milestone-receipt/v1"
+)
+MILESTONE_RECEIPT_SCHEMA_VERSION = "1.0.0"
+SUPPORTED_MILESTONE_RECEIPT_VERSIONS = frozenset({MILESTONE_RECEIPT_SCHEMA_VERSION})
+
 #: The neutral capabilities a CMS adapter must provide to drive a managed
 #: transaction.  Each is a verb on the adapter, never a provider named by the
 #: contract.  ``restore`` is mandatory: a transaction whose baseline cannot be
@@ -2467,6 +2504,20 @@ class CmsStageError(ValueError):
             f"CMS transaction stage {got!r} is not reachable from {expected!r}; "
             f"the managed lifecycle is {list(CMS_STAGES)}"
         )
+
+
+class ExternalHold(ValueError):
+    """A named external HOLD: a required resource is not in this repository.
+
+    Raised when credentials, a live provider or live egress are required but the
+    private implementation stays in skillweave-packs-pro.  This is a *typed
+    refusal*, never a silent pass or a fabricated success: the caller receives
+    the named hold reason verbatim.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
 
 
 @dataclass(frozen=True)
@@ -3101,6 +3152,149 @@ class PublicationDecision:
     reason: str
     policy_reason: str = ""
     requires_human: bool = False
+
+
+# ── criterion 5: candidate-bound milestone receipt ─────────────────────────
+
+
+class MilestoneReceiptRefused(ValueError):
+    """A candidate-bound milestone receipt was missing, changed, stale or foreign.
+
+    Raised when ``require_cms_milestone_receipt`` cannot find a receipt bound to
+    the installed candidate, or when the receipt's digest does not match the
+    stored candidate -- the operation is refused fail-closed, never skipped.
+    """
+
+    def __init__(self, reason: str, *, found: str = "", expected: str = ""):
+        self.reason = reason
+        self.found = found
+        self.expected = expected
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class CmsMilestoneReceipt:
+    """A candidate-bound milestone receipt stored *before* any runtime CMS apply.
+
+    The receipt binds the installed candidate (its commit SHA) to the Assay
+    proofs that qualified it: the CLI proof and the Operator-MCP proof.  It is
+    stored durably and must be *present and unchanged* before any
+    runtime-dependent CMS apply proceeds -- a missing, changed, stale or foreign
+    receipt is refused fail-closed.
+
+    ``candidate_sha`` is the exact commit of the installed candidate.
+    ``cli_assay_proof`` and ``mcp_assay_proof`` are the digest-bound evidence
+    the native Assay recorded for the CLI and Operator-MCP qualification runs.
+    ``digest`` is the content digest that binds the receipt to its payload.
+    """
+
+    candidate_sha: str
+    cli_assay_proof: str
+    mcp_assay_proof: str
+    stored_at: str = ""
+    schema_version: str = MILESTONE_RECEIPT_SCHEMA_VERSION
+    digest: str = ""
+
+    def __post_init__(self) -> None:
+        if self.schema_version not in SUPPORTED_MILESTONE_RECEIPT_VERSIONS:
+            raise UnsupportedContractVersion(
+                "cms-milestone-receipt-v1", self.schema_version,
+                SUPPORTED_MILESTONE_RECEIPT_VERSIONS,
+            )
+        for name in ("candidate_sha", "cli_assay_proof", "mcp_assay_proof"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"a CMS milestone receipt must carry a non-empty {name}"
+                )
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "schema_id": MILESTONE_RECEIPT_SCHEMA_ID,
+            "schema_version": self.schema_version,
+            "candidate_sha": self.candidate_sha,
+            "cli_assay_proof": self.cli_assay_proof,
+            "mcp_assay_proof": self.mcp_assay_proof,
+            "stored_at": self.stored_at,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        data = self.payload()
+        data["digest"] = self.digest
+        return data
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True)
+
+
+def _milestone_receipt_digest(payload: dict[str, Any]) -> str:
+    """A content digest binding a milestone receipt to its payload."""
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_cms_milestone_receipt(record: Mapping[str, Any]) -> None:
+    """Validate a ``cms-milestone-receipt-v1`` record; fail-closed on mismatch."""
+    if record.get("schema_id") != MILESTONE_RECEIPT_SCHEMA_ID:
+        raise ValueError(
+            f"CMS milestone receipt schema_id {record.get('schema_id')!r} is "
+            f"not {MILESTONE_RECEIPT_SCHEMA_ID!r}"
+        )
+    CmsMilestoneReceipt(
+        candidate_sha=record.get("candidate_sha", ""),
+        cli_assay_proof=record.get("cli_assay_proof", ""),
+        mcp_assay_proof=record.get("mcp_assay_proof", ""),
+        stored_at=record.get("stored_at", ""),
+        schema_version=record.get("schema_version", MILESTONE_RECEIPT_SCHEMA_VERSION),
+    )
+
+
+def require_cms_milestone_receipt(
+    *,
+    store: Any,
+    candidate_sha: str,
+) -> CmsMilestoneReceipt:
+    """Require an exact candidate-bound milestone receipt; refuse otherwise.
+
+    The receipt must be present in the durable store, must bind to exactly
+    ``candidate_sha``, and its content digest must match the stored record --
+    a missing, changed, stale or foreign receipt is refused fail-closed.
+
+    Returns the validated receipt when present and unchanged.
+    """
+    record = getattr(store, "get_cms_milestone_receipt", lambda c: None)(
+        candidate_sha
+    )
+    if record is None:
+        raise MilestoneReceiptRefused(
+            f"no CMS milestone receipt found for candidate {candidate_sha!r}; "
+            f"a runtime-dependent CMS apply requires an exact, unchanged "
+            f"receipt bound to the installed candidate",
+            expected=candidate_sha,
+        )
+    validate_cms_milestone_receipt(record)
+    stored_digest = record.get("digest", "")
+    receipt = CmsMilestoneReceipt(
+        candidate_sha=record.get("candidate_sha", ""),
+        cli_assay_proof=record.get("cli_assay_proof", ""),
+        mcp_assay_proof=record.get("mcp_assay_proof", ""),
+        stored_at=record.get("stored_at", ""),
+        schema_version=record.get(
+            "schema_version", MILESTONE_RECEIPT_SCHEMA_VERSION
+        ),
+    )
+    expected_digest = _milestone_receipt_digest(receipt.payload())
+    if stored_digest != expected_digest:
+        raise MilestoneReceiptRefused(
+            f"CMS milestone receipt for candidate {candidate_sha!r} has been "
+            f"changed: stored digest {stored_digest!r} does not match the "
+            f"payload digest {expected_digest!r}; a changed receipt is refused",
+            found=stored_digest,
+            expected=expected_digest,
+        )
+    return receipt
 
 
 #: The MCP reviewing role that may decide a publication gate.  A publication
@@ -4605,6 +4799,68 @@ class NativeProcessService:
         )
         self._store.save_cms_transaction(advanced, upsert=True)
         return advanced, ""
+
+    def cms_run_no_transformer(
+        self,
+        *,
+        run_id: str,
+        task_id: str = "cms-no-txt",
+        attempt: int = 1,
+        subject: Any = None,
+        baseline: Any = None,
+        owner_sandbox: Any = None,
+        binding: Any = None,
+    ) -> CmsTransaction:
+        """Run a complete no-text-transformer CMS transaction (criterion 4).
+
+        Opens, drafts, applies, readback-verifies and restores a CMS transaction
+        through the dummy :class:`RawContentAdapter` -- no provider, no
+        transformer, no live egress.  Returns the restored transaction.
+
+        When credentials or a live provider would be required, the method raises
+        :class:`ExternalHold` rather than fabricating a success: the private
+        provider implementation stays in skillweave-packs-pro and this
+        repository carries only the dummy sandbox adapter.  The caller receives
+        ``EXTERNAL_HOLD_PROVIDER_NOT_HERE`` as a typed refusal.
+        """
+        from skillweave.dispatch.work_contract import ContentSubject
+
+        self._require_controller()
+        subject = subject or ContentSubject(
+            channel="sandbox/ch", content_id="e1", revision="rev-1"
+        )
+        baseline = baseline or {"title": "old", "body": "hello"}
+        binding = binding or SandboxBinding(target="sandbox/ch")
+        owner_sandbox = owner_sandbox or OwnerSandboxDeclaration(
+            targets=("sandbox/ch",)
+        )
+        captured = process_identity_module.capture(os.getpid())
+        intent, _ = self.dispatch(
+            run_id=run_id, task_id=task_id, attempt=attempt,
+            step=STEP_READY_DISPATCH,
+            process_identity=captured.to_dict() if captured else None,
+        )
+        producer = _durable_producer_identity(intent)
+        if not producer:
+            raise ExternalHold(EXTERNAL_HOLD_PROVIDER_NOT_HERE)
+        txn = self.open_cms_transaction(
+            intent.intent_id, subject, RawContentAdapter(),
+            baseline=baseline, producer_identity=producer,
+            binding=binding, owner_sandbox=owner_sandbox,
+        )
+        txn = self.draft_cms_transaction(
+            txn, change={"title": "new", "body": "hello"}
+        )
+        txn = self.apply_cms_transaction(
+            txn, change={"title": "new", "body": "hello"}
+        )
+        txn, blocker = self.restore_cms_transaction(txn)
+        if blocker:
+            raise ExternalHold(
+                f"external_hold: restore blocker {blocker!r}; "
+                f"no live provider is probed"
+            )
+        return txn
 
     def load_cms_transaction(self, run_id: str, txn_id: str) -> Optional[CmsTransaction]:
         """Load a persisted managed CMS transaction (a recovering controller).

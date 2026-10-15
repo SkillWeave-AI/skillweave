@@ -465,6 +465,20 @@ class SQLiteRunStore(RunStore):
                 record TEXT NOT NULL,
                 PRIMARY KEY (run_id, txn_id)
             );
+            -- SW-1511-CMS-TRANSACTION criterion 5: a candidate-bound milestone
+            -- receipt stored *before* any runtime CMS apply.  Keyed by
+            -- candidate_sha so a missing, changed, stale or foreign receipt is
+            -- refused fail-closed.  Additive and opt-in; no existing table
+            -- changes.
+            CREATE TABLE IF NOT EXISTS cms_milestone_receipts (
+                candidate_sha TEXT PRIMARY KEY,
+                cli_assay_proof TEXT NOT NULL,
+                mcp_assay_proof TEXT NOT NULL,
+                stored_at TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                record TEXT NOT NULL
+            );
         """)
         self._conn.commit()
         self._migrate_legacy_states()
@@ -1469,6 +1483,49 @@ class SQLiteRunStore(RunStore):
         row = self._conn.execute(
             "SELECT record FROM cms_transactions WHERE run_id = ? AND txn_id = ?",
             (run_id, txn_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["record"])
+
+    # ── criterion 5: candidate-bound milestone receipt ─────────────────────
+
+    def save_cms_milestone_receipt(self, receipt: Any) -> Any:
+        """Persist a candidate-bound milestone receipt (criterion 5).
+
+        The receipt is keyed by ``candidate_sha`` -- a second save for the same
+        candidate overwrites the prior receipt (a re-qualification).  The
+        persisted record includes the content digest so a later read can detect
+        tampering.
+        """
+        payload = receipt.payload()
+        digest = receipt.digest or payload.get("digest", "")
+        record = json.dumps(receipt.to_dict())
+        self._conn.execute(
+            """INSERT OR REPLACE INTO cms_milestone_receipts
+               (candidate_sha, cli_assay_proof, mcp_assay_proof, stored_at,
+                schema_version, digest, record)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                receipt.candidate_sha,
+                receipt.cli_assay_proof,
+                receipt.mcp_assay_proof,
+                receipt.stored_at,
+                receipt.schema_version,
+                digest,
+                record,
+            ),
+        )
+        self._conn.commit()
+        return receipt
+
+    def get_cms_milestone_receipt(
+        self, candidate_sha: str
+    ) -> Optional[dict]:
+        """The persisted milestone receipt for ``candidate_sha``, or None."""
+        row = self._conn.execute(
+            "SELECT record FROM cms_milestone_receipts WHERE candidate_sha = ?",
+            (candidate_sha,),
         ).fetchone()
         if row is None:
             return None

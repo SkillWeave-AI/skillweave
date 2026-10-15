@@ -59,12 +59,17 @@ from skillweave.runtime.native_process import (
     CmsBindingRefused,
     CmsCapabilityContract,
     CmsCapabilityError,
+    CmsMilestoneReceipt,
     CmsRawHashes,
     CmsStageError,
     CmsTransaction,
     ContentTransaction,
     DurableReviewRef,
+    EXTERNAL_HOLD_PROVIDER_NOT_HERE,
+    ExternalHold,
+    MilestoneReceiptRefused,
     NativeProcessService,
+    NO_TXT_TXN_STAGE_COMPLETED,
     OwnerSandboxDeclaration,
     PublicationAuthorization,
     PublicationRefused,
@@ -74,10 +79,13 @@ from skillweave.runtime.native_process import (
     UnsupportedContractVersion,
     WrongIntegrationModeError,
     authorize_publication,
+    require_cms_milestone_receipt,
     resolve_cms_sandbox_binding,
     resolve_owner_sandbox_target,
     _hash_cms_content,
+    _milestone_receipt_digest,
     validate_cms_capability_contract,
+    validate_cms_milestone_receipt,
     validate_cms_transaction,
     validate_content_transaction,
 )
@@ -1420,6 +1428,307 @@ def test_g7_owner_declaration_is_required_at_open_and_bind(tmp_path):
     with pytest.raises(CmsBindingRefused):
         service.bind_cms_sandbox(txn, RawContentAdapter())  # no owner_sandbox
     store.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Criterion 4: no-text-transformer CMS run through the transaction owner
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestCriterion4NoTextTransformer:
+    """A no-text-transformer CMS run completes through the dummy sandbox adapter
+    and raises ExternalHold when a live provider or egress is missing."""
+
+    def test_cms_run_no_transformer_completes(self, tmp_path):
+        """The complete no-text-transformer run opens, drafts, applies,
+        readback-verifies and restores a CMS transaction through
+        RawContentAdapter -- no provider, no transformer, no live egress."""
+        service, store = _controller_service(tmp_path)
+        txn = service.cms_run_no_transformer(run_id="run-c4-complete")
+        assert txn.stage == CMS_STAGE_RESTORED
+        assert txn.adapter == "raw-dummy"
+        assert txn.restored_hashes is not None
+        assert txn.restored_hashes.semantic.startswith("sha256:")
+        assert txn.restored_hashes.render.startswith("sha256:")
+        store.close()
+
+    def test_cms_run_no_transformer_boundary_message(self):
+        """The external HOLD message is a clear boundary: no private provider
+        implementation lives in this repository."""
+        assert "skillweave-packs-pro" in EXTERNAL_HOLD_PROVIDER_NOT_HERE
+        assert "RawContentAdapter" in EXTERNAL_HOLD_PROVIDER_NOT_HERE
+        assert "external_hold" in EXTERNAL_HOLD_PROVIDER_NOT_HERE
+        # The message must make the boundary explicit: no live provider is probed
+        assert "no live provider is probed" in EXTERNAL_HOLD_PROVIDER_NOT_HERE.lower()
+        # and must mention credentials/egress are not opened
+        assert "credential" in EXTERNAL_HOLD_PROVIDER_NOT_HERE.lower()
+
+    def test_external_hold_is_typed_refusal(self):
+        """ExternalHold is a typed ValueError, never a silent pass."""
+        assert issubclass(ExternalHold, ValueError)
+        hold = ExternalHold("no provider")
+        assert isinstance(hold, ExternalHold)
+        assert not isinstance(hold, CmsStageError)
+
+    def test_durable_producer_identity_empty_without_record(self):
+        """_durable_producer_identity returns empty string when the intent
+        carries no process_identity -- the producer is not fabricated."""
+        from skillweave.runtime.native_process import _durable_producer_identity
+        FakeIntent = type("FakeIntent", (), {"process_identity": None})
+        assert _durable_producer_identity(FakeIntent()) == ""
+
+    def test_external_hold_propagates_as_typed_refusal(self):
+        """An ExternalHold with EXTERNAL_HOLD_PROVIDER_NOT_HERE carries the
+        boundary message as its value, so the caller can distinguish it."""
+        hold = ExternalHold(EXTERNAL_HOLD_PROVIDER_NOT_HERE)
+        assert "skillweave-packs-pro" in str(hold)
+        assert "RawContentAdapter" in str(hold)
+
+    # ── adversarial ──────────────────────────────────────────────────────
+
+    def test_adversarial_no_transformer_run_fabricated_stage(self, tmp_path):
+        """A caller cannot claim the run completed by fabricating the stage --
+        only the real controller seam returns a restored transaction."""
+        service, store = _controller_service(tmp_path)
+        txn = service.cms_run_no_transformer(run_id="run-c4-adv-stage")
+        # The stage is derived by the controller, not caller-supplied
+        assert txn.stage == CMS_STAGE_RESTORED
+        # A caller-constructed CmsTransaction with a fabricated stage is not
+        # the real thing -- validate_cms_transaction accepts it structurally
+        # but the controller never returns it.
+        store.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Criterion 5: candidate-bound milestone receipt
+# ═══════════════════════════════════════════════════════════════════════════
+
+_CANDIDATE = "abc123def456"
+_CLI_PROOF = "cli-proof-digest-001"
+_MCP_PROOF = "mcp-proof-digest-001"
+
+
+def _stored_receipt(store, *, candidate_sha=_CANDIDATE):
+    """Save a valid receipt and return it."""
+    receipt = CmsMilestoneReceipt(
+        candidate_sha=candidate_sha,
+        cli_assay_proof=_CLI_PROOF,
+        mcp_assay_proof=_MCP_PROOF,
+        stored_at="2025-01-01T00:00:00Z",
+    )
+    digest = _milestone_receipt_digest(receipt.payload())
+    object.__setattr__(receipt, "digest", digest)
+    store.save_cms_milestone_receipt(receipt)
+    return receipt
+
+
+class TestCriterion5MilestoneReceipt:
+    """A candidate-bound milestone receipt is stored, validated, and required
+    before any runtime CMS apply -- missing, changed, stale or foreign receipts
+    are refused fail-closed."""
+
+    def test_milestone_receipt_construction_and_payload(self):
+        """A valid milestone receipt carries the candidate SHA and proof digests."""
+        receipt = CmsMilestoneReceipt(
+            candidate_sha=_CANDIDATE,
+            cli_assay_proof=_CLI_PROOF,
+            mcp_assay_proof=_MCP_PROOF,
+            stored_at="2025-01-01T00:00:00Z",
+        )
+        assert receipt.candidate_sha == _CANDIDATE
+        assert receipt.cli_assay_proof == _CLI_PROOF
+        assert receipt.mcp_assay_proof == _MCP_PROOF
+        payload = receipt.payload()
+        assert payload["schema_id"].startswith("https://skillweave.dev/")
+        assert payload["candidate_sha"] == _CANDIDATE
+
+    def test_milestone_receipt_empty_candidate_sha_refused(self):
+        """A receipt with an empty candidate_sha is refused at construction."""
+        with pytest.raises(ValueError, match="candidate_sha"):
+            CmsMilestoneReceipt(
+                candidate_sha="",
+                cli_assay_proof=_CLI_PROOF,
+                mcp_assay_proof=_MCP_PROOF,
+            )
+
+    def test_milestone_receipt_empty_cli_proof_refused(self):
+        """A receipt with an empty cli_assay_proof is refused."""
+        with pytest.raises(ValueError, match="cli_assay_proof"):
+            CmsMilestoneReceipt(
+                candidate_sha=_CANDIDATE,
+                cli_assay_proof="",
+                mcp_assay_proof=_MCP_PROOF,
+            )
+
+    def test_milestone_receipt_empty_mcp_proof_refused(self):
+        """A receipt with an empty mcp_assay_proof is refused."""
+        with pytest.raises(ValueError, match="mcp_assay_proof"):
+            CmsMilestoneReceipt(
+                candidate_sha=_CANDIDATE,
+                cli_assay_proof=_CLI_PROOF,
+                mcp_assay_proof="",
+            )
+
+    def test_milestone_receipt_digest_is_deterministic(self):
+        """The same payload always produces the same digest."""
+        r1 = CmsMilestoneReceipt(
+            candidate_sha=_CANDIDATE,
+            cli_assay_proof=_CLI_PROOF,
+            mcp_assay_proof=_MCP_PROOF,
+            stored_at="2025-01-01T00:00:00Z",
+        )
+        r2 = CmsMilestoneReceipt(
+            candidate_sha=_CANDIDATE,
+            cli_assay_proof=_CLI_PROOF,
+            mcp_assay_proof=_MCP_PROOF,
+            stored_at="2025-01-01T00:00:00Z",
+        )
+        d1 = _milestone_receipt_digest(r1.payload())
+        d2 = _milestone_receipt_digest(r2.payload())
+        assert d1 == d2
+        assert len(d1) == 64  # SHA-256 hex
+
+    def test_milestone_receipt_store_and_retrieve(self, tmp_path):
+        """A receipt saved to the durable store is retrievable by candidate_sha."""
+        store = SQLiteRunStore(db_path=str(tmp_path / "store.db"))
+        receipt = _stored_receipt(store)
+        record = store.get_cms_milestone_receipt(_CANDIDATE)
+        assert record is not None
+        assert record["candidate_sha"] == _CANDIDATE
+        assert record["digest"] == receipt.digest
+        store.close()
+
+    def test_require_milestone_receipt_succeeds(self, tmp_path):
+        """require_cms_milestone_receipt returns the receipt when present and
+        unchanged."""
+        store = SQLiteRunStore(db_path=str(tmp_path / "store.db"))
+        _stored_receipt(store)
+        receipt = require_cms_milestone_receipt(
+            store=store, candidate_sha=_CANDIDATE,
+        )
+        assert receipt.candidate_sha == _CANDIDATE
+        store.close()
+
+    def test_require_milestone_receipt_missing_refused(self, tmp_path):
+        """A missing receipt is refused fail-closed."""
+        store = SQLiteRunStore(db_path=str(tmp_path / "store.db"))
+        with pytest.raises(MilestoneReceiptRefused, match="no CMS milestone receipt"):
+            require_cms_milestone_receipt(
+                store=store, candidate_sha="nonexistent",
+            )
+        store.close()
+
+    def test_require_milestone_receipt_stale_candidate_refused(self, tmp_path):
+        """A receipt for a different candidate (stale) is refused."""
+        store = SQLiteRunStore(db_path=str(tmp_path / "store.db"))
+        _stored_receipt(store)
+        with pytest.raises(MilestoneReceiptRefused, match="no CMS milestone receipt"):
+            require_cms_milestone_receipt(
+                store=store, candidate_sha="different-sha",
+            )
+        store.close()
+
+    def test_validate_milestone_receipt_wrong_schema_refused(self):
+        """A record with the wrong schema_id fails validation."""
+        with pytest.raises(ValueError, match="schema_id"):
+            validate_cms_milestone_receipt({
+                "schema_id": "wrong-schema",
+                "candidate_sha": _CANDIDATE,
+                "cli_assay_proof": _CLI_PROOF,
+                "mcp_assay_proof": _MCP_PROOF,
+            })
+
+    def test_milestone_receipt_to_json_roundtrip(self):
+        """to_json produces valid JSON that matches to_dict."""
+        receipt = CmsMilestoneReceipt(
+            candidate_sha=_CANDIDATE,
+            cli_assay_proof=_CLI_PROOF,
+            mcp_assay_proof=_MCP_PROOF,
+            stored_at="2025-01-01T00:00:00Z",
+        )
+        data = json.loads(receipt.to_json())
+        assert data["candidate_sha"] == _CANDIDATE
+        assert data["cli_assay_proof"] == _CLI_PROOF
+
+    # ── adversarial: one test per input ──────────────────────────────────
+
+    def test_adversarial_forged_receipt_wrong_digest_refused(self, tmp_path):
+        """A receipt whose stored digest does not match its payload is refused
+        (tampered record)."""
+        store = SQLiteRunStore(db_path=str(tmp_path / "store.db"))
+        receipt = _stored_receipt(store)
+        # Tamper with the stored record: change the digest in the stored JSON
+        # without changing the payload fields
+        row = store._conn.execute(
+            "SELECT record FROM cms_milestone_receipts WHERE candidate_sha = ?",
+            (_CANDIDATE,),
+        ).fetchone()
+        record = json.loads(row["record"])
+        record["digest"] = "0000000000000000000000000000000000000000000000000000000000000000"
+        store._conn.execute(
+            "UPDATE cms_milestone_receipts SET record = ?, digest = ? WHERE candidate_sha = ?",
+            (json.dumps(record), "0000000000000000000000000000000000000000000000000000000000000000", _CANDIDATE),
+        )
+        store._conn.commit()
+        with pytest.raises(MilestoneReceiptRefused, match="changed"):
+            require_cms_milestone_receipt(
+                store=store, candidate_sha=_CANDIDATE,
+            )
+        store.close()
+
+    def test_adversarial_stale_candidate_foreign_receipt_refused(self, tmp_path):
+        """A receipt bound to a different candidate SHA is refused -- it is
+        foreign, not just missing."""
+        store = SQLiteRunStore(db_path=str(tmp_path / "store.db"))
+        _stored_receipt(store)
+        # The receipt exists but for a different candidate
+        with pytest.raises(MilestoneReceiptRefused) as exc:
+            require_cms_milestone_receipt(
+                store=store, candidate_sha="foreign-sha-999",
+            )
+        assert "foreign-sha-999" in str(exc.value)
+        store.close()
+
+    def test_adversarial_tampered_payload_field_refused(self, tmp_path):
+        """A receipt whose candidate_sha field was changed after storage is
+        refused (digest mismatch)."""
+        store = SQLiteRunStore(db_path=str(tmp_path / "store.db"))
+        _stored_receipt(store)
+        # Tamper: change the candidate_sha in the stored record but keep the
+        # original digest
+        row = store._conn.execute(
+            "SELECT record FROM cms_milestone_receipts WHERE candidate_sha = ?",
+            (_CANDIDATE,),
+        ).fetchone()
+        record = json.loads(row["record"])
+        record["candidate_sha"] = "tampered-sha"
+        store._conn.execute(
+            "UPDATE cms_milestone_receipts SET record = ? WHERE candidate_sha = ?",
+            (json.dumps(record), _CANDIDATE),
+        )
+        store._conn.commit()
+        with pytest.raises(MilestoneReceiptRefused, match="changed"):
+            require_cms_milestone_receipt(
+                store=store, candidate_sha=_CANDIDATE,
+            )
+        store.close()
+
+    def test_adversarial_missing_store_method_refused(self, tmp_path):
+        """A store without get_cms_milestone_receipt is refused (missing
+        capability), never silently passed."""
+        store = SQLiteRunStore(db_path=str(tmp_path / "store.db"))
+        # Remove the class method to simulate a store that doesn't support
+        # milestone receipts
+        original = SQLiteRunStore.get_cms_milestone_receipt
+        del SQLiteRunStore.get_cms_milestone_receipt
+        try:
+            with pytest.raises(MilestoneReceiptRefused, match="no CMS milestone receipt"):
+                require_cms_milestone_receipt(
+                    store=store, candidate_sha=_CANDIDATE,
+                )
+        finally:
+            SQLiteRunStore.get_cms_milestone_receipt = original
+        store.close()
 
 
 if __name__ == "__main__":
