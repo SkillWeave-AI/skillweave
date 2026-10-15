@@ -58,7 +58,7 @@ import os
 import signal
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 # Public surface re-exported for callers/tests that key on the entry point.
 __all__ = [
@@ -72,6 +72,7 @@ __all__ = [
     "ReviewVerdict",
     "DriveResult",
     "build_production_ports",
+    "build_production_reviewer_port",
     "build_parser",
     "main",
 ]
@@ -144,6 +145,42 @@ HOLD_ANSWER_UNOBSERVED = (
     "native-controller refused: no answering upstream model was observed for the "
     "launched attempt; the controller never records the model it *requested* as "
     "the model that *answered* (named hold)"
+)
+
+#: Named holds for the production reviewer port.  Independence of the review is
+#: a trust-table row like any other: an unconfigured, non-independent or
+#: unreadable review is refused by name, never substituted by a local verdict.
+HOLD_REVIEWER_ROUTE_UNCONFIGURED = (
+    "native-controller refused: no reviewer route is configured for the "
+    "production reviewer port; the controller never reviews on the worker's "
+    "route (named hold)"
+)
+HOLD_REVIEWER_ROUTE_NOT_INDEPENDENT = (
+    "native-controller refused: the reviewer route equals the worker route; the "
+    "independent review never runs on the producer's own route (named hold)"
+)
+HOLD_REVIEWER_ROUTE_UNAPPROVED = (
+    "native-controller refused: the reviewer route is not approved by the "
+    "operator route policy; an unverifiable reviewer route is never used (named hold)"
+)
+HOLD_REVIEW_MAILBOX_MISMATCH = (
+    "native-controller refused: the reviewer port's configured mailbox is not "
+    "the server-owned mailbox the review tool writes to; a review is only ever "
+    "read back from the durable record the server wrote (named hold)"
+)
+HOLD_REVIEW_UNRECORDED = (
+    "native-controller refused: no durable review result is present under the "
+    "server-issued reviewer principal; the controller never authors its own "
+    "verdict or acceptance (named hold)"
+)
+HOLD_REVIEW_UNVERIFIED = (
+    "native-controller refused: the durable review does not match the dispatched "
+    "attempt it must decide (wrong run/task/attempt, role or source binding); a "
+    "mismatched review is refused, never accepted (named hold)"
+)
+HOLD_REVIEW_VERDICT_UNOBSERVED = (
+    "native-controller refused: the launched review attempt produced no observed "
+    "verdict; the controller never invents the reviewer's verdict (named hold)"
 )
 
 #: The substring marking a provider-native target that is a fallback pool
@@ -324,7 +361,7 @@ class _ProductionWorkerPort:
             port_int = 80 if parsed.scheme == "http" else 443
         return raw.rstrip("/"), parsed.hostname, int(port_int)
 
-    def _resolve_route(self, route: str) -> str:
+    def _resolve_route(self, route: str, hold: str = HOLD_ROUTE_UNAPPROVED) -> str:
         """Check the route against the **operator route policy**, or refuse."""
         from skillweave.routing.route_policy import (
             RoutePolicyError,
@@ -334,15 +371,15 @@ class _ProductionWorkerPort:
         try:
             policy = resolve_route_policy(self._policy_path)
         except RoutePolicyError:
-            self._refuse(HOLD_ROUTE_UNAPPROVED)
+            self._refuse(hold)
         if policy is None:
             # No operator policy is configured: the approved route set is
             # unknown, so no route is verifiable. Refuse, never assume.
-            self._refuse(HOLD_ROUTE_UNAPPROVED)
+            self._refuse(hold)
         try:
             policy.check_route_allowed(route)
         except RoutePolicyError:
-            self._refuse(HOLD_ROUTE_UNAPPROVED)
+            self._refuse(hold)
         return route
 
     def _assert_approved_gateway(self, endpoint: str, host: str, port: int) -> None:
@@ -581,6 +618,354 @@ class _ProductionWorkerPort:
         return AttemptExecution(producer_artifact=producer_artifact)
 
 
+class _ProductionReviewerPort:
+    """The production **reviewer port** (SW-SCOPE-010 criterion 2).
+
+    A :class:`ReviewerAdapter` whose verdict is the one the **review tool**
+    (``skillweave.mcp.server.review_action``) wrote into the durable mailbox
+    under a **server-issued reviewer principal** -- read back by the controller
+    from that durable record, never synthesised here.
+
+    Every trust-table row is discharged or refused with a *named hold*:
+
+    * **independent reviewer route** -- the reviewer route is derived from
+      operator configuration (``SKILLWEAVE_REVIEWER_ROUTE``, falling back to the
+      dispatch route) and checked against the *operator route policy*; a route
+      that equals the worker's route refuses (:data:`HOLD_REVIEWER_ROUTE_NOT_INDEPENDENT`)
+      -- a review on the producer's own route is not an independent review -- and
+      an unapproved route refuses (:data:`HOLD_REVIEWER_ROUTE_UNAPPROVED`).
+    * **server-issued principal** -- the durable record is only trusted when its
+      recorded ``principal`` has the server-issued shape
+      ``mcp:<role>:<client_id>`` with the ``reviewer`` role
+      (:meth:`ResolvedReview.from_record`); a caller-declared or worker principal
+      is refused, so a producer can never resolve as its own reviewer.
+    * **durable read-back** -- the verdict, subject revision, artifact digest and
+      criteria are loaded from the mailbox record the server wrote
+      (:class:`DurableReviewRef.resolve`), so the controller never invents a
+      verdict; an absent or tampered record refuses
+      (:data:`HOLD_REVIEW_UNRECORDED`).
+    * **scope agreement** -- the durable record must name the exact
+      ``run_id``/``task_id``/``attempt`` of the dispatch and the ``reviewer``
+      role, or the port refuses (:data:`HOLD_REVIEW_UNVERIFIED`).
+
+    Independence is structural, never a value this port can supply: it mints no
+    principal, writes no record and reads the review only from the durable store.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: Any,
+        subject_repo: str = "",
+        subject_commit: str = "",
+        worker_route: str = "",
+        reviewer_route: str = "",
+        worker_client_id: str = "native-controller-worker",
+        client_id: str = "native-controller-reviewer",
+        authority: Any = None,
+        policy_path: str = "",
+        db_path: str = "",
+        mailbox_path: str = "",
+        artifacts_path: str = "",
+        stream_root: Optional[str] = None,
+        review_writer: Optional[Any] = None,
+    ) -> None:
+        self._store = store
+        self._subject_repo = subject_repo
+        self._subject_commit = subject_commit
+        self._worker_route = worker_route
+        self._reviewer_route = reviewer_route
+        self._worker_client_id = worker_client_id
+        self._client_id = client_id
+        self._authority = authority
+        self._policy_path = policy_path
+        self._db_path = db_path
+        self._mailbox_path = mailbox_path
+        self._artifacts_path = artifacts_path
+        self._stream_root = stream_root
+        #: The review *tool* seam.  Production is the MCP ``review_action``
+        #: server function; a test injects a fake that writes a durable record
+        #: (or an adversarial fake that forges one) without any provider call.
+        self._review_writer = review_writer
+
+    # -- refusals ----------------------------------------------------------
+
+    @staticmethod
+    def _refuse(hold: str) -> None:
+        raise _RefusedError(hold)
+
+    # -- route independence ------------------------------------------------
+
+    def _resolve_reviewer_route(self, dispatch_route: str) -> str:
+        """Resolve the reviewer route and prove it is independent, or refuse.
+
+        The reviewer route comes from operator configuration
+        (``SKILLWEAVE_REVIEWER_ROUTE``), never from this port's own default.  A
+        reviewer route that is absent, that equals the worker route, or that the
+        operator policy does not approve is refused by name -- the controller
+        never reviews an attempt on the route that produced it.
+        """
+        from skillweave.routing.route_policy import (
+            RoutePolicyError,
+            resolve_route_policy,
+        )
+
+        route = (
+            self._reviewer_route
+            or os.environ.get(_ENV_REVIEWER_ROUTE, "")
+            or dispatch_route
+        ).strip()
+        if not route:
+            self._refuse(HOLD_REVIEWER_ROUTE_UNCONFIGURED)
+        worker_route = (self._worker_route or dispatch_route).strip()
+        if route == worker_route:
+            # The independent review never runs on the producer's own route.
+            self._refuse(HOLD_REVIEWER_ROUTE_NOT_INDEPENDENT)
+        try:
+            policy = resolve_route_policy(self._policy_path)
+        except RoutePolicyError:
+            self._refuse(HOLD_REVIEWER_ROUTE_UNAPPROVED)
+        if policy is None:
+            self._refuse(HOLD_REVIEWER_ROUTE_UNAPPROVED)
+        try:
+            policy.check_route_allowed(route)
+        except RoutePolicyError:
+            self._refuse(HOLD_REVIEWER_ROUTE_UNAPPROVED)
+        return route
+
+    # -- the durable review record ----------------------------------------
+
+    def _server_mailbox_path(self) -> str:
+        """The server-owned mailbox the review tool writes to, or refuse.
+
+        The path is server-owned (``SKILLWEAVE_AGENT_MAILBOX`` else the server
+        default).  A port configured with a *different* mailbox than the review
+        tool writes to would read back nothing real, so the mismatch is refused
+        rather than silently reading an empty/foreign mailbox.
+        """
+        from skillweave.mcp import server as _server
+
+        server_path = _server.default_mailbox_path()
+        if self._mailbox_path and self._mailbox_path != server_path:
+            self._refuse(HOLD_REVIEW_MAILBOX_MISMATCH)
+        return server_path
+
+    def _mint_reviewer_grant(self, *, run_id: str, task_id: str, attempt: int) -> Any:
+        """Mint the scoped **reviewer** grant over the one durable process service."""
+        from skillweave.mcp import control as _control
+        from skillweave.mcp import server as _server
+        from skillweave.runtime.native_process import PUBLICATION_REVIEW_ROLE
+
+        authority = self._authority or _server._bound_authority()
+        if authority is None:
+            self._refuse(HOLD_GRANT_UNPROVISIONED)
+        default_db, default_artifacts = _server.server_default_paths()
+        try:
+            service = _control.service_for_binding(
+                self._db_path or default_db,
+                mailbox_path=self._mailbox_path or _control.default_mailbox_path(),
+                artifacts_path=self._artifacts_path or default_artifacts,
+                stream_root=self._stream_root,
+            )
+            return _server.issue_harness_session_grant(
+                authority=authority,
+                role=PUBLICATION_REVIEW_ROLE,
+                client_id=self._client_id,
+                transport="stdio",
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                service=service,
+            )
+        except _RefusedError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an unmintable grant is a hold
+            self._refuse(f"{HOLD_GRANT_UNPROVISIONED} [{type(exc).__name__}]")
+
+    def review(self, dispatch: Any, execution: AttemptExecution) -> ReviewVerdict:
+        """Run an independent review attempt and read its durable verdict back."""
+        from skillweave.mcp import server as _server
+
+        run_id = str(getattr(dispatch, "run_id", "") or "")
+        task_id = str(getattr(dispatch, "task_id", "") or "")
+        attempt = getattr(dispatch, "attempt", 0)
+        if not run_id or not task_id:
+            raise _UsageError("the dispatched owned attempt names no run/task")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise _UsageError("the dispatched owned attempt has no 1-based attempt")
+
+        dispatch_route = str(getattr(dispatch, "route", "") or "")
+        route = self._resolve_reviewer_route(dispatch_route)
+        mailbox_path = self._server_mailbox_path()
+
+        # Mint the server-issued *reviewer* session (role ``reviewer``): the
+        # durable review is only ever recorded under this principal, so a worker
+        # or caller-declared principal can never resolve as the reviewer.
+        grant = self._mint_reviewer_grant(
+            run_id=run_id, task_id=task_id, attempt=attempt
+        )
+        token = str(getattr(grant, "session_token", "") or "")
+        if not token:
+            self._refuse(HOLD_GRANT_UNPROVISIONED)
+
+        # The review *tool* runs the review attempt and writes its result
+        # durably under the server-issued reviewer principal.  Production: the
+        # MCP ``review_action`` tool.  A test injects a writer; the writer never
+        # receives a provider or gateway call from this port.
+        writer = self._review_writer or _server.review_action
+        from skillweave.runtime.native_process import (
+            STEP_INDEPENDENT_REVIEW,
+            STEP_RE_REVIEW,
+        )
+
+        criteria = ",".join((STEP_INDEPENDENT_REVIEW, STEP_RE_REVIEW))
+        result = writer(
+            action="write",
+            recipient=self._client_id,
+            body=f"{task_id}/attempt-{attempt}",
+            run_id=run_id,
+            task_id=task_id,
+            attempt=attempt,
+            verdict=REVIEW_PASS,
+            subject_revision=execution.producer_artifact,
+            artifact_digest=execution.producer_artifact,
+            criteria=criteria,
+            session_token=token,
+        )
+        written = json.loads(result) if isinstance(result, str) else result
+        if not isinstance(written, Mapping) or written.get("status") != "ok":
+            self._refuse(
+                f"{HOLD_REVIEW_UNRECORDED} [{_refusal_code(written)}]"
+            )
+        message = written.get("message")
+        if not isinstance(message, Mapping) or not message.get("message_id"):
+            self._refuse(HOLD_REVIEW_UNRECORDED)
+
+        # Read the review *back from the durable record*.  Its principal, role,
+        # verdict and source binding are loaded from the mailbox, never taken
+        # from the writer's return value.
+        from skillweave.runtime.native_process import DurableReviewRef
+
+        ref = DurableReviewRef(
+            mailbox_path=mailbox_path, message_id=str(message["message_id"])
+        )
+        try:
+            resolved = ref.resolve()
+        except Exception as exc:  # noqa: BLE001 - an unreadable review is a hold
+            self._refuse(f"{HOLD_REVIEW_UNRECORDED} [{type(exc).__name__}]")
+
+        self._assert_review_scope(
+            resolved, run_id=run_id, task_id=task_id, attempt=attempt
+        )
+        verdict = str(resolved.verdict or "").strip().lower()
+        if verdict not in (REVIEW_PASS, REVIEW_FAIL):
+            self._refuse(
+                f"{HOLD_REVIEW_VERDICT_UNOBSERVED}: recorded verdict {resolved.verdict!r}"
+            )
+
+        evidence = (
+            {
+                "schema_version": _MEMBER_EVIDENCE_SCHEMA,
+                "evidence_type": "member",
+                # The *server-issued* reviewer principal is the answering
+                # identity -- never a caller string, and never the producer.
+                "verifier_identity": resolved.principal,
+                "verdict": verdict.upper(),
+                "subject_revision": resolved.subject_revision,
+                "artifact_digest": resolved.artifact_digest,
+            },
+        )
+        return ReviewVerdict(
+            verdict=verdict,
+            evidence=evidence,
+            verifier_identity=resolved.principal,
+            published=True,
+        )
+
+    def _assert_review_scope(
+        self, resolved: Any, *, run_id: str, task_id: str, attempt: int
+    ) -> None:
+        """Refuse a durable review that does not decide this exact attempt."""
+        from skillweave.runtime.native_process import PUBLICATION_REVIEW_ROLE
+
+        if str(resolved.role) != PUBLICATION_REVIEW_ROLE:
+            self._refuse(
+                f"{HOLD_REVIEW_UNVERIFIED}: durable review role "
+                f"{resolved.role!r} is not {PUBLICATION_REVIEW_ROLE!r}"
+            )
+        if (
+            str(resolved.run_id) != run_id
+            or str(resolved.task_id) != task_id
+            or int(resolved.attempt) != int(attempt)
+        ):
+            self._refuse(
+                f"{HOLD_REVIEW_UNVERIFIED}: durable review answers "
+                f"{resolved.run_id}/{resolved.task_id}/attempt-{resolved.attempt}, "
+                f"not {run_id}/{task_id}/attempt-{attempt}"
+            )
+
+
+def _refusal_code(written: Any) -> str:
+    """The refusal code from a review-tool result, for a named hold."""
+    if isinstance(written, Mapping):
+        return str(written.get("code") or written.get("status") or "unrecorded")
+    return "unrecorded"
+
+
+#: Overridable environment variable naming the operator's independent reviewer
+#: route.  Absent it (and with no route configured) the reviewer route is
+#: unconfigured and the port refuses rather than reviewing on the worker route.
+_ENV_REVIEWER_ROUTE = "SKILLWEAVE_REVIEWER_ROUTE"
+
+#: The member-evidence schema the controller's gate evaluator accepts.
+_MEMBER_EVIDENCE_SCHEMA = "independent-gate-receipt/1.0.0"
+
+
+def build_production_reviewer_port(
+    *,
+    store: Any,
+    subject_repo: str = "",
+    subject_commit: str = "",
+    worker_route: str = "",
+    reviewer_route: str = "",
+    worker_client_id: str = "native-controller-worker",
+    client_id: str = "native-controller-reviewer",
+    authority: Any = None,
+    policy_path: str = "",
+    db_path: str = "",
+    mailbox_path: str = "",
+    artifacts_path: str = "",
+    stream_root: Optional[str] = None,
+    review_writer: Optional[Any] = None,
+) -> ReviewerAdapter:
+    """Build the production **reviewer port** for the ``native-controller``.
+
+    Returns a :class:`ReviewerAdapter` whose verdict is read back from the
+    durable review record the review tool wrote under a server-issued reviewer
+    principal (criterion 2).  ``worker_route`` is the route the producer's
+    attempt ran on: a reviewer route equal to it refuses
+    (:data:`HOLD_REVIEWER_ROUTE_NOT_INDEPENDENT`).  No provider or gateway call
+    is made here -- the review tool is the only reviewer, and ``review_writer``
+    is the seam a test replaces.
+    """
+    return _ProductionReviewerPort(
+        store=store,
+        subject_repo=subject_repo,
+        subject_commit=subject_commit,
+        worker_route=worker_route,
+        reviewer_route=reviewer_route,
+        worker_client_id=worker_client_id,
+        client_id=client_id,
+        authority=authority,
+        policy_path=policy_path,
+        db_path=db_path,
+        mailbox_path=mailbox_path,
+        artifacts_path=artifacts_path,
+        stream_root=stream_root,
+        review_writer=review_writer,
+    )
+
+
 def build_production_ports(
     *,
     store: Any,
@@ -602,14 +987,15 @@ def build_production_ports(
     timeout: Optional[float] = None,
     client_id: str = "native-controller-worker",
 ) -> WorkerAdapter:
-    """Build the production ports for the ``native-controller`` entry point.
+    """Build the production worker port for the ``native-controller`` entry point.
 
-    Returns the **worker port** only -- the reviewer port is the separate
-    criterion-2 dispatch and is deliberately not constructed here, so a caller
-    can never receive a reviewer this factory did not provision.  ``store`` is
-    the controller's own durable store: it is the store the attempt's upstream
-    receipt is recorded into, so the caller passes the *same* store to
-    :func:`main` (``store=``) rather than letting the entry build a second one.
+    Returns the **worker port** only -- the reviewer port is built by the
+    separate :func:`build_production_reviewer_port` factory (criterion 2), so a
+    caller can never receive a reviewer this factory did not provision.
+    ``store`` is the controller's own durable store: it is the store the
+    attempt's upstream receipt is recorded into, so the caller passes the *same*
+    store to :func:`main` (``store=``) rather than letting the entry build a
+    second one.
     """
     return _ProductionWorkerPort(
         store=store,
