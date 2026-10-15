@@ -83,6 +83,12 @@ __all__ = [
     "OwnerSandboxDeclaration",
     "load_owner_sandbox_declaration",
     "resolve_sandbox_admission",
+    "HOLD_CMS_PUBLICATION_NO_DURABLE_REVIEW",
+    "HOLD_CMS_PUBLICATION_PRODUCER_UNVERIFIED",
+    "HOLD_CMS_PUBLICATION_UNAUTHORIZED",
+    "HOLD_CMS_PUBLICATION_CREDENTIAL_MISSING",
+    "HOLD_CMS_PUBLICATION_EGRESS_UNPERMITTED",
+    "CMS_PUBLICATION_SANDBOX_TARGET",
     "build_production_ports",
     "build_production_reviewer_port",
     "build_parser",
@@ -360,6 +366,51 @@ _SANDBOX_PRODUCTION_MARKERS = frozenset({"prod", "production", "live", "main"})
 #: the caller -- never an argument.
 OWNER_SANDBOX_DECLARATION_FILENAME = "owner-sandbox.yaml"
 
+#: The owner-authorized *sandbox* target an irreversible CMS publication is
+#: authorized on (SW-SCOPE-010 S10-C criterion 3).  It is the same declared
+#: sandbox the CMS lifecycle is driven on, carries no production marker, and is
+#: the only target this controller is allowed to touch -- the publication path
+#: never contacts a remote CMS, so nothing production is published.
+CMS_PUBLICATION_SANDBOX_TARGET = "sandbox/ch"
+
+#: Named holds for the irreversible CMS publication **authorization**
+#: (SW-SCOPE-010 S10-C criterion 3).  Publication through the controller
+#: requires the durable independent review and the verified producer facts, a
+#: designated human authorization, and a provisioned credential and permitted
+#: egress.  Each refusal is named -- following the existing holds in this module
+#: -- so an unauthorized or unprovisioned publication is never anonymous and
+#: never silently collapsed into a normal outcome.
+HOLD_CMS_PUBLICATION_NO_DURABLE_REVIEW = (
+    "native-controller refused: the irreversible CMS publication was presented "
+    "no durable, server-recorded independent review binding the transaction's "
+    "exact subject revision and artifact digest; a caller-constructed review is "
+    "never accepted, so the publication is refused fail-closed (named hold)"
+)
+HOLD_CMS_PUBLICATION_PRODUCER_UNVERIFIED = (
+    "native-controller refused: the publishing attempt's producer identity does "
+    "not match the identity the controller derived from the owned attempt's "
+    "durable record; a forged or unverified producer can never authorize its own "
+    "irreversible publication (named hold)"
+)
+HOLD_CMS_PUBLICATION_UNAUTHORIZED = (
+    "native-controller refused: irreversible CMS publication requires the "
+    "designated human authorization bound to the exact subject revision and "
+    "artifact digest, and the governing autonomy policy must approve the "
+    "irreversible action; without them the publication is refused fail-closed "
+    "(named hold)"
+)
+HOLD_CMS_PUBLICATION_CREDENTIAL_MISSING = (
+    "native-controller refused: no credential reference for the publication is "
+    "observed available under the effective admission policy; a missing "
+    "credential is refused by name, never simulated, and no unprovisioned "
+    "publication is attempted (named hold)"
+)
+HOLD_CMS_PUBLICATION_EGRESS_UNPERMITTED = (
+    "native-controller refused: the publication endpoint cannot egress under the "
+    "effective admission policy; egress is default-deny, so an unpermitted "
+    "endpoint is refused by name and no remote CMS is contacted (named hold)"
+)
+
 #: The principal a recovered controller reads its continuation decision under
 #: when the caller names none.  It mirrors the handoff tool's own direct-caller
 #: principal (``in-process``, the documented CLI-parity seam of the messaging
@@ -382,6 +433,45 @@ _ENV_GATEWAY_HOST = "FAIGATE_HOST"
 _ENV_GATEWAY_PORT = "FAIGATE_PORT"
 _DEFAULT_GATEWAY_HOST = "127.0.0.1"
 _DEFAULT_GATEWAY_PORT = 8090
+
+#: The environment variable describing the *admission* facts of an irreversible
+#: CMS publication (SW-SCOPE-010 S10-C criterion 3): the egress endpoint and
+#: allowlist, and the credential references with their observed availability.
+#: It is one JSON object so the controller reads the operator's provisioned
+#: environment rather than inventing a credential or an endpoint: absent the
+#: variable the publication is an in-process action with no credential
+#: requirement.  Shape::
+#:
+#:   {"endpoint": "https://cms.example/prod", "allow_network": true,
+#:    "endpoint_allowlist": ["cms.example"],
+#:    "credential_refs": ["cms_token"],
+#:    "credential_availability": {"cms_token": "available"}}
+#:
+#: A missing credential reference or an endpoint that cannot egress is refused
+#: *by name* -- never simulated, never probed on the network.
+_ENV_CMS_PUBLICATION_ADMISSION = "SKILLWEAVE_CMS_PUBLICATION_ADMISSION"
+
+#: The publication adapter's descriptor id and operation, gated through the
+#: common adapter admission policy.  The publication is a *single* declared
+#: adapter/operation so the credential and egress gates have a name to attribute
+#: their refusal to.
+_CMS_PUBLICATION_ADAPTER_ID = "cms-publication"
+_CMS_PUBLICATION_OPERATION = "publish"
+
+#: The autonomy-policy names the publication branch understands.  ``none`` (the
+#: default) means *no* policy governs the irreversible action, so the
+#: publication is never auto-approved; ``owner`` is the designated publication
+#: authority that approves only the irreversible publication.  The shipped
+#: policies (conservative/moderate/unicorn) all *hold* an irreversible action.
+_PUBLICATION_POLICY_NONE = "none"
+_PUBLICATION_POLICY_OWNER = "owner"
+
+#: The environment variable naming the autonomy policy that governs the
+#: irreversible publication.  Absent (or ``none``) means *no* policy governs it,
+#: so the publication is never auto-approved; ``owner`` is the designated
+#: publication authority.  An unknown name is a caller error (exit 2), never an
+#: implicit approval.
+_ENV_CMS_PUBLICATION_POLICY = "SKILLWEAVE_CMS_PUBLICATION_POLICY"
 
 
 @dataclass(frozen=True)
@@ -1439,6 +1529,68 @@ def build_parser(prog: str = "skillweave native-controller") -> argparse.Argumen
              "record. Additive and opt-in; no worker/reviewer adapter and no "
              "provider, gateway or CMS call is made.",
     )
+    parser.add_argument(
+        "--authorize-cms-publication",
+        dest="authorize_cms_publication",
+        default="",
+        help="Authorize the irreversible publication of one managed CMS "
+             "transaction (SW-SCOPE-010 S10-C criterion 3): load the transaction "
+             "and the durable independent review, verify the producer identity "
+             "against the owned attempt's record, require the designated human "
+             "authorization, then decide under the autonomy policy. Additive and "
+             "opt-in; refuses by name when the review, producer, authorization, "
+             "credential or egress is missing. No remote CMS is contacted.",
+    )
+    parser.add_argument(
+        "--cms-txn-id",
+        dest="cms_txn_id",
+        default="",
+        help="The managed CMS transaction id to authorize for publication "
+             "(default: <run-id>/<task-id>).",
+    )
+    parser.add_argument(
+        "--cms-artifact-digest",
+        dest="cms_artifact_digest",
+        default="",
+        help="The artifact digest the publication asserts; the durable review "
+             "and the designated authorization must both bind to it.",
+    )
+    parser.add_argument(
+        "--cms-review-mailbox",
+        dest="cms_review_mailbox",
+        default="",
+        help="Path to the durable mailbox holding the independent publication "
+             "review (defaults to the server-owned mailbox path).",
+    )
+    parser.add_argument(
+        "--cms-review-message-id",
+        dest="cms_review_message_id",
+        default="",
+        help="The durable review message id to load as the independent review; "
+             "a missing reference is refused, never fabricated.",
+    )
+    parser.add_argument(
+        "--cms-publication-authorizer",
+        dest="cms_publication_authorizer",
+        default="",
+        help="The designated human authorizer for the publication; must differ "
+             "from the derived producer identity.",
+    )
+    parser.add_argument(
+        "--cms-publication-authority",
+        dest="cms_publication_authority",
+        default="",
+        help="Optional authority label recorded on the designated publication "
+             "authorization.",
+    )
+    parser.add_argument(
+        "--cms-binding",
+        dest="cms_binding",
+        default="",
+        help="Optional authorized CMS sandbox target the publication is bound "
+             "to (default: the declared sandbox target; a production-looking "
+             "target is refused).",
+    )
     return parser
 
 
@@ -1488,6 +1640,46 @@ def main(
                 db_path=args.db_path,
                 holder=args.holder,
                 ttl_seconds=args.ttl_seconds,
+                store=store,
+            )
+        except _UsageError as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            return EXIT_INVALID_INPUT
+        except _RefusedError as exc:
+            sys.stderr.write(f"refused: {exc}\n")
+            return EXIT_REFUSED
+        except KeyboardInterrupt:
+            sys.stderr.write("interrupted\n")
+            return EXIT_FAILED
+        except Exception as exc:  # noqa: BLE001 -- a crash is exit 5, never a verdict
+            sys.stderr.write(f"error: {type(exc).__name__}: {exc}\n")
+            return EXIT_FAILED
+        sys.stdout.write(json.dumps(result.to_dict(), sort_keys=True) + "\n")
+        return EXIT_OK
+
+    # Additive, opt-in irreversible CMS publication *authorization*
+    # (SW-SCOPE-010 S10-C criterion 3): this branch loads the managed
+    # transaction and the durable independent review, verifies the producer
+    # against the owned attempt's record, requires the designated human
+    # authorization and consults the autonomy policy -- and contacts no remote
+    # CMS. It is checked before the worker/reviewer fail-closed holds so the
+    # surfaces never interfere.
+    if args.authorize_cms_publication:
+        try:
+            result = _authorize_cms_publication(
+                run_id=args.run_id,
+                task_id=args.task_id,
+                attempt=args.attempt,
+                db_path=args.db_path,
+                holder=args.holder,
+                ttl_seconds=args.ttl_seconds,
+                txn_id=args.cms_txn_id,
+                artifact_digest=args.cms_artifact_digest,
+                review_mailbox=args.cms_review_mailbox,
+                review_message_id=args.cms_review_message_id,
+                authorizer=args.cms_publication_authorizer,
+                authority=args.cms_publication_authority,
+                binding_target=args.cms_binding,
                 store=store,
             )
         except _UsageError as exc:
@@ -1648,6 +1840,356 @@ def _qualify_cms_path(
     finally:
         if owns_store:
             store.close()
+
+
+# ── irreversible CMS publication authorization (SW-SCOPE-010 S10-C crit. 3) ──
+
+
+@dataclass(frozen=True)
+class _OwnerPublicationPolicy:
+    """The designated publication authority, named ``owner``.
+
+    It approves *only* the irreversible publication action, so the owner holds
+    the explicit publication grant while every shipped autonomy policy
+    (conservative/moderate/unicorn) *holds* an irreversible action.  This is a
+    policy *name* the operator selects; it is never an implicit approval.
+    """
+
+    name: str = _PUBLICATION_POLICY_OWNER
+
+    def check(self, action: Any) -> Any:
+        from skillweave.runtime.assay import ActionType, PolicyDecision
+
+        if getattr(action, "action_type", None) == ActionType.IRREVERSIBLE_ACTION:
+            return PolicyDecision(
+                approved=True, reason="owner approved the irreversible publication"
+            )
+        return PolicyDecision(
+            approved=False, reason="the owner approves only the publication"
+        )
+
+
+def _resolve_publication_policy(name: str) -> Any:
+    """Resolve the autonomy policy *name* governing the publication, or refuse.
+
+    ``none``/empty means *no* policy governs the irreversible action (never an
+    auto-approval); ``owner`` is the designated publication authority; any other
+    name is a caller error (:class:`_UsageError`, exit 2).  The shipped policies
+    are reachable by name too, so ``conservative``/``moderate``/``unicorn`` hold
+    rather than publish.
+    """
+    normalized = (name or "").strip().lower()
+    if not normalized or normalized == _PUBLICATION_POLICY_NONE:
+        return None
+    if normalized == _PUBLICATION_POLICY_OWNER:
+        return _OwnerPublicationPolicy()
+    from skillweave.runtime.assay import create_policy
+
+    try:
+        return create_policy(normalized)
+    except (ValueError, KeyError) as exc:
+        raise _UsageError(
+            f"unknown CMS publication autonomy policy {name!r}; expected one of "
+            f"{_PUBLICATION_POLICY_NONE!r}, {_PUBLICATION_POLICY_OWNER!r} or a "
+            f"shipped assay policy name"
+        ) from exc
+
+
+def _publication_admission(
+    *, binding_target: str, admission_json: str, held_adapter: bool
+) -> None:
+    """Gate the publication through the common adapter admission policy.
+
+    The endpoint, the egress decision and the credential references are read
+    from the operator's ``_ENV_CMS_PUBLICATION_ADMISSION`` JSON -- the controller
+    never invents an endpoint or a credential.  Egress is checked *before*
+    credentials (default-deny), so an unpermitted endpoint is refused by name
+    whether or not a credential is also missing; a missing credential reference
+    is then refused by name.  Nothing here contacts the network: it is a pure
+    decision over the declared facts.
+
+    ``held_adapter`` admits a *local* publication (no out-of-process transport),
+    where the egress gate does not apply and only the declared credential
+    references are required.
+    """
+    from skillweave.adapters.descriptor import AdapterDescriptor, OperationBinding
+    from skillweave.adapters.policy import (
+        EffectivePolicy,
+        EgressPolicy,
+        admit_invocation,
+    )
+
+    facts: Mapping[str, Any] = {}
+    if admission_json.strip():
+        try:
+            parsed = json.loads(admission_json)
+        except ValueError as exc:
+            raise _UsageError(
+                f"{_ENV_CMS_PUBLICATION_ADMISSION} is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(parsed, Mapping):
+            raise _UsageError(
+                f"{_ENV_CMS_PUBLICATION_ADMISSION} must be a JSON object"
+            )
+        facts = parsed
+
+    endpoint = str(facts.get("endpoint") or "").strip()
+    allow_network = bool(facts.get("allow_network", False))
+    allowlist = tuple(str(h) for h in (facts.get("endpoint_allowlist") or ()))
+    credential_refs = tuple(str(r) for r in (facts.get("credential_refs") or ()))
+    reported = {
+        str(k): str(v)
+        for k, v in dict(facts.get("credential_availability") or {}).items()
+    }
+
+    policy = EffectivePolicy(
+        allowed_adapter_ids=(_CMS_PUBLICATION_ADAPTER_ID,),
+        egress=EgressPolicy(
+            allow_network=allow_network, endpoint_allowlist=allowlist
+        ),
+    )
+
+    serving = "held" if held_adapter else "remote"
+    operations = (
+        OperationBinding(
+            name=_CMS_PUBLICATION_OPERATION,
+            input_contract=f"cms-publication-{serving}/v1",
+            result_contract=f"cms-publication-{serving}/v1",
+        ),
+    )
+    if held_adapter:
+        descriptor = AdapterDescriptor(
+            id=_CMS_PUBLICATION_ADAPTER_ID,
+            version="1.0.0",
+            categories=("generic",),
+            operations=operations,
+            transport="local",
+            credential_refs=credential_refs,
+        )
+    else:
+        descriptor = AdapterDescriptor(
+            id=_CMS_PUBLICATION_ADAPTER_ID,
+            version="1.0.0",
+            categories=("generic",),
+            operations=operations,
+            transport="https",
+            credential_refs=credential_refs,
+        )
+
+    decision = admit_invocation(
+        policy,
+        descriptor,
+        category="generic",
+        operation=_CMS_PUBLICATION_OPERATION,
+        credential_availability=reported,
+        endpoint=endpoint,
+    )
+    if decision.admitted:
+        return
+    asset = decision.asset or ""
+    if asset == "egress":
+        raise _RefusedError(HOLD_CMS_PUBLICATION_EGRESS_UNPERMITTED)
+    if asset.startswith("credential:"):
+        raise _RefusedError(HOLD_CMS_PUBLICATION_CREDENTIAL_MISSING)
+    # Any other unadmitted asset (allowlist/operation/capability) is a
+    # caller-input problem, not an external hold.
+    raise _UsageError(decision.reason)
+
+
+@dataclass(frozen=True)
+class _PublicationAuthorizationResult:
+    """What authorizing one CMS publication for publication produced.
+
+    A decision, never a publication: the record reports whether the irreversible
+    publication was authorized and, if not, *why*.  No remote CMS is contacted
+    and the transaction is left untouched.
+    """
+
+    run_id: str
+    txn_id: str
+    subject_revision: str
+    artifact_digest: str
+    producer_identity: str
+    approved: bool
+    reason: str
+    policy_reason: str = ""
+    requires_human: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "txn_id": self.txn_id,
+            "subject_revision": self.subject_revision,
+            "artifact_digest": self.artifact_digest,
+            "producer_identity": self.producer_identity,
+            "approved": self.approved,
+            "reason": self.reason,
+            "policy_reason": self.policy_reason,
+            "requires_human": self.requires_human,
+        }
+
+
+def _mailbox_path() -> str:
+    """The server-owned durable mailbox the review tool writes to."""
+    from skillweave.mcp import server as _server
+
+    return _server.default_mailbox_path()
+
+
+def _authorize_cms_publication(
+    *,
+    run_id: str,
+    task_id: str,
+    attempt: int,
+    db_path: str,
+    holder: str,
+    ttl_seconds: int,
+    txn_id: str,
+    artifact_digest: str,
+    review_mailbox: str,
+    review_message_id: str,
+    authorizer: str,
+    authority: str,
+    binding_target: str,
+    store: Any,
+) -> _PublicationAuthorizationResult:
+    """Authorize an irreversible CMS publication through the native controller.
+
+    Every fact the decision rests on is read from durable state, never taken
+    from the caller's hope: the transaction (and its *derived* producer) is
+    loaded from the store, the independent review is loaded *by reference* from
+    the durable mailbox, and the credential/egress facts come from the
+    operator's declared admission environment.  The five refusals each fail
+    closed with a *named hold*:
+
+    * no durable, server-recorded review binds the exact revision/digest;
+    * the publishing attempt's producer does not match the owned attempt's
+      durable record (a forged producer);
+    * no designated human authorization (or a non-binding/self-authorization);
+    * a credential reference is not observed available;
+    * the endpoint cannot egress under the effective policy.
+
+    No provider, gateway or CMS call is made or probed, and nothing is published
+    here -- the decision is returned for the caller to record.
+    """
+    from skillweave.runtime.native_process import (
+        ExternalHold,
+        NativeProcessService,
+        PublicationAuthorization,
+        PublicationRefused,
+    )
+    from skillweave.runtime.store import SQLiteRunStore
+
+    owns_store = store is None
+    if owns_store:
+        store = SQLiteRunStore(db_path)
+    try:
+        service = NativeProcessService(store, holder)
+        with _LeaseGuard(service, ttl_seconds=ttl_seconds):
+            resolved_txn_id = txn_id.strip() or f"{run_id}/{task_id}"
+            txn = service.load_cms_transaction(run_id, resolved_txn_id)
+            if txn is None:
+                # The durable review cannot bind a transaction that is not there.
+                raise _RefusedError(HOLD_CMS_PUBLICATION_NO_DURABLE_REVIEW)
+
+            # The publishing attempt's producer must be the identity the
+            # controller derived from the owned attempt's *durable* record -- the
+            # exact value ``open_cms_transaction`` derived and live-verified when
+            # the transaction was opened.  A blanked or forged producer (an
+            # identity the owned attempt does not verify to) is refused by name
+            # *before* the review is resolved, so the durable producer fact is
+            # checked, never trusted.
+            from skillweave.runtime.native_process import _durable_producer_identity
+
+            intent = (
+                store.get_dispatch_intent(txn.intent_id) if txn.intent_id else None
+            )
+            verified_producer = (
+                _durable_producer_identity(intent) if intent is not None else ""
+            )
+            if not verified_producer or txn.producer_identity != verified_producer:
+                raise _RefusedError(HOLD_CMS_PUBLICATION_PRODUCER_UNVERIFIED)
+
+            path = review_mailbox.strip() or _mailbox_path()
+            message_id = (review_message_id or "").strip()
+            if not message_id:
+                # No review reference at all: the publication presents no durable
+                # independent review, so it is refused by that name.
+                raise _RefusedError(HOLD_CMS_PUBLICATION_NO_DURABLE_REVIEW)
+
+            # The egress/credential admission gate runs BEFORE the service call so
+            # a missing credential or an unpermitted endpoint is the *named*
+            # refusal, never simulated and never attempted.
+            held_adapter = not binding_target.strip()
+            _publication_admission(
+                binding_target=binding_target,
+                admission_json=os.environ.get(_ENV_CMS_PUBLICATION_ADMISSION, ""),
+                held_adapter=held_adapter,
+            )
+
+            policy = _resolve_publication_policy(
+                os.environ.get(_ENV_CMS_PUBLICATION_POLICY, "")
+            )
+            if not (authorizer or "").strip():
+                # No designated human authorization was presented at all: refuse
+                # by name rather than constructing a non-binding authorization.
+                raise _RefusedError(HOLD_CMS_PUBLICATION_UNAUTHORIZED)
+            authorization = PublicationAuthorization(
+                authorizer=authorizer,
+                subject_revision=txn.subject_revision,
+                artifact_digest=artifact_digest,
+                authority=authority,
+            )
+            from skillweave.runtime.native_process import DurableReviewRef
+
+            try:
+                decision = service.authorize_cms_publication(
+                    txn,
+                    authorization=authorization,
+                    artifact_digest=artifact_digest,
+                    review_ref=DurableReviewRef(
+                        mailbox_path=path, message_id=message_id
+                    ),
+                    policy=policy,
+                )
+            except PublicationRefused as exc:
+                raise _RefusedError(_publication_hold_for_field(exc.field)) from exc
+            except ExternalHold as exc:
+                # A missing external prerequisite is a *named external hold*.
+                raise _RefusedError(str(exc)) from exc
+
+            result = _PublicationAuthorizationResult(
+                run_id=run_id,
+                txn_id=resolved_txn_id,
+                subject_revision=txn.subject_revision,
+                artifact_digest=artifact_digest,
+                producer_identity=txn.producer_identity,
+                approved=bool(decision.approved),
+                reason=decision.reason,
+                policy_reason=getattr(decision, "policy_reason", ""),
+                requires_human=bool(getattr(decision, "requires_human", False)),
+            )
+        if not result.approved:
+            # An unapproved irreversible publication is refused by name (exit 3),
+            # never silently reported as authorized.
+            raise _RefusedError(
+                f"{HOLD_CMS_PUBLICATION_UNAUTHORIZED} (policy: {result.policy_reason or result.reason})"
+            )
+        return result
+    finally:
+        if owns_store:
+            store.close()
+
+
+def _publication_hold_for_field(field: str) -> str:
+    """Map a :class:`PublicationRefused` field to its named controller hold."""
+    if field == "review":
+        return HOLD_CMS_PUBLICATION_NO_DURABLE_REVIEW
+    if field == "producer_identity":
+        return HOLD_CMS_PUBLICATION_PRODUCER_UNVERIFIED
+    # authorization / authorizer / subject_revision / scope: the designated
+    # human authorization is missing, non-binding, self-authored or widening.
+    return HOLD_CMS_PUBLICATION_UNAUTHORIZED
 
 
 def _drive(
