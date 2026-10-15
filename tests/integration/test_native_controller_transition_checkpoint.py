@@ -147,32 +147,58 @@ def test_checkpoint_records_the_last_transition_step(tmp_path, capsys):
 def test_a_caller_value_cannot_repoint_the_checkpoint(tmp_path, capsys):
     """A caller-named run cannot create or capture a checkpoint.
 
-    The run key is *derived* from the service's durable intents.  Two
+    The run key is *derived* from the durable intent the transition named.  Two
     directions, both fail-closed:
 
-    * a service whose durable records name no run persists nothing under the
-      caller's label;
-    * a service sharing the driven store persists under the run its *intents*
-      name (``run-1``), never under the caller-named run.
+    * a service with no durable intent for the named id persists nothing;
+    * a service named by the caller (``caller-named-run``) sharing the driven
+      store persists under the run its *intent* names (``run-1``), never under
+      the caller-named run.
 
     On the base this is an ``AttributeError`` (no derived write path exists).
     """
-    # No durable intents at all: the caller's label is not a run key.
+    # No durable intent at all: nothing is written.
     empty = SQLiteRunStore(_db(tmp_path))
-    written = NativeProcessService(
-        empty, "caller-named-run"
-    ).persist_transition_checkpoint(STEP_READY_DISPATCH)
+    written = NativeProcessService(empty, "caller-named-run").persist_transition_checkpoint(
+        STEP_READY_DISPATCH, "no-such-intent"
+    )
     assert written is None
     assert empty.get_checkpoint("caller-named-run") is None
     empty.close()
 
-    # Sharing the driven store: the write lands under the *durable* run.
+    # Sharing the driven store: even a service named by the caller writes under
+    # the *durable* run its intent names, never under the caller's label.  The
+    # named step is the one the durable intent recorded (the dependent wave the
+    # drive ended on), so the write genuinely happens -- just not where the
+    # caller named it.
     store, _ = _drive(tmp_path, capsys)
-    NativeProcessService(store, "caller-named-run").persist_transition_checkpoint(
-        STEP_READY_DISPATCH
-    )
+    intent_id = store.list_dispatch_intents(run_id="run-1")[0].intent_id
+    written = NativeProcessService(
+        store, "caller-named-run"
+    ).persist_transition_checkpoint(STEP_DEPENDENT_WAVE, intent_id)
+    assert written is not None, "the write for a durable transition was skipped"
+    assert written.run_id == "run-1"
     assert store.get_checkpoint("caller-named-run") is None
     assert store.get_checkpoint("run-1") is not None
+    store.close()
+
+
+def test_a_caller_supplied_step_cannot_forge_a_transition(tmp_path, capsys):
+    """The named transition must be the one the durable intent recorded.
+
+    ``step`` and ``intent_id`` name the durable intent the transition was driven
+    on and neither enters the checkpoint: the intent's recorded ``step`` must
+    equal ``step``.  A caller that names a transition the intent never reached
+    (here the drive ended on the dependent wave, not on ready_dispatch) writes
+    nothing and fails closed rather than durably recording a transition that did
+    not happen.  On the base this is an ``AttributeError`` (no such write path).
+    """
+    store, _ = _drive(tmp_path, capsys)
+    intent_id = store.list_dispatch_intents(run_id="run-1")[0].intent_id
+    svc = NativeProcessService(store, "caller-named-run")
+    assert svc.persist_transition_checkpoint(STEP_READY_DISPATCH, intent_id) is None
+    # The genuine transition step does persist, proving the guard discriminates.
+    assert svc.persist_transition_checkpoint(STEP_DEPENDENT_WAVE, intent_id) is not None
     store.close()
 
 
