@@ -63,6 +63,31 @@ _INTENT_ID = "intent-live"
 _PRINCIPAL = "in-process"
 
 
+def _spawn_stable_child() -> subprocess.Popen:
+    """A real, long-lived child whose *image* is stable for its whole life.
+
+    ``process_identity.verify`` compares the recorded ``exec_path`` with the
+    live one, so the adopted identity has to name a process whose image never
+    changes.  A ``sys.executable`` child does not qualify on every host: the
+    interpreter can be launched through a shim that ``execve``-replaces itself
+    with the real framework image, so a capture taken before the replacement
+    records a path the process no longer runs -- a *transient* ``foreign_worker``
+    that would make the identity an observation-race flake rather than the
+    durable record under test.  ``/bin/sleep`` is a single static image, so the
+    capture and the restart's re-observation always agree.
+    """
+    return subprocess.Popen(["/bin/sleep", "120"])
+
+
+def _stop(child: subprocess.Popen) -> None:
+    child.terminate()
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait()
+
+
 # ── Seeding helpers (mirrors tests/integration/test_native_controller_restart_adoption.py) ──
 
 
@@ -244,9 +269,7 @@ def test_restart_of_a_killed_controller_reads_the_persisted_decision(
 
     # A real, still-live child process is the recorded owned identity -- the
     # restart re-observes the live OS, nothing is fabricated.
-    child = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(120)"]
-    )
+    child = _spawn_stable_child()
     try:
         child_identity = process_identity.capture(child.pid)
         assert child_identity is not None, "could not observe the live child"
@@ -282,12 +305,7 @@ def test_restart_of_a_killed_controller_reads_the_persisted_decision(
         claiming = store.list_dispatch_intents(_RUN_ID, claiming_only=True)
         assert [i.intent_id for i in claiming] == [_INTENT_ID]
     finally:
-        child.terminate()
-        try:
-            child.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait()
+        _stop(child)
         store.close()
 
 
@@ -305,9 +323,7 @@ def test_fencing_token_is_strictly_higher_than_the_killed_controller(
     store = SQLiteRunStore(db)
     _seed_run(store, _RUN_ID)
 
-    child = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(120)"]
-    )
+    child = _spawn_stable_child()
     try:
         child_identity = process_identity.capture(child.pid)
         assert child_identity is not None
@@ -325,12 +341,7 @@ def test_fencing_token_is_strictly_higher_than_the_killed_controller(
         assert result["fencing_token"] == store.current_fencing_token()
         assert result["fencing_token"] > stale_token
     finally:
-        child.terminate()
-        try:
-            child.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait()
+        _stop(child)
         store.close()
 
 
@@ -345,7 +356,7 @@ def _seed_adoptable(tmp_path, monkeypatch, mailbox_path: Path):
     db = _db(tmp_path)
     store = SQLiteRunStore(db)
     _seed_run(store, _RUN_ID)
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    child = _spawn_stable_child()
     child_identity = process_identity.capture(child.pid)
     assert child_identity is not None
     _seed_intent(store, intent_id=_INTENT_ID, process_identity=child_identity.to_dict())
@@ -385,8 +396,7 @@ def test_restart_refuses_a_foreign_run_decision_named(tmp_path, monkeypatch):
             _INTENT_ID
         ]
     finally:
-        child.terminate()
-        child.wait(timeout=5)
+        _stop(child)
         store.close()
 
 
@@ -402,8 +412,7 @@ def test_restart_refuses_when_no_decision_is_persisted(tmp_path, monkeypatch):
             _INTENT_ID
         ]
     finally:
-        child.terminate()
-        child.wait(timeout=5)
+        _stop(child)
         store.close()
 
 
@@ -434,8 +443,7 @@ def test_restart_reads_nothing_from_another_runs_decision(tmp_path, monkeypatch)
         assert code == nc.EXIT_REFUSED
         assert err == f"refused: {nc.HOLD_CONTINUATION_NOT_PERSISTED}\n"
     finally:
-        child.terminate()
-        child.wait(timeout=5)
+        _stop(child)
         store.close()
 
 
@@ -468,6 +476,5 @@ def test_restart_refuses_a_decision_for_a_different_attempt(tmp_path, monkeypatc
             _INTENT_ID
         ]
     finally:
-        child.terminate()
-        child.wait(timeout=5)
+        _stop(child)
         store.close()

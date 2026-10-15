@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from skillweave.cli import native_controller as nc
+from skillweave.mcp import server as mcp_server
 from skillweave.runtime import process_identity
 from skillweave.runtime.checkpoint import Checkpoint, EnvironmentFingerprint
 from skillweave.runtime.native_process import (
@@ -143,10 +144,31 @@ class _NeverCalledReviewer:
         raise AssertionError("a restart replayed the review instead of adopting")
 
 
-def _resume(store: SQLiteRunStore, db: str) -> tuple[int, str]:
-    """Drive ``run-1`` as a *restart* and return (exit code, stderr)."""
+def _resume(store: SQLiteRunStore, db: str, monkeypatch) -> tuple[int, str]:
+    """Drive ``run-1`` as a *restart* and return (exit code, stderr).
+
+    A recovered controller reads the run's *persisted* ``harness-continuation-v1``
+    decision (criterion 3), so the restart drive persists it first through the
+    **real handoff tool** -- the same production seam -- into a temporary
+    mailbox.  The adoption this file exercises is then reached exactly as it is
+    in the field: an adoptable in-flight attempt *and* the decision the handoff
+    tool recorded for it (a run carrying no persisted decision is the named
+    continuation hold of ``test_native_controller_continuation_restart.py``).
+    """
     import io
     import contextlib
+
+    monkeypatch.setenv(
+        mcp_server.MAILBOX_PATH_ENV, str(Path(db).parent / "mb.jsonl")
+    )
+    monkeypatch.setattr(mcp_server, "_AUTHORITY", None)
+    persisted = json.loads(
+        mcp_server.handoff_adapter(
+            client_id="cli", recipients="ops", run_id="run-1",
+            db_path=db, session_token="",
+        )
+    )
+    assert persisted["continuation_persisted"]["status"] == "persisted", persisted
 
     err = io.StringIO()
     worker = _NeverCalledWorker()
@@ -167,7 +189,7 @@ def _resume(store: SQLiteRunStore, db: str) -> tuple[int, str]:
 # ── The criterion: adoption of the ordering-first verifiable intent ────────
 
 def test_restart_adopts_the_ordering_first_verifiable_in_flight_intent(
-    tmp_path, capsys
+    tmp_path, capsys, monkeypatch
 ):
     """A restarted controller adopts the in-flight attempt it can still verify.
 
@@ -186,7 +208,7 @@ def test_restart_adopts_the_ordering_first_verifiable_in_flight_intent(
     )
     _write_checkpoint(store, "run-1", ["run-1/task-a/1"])
 
-    code, _ = _resume(store, db)
+    code, _ = _resume(store, db, monkeypatch)
     assert code == nc.EXIT_OK
     result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert result["adoption"]["adopted"] is True
@@ -202,7 +224,7 @@ def test_restart_adopts_the_ordering_first_verifiable_in_flight_intent(
 
 
 def test_the_adopted_identity_is_the_durable_record_not_a_new_capture(
-    tmp_path, capsys
+    tmp_path, capsys, monkeypatch
 ):
     """The adopted ``owned_identity`` repeats the *durable* record verbatim.
 
@@ -220,7 +242,7 @@ def test_the_adopted_identity_is_the_durable_record_not_a_new_capture(
     )
     _write_checkpoint(store, "run-1", ["run-1/task-a/1"])
 
-    code, _ = _resume(store, db)
+    code, _ = _resume(store, db, monkeypatch)
     assert code == nc.EXIT_OK
     result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     recorded = store.get_dispatch_intent("intent-live").process_identity
@@ -245,7 +267,7 @@ def _seed_stale_first_then_live(store: SQLiteRunStore, live: dict) -> None:
     _write_checkpoint(store, "run-1", ["run-1/task-a/1", "run-1/task-a/2"])
 
 
-def test_stale_first_plus_live_is_refused_named(tmp_path):
+def test_stale_first_plus_live_is_refused_named(tmp_path, monkeypatch):
     """The ordering-first intent is non-verifying: the restart refuses by name.
 
     It is never *skipped* to adopt the later live intent -- the frontier order
@@ -258,7 +280,7 @@ def test_stale_first_plus_live_is_refused_named(tmp_path):
     _seed_review_record(store, "run-1", "pass")
     _seed_stale_first_then_live(store, _live_identity())
 
-    code, err = _resume(store, db)
+    code, err = _resume(store, db, monkeypatch)
     assert code == nc.EXIT_REFUSED
     assert "checkpoint_identity_recycled" in err
     # The live second intent was not adopted: no intents were advanced/removed.
@@ -270,7 +292,7 @@ def test_stale_first_plus_live_is_refused_named(tmp_path):
 
 # ── One adversarial test per named checkpoint hold ─────────────────────────
 
-def test_restart_refuses_when_no_checkpoint_is_written(tmp_path):
+def test_restart_refuses_when_no_checkpoint_is_written(tmp_path, monkeypatch):
     """No written checkpoint -> ``checkpoint_not_written`` (named hold)."""
     db = _db(tmp_path)
     store = SQLiteRunStore(db)
@@ -281,13 +303,13 @@ def test_restart_refuses_when_no_checkpoint_is_written(tmp_path):
         process_identity=_live_identity(), created_at="2026-01-01T00:00:00+00:00",
     )
 
-    code, err = _resume(store, db)
+    code, err = _resume(store, db, monkeypatch)
     assert code == nc.EXIT_REFUSED
     assert "checkpoint_not_written" in err
     store.close()
 
 
-def test_restart_refuses_a_checkpoint_that_does_not_name_the_intent(tmp_path):
+def test_restart_refuses_a_checkpoint_that_does_not_name_the_intent(tmp_path, monkeypatch):
     """The checkpoint names another state -> ``checkpoint_ordering_first_mismatch``."""
     db = _db(tmp_path)
     store = SQLiteRunStore(db)
@@ -299,13 +321,13 @@ def test_restart_refuses_a_checkpoint_that_does_not_name_the_intent(tmp_path):
     )
     _write_checkpoint(store, "run-1", ["run-1/task-b/1"])
 
-    code, err = _resume(store, db)
+    code, err = _resume(store, db, monkeypatch)
     assert code == nc.EXIT_REFUSED
     assert "checkpoint_ordering_first_mismatch" in err
     store.close()
 
 
-def test_restart_refuses_an_intent_without_recorded_identity(tmp_path):
+def test_restart_refuses_an_intent_without_recorded_identity(tmp_path, monkeypatch):
     """No recorded owned identity -> ``checkpoint_no_recorded_identity``."""
     db = _db(tmp_path)
     store = SQLiteRunStore(db)
@@ -317,13 +339,13 @@ def test_restart_refuses_an_intent_without_recorded_identity(tmp_path):
     )
     _write_checkpoint(store, "run-1", ["run-1/task-a/1"])
 
-    code, err = _resume(store, db)
+    code, err = _resume(store, db, monkeypatch)
     assert code == nc.EXIT_REFUSED
     assert "checkpoint_no_recorded_identity" in err
     store.close()
 
 
-def test_restart_refuses_a_stale_recorded_command(tmp_path):
+def test_restart_refuses_a_stale_recorded_command(tmp_path, monkeypatch):
     """Same PID and creation instant, different argv -> ``..._stale_command``."""
     live = _live_identity()
     if not live.get("argv"):
@@ -341,13 +363,13 @@ def test_restart_refuses_a_stale_recorded_command(tmp_path):
     )
     _write_checkpoint(store, "run-1", ["run-1/task-a/1"])
 
-    code, err = _resume(store, db)
+    code, err = _resume(store, db, monkeypatch)
     assert code == nc.EXIT_REFUSED
     assert "checkpoint_identity_stale_command" in err
     store.close()
 
 
-def test_restart_refuses_a_foreign_recorded_image(tmp_path):
+def test_restart_refuses_a_foreign_recorded_image(tmp_path, monkeypatch):
     """Same PID and instant, different exec image -> ``..._identity_foreign``."""
     forged = dict(_live_identity())
     forged["exec_path"] = "/bin/definitely-not-the-recorded-image"
@@ -362,13 +384,13 @@ def test_restart_refuses_a_foreign_recorded_image(tmp_path):
     )
     _write_checkpoint(store, "run-1", ["run-1/task-a/1"])
 
-    code, err = _resume(store, db)
+    code, err = _resume(store, db, monkeypatch)
     assert code == nc.EXIT_REFUSED
     assert "checkpoint_identity_foreign" in err
     store.close()
 
 
-def test_restart_refuses_a_no_longer_observable_process(tmp_path):
+def test_restart_refuses_a_no_longer_observable_process(tmp_path, monkeypatch):
     """The recorded PID is gone -> ``checkpoint_identity_not_alive``.
 
     The recorded process is a real one that has already exited and been reaped
@@ -394,7 +416,7 @@ def test_restart_refuses_a_no_longer_observable_process(tmp_path):
     )
     _write_checkpoint(store, "run-1", ["run-1/task-a/1"])
 
-    code, err = _resume(store, db)
+    code, err = _resume(store, db, monkeypatch)
     assert code == nc.EXIT_REFUSED
     assert "checkpoint_identity_not_alive" in err
     store.close()
