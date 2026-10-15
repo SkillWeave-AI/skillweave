@@ -4171,6 +4171,60 @@ class NativeProcessService:
         pid = int(recorded.get("pid", 0))
         return process_identity.verify(recorded, pid)
 
+    def persist_transition_checkpoint(self, step: str) -> Any:
+        """Persist a run-keyed checkpoint after a controller transition.
+
+        The controller's transition log is only *readable* durable state; this
+        makes it a *written* one: after each transition the loop persists a
+        ``skillweave.runtime.checkpoint.Checkpoint`` into the store's
+        ``checkpoints`` table, keyed by ``run_id``.
+
+        ``step`` names *which* transition just happened and is recorded in the
+        checkpoint metadata; it is the only argument and it is not the run key.
+
+        The persisted content is derived -- never caller-supplied: the run key,
+        the journal offset and the in-flight intent state all come from the
+        store's own durable records (:meth:`SQLiteRunStore.last_journal_sequence`
+        and :meth:`SQLiteRunStore.list_dispatch_intents`), and the run comes from
+        this service's own ``_run_id_label()`` (the run its durable intents name)
+        rather than from the caller's ``--run-id``.  A caller-supplied value can
+        therefore not forge or repoint the checkpoint.
+        """
+        from skillweave.runtime.checkpoint import Checkpoint, EnvironmentFingerprint
+
+        resolved_run = self._run_id_label()
+        # The run key comes from the service's own durable intents, not from
+        # the caller: a caller cannot repoint the checkpoint at another run.
+        if not resolved_run or resolved_run == self.holder:
+            return None
+        intents = tuple(self._store.list_dispatch_intents(run_id=resolved_run))
+        checkpoint = Checkpoint(
+            run_id=resolved_run,
+            root_run_id=resolved_run,
+            parent_run_id=None,
+            journal_offset=self._store.last_journal_sequence(resolved_run),
+            environment=EnvironmentFingerprint(
+                hostname="",
+                os_name="",
+                python_version="",
+                branch="",
+                commit_sha="",
+                key_hashes={},
+            ),
+            metadata={
+                "schema_id": CHECKPOINT_SCHEMA_ID,
+                "fencing_token": (
+                    self._lease.fencing_token
+                    if self._lease is not None
+                    else self._store.current_fencing_token()
+                ),
+                "in_flight": [
+                    [intent.execution_scope, intent.step] for intent in intents
+                ],
+            },
+        )
+        return self._store.save_checkpoint(checkpoint)
+
     # -- recovery (native-process-checkpoint-v1) -------------------------
 
     def checkpoint(
