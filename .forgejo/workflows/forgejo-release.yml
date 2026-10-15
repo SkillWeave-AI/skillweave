@@ -679,7 +679,6 @@ jobs:
       # the forge and hold the run red, by name, if the attached set is not the
       # set SHA256SUMS declares.
       - name: Verify the published release attachments
-        if: ${{ !cancelled() }}
         env:
           TAG_NAME: "${{ github.event.inputs.tag_name || github.ref_name }}"
           FORGEJO_REPOSITORY: "${{ github.repository }}"

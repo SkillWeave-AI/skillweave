@@ -117,8 +117,13 @@ def test_diff_is_exactly_one_step_inserted_before_publish():
     added = [n for n in cand_names if n not in base_names]
     removed = [n for n in base_names if n not in cand_names]
 
-    assert added == [BUILD_STEP_NAME], (
-        f"exactly one step must be added; added={added!r}"
+    # This test owns the step CORE-ZR-026 inserted: it is present exactly once
+    # and no base step was removed. Later units may add steps of their own
+    # (SW-1511-GATE criterion 9 adds the post-publication attachment check);
+    # their addition must not be needed here, and each such unit proves its own
+    # step is additive, so the assertion is on this step, not on a frozen total.
+    assert added.count(BUILD_STEP_NAME) == 1, (
+        f"{BUILD_STEP_NAME!r} must be added exactly once; added={added!r}"
     )
     assert removed == [], f"no base step may be removed; removed={removed!r}"
     assert cand_names.count(BUILD_STEP_NAME) == 1, "the new step appears once"
@@ -147,14 +152,18 @@ def test_every_other_step_run_text_is_byte_identical_to_base():
             f"step {key!r} changed; the diff must touch no other step"
         )
 
-    # Whole-document equality once the one new step is removed: nothing else in
-    # the workflow — no job key, no trigger, no comment-adjacent scalar — moved.
+    # Whole-document equality once the new step is removed: nothing else in the
+    # workflow — no job key, no trigger, no comment-adjacent scalar — moved.
+    # Later units may insert their own steps; removing every step absent from
+    # base keeps this "the diff inserted steps and touched nothing else" rather
+    # than a frozen "exactly one step" that any later additive unit would break.
+    base_keys = {_step_key(s) for s in base_steps}
     stripped = _candidate_doc()
     stripped["jobs"]["release"]["steps"] = [
-        s for s in _steps(stripped) if _step_key(s) != BUILD_STEP_NAME
+        s for s in _steps(stripped) if _step_key(s) in base_keys
     ]
     assert stripped == _base_doc(), (
-        "the workflow must be the base plus exactly one step and nothing else"
+        "the workflow must be the base plus inserted steps and nothing else"
     )
 
 
@@ -162,6 +171,13 @@ def test_diff_touches_only_the_workflow_and_this_test():
     changed = set(_git("diff", "--name-only", BASE_COMMIT).splitlines())
     changed |= set(_git("ls-files", "--others", "--exclude-standard").splitlines())
 
+    # NOTE (SW-1511-GATE c9): this assertion diffs the worktree against
+    # BASE_COMMIT (4ff639e6), the clean CORE-ZR-026 checkout. The lane worktree
+    # is based on afdf20d, which already carries many commits since that SHA, so
+    # the set below is non-empty on the lane base itself — the failure is a
+    # pre-existing base condition of this worktree, not a regression, and is
+    # reported as such rather than widened here. Left byte-identical on purpose:
+    # relaxing it would gut the check the criterion relies on.
     assert changed == {WORKFLOW_REL, TEST_REL}, (
         f"the change must touch only {WORKFLOW_REL!r} and {TEST_REL!r}; "
         f"got {sorted(changed)}"
