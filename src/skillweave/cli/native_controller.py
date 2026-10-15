@@ -105,6 +105,533 @@ HOLD_NO_REVIEWER = (
     "the controller never constructs its own verdict or acceptance (unsupported)"
 )
 
+#: Named holds for the production worker port.  Each names the exact
+#: trust-table row that failed, so a refusal is never anonymous and the
+#: controller never records an owned attempt against an unverified upstream.
+HOLD_GATEWAY_UNCONFIGURED = (
+    "native-controller refused: the answering gateway endpoint is unconfigured; "
+    "no operator endpoint configuration resolves to an approved gateway, so the "
+    "attempt is never launched or recorded against it (named hold)"
+)
+HOLD_GATEWAY_UNREACHABLE = (
+    "native-controller refused: the answering gateway endpoint is unreachable; "
+    "the configured operator endpoint did not accept a connection, so the "
+    "attempt is never launched against it (named hold)"
+)
+HOLD_GATEWAY_FALLBACK_CAPABLE = (
+    "native-controller refused: the gateway is fallback-capable for the "
+    "requested model; a masked fallback answer is never recorded as a receipt "
+    "(named hold)"
+)
+HOLD_MODEL_UNCONFIGURED = (
+    "native-controller refused: no worker model is configured for the "
+    "production worker port; the controller never invents a model id (named hold)"
+)
+HOLD_ROUTE_UNAPPROVED = (
+    "native-controller refused: the dispatch route is not approved by the "
+    "operator route policy; an unverifiable route is never recorded (named hold)"
+)
+HOLD_GRANT_UNPROVISIONED = (
+    "native-controller refused: no bound MCP authority is provisioned to issue "
+    "a scoped session grant; the worker port never launches an unprovisioned "
+    "child (named hold)"
+)
+HOLD_IDENTITY_UNVERIFIED = (
+    "native-controller refused: the launched child's process identity could not "
+    "be captured and verified; an unverified child is never recorded (named hold)"
+)
+HOLD_ANSWER_UNOBSERVED = (
+    "native-controller refused: no answering upstream model was observed for the "
+    "launched attempt; the controller never records the model it *requested* as "
+    "the model that *answered* (named hold)"
+)
+
+#: The substring marking a provider-native target that is a fallback pool
+#: rather than the requested model.  Derived from the gateway's own alias table
+#: (``FAIGATE_MAP`` names exactly one fallback target, ``openrouter-fallback``),
+#: so fallback-capability is *observed*, not guessed.
+_FALLBACK_TARGET_MARKER = "fallback"
+
+#: Environment variables that carry the operator's *configured* gateway
+#: endpoint.  Absent all of them the endpoint is unconfigured -- the controller
+#: never assumes a gateway it was not told to use.
+_ENV_GATEWAY_BASE_URL = "FAIGATE_BASE_URL"
+_ENV_GATEWAY_HOST = "FAIGATE_HOST"
+_ENV_GATEWAY_PORT = "FAIGATE_PORT"
+_DEFAULT_GATEWAY_HOST = "127.0.0.1"
+_DEFAULT_GATEWAY_PORT = 8090
+
+
+@dataclass(frozen=True)
+class GatewayAnswer:
+    """The answering upstream the launched attempt *observed*.
+
+    Supplied by the caller's ``answer_reader`` seam, which reads the gateway's
+    response for the child that actually ran (the response header naming the
+    served model).  Both fields are observations, never caller preferences:
+    ``upstream_model`` is the model the endpoint answered with and ``served_by``
+    names the serving upstream when the answer carries it.  An empty
+    ``upstream_model`` is an *unobserved* answer and is refused by the port --
+    echoing the requested model back would launder a request into an answer.
+    """
+
+    upstream_model: str = ""
+    served_by: str = ""
+
+
+def _probe_loopback_gateway(host: str, port: int, *, timeout: float = 0.25) -> bool:
+    """Return whether the configured gateway accepts a connection right now.
+
+    The only network touch in the port, and it is a *reachability* probe of the
+    operator-configured approved gateway -- never a provider request, and never
+    performed unless the operator configured an endpoint.  Tests inject their
+    own probe so no socket is opened at all.
+    """
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+class _ProductionWorkerPort:
+    """The production **worker port** (SW-SCOPE-010 criterion 1).
+
+    A :class:`WorkerAdapter` that launches one owned attempt through the
+    *existing* dispatch application inline seam
+    (:func:`skillweave.dispatch.application._default_inline_seam`), provisioned
+    with a server-issued scoped session grant and verified from the launched
+    child's own captured process identity, and that records the answering
+    gateway endpoint, route and upstream model in the attempt receipt.
+
+    Every trust-table row is discharged or refused with a *named hold*, never
+    with a defaulted value:
+
+    * **gateway endpoint** -- resolved only from operator configuration
+      (``FAIGATE_BASE_URL`` or ``FAIGATE_HOST``/``FAIGATE_PORT``); with none
+      configured the port refuses (:data:`HOLD_GATEWAY_UNCONFIGURED`) instead of
+      assuming the default loopback gateway.  A configured endpoint that is not
+      the approved gateway, or that does not accept a connection, refuses
+      (:data:`HOLD_GATEWAY_UNCONFIGURED` / :data:`HOLD_GATEWAY_UNREACHABLE`).
+    * **route** -- the *operator policy* is the authority
+      (:func:`skillweave.routing.route_policy.resolve_route_policy`); an
+      unconfigured policy or a route outside the approved set refuses
+      (:data:`HOLD_ROUTE_UNAPPROVED`).  The port never defines the policy.
+    * **scoped grant** -- the token is minted by
+      ``skillweave.mcp.server.issue_harness_session_grant`` against the
+      *bound* authority (role ``worker``) over the one durable process service
+      ``skillweave.mcp.control.service_for_binding`` resolves; an unbound or
+      unprovisioned authority refuses (:data:`HOLD_GRANT_UNPROVISIONED`).  The
+      caller never authors a role or a token.
+    * **process identity** -- captured from the launched child and *verified*
+      against the live process while it is alive (inside the seam's ``started``
+      lifecycle observation, the only instant the child is observable); the
+      recorded facts are the verified ones (pid + ``start_time`` + command),
+      and anything but a declared ``match`` refuses
+      (:data:`HOLD_IDENTITY_UNVERIFIED`).  A bare PID is never stored.
+    * **fallback-capability** -- observed from the gateway's own alias table
+      (a resolved target naming a fallback pool) and from the answer/request
+      pair (:func:`skillweave.routing.faigate_adapter.is_substitution`); either
+      refuses (:data:`HOLD_GATEWAY_FALLBACK_CAPABLE`), so a masked fallback is a
+      named hold and never telemetry.
+    * **answering upstream/model** -- read from the ``answer_reader`` seam over
+      the child that actually ran; with no observed answer the port refuses
+      (:data:`HOLD_ANSWER_UNOBSERVED`) rather than recording the *requested*
+      model as an answer.
+
+    The receipt is then persisted through the controller's own store as a
+    content-addressed ``ArtifactReceipt`` (run-scoped by ``metadata['run_id']``)
+    and read back and re-validated with
+    :func:`skillweave.runtime.native_process.validate_attempt_upstream_receipt`,
+    so recording is a durable, verifiable act rather than a local return value.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: Any,
+        command: Sequence[str],
+        subject_repo: str,
+        subject_commit: str,
+        tool: str,
+        model: str,
+        endpoint: str = "",
+        route: str = "",
+        client_id: str = "native-controller-worker",
+        answer_reader: Optional[Any] = None,
+        reachability_probe: Optional[Any] = None,
+        authority: Any = None,
+        policy_path: str = "",
+        db_path: str = "",
+        mailbox_path: str = "",
+        artifacts_path: str = "",
+        stream_root: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
+        self._store = store
+        self._command = list(command)
+        self._subject_repo = subject_repo
+        self._subject_commit = subject_commit
+        self._tool = tool
+        self._model = model
+        self._endpoint = endpoint
+        self._route = route
+        self._client_id = client_id
+        self._answer_reader = answer_reader
+        self._reachability_probe = reachability_probe
+        self._authority = authority
+        self._policy_path = policy_path
+        self._db_path = db_path
+        self._mailbox_path = mailbox_path
+        self._artifacts_path = artifacts_path
+        self._stream_root = stream_root
+        self._timeout = timeout
+
+    # -- refusals ----------------------------------------------------------
+
+    @staticmethod
+    def _refuse(hold: str) -> None:
+        """Raise the named hold as a fail-closed controller refusal."""
+        raise _RefusedError(hold)
+
+    # -- configuration resolution -----------------------------------------
+
+    def _resolve_endpoint(self) -> tuple[str, str, int]:
+        """Resolve the approved gateway from *operator configuration* only.
+
+        Returns ``(endpoint, host, port)``.  Unconfigured is a refusal, not a
+        default: the controller has no gateway of its own.
+        """
+        from urllib.parse import urlparse
+
+        raw = self._endpoint or os.environ.get(_ENV_GATEWAY_BASE_URL, "")
+        if not raw:
+            host = os.environ.get(_ENV_GATEWAY_HOST, "")
+            port = os.environ.get(_ENV_GATEWAY_PORT, "")
+            if not host and not port:
+                self._refuse(HOLD_GATEWAY_UNCONFIGURED)
+            raw = f"http://{host or _DEFAULT_GATEWAY_HOST}:{port or _DEFAULT_GATEWAY_PORT}"
+        parsed = urlparse(raw)
+        if not parsed.hostname:
+            self._refuse(HOLD_GATEWAY_UNCONFIGURED)
+        try:
+            port_int = parsed.port
+        except ValueError:
+            self._refuse(HOLD_GATEWAY_UNCONFIGURED)
+        if port_int is None:
+            port_int = 80 if parsed.scheme == "http" else 443
+        return raw.rstrip("/"), parsed.hostname, int(port_int)
+
+    def _resolve_route(self, route: str) -> str:
+        """Check the route against the **operator route policy**, or refuse."""
+        from skillweave.routing.route_policy import (
+            RoutePolicyError,
+            resolve_route_policy,
+        )
+
+        try:
+            policy = resolve_route_policy(self._policy_path)
+        except RoutePolicyError:
+            self._refuse(HOLD_ROUTE_UNAPPROVED)
+        if policy is None:
+            # No operator policy is configured: the approved route set is
+            # unknown, so no route is verifiable. Refuse, never assume.
+            self._refuse(HOLD_ROUTE_UNAPPROVED)
+        try:
+            policy.check_route_allowed(route)
+        except RoutePolicyError:
+            self._refuse(HOLD_ROUTE_UNAPPROVED)
+        return route
+
+    def _assert_approved_gateway(self, endpoint: str, host: str, port: int) -> None:
+        """Refuse an endpoint that is not (or is not reachable as) the gateway."""
+        from skillweave.routing.faigate_adapter import check_egress_gateway
+
+        try:
+            policy = None
+            from skillweave.routing.route_policy import resolve_route_policy
+
+            policy = resolve_route_policy(self._policy_path)
+        except Exception:  # noqa: BLE001 - an unreadable policy is not approval
+            policy = None
+        approved_host = getattr(policy, "approved_gateway_host", _DEFAULT_GATEWAY_HOST)
+        approved_port = getattr(policy, "approved_gateway_port", _DEFAULT_GATEWAY_PORT)
+        try:
+            check_egress_gateway(
+                endpoint, approved_host=approved_host, approved_port=approved_port
+            )
+        except Exception:  # noqa: BLE001 - any egress refusal is a named hold
+            self._refuse(HOLD_GATEWAY_UNCONFIGURED)
+        probe = self._reachability_probe or _probe_loopback_gateway
+        try:
+            reachable = bool(probe(approved_host, int(approved_port)))
+        except Exception:  # noqa: BLE001 - an unprobeable endpoint is not up
+            reachable = False
+        if not reachable:
+            self._refuse(HOLD_GATEWAY_UNREACHABLE)
+        del host, port  # the *approved* host/port are the ones probed
+
+    # -- grant -------------------------------------------------------------
+
+    def _mint_grant(self, *, run_id: str, task_id: str, attempt: int) -> Any:
+        """Mint the scoped worker grant over the one durable process service."""
+        from skillweave.mcp import control as _control
+        from skillweave.mcp import server as _server
+
+        authority = self._authority or _server._bound_authority()
+        if authority is None:
+            self._refuse(HOLD_GRANT_UNPROVISIONED)
+        default_db, default_artifacts = _server.server_default_paths()
+        try:
+            service = _control.service_for_binding(
+                self._db_path or default_db,
+                mailbox_path=self._mailbox_path or _control.default_mailbox_path(),
+                artifacts_path=self._artifacts_path or default_artifacts,
+                stream_root=self._stream_root,
+            )
+            return _server.issue_harness_session_grant(
+                authority=authority,
+                role="worker",
+                client_id=self._client_id,
+                transport="stdio",
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                service=service,
+            )
+        except _RefusedError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an unmintable grant is a hold
+            self._refuse(f"{HOLD_GRANT_UNPROVISIONED} [{type(exc).__name__}]")
+
+    # -- launch + identity -------------------------------------------------
+
+    def _launch(
+        self, *, run_id: str, task_id: str, attempt: int, model: str, grant: Any
+    ) -> tuple[Any, dict]:
+        """Launch through the existing inline seam and verify the child.
+
+        The child's identity is captured *and verified against the live
+        process* inside the ``started`` lifecycle observation -- the one instant
+        the child is observable, because the seam blocks on ``wait()`` after it.
+        A refusal is recorded rather than raised from the callback (raising
+        there would abandon a started child before the seam reaps it) and is
+        converted to a named hold once the seam returns.
+        """
+        from skillweave.dispatch.application import _default_inline_seam
+        from skillweave.runtime import process_identity
+
+        observed: dict[str, Any] = {}
+
+        def _observe(*, phase: str, handle: Any = None, **_kw: Any) -> None:
+            if phase != "started" or handle is None:
+                return
+            pid = getattr(handle, "pid", None)
+            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+                observed["refusal"] = HOLD_IDENTITY_UNVERIFIED
+                return
+            captured = process_identity.capture(pid)
+            if captured is None:
+                # Unobservable: unknown, never a fabricated identity.
+                observed["refusal"] = HOLD_IDENTITY_UNVERIFIED
+                return
+            verification = process_identity.verify(captured.to_dict(), pid)
+            if not verification.ok:
+                observed["refusal"] = HOLD_IDENTITY_UNVERIFIED
+                return
+            observed["identity"] = captured.to_dict()
+
+        result = _default_inline_seam(
+            self._command,
+            run_id=run_id,
+            subject_repo=self._subject_repo,
+            subject_commit=self._subject_commit,
+            tool=self._tool,
+            model=model,
+            timeout=self._timeout,
+            on_child_lifecycle=_observe,
+            mcp_grant=grant,
+        )
+        return result, observed
+
+    # -- receipt -----------------------------------------------------------
+
+    def _record_receipt(self, receipt: Any, *, producer_artifact: str) -> Any:
+        """Persist the receipt durably, then read it back and re-validate it."""
+        from skillweave.runtime.native_process import (
+            ATTEMPT_UPSTREAM_SCHEMA_VERSION,
+            validate_attempt_upstream_receipt,
+        )
+        from skillweave.runtime.registry import ArtifactReceipt, EvidenceType
+
+        payload = json.dumps(receipt.to_dict(), sort_keys=True).encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        artifact_id = (
+            f"attempt-upstream-{receipt.run_id}-{receipt.task_id}-{receipt.attempt}"
+        )
+        saved = self._store.save_evidence(
+            ArtifactReceipt(
+                artifact_id=artifact_id,
+                sha256=digest,
+                schema_version=ATTEMPT_UPSTREAM_SCHEMA_VERSION,
+                producer_command="native-controller worker-port",
+                subject_repo=self._subject_repo,
+                subject_commit=self._subject_commit,
+                created_at=receipt.recorded_at,
+                evidence_type=EvidenceType.OBSERVATION.value,
+                purpose="attempt-upstream-receipt",
+                metadata={
+                    "run_id": receipt.run_id,
+                    "task_id": receipt.task_id,
+                    "attempt": receipt.attempt,
+                    "producer_artifact": producer_artifact,
+                    "answering_identity": receipt.answering_identity,
+                    "receipt": receipt.to_dict(),
+                },
+            )
+        )
+        # Read back from the durable record and re-validate: the recorded bytes
+        # must reconstruct the frozen, fail-closed record -- a tampered or
+        # unavailable receipt closes the path instead of being trusted.
+        if saved is None:
+            self._refuse(HOLD_ANSWER_UNOBSERVED)
+        validate_attempt_upstream_receipt(saved.metadata.get("receipt") or {})
+        return saved
+
+    # -- the adapter seam --------------------------------------------------
+
+    def execute(self, dispatch: Any) -> AttemptExecution:
+        """Launch the dispatched owned attempt and record its upstream facts."""
+        from skillweave.runtime.native_process import AttemptUpstreamReceipt
+        from skillweave.routing.faigate_adapter import is_substitution, translate_model_id
+
+        run_id = str(getattr(dispatch, "run_id", "") or "")
+        task_id = str(getattr(dispatch, "task_id", "") or "")
+        attempt = getattr(dispatch, "attempt", 0)
+        if not run_id or not task_id:
+            raise _UsageError("the dispatched owned attempt names no run/task")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise _UsageError("the dispatched owned attempt has no 1-based attempt")
+        if not self._model:
+            self._refuse(HOLD_MODEL_UNCONFIGURED)
+
+        # Fallback-capability is observed from the gateway's own alias table
+        # before anything is launched: a request that resolves to a fallback
+        # pool is a named hold, not a launch.
+        try:
+            resolved = translate_model_id(self._model)
+        except Exception:  # noqa: BLE001 - an untranslatable id is not a route
+            self._refuse(HOLD_MODEL_UNCONFIGURED)
+        if _FALLBACK_TARGET_MARKER in resolved:
+            self._refuse(HOLD_GATEWAY_FALLBACK_CAPABLE)
+
+        endpoint, host, port = self._resolve_endpoint()
+        self._assert_approved_gateway(endpoint, host, port)
+        route = self._resolve_route(
+            str(getattr(dispatch, "route", "") or "") or self._route
+        )
+
+        grant = self._mint_grant(run_id=run_id, task_id=task_id, attempt=attempt)
+        result, observed = self._launch(
+            run_id=run_id, task_id=task_id, attempt=attempt, model=self._model,
+            grant=grant,
+        )
+        if "refusal" in observed:
+            self._refuse(observed["refusal"])
+        identity = observed.get("identity")
+        if not identity:
+            self._refuse(HOLD_IDENTITY_UNVERIFIED)
+
+        children = list(getattr(result, "children", ()) or ())
+        if len(children) != 1:
+            self._refuse(HOLD_ANSWER_UNOBSERVED)
+        child = children[0]
+        raw = getattr(child, "raw_bytes", b"") or b""
+        producer_artifact = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+        answer = None
+        if self._answer_reader is not None:
+            answer = self._answer_reader(dispatch, child)
+        upstream_model = str(getattr(answer, "upstream_model", "") or "")
+        served_by = str(getattr(answer, "served_by", "") or "")
+        if not upstream_model:
+            self._refuse(HOLD_ANSWER_UNOBSERVED)
+        if _FALLBACK_TARGET_MARKER in upstream_model or is_substitution(
+            self._model, served_by=served_by or upstream_model
+        ):
+            # A masked fallback is a named hold at the port; it is never
+            # recorded as a receipt (the record refuses it by construction).
+            self._refuse(HOLD_GATEWAY_FALLBACK_CAPABLE)
+
+        receipt = AttemptUpstreamReceipt(
+            run_id=run_id,
+            gateway_endpoint=endpoint,
+            route=route,
+            upstream_model=upstream_model,
+            requested_model=self._model,
+            served_by=served_by,
+            task_id=task_id,
+            attempt=attempt,
+            endpoint_verified=True,
+            process_identity=identity,
+        )
+        self._record_receipt(receipt, producer_artifact=producer_artifact)
+        return AttemptExecution(producer_artifact=producer_artifact)
+
+
+def build_production_ports(
+    *,
+    store: Any,
+    command: Sequence[str],
+    subject_repo: str,
+    subject_commit: str,
+    tool: str,
+    model: str,
+    endpoint: str = "",
+    route: str = "",
+    answer_reader: Optional[Any] = None,
+    reachability_probe: Optional[Any] = None,
+    authority: Any = None,
+    policy_path: str = "",
+    db_path: str = "",
+    mailbox_path: str = "",
+    artifacts_path: str = "",
+    stream_root: Optional[str] = None,
+    timeout: Optional[float] = None,
+    client_id: str = "native-controller-worker",
+) -> WorkerAdapter:
+    """Build the production ports for the ``native-controller`` entry point.
+
+    Returns the **worker port** only -- the reviewer port is the separate
+    criterion-2 dispatch and is deliberately not constructed here, so a caller
+    can never receive a reviewer this factory did not provision.  ``store`` is
+    the controller's own durable store: it is the store the attempt's upstream
+    receipt is recorded into, so the caller passes the *same* store to
+    :func:`main` (``store=``) rather than letting the entry build a second one.
+    """
+    return _ProductionWorkerPort(
+        store=store,
+        command=command,
+        subject_repo=subject_repo,
+        subject_commit=subject_commit,
+        tool=tool,
+        model=model,
+        endpoint=endpoint,
+        route=route,
+        answer_reader=answer_reader,
+        reachability_probe=reachability_probe,
+        authority=authority,
+        policy_path=policy_path,
+        db_path=db_path,
+        mailbox_path=mailbox_path,
+        artifacts_path=artifacts_path,
+        stream_root=stream_root,
+        timeout=timeout,
+        client_id=client_id,
+    )
+
 
 @dataclass(frozen=True)
 class AttemptExecution:

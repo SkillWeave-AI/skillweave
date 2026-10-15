@@ -15,16 +15,19 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from skillweave.cli import native_controller as nc
 from skillweave.cli.main import main as router_main
+from skillweave.runtime.authority import MCPPrincipalAuthority
 from skillweave.runtime.native_process import (
     INTENT_FAILED,
     INTENT_INTEGRATED,
@@ -756,3 +759,344 @@ sys.exit(main(
         svc.release()
     finally:
         store2.close()
+
+
+# ── The production worker port (criterion 1) ───────────────────────────────
+#
+# ``build_production_ports`` is the production caller the criterion names: it
+# composes the *worker* port that launches the owned attempt through the
+# existing dispatch application inline seam, with a server-issued scoped grant
+# and a verified captured child identity, and records the answering gateway
+# endpoint/route/upstream model.  Nothing here launches a real process or opens
+# a socket: the runner adapter's ``start_process`` is replaced with a fake and
+# the reachability probe and answer reader are injected, so every assertion is
+# about the port's own refusal/recording decision, not about a provider.
+
+_APPROVED_ROUTE = "faigate/deepseek-v4"
+
+
+def _write_route_policy(tmp_path: Path) -> str:
+    """The *operator* route policy the port reads its authority from.
+
+    The port never defines the approved set; this file is the operator
+    configuration stand-in, naming the approved gateway the port must probe and
+    the single approved route.
+    """
+    path = tmp_path / "route-policy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "route-policy-v1",
+                "required_revision": "1.3.11",
+                "approved_gateway": {"host": "127.0.0.1", "port": 8090},
+                "approved_routes": [_APPROVED_ROUTE],
+            }
+        )
+    )
+    return str(path)
+
+
+class _FakePortHandle:
+    """A live-process stand-in for the inline seam.
+
+    ``_sw_effective_env`` is the child's *observed* effective configuration: the
+    dispatch seam hands it to ``verify_child_launch``, which refuses a child
+    that did not resolve the granted process service.  ``pid`` is the pid the
+    worker port captures and verifies; the tests set it to the live test
+    process so the capture/verify pair sees a genuinely matching process, and to
+    ``0`` to exercise the unobservable-identity refusal.
+    """
+
+    def __init__(self, *, pid: int, effective_env: dict, stdout: bytes = b"answer"):
+        self.pid = pid
+        self._sw_effective_env = dict(effective_env)
+        self._stdout = stdout
+        self._stderr = b""
+
+    def wait(self, timeout=None):
+        class _Result:
+            exit_code = 0
+            signal = None
+            termination = "exited"
+            stdout = b""
+            stderr = b""
+            stdout_receipt = None
+            stderr_receipt = None
+
+            @property
+            def succeeded(self):
+                return True
+
+        _Result.stdout = self._stdout
+        _Result.stderr = self._stderr
+        return _Result()
+
+
+class _ProductionPortFixture:
+    """Builds the production worker port over a durable store + operator policy.
+
+    ``runner_adapter.start_process`` is replaced by a fake that records the
+    command/model it was handed and returns a :class:`_FakePortHandle` carrying
+    the child's observed effective environment (which the fake computes from the
+    very ``env``/``env_allowlist`` the seam passed it, so the grant verification
+    is a real round trip through the child environment, never a constant).
+    """
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.tmp_path = tmp_path
+        self.db = str(tmp_path / "store.db")
+        self.mailbox = str(tmp_path / "agent-mailbox.jsonl")
+        self.artifacts = str(tmp_path / "artifacts")
+        self.stream_root = str(tmp_path / "streams")
+        self.policy = _write_route_policy(tmp_path)
+        self.store = SQLiteRunStore(self.db)
+        self.recorded: list = []
+
+    def install(self, monkeypatch, *, child_pid: int) -> None:
+        import skillweave.runtime.runner_adapter as runner_adapter
+
+        fixture = self
+
+        class _FakeRunner:
+            def start_process(self, command, *, env=None, env_allowlist=None, **kw):
+                fixture.recorded.append(
+                    {"command": list(command), "kw": dict(kw), "env": dict(env or {})}
+                )
+                return _FakePortHandle(pid=child_pid, effective_env=dict(env or {}))
+
+        monkeypatch.setattr(runner_adapter, "start_process", _FakeRunner().start_process)
+
+    def authority(self) -> MCPPrincipalAuthority:
+        from skillweave.mcp import server as mcp_server
+
+        auth = MCPPrincipalAuthority()
+        mcp_server.bind_authority(auth)
+        return auth
+
+    def build(self, *, model: str, endpoint: str, answer_reader=None, probe=None,
+              authority=None) -> object:
+        return nc.build_production_ports(
+            store=self.store,
+            command=["true"],
+            subject_repo="owner/repo",
+            subject_commit="c0ffee",
+            tool="worker",
+            model=model,
+            endpoint=endpoint,
+            route=_APPROVED_ROUTE,
+            answer_reader=answer_reader,
+            reachability_probe=probe if probe is not None else (lambda h, p: True),
+            authority=authority if authority is not None else self.authority(),
+            policy_path=self.policy,
+            db_path=self.db,
+            mailbox_path=self.mailbox,
+            artifacts_path=self.artifacts,
+            stream_root=self.stream_root,
+            timeout=5.0,
+        )
+
+    def dispatch(self, **over):
+        base = {
+            "run_id": "run-1",
+            "task_id": "task-a",
+            "attempt": 1,
+            "route": _APPROVED_ROUTE,
+        }
+        base.update(over)
+        return SimpleNamespace(**base)
+
+
+class TestProductionWorkerPort:
+    def test_success_records_answering_endpoint_route_and_upstream_model(
+        self, tmp_path, monkeypatch
+    ):
+        """The success path: launch through the real inline seam, verify the
+        child's captured identity, and record the *observed* answer durably."""
+        fx = _ProductionPortFixture(tmp_path)
+        fx.install(monkeypatch, child_pid=os.getpid())
+        port = fx.build(
+            model=_APPROVED_ROUTE,
+            endpoint="http://127.0.0.1:8090",
+            answer_reader=lambda dispatch, child: nc.GatewayAnswer(
+                upstream_model="deepseek-v4-pro"
+            ),
+        )
+
+        execution = port.execute(fx.dispatch())
+
+        # The seam was reached with the *requested* model, and a grant was
+        # provisioned into the child environment.
+        assert len(fx.recorded) == 1
+        assert fx.recorded[0]["kw"]["model"] == _APPROVED_ROUTE
+        assert "SKILLWEAVE_MCP_SESSION_TOKEN" in fx.recorded[0]["env"]
+        assert execution.producer_artifact.startswith("sha256:")
+
+        # The receipt is durable, run-scoped, and carries the observed answer.
+        evidence = fx.store.list_evidence(run_id="run-1")
+        assert len(evidence) == 1
+        receipt = evidence[0].metadata["receipt"]
+        assert receipt["gateway_endpoint"] == "http://127.0.0.1:8090"
+        assert receipt["route"] == _APPROVED_ROUTE
+        assert receipt["upstream_model"] == "deepseek-v4-pro"
+        assert receipt["requested_model"] == _APPROVED_ROUTE
+        assert receipt["endpoint_verified"] is True
+        assert receipt["answering_identity"] == (
+            f"http://127.0.0.1:8090|{_APPROVED_ROUTE}|deepseek-v4-pro"
+        )
+        # The identity recorded is the verified one (pid + start_time), not a
+        # bare PID.
+        assert receipt["process_identity"]["pid"] == os.getpid()
+        assert receipt["process_identity"]["start_time"]
+        fx.store.close()
+
+    def test_unconfigured_endpoint_refuses_named_hold_and_records_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """No operator endpoint configuration -> the port never assumes the
+        default gateway: a named hold, and nothing recorded."""
+        fx = _ProductionPortFixture(tmp_path)
+        fx.install(monkeypatch, child_pid=os.getpid())
+        for key in ("FAIGATE_BASE_URL", "FAIGATE_HOST", "FAIGATE_PORT"):
+            monkeypatch.delenv(key, raising=False)
+        port = fx.build(
+            model=_APPROVED_ROUTE,
+            endpoint="",
+            answer_reader=lambda dispatch, child: nc.GatewayAnswer(
+                upstream_model="deepseek-v4-pro"
+            ),
+        )
+
+        with pytest.raises(nc._RefusedError) as excinfo:
+            port.execute(fx.dispatch())
+        assert "unconfigured" in str(excinfo.value)
+        assert nc.HOLD_GATEWAY_UNCONFIGURED in str(excinfo.value)
+        # Nothing launched, nothing recorded.
+        assert fx.recorded == []
+        assert fx.store.list_evidence(run_id="run-1") == []
+        fx.store.close()
+
+    def test_unreachable_endpoint_refuses_named_hold_and_records_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """A configured approved gateway that does not accept a connection is a
+        named hold, not a launch against a dead endpoint."""
+        fx = _ProductionPortFixture(tmp_path)
+        fx.install(monkeypatch, child_pid=os.getpid())
+        port = fx.build(
+            model=_APPROVED_ROUTE,
+            endpoint="http://127.0.0.1:8090",
+            answer_reader=lambda dispatch, child: nc.GatewayAnswer(
+                upstream_model="deepseek-v4-pro"
+            ),
+            probe=lambda host, port: False,
+        )
+
+        with pytest.raises(nc._RefusedError) as excinfo:
+            port.execute(fx.dispatch())
+        assert nc.HOLD_GATEWAY_UNREACHABLE in str(excinfo.value)
+        assert fx.recorded == []
+        assert fx.store.list_evidence(run_id="run-1") == []
+        fx.store.close()
+
+    def test_fallback_capable_model_refuses_named_hold_and_records_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """A model whose resolved target is the gateway's fallback pool is a
+        named hold *before* launch: a masked fallback never becomes a receipt."""
+        fx = _ProductionPortFixture(tmp_path)
+        fx.install(monkeypatch, child_pid=os.getpid())
+        port = fx.build(
+            model="faigate/llama-4",  # resolves to ``openrouter-fallback``
+            endpoint="http://127.0.0.1:8090",
+            answer_reader=lambda dispatch, child: nc.GatewayAnswer(
+                upstream_model="some-other-model"
+            ),
+        )
+
+        with pytest.raises(nc._RefusedError) as excinfo:
+            port.execute(fx.dispatch())
+        assert nc.HOLD_GATEWAY_FALLBACK_CAPABLE in str(excinfo.value)
+        assert fx.recorded == []
+        assert fx.store.list_evidence(run_id="run-1") == []
+        fx.store.close()
+
+    def test_observed_answer_that_substitutes_refuses_named_hold(
+        self, tmp_path, monkeypatch
+    ):
+        """The answer reader observes a *different* upstream than the one
+        requested: a masked substitution is a named hold at the port."""
+        fx = _ProductionPortFixture(tmp_path)
+        fx.install(monkeypatch, child_pid=os.getpid())
+        port = fx.build(
+            model=_APPROVED_ROUTE,
+            endpoint="http://127.0.0.1:8090",
+            answer_reader=lambda dispatch, child: nc.GatewayAnswer(
+                upstream_model="anthropic-sonnet", served_by="anthropic-sonnet"
+            ),
+        )
+
+        with pytest.raises(nc._RefusedError) as excinfo:
+            port.execute(fx.dispatch())
+        assert nc.HOLD_GATEWAY_FALLBACK_CAPABLE in str(excinfo.value)
+        assert fx.store.list_evidence(run_id="run-1") == []
+        fx.store.close()
+
+    def test_unobservable_child_identity_refuses_named_hold(
+        self, tmp_path, monkeypatch
+    ):
+        """A child whose process identity cannot be captured is a named hold:
+        the port never records an unverified child."""
+        fx = _ProductionPortFixture(tmp_path)
+        fx.install(monkeypatch, child_pid=0)
+        port = fx.build(
+            model=_APPROVED_ROUTE,
+            endpoint="http://127.0.0.1:8090",
+            answer_reader=lambda dispatch, child: nc.GatewayAnswer(
+                upstream_model="deepseek-v4-pro"
+            ),
+        )
+
+        with pytest.raises(nc._RefusedError) as excinfo:
+            port.execute(fx.dispatch())
+        assert nc.HOLD_IDENTITY_UNVERIFIED in str(excinfo.value)
+        assert fx.store.list_evidence(run_id="run-1") == []
+        fx.store.close()
+
+    def test_unobserved_answer_refuses_named_hold(self, tmp_path, monkeypatch):
+        """The answer reader observed no upstream model: the port refuses rather
+        than recording the *requested* model as the answering one."""
+        fx = _ProductionPortFixture(tmp_path)
+        fx.install(monkeypatch, child_pid=os.getpid())
+        port = fx.build(
+            model=_APPROVED_ROUTE,
+            endpoint="http://127.0.0.1:8090",
+            answer_reader=lambda dispatch, child: nc.GatewayAnswer(),
+        )
+
+        with pytest.raises(nc._RefusedError) as excinfo:
+            port.execute(fx.dispatch())
+        assert nc.HOLD_ANSWER_UNOBSERVED in str(excinfo.value)
+        assert fx.store.list_evidence(run_id="run-1") == []
+        fx.store.close()
+
+    def test_route_outside_the_operator_policy_refuses_named_hold(
+        self, tmp_path, monkeypatch
+    ):
+        """A route the operator policy does not approve is a named hold: the
+        port never defines the approved set itself."""
+        fx = _ProductionPortFixture(tmp_path)
+        fx.install(monkeypatch, child_pid=os.getpid())
+        port = fx.build(
+            model=_APPROVED_ROUTE,
+            endpoint="http://127.0.0.1:8090",
+            answer_reader=lambda dispatch, child: nc.GatewayAnswer(
+                upstream_model="deepseek-v4-pro"
+            ),
+        )
+
+        with pytest.raises(nc._RefusedError) as excinfo:
+            port.execute(fx.dispatch(route="faigate/unapproved-route"))
+        assert nc.HOLD_ROUTE_UNAPPROVED in str(excinfo.value)
+        assert fx.recorded == []
+        assert fx.store.list_evidence(run_id="run-1") == []
+        fx.store.close()
