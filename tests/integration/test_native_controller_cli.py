@@ -851,10 +851,12 @@ class _ProductionPortFixture:
         self.policy = _write_route_policy(tmp_path)
         self.store = SQLiteRunStore(self.db)
         self.recorded: list = []
+        self._monkeypatch = None
 
     def install(self, monkeypatch, *, child_pid: int) -> None:
         import skillweave.runtime.runner_adapter as runner_adapter
 
+        self._monkeypatch = monkeypatch
         fixture = self
 
         class _FakeRunner:
@@ -870,6 +872,12 @@ class _ProductionPortFixture:
         from skillweave.mcp import server as mcp_server
 
         auth = MCPPrincipalAuthority()
+        # ``bind_authority`` writes *process-wide* module state. Register the
+        # global with this test's ``monkeypatch`` first, so pytest hands the
+        # host's previous authority back at teardown. Binding it directly (the
+        # pre-fix form) leaked the authority into later, unrelated MCP test
+        # modules, which then resolved a stale principal and failed.
+        self._monkeypatch.setattr(mcp_server, "_AUTHORITY", None)
         mcp_server.bind_authority(auth)
         return auth
 
@@ -1163,8 +1171,14 @@ class _ReviewerPortFixture:
 
         monkeypatch.setenv(mcp_server.MAILBOX_PATH_ENV, self.mailbox)
         auth = MCPPrincipalAuthority()
+        # Both of these are *process-wide* module state: register the previous
+        # values with ``monkeypatch`` so pytest restores the host's authority
+        # and ready token at teardown. Setting them directly (the pre-fix form)
+        # leaked a foreign authority (and a cleared token) into later MCP test
+        # modules, which then resolved a stale principal and failed.
+        monkeypatch.setattr(mcp_server, "_AUTHORITY", None)
+        monkeypatch.setattr(mcp_server, "_READY_SESSION_TOKEN", None)
         mcp_server.bind_authority(auth)
-        mcp_server._READY_SESSION_TOKEN = None
         return auth
 
     def build(self, *, reviewer_route=_REVIEWER_ROUTE, worker_route=_WORKER_ROUTE,
@@ -1410,3 +1424,61 @@ class TestProductionReviewerPort:
         # not server-issued as a reviewer, so no review is recorded.
         assert nc.HOLD_REVIEW_UNRECORDED in str(excinfo.value)
         fx.store.close()
+
+
+# ── Isolation of the process-wide MCP authority (regression) ───────────────
+#
+# The production-port fixtures bind the *process-wide* MCP authority
+# (``mcp.server._AUTHORITY``) -- the seam the port's own grant issuance reads --
+# and must hand it back when the test ends. Setting it directly leaves a
+# foreign authority bound in the test process: a later, unrelated MCP test
+# module (test_1511_mcp_bootstrap, test_1510_mcp_auth) then resolves a stale
+# principal and fails, while the same files pass alone or in reverse order.
+# These two tests pin the invariant the fixtures must preserve.
+
+
+def test_binding_the_production_authority_does_not_leak_it(tmp_path, monkeypatch):
+    """The worker-port fixture restores the host authority at teardown.
+
+    A foreign authority left bound in the process is what failed the combined
+    three-file run; this fails on the base revision, where the fixture bound it
+    directly with no restore.
+    """
+    from skillweave.mcp import server as mcp_server
+
+    previous_authority = mcp_server._AUTHORITY
+    fixture = _ProductionPortFixture(tmp_path)
+    fixture.install(monkeypatch, child_pid=os.getpid())
+    assert mcp_server._bound_authority() is None
+
+    fixture.authority()
+    # While the fixture is live the bound authority is its own ...
+    assert mcp_server._bound_authority() is not None
+    fixture.store.close()
+
+    # ... and at teardown the host's previous authority returns.
+    monkeypatch.undo()
+    assert mcp_server._AUTHORITY is previous_authority
+
+
+def test_reviewer_port_fixture_restores_the_host_authority_and_ready_token(
+    tmp_path, monkeypatch
+):
+    """Both process-wide globals are restored, never left mutated.
+
+    ``_READY_SESSION_TOKEN`` is set to ``None`` by the reviewer fixture and the
+    authority is bound; neither may survive the test.
+    """
+    from skillweave.mcp import server as mcp_server
+
+    previous_authority = mcp_server._AUTHORITY
+    previous_ready = mcp_server._READY_SESSION_TOKEN
+
+    fixture = _ReviewerPortFixture(tmp_path)
+    fixture.authority(monkeypatch)
+    assert mcp_server._AUTHORITY is not previous_authority
+
+    # Pytest restores both registered globals; simulate teardown.
+    monkeypatch.undo()
+    assert mcp_server._AUTHORITY is previous_authority
+    assert mcp_server._READY_SESSION_TOKEN is previous_ready
