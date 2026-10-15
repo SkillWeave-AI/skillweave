@@ -52,7 +52,9 @@ while a step runs.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import signal
 import sys
 from dataclasses import dataclass, field
@@ -69,6 +71,7 @@ __all__ = [
     "ReviewerAdapter",
     "ReviewVerdict",
     "DriveResult",
+    "build_production_ports",
     "build_parser",
     "main",
 ]

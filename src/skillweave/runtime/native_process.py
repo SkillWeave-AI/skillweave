@@ -249,6 +249,13 @@ __all__ = [
     # the service
     "NativeProcessService",
     "NotControllerError",
+    # attempt upstream telemetry (additive)
+    "ATTEMPT_UPSTREAM_SCHEMA_ID",
+    "ATTEMPT_UPSTREAM_SCHEMA_VERSION",
+    "SUPPORTED_ATTEMPT_UPSTREAM_VERSIONS",
+    "AttemptUpstreamRefused",
+    "AttemptUpstreamReceipt",
+    "validate_attempt_upstream_receipt",
 ]
 
 
@@ -5180,6 +5187,192 @@ class NativeProcessService:
             accepted_revision=recorded_revision,
             accepted_digest=recorded_digest,
         )
+
+
+# ---------------------------------------------------------------------------
+# attempt upstream telemetry (additive)
+# ---------------------------------------------------------------------------
+#
+# A production worker port launches an owned attempt and must record what the
+# gateway actually *answered*: the answering gateway endpoint, the route and the
+# upstream model.  This is that record.  It is deliberately fail-closed about
+# its own content -- it cannot exist without the answering endpoint/route/model,
+# it cannot exist without a verified endpoint, and it can never be a receipt of
+# a substituted (fallback-masked) answer.  A substituted answer is a *named hold
+# at the port*, never telemetry: recording one here would launder a fallback
+# into evidence.
+
+ATTEMPT_UPSTREAM_SCHEMA_ID = (
+    "https://skillweave.dev/schemas/process/attempt-upstream-receipt/v1"
+)
+ATTEMPT_UPSTREAM_SCHEMA_VERSION = "1.0.0"
+SUPPORTED_ATTEMPT_UPSTREAM_VERSIONS = frozenset({ATTEMPT_UPSTREAM_SCHEMA_VERSION})
+
+
+class AttemptUpstreamRefused(ValueError):
+    """An owned attempt's gateway answer could not be recorded as trustworthy.
+
+    *hold* names the declared refusal -- an unconfigured, unreachable or
+    fallback-capable endpoint, an unverifiable route, an unverified process
+    identity or an unprovisioned scoped grant -- so the caller records a
+    *named hold* rather than an anonymous failure.  The attempt is never
+    recorded against an unverified upstream.
+    """
+
+    def __init__(self, reason: str, *, hold: str = "", field: str = ""):
+        self.hold = hold
+        self.field = field
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class AttemptUpstreamReceipt:
+    """An ``attempt-upstream-receipt-v1`` record: the answering upstream facts.
+
+    Every field is read from the observed launch and the gateway answer; nothing
+    it records is caller-chosen.  ``answering_identity`` names the endpoint +
+    route + upstream model so the receipt cannot be satisfied by naming an
+    upstream it did not observe.
+
+    Fail-closed invariants enforced at construction:
+
+    * ``schema_version`` must be supported;
+    * the receipt must name its run and carry an integer attempt >= 0;
+    * the answering gateway endpoint, route and upstream model are all present
+      (an unrecorded field is never "verified");
+    * the endpoint must be marked verified;
+    * a substituted or fallback-capable answer must not be recorded at all (it
+      is a named hold, not a receipt);
+    * a carried process identity must be the verified facts (pid +
+      start_time), never a bare PID.
+    """
+
+    run_id: str
+    gateway_endpoint: str = ""
+    route: str = ""
+    upstream_model: str = ""
+    requested_model: str = ""
+    served_by: str = ""
+    task_id: str = ""
+    attempt: int = 0
+    substituted: bool = False
+    fallback_capable: bool = False
+    endpoint_verified: bool = False
+    process_identity: Optional[dict] = None
+    recorded_at: str = field(default_factory=_now_iso)
+    schema_version: str = ATTEMPT_UPSTREAM_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version not in SUPPORTED_ATTEMPT_UPSTREAM_VERSIONS:
+            raise UnsupportedContractVersion(
+                "attempt-upstream-receipt-v1", self.schema_version,
+                SUPPORTED_ATTEMPT_UPSTREAM_VERSIONS,
+            )
+        if not self.run_id:
+            raise ValueError("attempt upstream receipt must name its run_id")
+        if isinstance(self.attempt, bool) or not isinstance(self.attempt, int):
+            raise ValueError("attempt upstream receipt attempt must be an integer")
+        if self.attempt < 0:
+            raise ValueError("attempt upstream receipt attempt must be >= 0")
+        for name, value in (
+            ("gateway_endpoint", self.gateway_endpoint),
+            ("route", self.route),
+            ("upstream_model", self.upstream_model),
+        ):
+            if not value:
+                raise ValueError(
+                    f"attempt upstream receipt must record the answering "
+                    f"{name}; an unrecorded {name} is not verifiable and is "
+                    f"never recorded as a receipt"
+                )
+        if not self.endpoint_verified:
+            raise ValueError(
+                "attempt upstream receipt must carry a verified gateway "
+                "endpoint; an unverified endpoint is a named hold, not a receipt"
+            )
+        if self.substituted:
+            raise ValueError(
+                "attempt upstream receipt must not record a substituted answer; "
+                "a fallback-masked answer is refused at the port, never recorded"
+            )
+        if self.fallback_capable:
+            raise ValueError(
+                "attempt upstream receipt must not record a fallback-capable "
+                "endpoint; a fallback-capable endpoint is a named hold"
+            )
+        if self.process_identity is not None:
+            if not isinstance(self.process_identity, Mapping):
+                raise ValueError(
+                    "attempt upstream receipt process_identity must be a mapping"
+                )
+            if process_identity.ProcessIdentity.from_dict(self.process_identity) is None:
+                raise ValueError(
+                    "attempt upstream receipt process_identity must carry the "
+                    "verified facts (pid + start_time), not a bare PID"
+                )
+
+    @property
+    def answering_identity(self) -> str:
+        """The recorded answering upstream identity (endpoint/route/model)."""
+        return f"{self.gateway_endpoint}|{self.route}|{self.upstream_model}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_id": ATTEMPT_UPSTREAM_SCHEMA_ID,
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "attempt": self.attempt,
+            "gateway_endpoint": self.gateway_endpoint,
+            "route": self.route,
+            "upstream_model": self.upstream_model,
+            "requested_model": self.requested_model,
+            "served_by": self.served_by,
+            "substituted": self.substituted,
+            "fallback_capable": self.fallback_capable,
+            "endpoint_verified": self.endpoint_verified,
+            "process_identity": self.process_identity,
+            "answering_identity": self.answering_identity,
+            "recorded_at": self.recorded_at,
+        }
+
+
+def validate_attempt_upstream_receipt(record: Mapping[str, Any]) -> None:
+    """Refuse an attempt upstream receipt this consumer cannot support.
+
+    Raises :class:`UnsupportedContractVersion` for an unknown version (or an
+    unknown schema id).  Reconstructing the frozen record re-runs every
+    fail-closed invariant, so a tampered receipt (a missing answering field, a
+    substituted answer, a fallback-capable endpoint, a bare PID posing as
+    identity) is refused rather than trusted.
+    """
+    version = record.get("schema_version")
+    if version not in SUPPORTED_ATTEMPT_UPSTREAM_VERSIONS:
+        raise UnsupportedContractVersion(
+            "attempt-upstream-receipt-v1", version,
+            SUPPORTED_ATTEMPT_UPSTREAM_VERSIONS,
+        )
+    if record.get("schema_id") != ATTEMPT_UPSTREAM_SCHEMA_ID:
+        raise ValueError(
+            f"attempt upstream receipt schema_id {record.get('schema_id')!r} is "
+            f"not {ATTEMPT_UPSTREAM_SCHEMA_ID!r}"
+        )
+    AttemptUpstreamReceipt(
+        run_id=record.get("run_id", ""),
+        gateway_endpoint=record.get("gateway_endpoint", ""),
+        route=record.get("route", ""),
+        upstream_model=record.get("upstream_model", ""),
+        requested_model=record.get("requested_model", ""),
+        served_by=record.get("served_by", ""),
+        task_id=record.get("task_id", ""),
+        attempt=record.get("attempt", 0),
+        substituted=record.get("substituted", False),
+        fallback_capable=record.get("fallback_capable", False),
+        endpoint_verified=record.get("endpoint_verified", False),
+        process_identity=record.get("process_identity"),
+        recorded_at=record.get("recorded_at", ""),
+        schema_version=version,
+    )
 
 
 class _EvidenceJournalView(Sequence):
