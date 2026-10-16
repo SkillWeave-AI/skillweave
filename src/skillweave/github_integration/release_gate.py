@@ -6,14 +6,17 @@ changelog, tests, required files, and WIP markers.
 """
 
 import re
+import os
+import sys
 import json
 import yaml
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from .capability_sync import CapaciumManifestSync
+from skillweave.release import environment_attestation
 
 
 @dataclass
@@ -34,6 +37,7 @@ class ReleaseGateResult:
     errors: list[str] = field(default_factory=list)
     candidate_sha: str = ""
     base_sha: str = ""
+    environment_attestation: dict = field(default_factory=dict)
 
     @property
     def passed_count(self) -> int:
@@ -335,12 +339,230 @@ class ReleaseReadinessGate:
             required=True,
         )
 
+    def _gate_environments(
+        self, declaration: environment_attestation.EnvironmentDeclaration
+    ) -> list[str]:
+        """The one declared interpreter the gate attests: the session's own.
+
+        ``SKILLWEAVE_ENV_ATTEST_PYTHONS`` (comma-separated) widens this when a
+        caller wants a receipt per declared interpreter, so the criterion-1
+        surface stays available without making every gate run build three
+        environments.
+        """
+        requested = os.environ.get("SKILLWEAVE_ENV_ATTEST_PYTHONS", "")
+        wanted = [p.strip() for p in requested.split(",") if p.strip()]
+        if not wanted:
+            session = "%d.%d" % tuple(sys.version_info[:2])
+            wanted = [session] if session in declaration.pythons else list(declaration.pythons)
+        undeclared = [p for p in wanted if p not in declaration.pythons]
+        if undeclared:
+            raise environment_attestation.EnvironmentDeclarationError(
+                f"SKILLWEAVE_ENV_ATTEST_PYTHONS names undeclared interpreter(s) "
+                f"{undeclared}; the declaration declares {list(declaration.pythons)}"
+            )
+        return wanted
+
+    def check_test_environment(
+        self,
+        *,
+        declaration: environment_attestation.EnvironmentDeclaration | None = None,
+        build: Callable[[str], Path] | None = None,
+        available: Mapping[str, bool] | None = None,
+        session_python: Path | str | None = None,
+        sdk_dir: Path | str | None = None,
+        receipt: Mapping[str, Any] | None = None,
+        environments: Iterable[str] | None = None,
+    ) -> tuple[GateCheck, dict, dict[str, dict]]:
+        """Run the SW-1511A-ENV-001 seam of the gate: build, guard, receipt.
+
+        A gate run (a) *builds* the declared environment for each declared
+        interpreter -- or for the one declared interpreter matching the
+        session -- (b) *refuses* a session whose declared collection
+        dependencies are missing (the selective-ignore cause, named), and
+        (c) *writes* the ``execution-environment-attestation/v1`` receipt with
+        the eight criterion-3 fields.
+
+        The heavy builder and the session probe are injection seams: ``build``
+        and ``available``/``session_python`` let a caller (or a test) supply
+        fakes, so nothing here reaches the network, an index or a credential.
+        Returns ``(check, receipt, receipts_by_python)``.
+        """
+        try:
+            decl = declaration or environment_attestation.load_declaration()
+        except environment_attestation.EnvironmentDeclarationError as exc:
+            return (
+                GateCheck(
+                    id="test-environment-attestation",
+                    name="Declared test environment attested",
+                    passed=False,
+                    detail=f"cannot load the declared test-environment input: {exc}",
+                    required=True,
+                ),
+                {},
+                {},
+            )
+
+        # Build *one* declared environment, not three: the gate's receipt is
+        # the evidence for the environment the unit suite actually ran in. A
+        # caller may widen ``environments`` to attest more than the session's.
+        targets = list(environments) if environments is not None else self._gate_environments(decl)
+        env_root = self.repo_root / ".skillweave" / "release" / "test-environments"
+
+        def default_build(minor: str) -> Path:
+            refusals: list[str] = []
+            venv_dir = environment_attestation.build_environment(
+                minor, decl, env_root, sdk_dir=sdk_dir, refusals=refusals
+            )
+            if refusals:
+                raise environment_attestation.EnvironmentBuildError(
+                    "incomplete environment for py"
+                    f"{minor}; refused dependencies: " + "; ".join(refusals)
+                )
+            return venv_dir
+
+        build_fn = build if build is not None else default_build
+
+        receipts: dict[str, dict] = {}
+        for minor in targets:
+            try:
+                venv_dir = Path(build_fn(minor))
+            except environment_attestation.EnvironmentBuildError as exc:
+                return (
+                    GateCheck(
+                        id="test-environment-attestation",
+                        name="Declared test environment attested",
+                        passed=False,
+                        detail=f"py{minor}: {exc}",
+                        required=True,
+                    ),
+                    {},
+                    receipts,
+                )
+            try:
+                env_receipt = environment_attestation.build_attestation(
+                    venv_dir, decl, sdk_dir=sdk_dir
+                ).to_dict()
+            except (
+                environment_attestation.EnvironmentBuildError,
+                environment_attestation.AttestationError,
+            ) as exc:
+                return (
+                    GateCheck(
+                        id="test-environment-attestation",
+                        name="Declared test environment attested",
+                        passed=False,
+                        detail=f"py{minor}: no attestation: {exc}",
+                        required=True,
+                    ),
+                    {},
+                    receipts,
+                )
+            receipts[minor] = env_receipt
+
+        # A built environment that attests it did not provide a declared
+        # dependency is incomplete, never evidence: the gate refuses it here as
+        # well as in the builder, so a partial environment cannot pass the gate
+        # when a caller supplies its own builder.
+        unprovided = sorted(
+            {name for r in receipts.values() for name in r.get("missing_dependencies", ())}
+        )
+        if unprovided:
+            return (
+                GateCheck(
+                    id="test-environment-attestation",
+                    name="Declared test environment attested",
+                    passed=False,
+                    detail=(
+                        "selective-ignore cause: the built environment(s) "
+                        f"{sorted(receipts)} attest they did not provide "
+                        f"{unprovided}; the full unit suite would collect with "
+                        "those dependencies skipped"
+                    ),
+                    required=True,
+                ),
+                {},
+                receipts,
+            )
+
+        primary = "%d.%d" % tuple(sys.version_info[:2])
+        if primary not in receipts:
+            primary = targets[0]
+        session_receipt = receipts[primary]
+        try:
+            session_attestation = environment_attestation.guard_session(
+                decl,
+                session_python=session_python,
+                sdk_dir=sdk_dir,
+                available=available,
+                receipt=receipt,
+            ).to_dict()
+        except (
+            environment_attestation.SessionGuardError,
+            environment_attestation.AttestationError,
+        ) as exc:
+            return (
+                GateCheck(
+                    id="test-environment-attestation",
+                    name="Declared test environment attested",
+                    passed=False,
+                    detail=f"refusing the unit-suite session: {exc}",
+                    required=True,
+                ),
+                {},
+                receipts,
+            )
+
+        # The attestation must be complete: a receipt that omits a declared
+        # dependency is an incomplete environment, never a pass.
+        missing = list(session_attestation.get("missing_dependencies", ()))
+        if missing:
+            return (
+                GateCheck(
+                    id="test-environment-attestation",
+                    name="Declared test environment attested",
+                    passed=False,
+                    detail=(
+                        "selective-ignore cause: the session attestation omits "
+                        f"{missing}; the full unit suite would collect with those "
+                        "dependencies skipped"
+                    ),
+                    required=True,
+                ),
+                {},
+                receipts,
+            )
+
+        complete = "complete" if all(
+            r.get("complete") for r in receipts.values()
+        ) else "incomplete"
+        check = GateCheck(
+            id="test-environment-attestation",
+            name="Declared test environment attested",
+            passed=True,
+            detail=(
+                f"{len(receipts)} declared environment(s) built ({complete}); "
+                f"session py{session_attestation['python_short']} guarded; SDK "
+                f"{session_attestation['sdk_version']} "
+                f"({session_attestation['sdk_install_type']}); lock digest "
+                f"{session_attestation['dependency_lock_digest'][:12]}"
+            ),
+            required=True,
+        )
+        return check, session_attestation, receipts
+
     def evaluate(
         self,
         current_version: str,
         latest_tag: Optional[str] = None,
         required_files: list[str] | None = None,
         wip_scan_paths: list[str] | None = None,
+        *,
+        environments: Iterable[str] | None = None,
+        build: Callable[[str], Path] | None = None,
+        available: Mapping[str, bool] | None = None,
+        session_python: Path | str | None = None,
+        sdk_dir: Path | str | None = None,
+        receipt: Mapping[str, Any] | None = None,
     ) -> ReleaseGateResult:
         result = ReleaseGateResult(
             timestamp=datetime.utcnow().isoformat() + "Z",
@@ -354,6 +576,18 @@ class ReleaseReadinessGate:
         result.checks.append(self.check_capacium_manifests())
         result.checks.extend(self.check_required_files(required_files))
         result.checks.append(self.check_wip_markers(wip_scan_paths))
+
+        if environments is not None or build is not None or available is not None:
+            env_check, env_receipt, _all_receipts = self.check_test_environment(
+                build=build,
+                available=available,
+                session_python=session_python,
+                sdk_dir=sdk_dir,
+                receipt=receipt,
+                environments=environments,
+            )
+            result.checks.append(env_check)
+            result.environment_attestation = env_receipt
 
         result.all_required_passed = len(result.required_failed) == 0
         result.can_release = result.all_required_passed
@@ -409,18 +643,67 @@ class ReleaseReadinessGate:
                 for c in result.checks
             ],
             "errors": result.errors,
+            "environment_attestation": result.environment_attestation,
         }, indent=2)
 
 
-def run_cli():
-    """CLI entry for GitHub Actions: reads env vars, runs gate, writes outputs."""
+def run_cli(
+    argv: Optional[list[str]] = None,
+    *,
+    build: Optional[Callable[[str], Path]] = None,
+    available: Optional[Mapping[str, bool]] = None,
+    environments: Optional[Iterable[str]] = None,
+    session_python: Optional[Path | str] = None,
+    receipt: Optional[Mapping[str, Any]] = None,
+) -> int:
+    """CLI entry for GitHub Actions: reads env vars, runs gate, writes outputs.
+
+    Also runs the SW-1511A-ENV-001 environment seam: the gate builds the
+    declared environment (``profiles/test-environments.v1.toml``) for the
+    session interpreter, refuses the run if that session is missing a declared
+    collection dependency, and records the
+    ``execution-environment-attestation/v1`` receipt -- all eight criterion-3
+    fields -- in ``release-gate-data.json``. A missing declared input raises
+    :class:`EnvironmentDeclarationError`, never a green report with no
+    environment evidence; ``SKILLWEAVE_ATTEST_ENV=0`` is the explicit opt-out.
+
+    ``build``/``available``/``environments``/``session_python``/``receipt`` are
+    the injection seams for a caller (or test) that supplies fakes; the real
+    run builds and probes for real.
+    """
     version = os.environ.get("RELEASE_VERSION", "unknown")
     latest_tag = os.environ.get("RELEASE_LATEST_TAG") or None
     gate = ReleaseReadinessGate()
+
+    attest_env = {
+        "environments": environments,
+        "build": build,
+        "available": available,
+        "session_python": session_python,
+        "receipt": receipt,
+    }
+    if "SKILLWEAVE_ATTEST_ENV" not in os.environ:
+        # Native runs always attest the declared environment. The declared
+        # input is required: a checkout that dropped it is refused loudly
+        # rather than reported green with no environment evidence.
+        declaration = environment_attestation.load_declaration()
+        if environments is None:
+            attest_env["environments"] = gate._gate_environments(declaration)
+    elif os.environ["SKILLWEAVE_ATTEST_ENV"] != "0":
+        try:
+            declaration = environment_attestation.load_declaration(
+                require_supported_pythons=False
+            )
+        except environment_attestation.EnvironmentDeclarationError:
+            declaration = None
+        if declaration is not None and environments is None:
+            attest_env["environments"] = gate._gate_environments(declaration)
+
     result = gate.evaluate(
         current_version=version,
         latest_tag=latest_tag,
         wip_scan_paths=["src", "README.md", "CHANGELOG.md"],
+        **attest_env,
     )
     # The gate always records which commit it inspected so a rework brief can
     # later point at the exact candidate/base pair. In Action runs these are
@@ -449,5 +732,4 @@ def run_cli():
             level = "error" if check.required else "warning"
             print(f"::{level} title=ReleaseGate::{check.name}: {check.detail}")
 
-
-import os
+    return 0
