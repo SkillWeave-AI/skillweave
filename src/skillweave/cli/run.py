@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 from skillweave.dispatch.application import generate_run_id
@@ -148,6 +149,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--final-result-root",
+        dest="final_result_root",
+        default=None,
+        help=(
+            "Directory the run wrapper writes the attempt-final-result/v1 "
+            "record into. Defaults to an attempt-final-results sibling of the "
+            "durable stream evidence, so the record survives independently of "
+            "stream retention. When absent, the directory the durable stream "
+            "store itself owns (its own attempt-final-results sibling) is left "
+            "to the child result reconciler, and the wrapper records nothing on "
+            "top of it -- exactly one record per launched attempt, never two."
+        ),
+    )
+    parser.add_argument(
         "--rework",
         action="store_true",
         help="Draft rework briefs from failed gates",
@@ -176,6 +191,119 @@ def _default_stream_root(db_path: str) -> str:
         return os.path.join(tempfile.mkdtemp(prefix="skillweave-stream-"), "streams")
     db_dir = os.path.dirname(os.path.abspath(db_path)) or "."
     return os.path.join(db_dir, "streams")
+
+
+def _default_final_result_root(stream_root: str) -> str:
+    """The final-result root used when the caller does not name one.
+
+    The record must outlive the retained stream bytes, so it is written beside
+    the stream root rather than inside the retention-capped stream evidence:
+    the contract's own store places each record under
+    ``<root>/attempt-final-results/``, so the default root is the stream root's
+    parent and the records land as a sibling directory of the stream evidence. A
+    caller-supplied ``--final-result-root`` always wins, keeping the location
+    explicit and reproducible.
+
+    The child result reconciler derives the *same* directory from the store's
+    own ``root``, so the named producer and the wrapper's confirmation write one
+    directory and one record for one launched attempt.
+    """
+    return os.path.dirname(os.path.abspath(stream_root)) or "."
+
+
+def _assay_state_for_result(assay_block: Optional[dict]) -> str:
+    """The assay state the wrapper records for this attempt.
+
+    An Assay run that reached HOLD records ``hold``; a drill that reached PASS
+    records ``pass``; a streamed attempt outside the Assay methodology records
+    ``artifact_verify`` — the state the probe's measured facts were classified
+    in — and is never silently upgraded to an Assay PASS.
+    """
+    if not isinstance(assay_block, dict):
+        return "artifact_verify"
+    outcome = assay_block.get("outcome")
+    if outcome == "pass":
+        return "pass"
+    if outcome == "hold":
+        return "hold"
+    return "artifact_verify"
+
+
+def _artifact_semantics_for_result(assay_block: Optional[dict]) -> Any:
+    """Classify the attempt's artifact semantics (criterion 2).
+
+    A successful child whose native Assay PASS was withheld *specifically* for
+    artifact-specific semantics (a missing source binding, an unadmitted proof
+    graph) is an intentionally-absent-artifact case: it is recorded as a named
+    hold, never flattened into an undifferentiated process failure. Every other
+    attempt keeps applicable semantics, so its verdict is derived purely from
+    the child's real machine outcome.
+    """
+    from skillweave.trace.attempt_final_result import ArtifactSemantics
+
+    if isinstance(assay_block, dict):
+        semantics = assay_block.get("artifact_evidence")
+        if isinstance(semantics, dict) and semantics.get("admitted") is False:
+            return ArtifactSemantics.NAMED_HOLD
+    return ArtifactSemantics.APPLICABLE
+
+
+def _hold_fields_for_result(assay_block: Optional[dict]) -> tuple:
+    """The ``(name, reason)`` that names an intentionally absent artifact case.
+
+    Both are empty unless the attempt is a named hold, so a normal attempt
+    carries no fabricated hold metadata.
+    """
+    if _artifact_semantics_for_result(assay_block).value != "named_hold":
+        return "", ""
+    reason = ""
+    if isinstance(assay_block, dict):
+        reason = str(assay_block.get("reason") or "")
+    return "artifact-semantics", reason or "artifact-specific semantics refused"
+
+
+def _write_attempt_final_result(
+    *, stream_store, root: str, run_id: str, task_id: str,
+    attempt: int, wrapper_exit: int, observed_at: str,
+    assay_block: Optional[dict],
+) -> None:
+    """Write the wrapper's ``attempt-final-result/v1`` for this launched attempt.
+
+    The record separates the child's raw machine outcome from the wrapper's own
+    exit code, names an intentionally absent artifact case as a hold rather than
+    a process failure, and takes its evidence digest from the whole-observed-byte
+    stream summary so the verdict survives retention. Fail-closed: the contract's
+    own refusal (an unreadable fact, a contradictory outcome, a conflicting
+    rewrite) propagates to the caller rather than being swallowed, because a
+    launched attempt without its one unambiguous final result is not a result.
+
+    The wrapper is the *last* writer of the attempt's record: within one
+    process the child result reconciler has already written the identity, so the
+    store's read-back sees the identical record and the re-write is idempotent.
+    The wrapper's own ``observed_at`` is passed in rather than minted here, so
+    the record has exactly one timestamp per process and the reconciler and the
+    wrapper cannot disagree on it.
+    """
+    if stream_store is None:
+        return
+    from skillweave.trace.attempt_final_result import (
+        AttemptFinalResultStore,
+        final_result_from_attempt,
+    )
+
+    result = final_result_from_attempt(
+        stream_store,
+        run_id=run_id,
+        task_id=task_id,
+        attempt=int(attempt),
+        wrapper_exit=int(wrapper_exit),
+        assay_state=_assay_state_for_result(assay_block),
+        artifact_semantics=_artifact_semantics_for_result(assay_block),
+        hold_name=_hold_fields_for_result(assay_block)[0],
+        hold_reason=_hold_fields_for_result(assay_block)[1],
+        observed_at=observed_at,
+    )
+    AttemptFinalResultStore(root=root).write(result)
 
 
 def _load_artifact_evidence(artifact_evidence: Optional[str]) -> Optional[list]:
@@ -268,12 +396,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stream_root = args.stream_root or _default_stream_root(args.db_path)
     stream_store = DurableStreamStore(root=stream_root)
 
+    # SW-1511A-RESULT-001: the attempt-final-result/v1 record the wrapper writes
+    # at attempt end. It is kept beside the stream root (not inside the
+    # retention-capped stream evidence), so the verdict and its receipt remain
+    # readable when the stream exceeded its retention limit.
+    final_result_root = (
+        args.final_result_root or _default_final_result_root(stream_root)
+    )
+
     # SW-1510-BUDGET: wire the atomic reservation store explicitly so the
     # installed `skillweave run` entry is bound to the budget guard.
     reservation_store = ReservationStore(args.db_path)
     svc = RunApplicationService(
         store, journal, raw_artifacts, stream_store,
         reservation_store=reservation_store,
+        final_result_root=final_result_root,
     )
     run_id = generate_run_id()
 
@@ -344,6 +481,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             source_resolver=source_resolver,
             analysis_reader=analysis_reader,
             route_proof=route_proof,
+            final_result_root=final_result_root,
         )
 
         result_obj = execution["result"]
@@ -373,6 +511,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         }
         if "assay" in execution:
             result_dict["assay"] = execution["assay"]
+
+        # SW-1511A-RESULT-001: the run wrapper is the producer named by the
+        # attempt-final-result/v1 data contract. The launch has completed, so
+        # exactly one unambiguous record is written durably beside the stream
+        # evidence -- child exit, wrapper exit, assay state, verdict, evidence
+        # digest and terminal reason -- before any exit. The record path is
+        # additive: the JSON printed to stdout and the exit codes below are
+        # unchanged for existing callers.
+        #
+        # The reconciler inside the execution already wrote the record for this
+        # attempt; the wrapper's write is the idempotent confirmation of the
+        # *wrapper* exit that only the wrapper knows, and it reuses the same
+        # observed_at so the confirmation is byte-identical. Only an explicit
+        # ``--final-result-root`` makes the wrapper a second writer of the
+        # store's directory, which is exactly the ``skillweave run`` entry a
+        # caller drives directly.
+        assay_block_for_result = result_dict.get("assay")
+        wrapper_exit = (
+            1
+            if isinstance(assay_block_for_result, dict)
+            and assay_block_for_result.get("outcome") == "hold"
+            else 0
+        )
+        _write_attempt_final_result(
+            stream_store=stream_store,
+            root=final_result_root,
+            run_id=run_id,
+            task_id=task_id,
+            attempt=args.attempt,
+            wrapper_exit=wrapper_exit,
+            observed_at=execution.get("final_result", {}).get("observed_at")
+            or datetime.now(timezone.utc).isoformat(),
+            assay_block=assay_block_for_result,
+        )
 
         if getattr(args, "rework", False) and execution["gate_state"] == "fail":
             # Unify on the structured brief artifact. run.py delegates to the

@@ -431,6 +431,7 @@ class RunApplicationService:
         raw_artifacts: RawArtifactStore,
         stream_store: Optional[Any] = None,
         reservation_store: Optional[Any] = None,
+        final_result_root: Optional[str] = None,
     ):
         self.store = store
         self.journal = journal
@@ -468,6 +469,13 @@ class RunApplicationService:
             except Exception:  # noqa: BLE001 - other init failure
                 raise
         self.reservation_store = reservation_store
+        # SW-1511A-RESULT-001: the directory the child result reconciler writes
+        # the attempt-final-result/v1 record into. It is configuration, not
+        # authority: when unset the reconciler derives a durable location beside
+        # the stream root, so a composed caller (the run wrapper, the native
+        # controller, the MCP entry) and the wrapper's own confirmation write
+        # one record instead of two.
+        self._final_result_root_override = final_result_root
 
     def execute(
         self,
@@ -3771,6 +3779,7 @@ class RunApplicationService:
         source_resolver: Optional[Any] = None,
         analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
         route_proof: Optional[Any] = None,
+        final_result_root: Optional[str] = None,
     ) -> dict[str, Any]:
         """Protected native execution whose output is durably streamed.
 
@@ -3845,6 +3854,12 @@ class RunApplicationService:
         )
 
         created_at = created_at or datetime.now(timezone.utc).isoformat()
+
+        # SW-1511A-RESULT-001: one ``observed_at`` for the whole attempt, minted
+        # once at ingest. It is the run wrapper's own value too, so the
+        # reconciler's record and the wrapper's *idempotent* confirmation of it
+        # carry one timestamp and cannot be read as two disagreeing writers.
+        final_result_observed_at = created_at
 
         # Where an exact-source binding exists, the receipt must match the base
         # that binding pins -- exactly as the bounded ``execute`` path checks,
@@ -4439,7 +4454,115 @@ class RunApplicationService:
         }
         if assay_block is not None:
             out["assay"] = assay_block
+
+        # SW-1511A-RESULT-001: the child result reconciler. Every launched
+        # attempt gets exactly one ``attempt-final-result/v1`` reconciled from
+        # the *same* durable facts and stream summaries the stages above wrote
+        # (child exit/signal/termination, whole-observed-byte evidence digest,
+        # assay state), so a controller never infers the outcome from the
+        # wrapper's exit code or from a retained raw stream. The reconciler
+        # fails closed -- a contract refusal propagates -- but never widens the
+        # method's existing public return surface for its callers.
+        reconciled = self._reconcile_attempt_final_result(
+            run_id=run_id,
+            task_id=task_id or run_id,
+            attempt=int(attempt),
+            # The wrapper's *own* exit code is the only value that belongs in
+            # this dimension: a withheld native Assay PASS is the sole non-zero
+            # wrapper exit (a failed child or a failed gate still exits 0 with
+            # the failure reported in the result), so the record never reports a
+            # wrapper exit the wrapper did not return.
+            wrapper_exit=(
+                1
+                if isinstance(assay_block, dict)
+                and assay_block.get("outcome") == "hold"
+                else 0
+            ),
+            observed_at=final_result_observed_at,
+            assay_block=assay_block,
+            final_result_root=final_result_root,
+        )
+        out["final_result"] = reconciled.to_dict()
         return out
+
+    def _final_result_root(self) -> Optional[str]:
+        """The directory final-result records are written to, if one is durable.
+
+        It sits beside the durable stream root so the record outlives the
+        retention-capped stream bytes. The contract's own store nests each
+        record under ``<root>/attempt-final-results/``, so the derived root is
+        the stream root's parent and this matches the wrapper's
+        ``_default_final_result_root`` exactly: both producers name one
+        directory for one launched attempt. No stream store (or a memory-only
+        one) means no durable location, and the reconciler stays memory-only
+        rather than inventing a path.
+        """
+        if self._final_result_root_override:
+            return str(self._final_result_root_override)
+        root = getattr(self.stream_store, "root", None)
+        if not root:
+            return None
+        return os.path.dirname(os.path.abspath(str(root))) or "."
+
+    def _reconcile_attempt_final_result(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        wrapper_exit: int,
+        observed_at: str,
+        final_result_root: Optional[str],
+        assay_block: Optional[dict[str, Any]],
+    ) -> Any:
+        """Reconcile one launched attempt's unambiguous final result (fail-closed).
+
+        The record separates the child's raw machine outcome from the wrapper's
+        exit code, names an intentionally absent artifact case as a hold rather
+        than a process failure, and takes its evidence digest from the
+        whole-observed-byte stream summary so the verdict survives retention.
+        """
+        from skillweave.trace.attempt_final_result import (
+            ArtifactSemantics,
+            AttemptFinalResultStore,
+            final_result_from_attempt,
+        )
+
+        semantics = ArtifactSemantics.APPLICABLE
+        hold_name = ""
+        hold_reason = ""
+        if isinstance(assay_block, dict):
+            declared = assay_block.get("artifact_evidence")
+            if isinstance(declared, dict) and declared.get("admitted") is False:
+                semantics = ArtifactSemantics.NAMED_HOLD
+                hold_name = "artifact-semantics"
+                hold_reason = str(
+                    assay_block.get("reason") or "artifact-specific semantics refused"
+                )
+        assay_state = "artifact_verify"
+        if isinstance(assay_block, dict):
+            outcome = assay_block.get("outcome")
+            if outcome == "pass":
+                assay_state = "pass"
+            elif outcome == "hold":
+                assay_state = "hold"
+
+        result = final_result_from_attempt(
+            self.stream_store,
+            run_id=run_id,
+            task_id=task_id,
+            attempt=int(attempt),
+            wrapper_exit=int(wrapper_exit),
+            assay_state=assay_state,
+            artifact_semantics=semantics,
+            hold_name=hold_name,
+            hold_reason=hold_reason,
+            observed_at=observed_at,
+        )
+        AttemptFinalResultStore(
+            root=final_result_root if final_result_root else self._final_result_root()
+        ).write(result)
+        return result
 
     # -- narrow collector interface for the owning composed lane ------------
     #
