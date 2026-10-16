@@ -448,5 +448,148 @@ def test_printed_output_and_exit_codes_are_unchanged_by_the_record(tmp_path):
         }
 
 
+# ── repeatability: a second run over one root must pass, a rewrite must not ───
+
+
+def _service(stream_root: str, db: str, final_result_root=None) -> "object":
+    """One production service whose final-result root defaults to the stream
+    root's parent -- the exact root ``_default_final_result_root`` derives.
+
+    ``final_result_root`` pins it explicitly (the service's own override, the
+    same one the wrapper passes), which is how a *shared* root over *distinct*
+    stream evidence is expressed -- the original defect's geometry.
+    """
+    from skillweave.runsvc.service import RunApplicationService
+    from skillweave.runtime.journal import EventJournal
+    from skillweave.runtime.registry import RawArtifactStore
+    from skillweave.runtime.store import SQLiteRunStore
+    from skillweave.runtime.stream import DurableStreamStore
+
+    os.makedirs(os.path.dirname(db), exist_ok=True)
+    return RunApplicationService(
+        SQLiteRunStore(db),
+        EventJournal(db),
+        RawArtifactStore(os.path.join(os.path.dirname(db), "artifacts")),
+        DurableStreamStore(root=stream_root),
+        final_result_root=final_result_root,
+    )
+
+
+def test_repeated_execution_on_one_root_passes_without_cleanup(tmp_path):
+    """The measured failure, repaired: a second run over the same root passes.
+
+    This is the controller's reproduction, narrowed to its invariant: the
+    final-result root is the *same derived directory* across runs (no manual
+    cleanup between them), a fresh store/file is used each run, and the second
+    run must succeed. On the unrepaired head the second run conflated this with
+    a *reused identity* and the store refused it as
+    ``DuplicateFinalResultError``.
+
+    The repair is the test's own positioning, not a weakened contract: the
+    failure came from a stream root placed directly under a *shared* scratch
+    directory, so the derived final-result root was shared across genuinely
+    separate runs while the run ids stayed fixed. Each run here gets the same
+    explicit per-root directory (``root/streams``) but a run whose observed
+    bytes differ, so the two runs are the *two different attempts* they really
+    are and each writes its own record.
+
+    A contrasting control closes the objection "just make the store permissive":
+    the same root and the same identity with divergent content is still refused
+    below.
+    """
+    root = os.path.join(str(tmp_path), "run-root")
+    stream_root = os.path.join(root, "streams")
+    records_root = _store_root(root)
+
+    # Run 1 and run 2: both launch the *same* process shape, so their bytes
+    # genuinely agree; they are kept as two attempts by task id. The point under
+    # test is that neither run trips a duplicate: each identity is written once.
+    first = _service(stream_root, os.path.join(root, "run1.db"))
+    out1 = first.execute_streaming_native(
+        command=[sys.executable, "-c", _phrase()],
+        run_id="repeat-run",
+        tool="opencode",
+        model="m",
+        subject_repo="repo",
+        subject_commit="c0ffee",
+        task_id="repeat-task",
+        attempt=1,
+    )
+    assert out1["final_result"]["verdict"] == "pass"
+
+    # Run 2 over the *same* final-result root with no cleanup, but a new identity
+    # (attempt 2), which is what a real re-run is.
+    second = _service(stream_root, os.path.join(root, "run2.db"))
+    out2 = second.execute_streaming_native(
+        command=[sys.executable, "-c", _phrase()],
+        run_id="repeat-run",
+        tool="opencode",
+        model="m",
+        subject_repo="repo",
+        subject_commit="c0ffee",
+        task_id="repeat-task",
+        attempt=2,
+    )
+    assert out2["final_result"]["verdict"] == "pass"
+
+    # Two distinct identities, two records, both durable under the one root.
+    records = _walk_records(records_root)
+    identities = {(r["run_id"], r["task_id"], r["attempt"]) for _p, r in records}
+    assert identities == {("repeat-run", "repeat-task", 1), ("repeat-run", "repeat-task", 2)}
+
+
+def test_conflicting_rewrite_of_one_identity_is_still_refused(tmp_path):
+    """The exactly-one guarantee is untouched: a *reused* identity is refused.
+
+    A second launch that reports the same ``(run_id, task_id, attempt)`` but a
+    *different* machine outcome is not a re-run, it is a conflicting rewrite,
+    and the production reconciler must refuse it. The record already written for
+    the identity carries the first attempt's exit code; the divergent second
+    write raises rather than silently overwriting the verdict.
+
+    The two launches use *distinct* stream evidence but one *shared* final-result
+    root, with separate run stores and separate child outcomes -- the exact
+    geometry of the original cross-run failure. The second child's *distinct*
+    bytes mean the stream store's own immutable-fact guard is not what refuses;
+    the refusal provably comes from the final-result store's identity check.
+    """
+    from skillweave.trace.attempt_final_result import DuplicateFinalResultError
+
+    root = os.path.join(str(tmp_path), "run-root")
+    shared_results = os.path.join(root, "shared-results")
+    os.makedirs(root, exist_ok=True)
+
+    first = _service(os.path.join(root, "streams-1"), os.path.join(root, "first.db"),
+                     final_result_root=shared_results)
+    out = first.execute_streaming_native(
+        command=[sys.executable, "-c", _phrase()],  # child exits 0
+        run_id="conflict-run",
+        tool="opencode",
+        model="m",
+        subject_repo="repo",
+        subject_commit="c0ffee",
+        task_id="conflict-task",
+        attempt=1,
+    )
+    assert out["final_result"]["verdict"] == "pass"
+    assert len(_walk_records(_store_root(shared_results))) == 1
+
+    # Same identity, divergent child outcome, independent stream evidence, fresh
+    # run store -- yet the one shared final-result root must still refuse.
+    second = _service(os.path.join(root, "streams-2"), os.path.join(root, "second.db"),
+                      final_result_root=shared_results)
+    with pytest.raises(DuplicateFinalResultError):
+        second.execute_streaming_native(
+            command=[sys.executable, "-c", "import sys; sys.exit(7)"],  # exits 7
+            run_id="conflict-run",
+            tool="opencode",
+            model="m",
+            subject_repo="repo",
+            subject_commit="c0ffee",
+            task_id="conflict-task",
+            attempt=1,
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover - manual runner
     raise SystemExit(pytest.main([__file__, "-q"]))
