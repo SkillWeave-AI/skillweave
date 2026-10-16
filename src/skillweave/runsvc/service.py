@@ -699,6 +699,15 @@ class RunApplicationService:
                         f"route {model!r} is not an approved BytePlus route; "
                         f"refusing unapproved route (HOLD: {exc})",
                     ) from exc
+            # SW-1511A-UPSTREAM-001: attest the provider attempt on the launch
+            # path before any worker starts. The allowed route, actual upstream,
+            # answering identity and credential binding must all be attestable
+            # without exposing a secret; the gate fails closed with a typed,
+            # auditable refusal otherwise.
+            if model is not None:
+                self._admit_provider_launch(
+                    model, route_policy=route_policy, route_proof=route_proof
+                )
             # Criterion 2: egress gateway check and OS confinement
             # (may require sandbox-exec).  This runs after the pure-logic
             # checks so that on a host without sandbox-exec the named HOLD
@@ -1680,6 +1689,56 @@ class RunApplicationService:
                 f"proof is supplied, but it is not available on this host; "
                 f"refusing to launch an unconfined worker (HOLD)",
             )
+
+    def _admit_provider_launch(
+        self,
+        resolved_route: str,
+        *,
+        route_policy: Optional[Any] = None,
+        route_proof: Optional[Any] = None,
+    ) -> dict:
+        """Attest the provider attempt before a worker is launched (SW-1511A-UPSTREAM-001).
+
+        This is the attempt-launch caller of the ``upstream-observation/v1``
+        contract's :func:`admit_provider_attempt`: the allowed route is the
+        proof's ``tier_routes`` (falling back to the proof's
+        ``approved_routes``, then the owner policy), the actual upstream is the
+        approved gateway the attempt will speak to, the answering identity is
+        the requested route's model, and the credential binding is the approved
+        gateway location — a *reference*, never a token.
+
+        A refusal is the same named HOLD the rest of this gate produces: stage
+        ``route_lock_direct_provider`` for an unattestable route/upstream/
+        binding, so a direct-provider bypass or a secret-shaped binding never
+        reaches a launched process. When no route proof is supplied this gate
+        does not run (legacy paths keep their behaviour).
+        """
+        if route_proof is None:
+            return {}
+        routes: set[str] = set()
+        for tier, tier_routes in getattr(route_proof, "tier_routes", {}).items():
+            routes.update(tier_routes)
+        if not routes:
+            routes.update(getattr(route_proof, "approved_routes", frozenset()))
+        if not routes and route_policy is not None:
+            routes.update(route_policy.approved_routes)
+        from skillweave.routing.faigate_adapter import admit_provider_launch
+
+        host = getattr(route_proof, "approved_gateway_host", "")
+        port = getattr(route_proof, "approved_gateway_port", None)
+        binding = f"gateway://{host}:{port}" if host and port else ""
+        try:
+            return admit_provider_launch(
+                resolved_route,
+                allowed_routes=routes,
+                credential_binding=binding,
+            )
+        except Exception as exc:
+            raise RunIntegrationError(
+                "route_lock_direct_provider",
+                f"provider attempt for route {resolved_route!r} is not "
+                f"attestable; refusing before launch (HOLD: {exc})",
+            ) from exc
 
     def _verify_route_proof_against_pin(
         self,
@@ -2774,6 +2833,11 @@ class RunApplicationService:
                         f"route {route!r} is not an approved BytePlus route; "
                         f"refusing unapproved route (HOLD: {exc})",
                     ) from exc
+                # SW-1511A-UPSTREAM-001: attest the provider attempt before the
+                # worker starts (same fail-closed admission as the launch path).
+                self._admit_provider_launch(
+                    route, route_policy=route_policy, route_proof=route_proof
+                )
             # Criterion 2: egress gateway check and OS confinement
             # (may require sandbox-exec).  This runs after the pure-logic
             # checks so that on a host without sandbox-exec the named HOLD
@@ -3907,6 +3971,11 @@ class RunApplicationService:
                         f"route {model!r} is not an approved BytePlus route; "
                         f"refusing unapproved route (HOLD: {exc})",
                     ) from exc
+                # SW-1511A-UPSTREAM-001: attest the provider attempt before the
+                # worker starts (same fail-closed admission as the launch path).
+                self._admit_provider_launch(
+                    model, route_policy=route_policy, route_proof=route_proof
+                )
             # Criterion 2: egress gateway check and OS confinement
             # (may require sandbox-exec).  This runs after the pure-logic
             # checks so that on a host without sandbox-exec the named HOLD
