@@ -167,21 +167,14 @@ def test_every_other_step_run_text_is_byte_identical_to_base():
     )
 
 
-def test_diff_touches_only_the_workflow_and_this_test():
-    changed = set(_git("diff", "--name-only", BASE_COMMIT).splitlines())
-    changed |= set(_git("ls-files", "--others", "--exclude-standard").splitlines())
-
-    # NOTE (SW-1511-GATE c9): this assertion diffs the worktree against
-    # BASE_COMMIT (4ff639e6), the clean CORE-ZR-026 checkout. The lane worktree
-    # is based on afdf20d, which already carries many commits since that SHA, so
-    # the set below is non-empty on the lane base itself — the failure is a
-    # pre-existing base condition of this worktree, not a regression, and is
-    # reported as such rather than widened here. Left byte-identical on purpose:
-    # relaxing it would gut the check the criterion relies on.
-    assert changed == {WORKFLOW_REL, TEST_REL}, (
-        f"the change must touch only {WORKFLOW_REL!r} and {TEST_REL!r}; "
-        f"got {sorted(changed)}"
-    )
+# test_diff_touches_only_the_workflow_and_this_test was retired on 2026-10-16 by
+# owner decision: it was a stale scope guard. It diffed the whole branch against
+# BASE_COMMIT (4ff639e6), the finished CORE-ZR-026 checkout, so it was
+# guaranteed to fail on every later head once unrelated commits landed on top of
+# that already-finished change. The single-step structure is still guarded, but
+# against the step itself, by
+# test_diff_is_exactly_one_step_inserted_before_publish and
+# test_every_other_step_run_text_is_byte_identical_to_base above.
 
 
 def test_build_step_declares_the_release_assets_contract():
