@@ -342,5 +342,53 @@ def test_reconciler_surface_writes_the_record_without_the_cli(tmp_path):
     )
 
 
+# ── the explicit root (the caller's own location) ─────────────────────────────
+
+
+def test_explicit_final_result_root_wins_over_the_default(tmp_path):
+    """A caller-named ``--final-result-root`` is where the one record lands.
+
+    The default is a convenience; the explicit location must be reproducible
+    and must win, so an operator can point the receipt at a durable, published
+    directory without it also being written to the default sibling.
+    """
+    tmp = str(tmp_path)
+    explicit = os.path.join(tmp, "explicit-results")
+    _rc, printed, default_root = _run_cli(
+        tmp, _phrase(), ["--final-result-root", explicit]
+    )
+
+    records = _walk_records(_store_root(explicit))
+    assert len(records) == 1
+    assert records[0][1]["verdict"] == "pass"
+    assert records[0][1]["run_id"] == printed["run_id"]
+    # Exactly one location: the default sibling is not also written.
+    assert _walk_records(_store_root(default_root)) == []
+
+
+# ── the presentation flag is orthogonal to the record ────────────────────────
+
+
+def test_output_root_does_not_disturb_the_record(tmp_path):
+    """``--output-root`` redirects the child's writes, not this receipt.
+
+    The scope-enforced launch flags must not change which record is written:
+    the same launched attempt still yields exactly one record with its machine
+    outcome, whether or not an output root is named.
+    """
+    tmp = str(tmp_path)
+    out_root = os.path.join(tmp, "checkout")
+    rc, printed, default_root = _run_cli(
+        tmp, "import sys; sys.stdout.write('hello-child')", ["--output-root", out_root]
+    )
+    assert rc == 0 and isinstance(printed, dict)
+    records = _walk_records(_store_root(default_root))
+    assert len(records) == 1
+    record = records[0][1]
+    assert record["child_exit"] == 0
+    assert record["terminal_reason"] == "child_exited"
+    assert record["verdict"] == "pass"
+
+
 if __name__ == "__main__":  # pragma: no cover - manual runner
     raise SystemExit(pytest.main([__file__, "-q"]))
