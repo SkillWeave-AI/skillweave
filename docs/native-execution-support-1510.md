@@ -146,6 +146,13 @@ which speaks the `run-snapshot-v1` public contract. The rows below are the table
 | `mcp` | operate | supported | `skillweave.mcp.server` |
 | `dispatch` | legacy | legacy | `skillweave.dispatch.cli:main` |
 
+`native-controller` is a first-class **source** surface: the router mounts the
+subcommand and `skillweave.cli.support` publishes the row above. Its **live**
+qualification -- a real controller run that acquires the lease and drives an
+owned attempt against a real store -- is **NOT PERFORMED** in this checkout, so
+the row is source support only and is never read as a claim that the live
+in-process loop has been exercised end to end.
+
 The interpretation of a state is **shared by construction**: it is *projected*
 from the one authority each part already lives in (`RunStateModel` canonical
 values and terminal subset, `LEGACY_STATE_ALIASES`, the lifecycle→lane

@@ -640,16 +640,32 @@ def _sleep_command(venv_dir: Path):
     return [str(_python(venv_dir)), "-c", "import time; time.sleep(30)"]
 
 
+#: The accepted surface set the composed install must publish, named once so the
+#: literal cannot drift from the live registry again. ``native-controller`` (the
+#: SW-SCOPE-010 production entry point) is a first-class *source* surface: it is
+#: mounted by the router and published by ``skillweave.cli.support.SURFACES``.
+#: Its *live* qualification (a real controller run against a real store) is
+#: **NOT PERFORMED** here -- the row is source support only, never a claim that
+#: the live loop has been exercised. ``test_surface_registry_and_router_agree``
+#: below proves this constant equals the live registry, so a future drift fails
+#: fast instead of only inside the wheel build.
+_ACCEPTED_SUPPORT_SURFACES = frozenset({
+    "entry", "run", "start", "inspect", "kill", "cancel", "resume",
+    "native-controller", "mcp", "dispatch",
+})
+
+
 def test_composed_support_table_lists_the_accepted_surfaces(composed_install, tmp_path):
     """criterion 5: the installed CLI ``--help`` exposes the async surfaces and
     the installed ``skillweave support`` prints the versioned
     ``skillweave.support/1`` table naming entry/run/start/inspect/kill/cancel/
-    resume/mcp/dispatch -- read from the table, not re-derived here."""
+    resume/native-controller/mcp/dispatch -- read from the table, not re-derived
+    here."""
     venv_dir, proj, env = _composed_case(composed_install, tmp_path, "support")
 
     help_proc = _cli(venv_dir, ["--help"], cwd=proj, env=env)
     assert help_proc.returncode == 0, help_proc.stderr
-    for surface in ("support", "start", "inspect", "kill"):
+    for surface in ("support", "start", "inspect", "kill", "native-controller"):
         assert surface in help_proc.stdout, help_proc.stdout
 
     table_proc = _cli(venv_dir, ["support", "--json"], cwd=proj, env=env)
@@ -657,14 +673,49 @@ def test_composed_support_table_lists_the_accepted_surfaces(composed_install, tm
     table = json.loads(table_proc.stdout)
     assert table["schema_id"] == "skillweave.support/1", table.get("schema_id")
     names = {row["name"] for row in table["surfaces"]}
-    assert names == {
-        "entry", "run", "start", "inspect", "kill", "cancel", "resume",
-        "mcp", "dispatch",
-    }, names
+    assert names == _ACCEPTED_SUPPORT_SURFACES, names
     # The shared rule and exit table are the accepted ones, published once.
     assert table["run_id_rule"] == r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
     assert table["exit_codes"]["invalid_input"] == 2
     assert table["exit_codes"]["command_not_found"] == 127
+
+
+def test_surface_registry_and_router_agree_about_native_controller():
+    """The published surface registry and the router agree about
+    ``native-controller`` -- the defect the composed gate above surfaced.
+
+    The composed smoke asserts a *literal* accepted set against the installed
+    wheel. That literal can drift from the live registry, so this test binds it
+    to the authority: the ``native-controller`` subcommand is mounted by the
+    router and published as a *source* surface with an honest status. It is
+    adversarial: on a base where the expected set omitted ``native-controller``
+    (i.e. before this fix) it fails on the literal, and it fails again if the
+    registry and the router ever disagree. The *live* controller run stays NOT
+    PERFORMED -- this binds the source surface only.
+    """
+    import skillweave.cli.support as support_mod
+    from skillweave.cli.main import _build_parser
+
+    registry_names = {row.name for row in support_mod.SURFACES}
+    router_choices = set(_build_parser()._subparsers._group_actions[0].choices)
+
+    # The defect: the expected set must name the mounted, registered surface.
+    assert "native-controller" in _ACCEPTED_SUPPORT_SURFACES
+    assert "native-controller" in registry_names
+    assert "native-controller" in router_choices
+    # The registry publishes native-controller as a first-class source surface,
+    # with the honest role/status its neighbours carry -- never a fabricated
+    # live-qualification.
+    row = support_mod.lookup("native-controller")
+    assert row is not None
+    assert row.role == support_mod.ROLE_EXECUTE
+    assert row.status == support_mod.STATUS_SUPPORTED
+    assert row.entry_point == "skillweave.cli.native_controller:main"
+    # The router surface list and the mounted subcommands agree, so the router
+    # cannot mount a surface the registry omits (or vice versa).
+    assert router_choices == set(support_mod.ROUTER_SURFACES)
+    # The composed literal is exactly the registry's published set.
+    assert _ACCEPTED_SUPPORT_SURFACES == registry_names
 
 
 def test_composed_async_start_inspect_kill_roundtrip(composed_install, tmp_path):
