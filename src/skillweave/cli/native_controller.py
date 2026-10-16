@@ -88,6 +88,12 @@ __all__ = [
     "HOLD_CMS_PUBLICATION_UNAUTHORIZED",
     "HOLD_CMS_PUBLICATION_CREDENTIAL_MISSING",
     "HOLD_CMS_PUBLICATION_EGRESS_UNPERMITTED",
+    "HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL",
+    "HOLD_CMS_PUBLICATION_APPROVAL_MISMATCH",
+    "HOLD_CMS_PUBLICATION_APPROVAL_CHANGED",
+    "OWNER_PUBLICATION_APPROVAL_FILENAME",
+    "OwnerPublicationApproval",
+    "load_owner_publication_approval",
     "CMS_PUBLICATION_SANDBOX_TARGET",
     "build_production_ports",
     "build_production_reviewer_port",
@@ -365,6 +371,42 @@ _SANDBOX_PRODUCTION_MARKERS = frozenset({"prod", "production", "live", "main"})
 #: *directory* is the production caller's own durable state location, resolved by
 #: the caller -- never an argument.
 OWNER_SANDBOX_DECLARATION_FILENAME = "owner-sandbox.yaml"
+
+#: The three names an owner **publication approval** is refused under
+#: (SW-SCOPE-010 S10-C criterion 3, option B).  The designated human
+#: authorization for an irreversible CMS publication is durable
+#: *owner-authored* state -- ``owner-publication-approval.yaml`` in the same
+#: owner state directory as the sandbox declaration -- which the production
+#: caller reads from a path it resolves itself.  It is **never** supplied
+#: through any tool, MCP argument or CLI argument: a caller that runs the
+#: controller can *never* name the authorizer, so the human authorization cannot
+#: be forged by the entity that also drives the publication.  Every other
+#: outcome is a *named* hold and nothing is published.
+HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL = (
+    "native-controller refused: no owner-authored publication approval exists "
+    "at the durable owner-authored path (missing, malformed or empty), so the "
+    "irreversible CMS publication has no designated human authorization; the "
+    "authorizer is never supplied by a tool or CLI argument and is never "
+    "invented (named hold)"
+)
+HOLD_CMS_PUBLICATION_APPROVAL_MISMATCH = (
+    "native-controller refused: the owner-authored publication approval binds "
+    "a different transaction revision or artifact digest than the transaction "
+    "under publication, so it does not authorize *this* irreversible "
+    "publication and is refused fail-closed (named hold)"
+)
+HOLD_CMS_PUBLICATION_APPROVAL_CHANGED = (
+    "native-controller refused: the owner-authored publication approval changed "
+    "between load and apply -- its recorded SHA-256 no longer matches the file "
+    "bytes -- so the publication is never authorized against an approval the "
+    "owner did not author (named hold)"
+)
+
+#: The owner-authored publication approval file name (option B).  As with the
+#: sandbox declaration, the *directory* is the production caller's own durable
+#: owner state location, resolved by the caller; the loader appends only this
+#: pinned file name, so no argument can point it at arbitrary bytes.
+OWNER_PUBLICATION_APPROVAL_FILENAME = "owner-publication-approval.yaml"
 
 #: The owner-authorized *sandbox* target an irreversible CMS publication is
 #: authorized on (SW-SCOPE-010 S10-C criterion 3).  It is the same declared
@@ -1570,20 +1612,6 @@ def build_parser(prog: str = "skillweave native-controller") -> argparse.Argumen
              "a missing reference is refused, never fabricated.",
     )
     parser.add_argument(
-        "--cms-publication-authorizer",
-        dest="cms_publication_authorizer",
-        default="",
-        help="The designated human authorizer for the publication; must differ "
-             "from the derived producer identity.",
-    )
-    parser.add_argument(
-        "--cms-publication-authority",
-        dest="cms_publication_authority",
-        default="",
-        help="Optional authority label recorded on the designated publication "
-             "authorization.",
-    )
-    parser.add_argument(
         "--cms-binding",
         dest="cms_binding",
         default="",
@@ -1677,8 +1705,6 @@ def main(
                 artifact_digest=args.cms_artifact_digest,
                 review_mailbox=args.cms_review_mailbox,
                 review_message_id=args.cms_review_message_id,
-                authorizer=args.cms_publication_authorizer,
-                authority=args.cms_publication_authority,
                 binding_target=args.cms_binding,
                 store=store,
             )
@@ -2048,8 +2074,6 @@ def _authorize_cms_publication(
     artifact_digest: str,
     review_mailbox: str,
     review_message_id: str,
-    authorizer: str,
-    authority: str,
     binding_target: str,
     store: Any,
 ) -> _PublicationAuthorizationResult:
@@ -2058,18 +2082,25 @@ def _authorize_cms_publication(
     Every fact the decision rests on is read from durable state, never taken
     from the caller's hope: the transaction (and its *derived* producer) is
     loaded from the store, the independent review is loaded *by reference* from
-    the durable mailbox, and the credential/egress facts come from the
-    operator's declared admission environment.  The five refusals each fail
-    closed with a *named hold*:
+    the durable mailbox, the **designated human authorization** is loaded from
+    the owner-authored approval file in the owner state directory, and the
+    credential/egress facts come from the operator's declared admission
+    environment.  The refusals each fail closed with a *named hold*:
 
     * no durable, server-recorded review binds the exact revision/digest;
     * the publishing attempt's producer does not match the owned attempt's
       durable record (a forged producer);
-    * no designated human authorization (or a non-binding/self-authorization);
+    * no owner-authored publication approval (missing, malformed, empty or
+      production-looking), an approval that names a different revision/digest
+      than the transaction, an approval whose bytes changed between load and
+      apply, or an approver equal to the producer;
     * a credential reference is not observed available;
     * the endpoint cannot egress under the effective policy.
 
-    No provider, gateway or CMS call is made or probed, and nothing is published
+    The human authorizer is **never** an argument: it can only come from
+    owner-authored durable state, so the caller that drives the controller
+    cannot forge the authorization of its own irreversible publication.  No
+    provider, gateway or CMS call is made or probed, and nothing is published
     here -- the decision is returned for the caller to record.
     """
     from skillweave.runtime.native_process import (
@@ -2130,15 +2161,34 @@ def _authorize_cms_publication(
             policy = _resolve_publication_policy(
                 os.environ.get(_ENV_CMS_PUBLICATION_POLICY, "")
             )
-            if not (authorizer or "").strip():
-                # No designated human authorization was presented at all: refuse
-                # by name rather than constructing a non-binding authorization.
-                raise _RefusedError(HOLD_CMS_PUBLICATION_UNAUTHORIZED)
-            authorization = PublicationAuthorization(
-                authorizer=authorizer,
+            # The designated human authorization is *owner-authored durable
+            # state*, loaded exactly like the sandbox declaration -- never a
+            # value a caller can pass.  A missing, malformed or empty approval
+            # authorizes nothing; an approval that binds a different
+            # revision/digest does not authorize *this* transaction; and an
+            # approval whose bytes changed between load and apply is refused.
+            # An approver equal to the producer is a self-authorization and is
+            # refused (fail closed) rather than publishing.
+            try:
+                approval = resolve_publication_approval()
+            except PublicationApprovalRefused as exc:
+                raise _RefusedError(exc.hold) from exc
+            if not approval.binds(
                 subject_revision=txn.subject_revision,
                 artifact_digest=artifact_digest,
-                authority=authority,
+            ):
+                raise _RefusedError(HOLD_CMS_PUBLICATION_APPROVAL_MISMATCH)
+            try:
+                approval.recheck_digest()
+            except PublicationApprovalRefused as exc:
+                raise _RefusedError(exc.hold) from exc
+            if approval.approver == txn.producer_identity:
+                # The producer cannot be its own designated human authorizer.
+                raise _RefusedError(HOLD_CMS_PUBLICATION_UNAUTHORIZED)
+            authorization = PublicationAuthorization(
+                authorizer=approval.approver,
+                subject_revision=txn.subject_revision,
+                artifact_digest=artifact_digest,
             )
             from skillweave.runtime.native_process import DurableReviewRef
 
@@ -2881,6 +2931,183 @@ def resolve_sandbox_admission(
         )
     declaration = load_owner_sandbox_declaration(_owner_state_root(project_root))
     return declaration.receipt_for(target_name, adapter=adapter)
+
+
+class PublicationApprovalRefused(Exception):
+    """The owner publication approval does not authorize this publication.
+
+    ``hold`` is the named hold (one of the ``HOLD_CMS_PUBLICATION_*`` names) the
+    refusal reports, so a caller never has to parse prose to learn why nothing
+    was published.  The refusal carries the digest of the approval it was
+    decided against (when one was loaded), so a rejected publication is bound to
+    the exact bytes that rejected it.
+    """
+
+    def __init__(self, hold: str, *, digest: str = "") -> None:
+        super().__init__(hold)
+        self.hold = hold
+        self.digest = digest
+
+
+@dataclass(frozen=True)
+class OwnerPublicationApproval:
+    """A loaded owner-authored publication approval and the digest of the bytes.
+
+    The designated human authorization for an irreversible CMS publication: it
+    names the ``approver``, binds the exact ``subject_revision`` and
+    ``artifact_digest`` it authorizes (so a content change invalidates it) and
+    records when it was ``approved_at``.  ``approval_path`` is the path the
+    **loader** resolved from the caller's owner state directory (never an
+    argument), ``digest`` the SHA-256 of the exact bytes read.  As with the
+    sandbox declaration, the file is only ever owner-authored state: the caller
+    can point at a directory of owner state but cannot name the file, so the
+    authorizer can never be supplied by the entity that drives the publication.
+    """
+
+    approval_path: str
+    digest: str
+    approver: str
+    subject_revision: str
+    artifact_digest: str
+    approved_at: str
+    production: bool = False
+
+    def binds(self, *, subject_revision: str, artifact_digest: str) -> bool:
+        """True when the approval names exactly this revision/digest."""
+        return (
+            self.subject_revision == subject_revision
+            and self.artifact_digest == artifact_digest
+        )
+
+    def recheck_digest(self) -> str:
+        """Re-read the approval and refuse if its bytes changed since load.
+
+        The owner decision's rule for the declaration applies here too: "if the
+        file changes between load and apply, the controller refuses".  An
+        approval deleted since load is no longer the approval that was recorded,
+        so it is refused under the same named hold; the returned digest is the
+        one *both* reads agreed on.
+        """
+        try:
+            with open(self.approval_path, "rb") as fh:
+                current = fh.read()
+        except OSError as exc:
+            raise PublicationApprovalRefused(
+                HOLD_CMS_PUBLICATION_APPROVAL_CHANGED, digest=self.digest
+            ) from exc
+        if hashlib.sha256(current).hexdigest() != self.digest:
+            raise PublicationApprovalRefused(
+                HOLD_CMS_PUBLICATION_APPROVAL_CHANGED, digest=self.digest
+            )
+        return self.digest
+
+
+def load_owner_publication_approval(owner_state_dir: Any) -> OwnerPublicationApproval:
+    """Load the owner-authored publication approval from durable owner state.
+
+    ``owner_state_dir`` is a directory the **production caller resolves itself**
+    from durable owner-authored state -- the *same* owner state directory the
+    sandbox declaration is read from.  It is never an argv, tool or MCP
+    argument, and no argument can name the approval *file*: the loader appends
+    only the pinned :data:`OWNER_PUBLICATION_APPROVAL_FILENAME`, so a caller can
+    name a directory of owner state but cannot point the loader at arbitrary
+    bytes.  The SHA-256 of the bytes actually read is returned with the parsed
+    approval.
+
+    Fail closed with a named hold: an absent, unreadable, undecodable or
+    empty/malformed approval is
+    :data:`HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL` (a file that is not a
+    complete approval authorizes nothing), and an approval whose ``production``
+    is not explicitly ``false`` is refused there too -- the approval is never a
+    licence to reach production.
+    """
+    import yaml
+
+    approval_path = os.path.join(
+        os.fspath(owner_state_dir), OWNER_PUBLICATION_APPROVAL_FILENAME
+    )
+    try:
+        with open(approval_path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        raise PublicationApprovalRefused(
+            HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL
+        ) from exc
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        document = yaml.safe_load(data.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise PublicationApprovalRefused(
+            HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL, digest=digest
+        ) from exc
+    if not isinstance(document, Mapping):
+        raise PublicationApprovalRefused(
+            HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL, digest=digest
+        )
+    approver = document.get("approver")
+    if not isinstance(approver, str) or not approver.strip():
+        raise PublicationApprovalRefused(
+            HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL, digest=digest
+        )
+    transaction = document.get("transaction")
+    if not isinstance(transaction, Mapping):
+        raise PublicationApprovalRefused(
+            HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL, digest=digest
+        )
+    subject_revision = transaction.get("revision")
+    artifact_digest = transaction.get("digest")
+    if not isinstance(subject_revision, str) or not subject_revision.strip():
+        raise PublicationApprovalRefused(
+            HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL, digest=digest
+        )
+    if not isinstance(artifact_digest, str) or not artifact_digest.strip():
+        raise PublicationApprovalRefused(
+            HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL, digest=digest
+        )
+    approved_at = document.get("approved_at", "")
+    if not isinstance(approved_at, str):
+        raise PublicationApprovalRefused(
+            HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL, digest=digest
+        )
+    # The owner decision requires an *explicit* `production: false`: an omitted
+    # or non-False value is not an approval of a sandbox publication, so it is
+    # refused rather than defaulted.
+    production = document.get("production")
+    if production is not False:
+        raise PublicationApprovalRefused(
+            HOLD_CMS_PUBLICATION_NO_OWNER_APPROVAL, digest=digest
+        )
+    return OwnerPublicationApproval(
+        approval_path=approval_path,
+        digest=digest,
+        approver=approver.strip(),
+        subject_revision=subject_revision,
+        artifact_digest=artifact_digest,
+        approved_at=approved_at,
+        production=False,
+    )
+
+
+def resolve_publication_approval(*, project_root: str = "") -> OwnerPublicationApproval:
+    """Load the owner publication approval from the caller's own durable state.
+
+    This is the **production caller** of
+    :func:`load_owner_publication_approval` (criterion 3's human-authorization
+    seam): it resolves the owner-state directory from the same durable
+    configuration the sandbox declaration uses -- ``SKILLWEAVE_OWNER_STATE_DIR``
+    if set, else the planning tree under ``project_root`` -- and loads
+    ``owner-publication-approval.yaml``.  Neither the approval file nor the
+    approver is taken from an argument a task could set, so the designated human
+    authorization cannot be forged by the entity that also drives the
+    publication.
+    """
+    if not project_root:
+        from skillweave import __file__ as _pkg_file
+
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(_pkg_file), os.pardir)
+        )
+    return load_owner_publication_approval(_owner_state_root(project_root))
 
 
 def _run_state_driven(
