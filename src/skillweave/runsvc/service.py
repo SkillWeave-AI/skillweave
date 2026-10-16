@@ -4565,6 +4565,18 @@ class RunApplicationService:
         directory for one launched attempt. No stream store (or a memory-only
         one) means no durable location, and the reconciler stays memory-only
         rather than inventing a path.
+
+        The derived root is the stream root's parent, so it spans every attempt
+        whose evidence lands under that stream root. The store keys each record
+        by the full ``(run_id, task_id, attempt)`` identity, so two genuinely
+        different attempts never collide even though they share a directory;
+        only a *reused* identity with different content is refused, which is
+        the exactly-one guarantee and must not be weakened. A caller that drives
+        the service against a shared stream root therefore still owns the
+        uniqueness of its own identities -- the store's job is to refuse a
+        conflicting rewrite of one identity, not to invent a per-caller scope.
+        A caller-named ``final_result_root`` (the ``skillweave run`` wrapper
+        always names one) pins the location explicitly and wins here.
         """
         if self._final_result_root_override:
             return str(self._final_result_root_override)
