@@ -22,6 +22,7 @@ Nothing here launches a process, reads a wall clock, opens a socket or touches
 a provider credential.
 """
 
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -190,6 +191,44 @@ def test_criterion1_axes_are_separate_and_monotone_per_axis():
     assert gate.acceptance == "pending"
     assert "HOLD" in gate.hold_reason
 
+    # A state outside an axis' vocabulary is refused at construction, so an
+    # illegal crossing (a live state on the review axis) can never be folded.
+    with pytest.raises(tl.UnknownAxisError):
+        tl.TaskLifecycleReceipt(
+            task_id="SW-1511-BASE",
+            axis=tl.AXIS_REVIEW,
+            state="qualified",
+            sequence=6,
+        )
+    with pytest.raises(tl.UnknownAxisError):
+        tl.TaskLifecycleReceipt(
+            task_id="SW-1511-BASE",
+            axis="deployment",
+            state="present",
+            sequence=6,
+        )
+
+    # The v1 receipt round-trips with its schema identity and version, so a
+    # later reader can tell which contract wrote it.
+    envelope = stream[0].to_dict()
+    assert envelope["schema"] == tl.TASK_LIFECYCLE_RECEIPT_SCHEMA_ID
+    assert envelope["schema_version"] == tl.TASK_LIFECYCLE_RECEIPT_SCHEMA_VERSION
+    assert envelope["axis"] == "source" and envelope["sequence"] == 1
+    # Backward compatibility is explicit, not assumed: only declared versions
+    # are accepted, and an unknown one is refused rather than coerced.
+    assert (
+        tl.TASK_LIFECYCLE_RECEIPT_SCHEMA_VERSION
+        in tl.SUPPORTED_TASK_LIFECYCLE_RECEIPT_VERSIONS
+    )
+    with pytest.raises(tl.TaskLedgerError):
+        tl.TaskLifecycleReceipt(
+            task_id="SW-1511-BASE",
+            axis=tl.AXIS_SOURCE,
+            state="present",
+            sequence=6,
+            schema_version="2.0.0",
+        )
+
     # Each axis owns its own monotone counter: the next sequence a producer may
     # use is the axis' current sequence plus one, per axis.
     assert ledger.next_sequence("SW-1511-BASE", tl.AXIS_REVIEW) == 3
@@ -313,6 +352,28 @@ def test_criterion2_conflicting_and_stale_inputs_cannot_overwrite_newer_state():
     only_authoritative = _replay(stream)
     assert only_authoritative.project().rows == ledger.project().rows
 
+    # The same authoritative receipt re-delivered is an idempotent no-op: it is
+    # neither applied a second time nor recorded as a new observation.
+    redelivery = ledger.record(stream[1])
+    assert redelivery.applied is False
+    assert "idempotent" in redelivery.reason
+    assert redelivery.retained_as_observation is False
+
+    # A status snapshot naming a task that never received a receipt still cannot
+    # manufacture acceptance: the acceptance axis keeps its default.
+    ledger.ingest_status_snapshot(
+        task_id="SW-1511-GATE", axis=tl.AXIS_ACCEPTANCE, state="accepted"
+    )
+    assert ledger.project().row("SW-1511-GATE").acceptance == "pending"
+
+    # ... and offered against a newer authoritative acceptance it is retained as
+    # history while the newer authoritative state stands.
+    snapshot_after = ledger.ingest_status_snapshot(
+        task_id="SW-1511-BASE", axis=tl.AXIS_ACCEPTANCE, state="rejected"
+    )
+    assert snapshot_after.applied is False
+    assert ledger.project().row("SW-1511-BASE").acceptance == "accepted"
+
 
 # ── criterion 3 ──────────────────────────────────────────────────────────────
 
@@ -345,11 +406,35 @@ def test_criterion3_reproduces_all_24_task_states_and_names_open_tasks():
     assert projection.row("SW-1511-CMS-FLOWS").source == "present"
     assert projection.is_open("SW-1511-CMS-FLOWS") is True
 
-    # (c) The 1.5.11 identity set matches the frozen canonical PRD exactly. The
-    # set is deliberately re-derived from the canonical map's SHA-pinned PRD so
-    # a drift between the ledger and the frozen plan is a hard failure rather
-    # than a silent divergence.
-    assert tuple(tl.CANONICAL_1511_TASK_IDS) == _canonical_prd_task_ids()
+    # (c) The identity set is the literal frozen 1.5.11 canonical 24, in PRD
+    # order. Spelling it out keeps a drift between the ledger and the frozen
+    # plan a hard failure rather than a silent divergence.
+    assert tuple(tl.CANONICAL_1511_TASK_IDS) == (
+        "SW-1511-BASE",
+        "SW-1511-EVIDENCE",
+        "SW-1511-CLOCK",
+        "SW-1511-CAPACITY",
+        "SW-1511-AVAILABILITY",
+        "SW-1511-REPAIR",
+        "SW-ORCH-001",
+        "SW-1511-REVIEW",
+        "SW-1511-RECOVERY",
+        "SW-1511-CMS-ENTRY",
+        "SW-1511-CMS-EVIDENCE",
+        "SW-1511-CMS-TRANSACTION",
+        "SW-1511-CMS-FLOWS",
+        "SW-1511-GATE",
+        "CORE-ZR-022",
+        "CORE-ZR-023",
+        "CORE-ZR-024",
+        "CORE-ZR-025",
+        "CORE-ZR-026",
+        "CORE-ZR-027",
+        "SW-1511-SCHEMA",
+        "SW-1511-MCP-PACK",
+        "SW-1511-MCP-BOOTSTRAP",
+        "SW-1511-SEARCH-ALIGN",
+    )
 
     # (d) The projection is JSON-serializable evidence (no clock, no handle).
     payload = json.loads(json.dumps(projection.to_dict()))
@@ -368,38 +453,18 @@ def test_criterion3_reproduces_all_24_task_states_and_names_open_tasks():
             sequence=1,
         )
 
-
-#: SHA-256 of the frozen canonical 1.5.11 PRD revision 1.1.0, as recorded by
-#: ``planning/roadmap/2026-10-12-v9/canonical-prd-map.json``. When the caller
-#: points the suite at that file the digest is verified before its task ids are
-#: trusted, so a mutated or drifted plan cannot be smuggled in as canonical.
-CANONICAL_1511_PRD_SHA256 = (
-    "6c7eb4e8d905aae6077c6cbbaf94716e034c62610c06e56a1bcb38a990a97b57"
-)
-
-
-def _canonical_prd_task_ids():
-    """Re-derive the frozen 24-task identity set from the canonical plan.
-
-    The planning repository is a sibling checkout and is not a dependency of
-    this package. The caller may point ``SKILLWEAVE_CANONICAL_1511_PRD`` at the
-    frozen revision; the digest is then checked and the ids compared. When it
-    is unset the check degrades to an equality against the ledger's own
-    identity set rather than failing for an unrelated missing mount — the
-    reproduction and openness assertions above remain the criterion-3 proof.
-    """
-    import hashlib
-    import os
-
-    raw = os.environ.get("SKILLWEAVE_CANONICAL_1511_PRD", "")
-    if not raw or not Path(raw).is_file():
-        from skillweave.trace import task_ledger as tl
-
-        return tuple(tl.CANONICAL_1511_TASK_IDS)
-    blob = Path(raw).read_bytes()
-    assert hashlib.sha256(blob).hexdigest() == CANONICAL_1511_PRD_SHA256, (
-        "the referenced PRD is not the frozen canonical 1.5.11 revision 1.1.0"
+    # A ledger rebuilt from the whole ordered stream via the public constructor
+    # helper projects identically, so the projection is reconstructible from
+    # persisted receipts alone (no live state, no manual reconstruction).
+    rebuilt = tl.ledger_from_receipts(_ordered_stream()).project()
+    assert rebuilt.to_dict() == projection.to_dict()
+    assert tl.project_ledger(tl.ledger_from_receipts(_ordered_stream())).to_dict() == (
+        projection.to_dict()
     )
-    prd = json.loads(blob.decode("utf-8"))
-    tasks = prd.get("tasks") or prd.get("userStories") or prd.get("stories") or []
-    return tuple(task["id"] for task in tasks)
+
+    # The barrel re-exports the same contract objects: ``skillweave.trace`` is
+    # the documented consumer import path and must name identical classes.
+    barrel = importlib.import_module("skillweave.trace")
+    assert barrel.TaskLedger is tl.TaskLedger
+    assert barrel.CANONICAL_1511_TASK_IDS is tl.CANONICAL_1511_TASK_IDS
+
