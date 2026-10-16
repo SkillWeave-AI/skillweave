@@ -390,5 +390,63 @@ def test_output_root_does_not_disturb_the_record(tmp_path):
     assert record["verdict"] == "pass"
 
 
+# ── the record path is additive: existing callers see nothing new ─────────────
+
+
+def test_printed_output_and_exit_codes_are_unchanged_by_the_record(tmp_path):
+    """The record is additive: no new key in stdout, no changed exit code.
+
+    A caller that already reads ``skillweave run``'s JSON and its exit status
+    must be unaffected by the repair. The record is *not* among the printed
+    keys, and each outcome keeps the wrapper exit code it had before -- which is
+    exactly the promise the finding's repair had to keep.
+    """
+    cases = [
+        # (label, child code, extra args, expected wrapper exit, pre-repair keys)
+        ("pass", _phrase(), [], 0, None),
+        ("fail", "import sys; sys.exit(3)", [], 0, None),
+        ("signal", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)", [], 0, None),
+        ("assay-hold", _phrase(), ["--methodology", "assay"], 1, {"assay"}),
+    ]
+    # The public key set the wrapper printed before the repair, byte for byte.
+    # An assay run already printed its ``assay`` block before the repair, so
+    # that one key is part of the *existing* surface, not a new one.
+    base_keys = {
+        "run_id",
+        "state",
+        "gate_state",
+        "raw_digest",
+        "verification",
+        "methodology",
+        "stream",
+        "receipt",
+    }
+    for label, code, extra, expected_rc, extra_keys in cases:
+        tmp = str(tmp_path / label)
+        os.makedirs(tmp, exist_ok=True)
+        rc, printed, _root = _run_cli(tmp, code, extra)
+        assert rc == expected_rc, f"{label}: wrapper exit changed"
+        assert isinstance(printed, dict)
+        # The record is written durably ...
+        assert len(_walk_records(_store_root(
+            os.path.dirname(os.path.abspath(os.path.join(tmp, "streams")))
+        ))) == 1
+        # ... and yet nothing the existing caller reads has gained the new
+        # dimension: the printed key set is exactly the pre-repair public set.
+        keys = set(printed.keys())
+        assert keys == base_keys | (extra_keys or set()), (
+            f"{label}: printed keys drifted: {keys}"
+        )
+        assert "final_result" not in keys
+        # The public value types the old caller relied on are unchanged too.
+        assert isinstance(printed["stream"], dict)
+        assert set(printed["stream"]) == {
+            "durable", "cursor", "stdout_digest", "stderr_digest"
+        }
+        assert set(printed["receipt"]) == {
+            "artifact_id", "sha256", "evidence_type", "purpose"
+        }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual runner
     raise SystemExit(pytest.main([__file__, "-q"]))
