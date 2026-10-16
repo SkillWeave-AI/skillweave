@@ -1102,11 +1102,8 @@ class FaigateProvider(CouncilProvider):
         approved = self._allowed_routes()
         if approved:
             for route in sorted(approved):
-                try:
-                    if translate_model_id(route) == clean_model:
-                        return route
-                except Exception:
-                    continue
+                if "/" in route and route.split("/", 1)[1] == clean_model:
+                    return route
         body = clean_model.split("/", 1)[1] if "/" in clean_model else clean_model
         candidate = f"{PROVIDER_NAMESPACE}/{body}"
         if candidate in approved:
@@ -1149,11 +1146,19 @@ class FaigateProvider(CouncilProvider):
                 "reason": "no attestable route (unprefixed legacy id, no owner route pin)",
             }
 
-        actual_upstream = self.provider_name()
-        if "served_by" in result:
-            served = result.get("served_by")
-            if isinstance(served, str) and served and "/" in served:
-                actual_upstream = served.split("/", 1)[0]
+        # The *actual upstream* is the observed serving identity when the
+        # gateway reported one — a differing value is a fallback/substitution
+        # and admission refuses it. When the gateway reported no serving
+        # identity, the upstream the attempt is addressed to is the provider
+        # the owner-approved route names, exactly as on the launch path; the
+        # transport name (``faigate``) is not a provider identity and is never
+        # substituted for one.
+        actual_upstream = ""
+        served = result.get("served_by")
+        if isinstance(served, str) and "/" in served:
+            actual_upstream = served.split("/", 1)[0]
+        if not actual_upstream and "/" in route:
+            actual_upstream = route.split("/", 1)[0]
 
         # The answering model here is the gateway's *requested* model record —
         # it is not the responding model, so it is only admitted when it was
