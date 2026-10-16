@@ -44,13 +44,24 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
+from skillweave.redaction import scrub_secrets
+
 # ── Contract identity ────────────────────────────────────────────────────────
 
 ATTEMPT_FINAL_RESULT_SCHEMA_ID = (
     "attempt-final-result/v1 (skillweave // SW-1511A-RESULT-001)"
 )
-ATTEMPT_FINAL_RESULT_SCHEMA_VERSION = "1.0.0"
-SUPPORTED_ATTEMPT_FINAL_RESULT_VERSIONS: Tuple[str, ...] = ("1.0.0",)
+ATTEMPT_FINAL_RESULT_SCHEMA_VERSION = "1.1.0"
+#: ``1.0.0`` records (written before the closing-message fields existed) remain
+#: readable: the fields added in ``1.1.0`` are additive and optional, so a
+#: legacy record loads with the explicit "no closing message observed" state.
+SUPPORTED_ATTEMPT_FINAL_RESULT_VERSIONS: Tuple[str, ...] = ("1.0.0", "1.1.0")
+
+# Secret redaction is a hard guarantee at the persistence seam: the durable
+# sibling and the record carry the mask, never the credential. The rule set is
+# the shared seam in :mod:`skillweave.redaction`, imported rather than restated
+# so the stream layer (which captures the tail) and this layer (which persists
+# it) mask a secret by exactly the same shapes.
 
 #: The closed vocabulary of assay states, byte-identical to
 #: :class:`skillweave.runtime.assay.AssayState`. It is restated (not imported)
@@ -220,6 +231,20 @@ class AttemptFinalResult:
     observed_at: str = ""
     migrated_from_legacy: bool = False
     schema_version: str = ATTEMPT_FINAL_RESULT_SCHEMA_VERSION
+    # -- the closing message, bound independently of stream retention ---------
+    # SW-1511A-RESULT-001 finding F-1511A-01: the record must let a controller
+    # read the child's *closing message* without the raw stream, because the
+    # stream cap drops exactly that tail. These fields are additive and
+    # optional: a ``1.0.0`` record has none, and its absence is stated
+    # explicitly rather than inferred from an empty string.
+    closing_observed: bool = False
+    closing_digest: str = ""
+    closing_text: str = ""
+    closing_byte_range_start: int = -1
+    closing_byte_range_end: int = -1
+    closing_stream: str = ""
+    closing_path: str = ""
+    closing_note: str = "no closing message was observed"
 
     def __post_init__(self) -> None:
         self.verdict = FinalVerdict(self.verdict)
@@ -235,6 +260,13 @@ class AttemptFinalResult:
                 f"unknown terminal reason '{self.terminal_reason}'; expected one "
                 f"of {list(TERMINAL_REASONS)}"
             )
+        # A record can be constructed by hand as well as derived from a store,
+        # so the closing-message guarantee is enforced here too: secret-shaped
+        # content in the bound message is scrubbed before the record can be
+        # persisted, and a record that observed no message says so explicitly.
+        self.closing_text = scrub_secrets(self.closing_text)
+        if not self.closing_observed and not self.closing_note:
+            self.closing_note = "no closing message was observed"
         self.verify_outcome()
         self._verify_artifact_semantics()
 
@@ -333,6 +365,14 @@ class AttemptFinalResult:
             "hold_reason": self.hold_reason,
             "observed_at": self.observed_at,
             "migrated_from_legacy": self.migrated_from_legacy,
+            "closing_observed": self.closing_observed,
+            "closing_digest": self.closing_digest,
+            "closing_text": self.closing_text,
+            "closing_byte_range_start": self.closing_byte_range_start,
+            "closing_byte_range_end": self.closing_byte_range_end,
+            "closing_stream": self.closing_stream,
+            "closing_path": self.closing_path,
+            "closing_note": self.closing_note,
         }
 
     @classmethod
@@ -355,6 +395,16 @@ class AttemptFinalResult:
             hold_reason=data.get("hold_reason", ""),
             observed_at=data.get("observed_at", ""),
             migrated_from_legacy=bool(data.get("migrated_from_legacy", False)),
+            # Additive and optional: a pre-repair (``1.0.0``) record has none of
+            # these, and loads with the explicit "no closing message" default.
+            closing_observed=bool(data.get("closing_observed", False)),
+            closing_digest=data.get("closing_digest", ""),
+            closing_text=data.get("closing_text", ""),
+            closing_byte_range_start=int(data.get("closing_byte_range_start", -1)),
+            closing_byte_range_end=int(data.get("closing_byte_range_end", -1)),
+            closing_stream=data.get("closing_stream", ""),
+            closing_path=data.get("closing_path", ""),
+            closing_note=data.get("closing_note", "no closing message was observed"),
             schema_version=data.get("schema_version", ATTEMPT_FINAL_RESULT_SCHEMA_VERSION),
         )
 
@@ -473,6 +523,33 @@ def evidence_digest_from_store(store: Any, *, run_id: str, task_id: str, attempt
     return evidence_digest(digests)
 
 
+def closing_excerpt_from_store(
+    store: Any, *, run_id: str, task_id: str, attempt: int
+) -> Optional[dict]:
+    """Read the child's bounded closing excerpt for one attempt, if captured.
+
+    Duck-typed and tolerant: a store that predates the closing excerpt (or a
+    stream whose tail was never captured) simply has no ``closing_excerpt``
+    method, and that absence is reported as ``None`` — the explicit "nothing was
+    observed", never an empty message misread as one.
+
+    ``stdout`` is preferred, then ``stderr``: the child's own words are what a
+    controller needs, and a failed child that reported only on stderr is still
+    better served by that than by nothing.
+    """
+    reader = getattr(store, "closing_excerpt", None)
+    if reader is None:
+        return None
+    for name in ("stdout", "stderr"):
+        try:
+            excerpt = reader(attempt, name, run_id=run_id, task_id=task_id)
+        except Exception:  # noqa: BLE001 - an absent stream is not a capture failure
+            continue
+        if isinstance(excerpt, Mapping) and excerpt.get("observed"):
+            return dict(excerpt)
+    return None
+
+
 # ── The durable writer/reader (criterion 1, 3) ───────────────────────────────
 
 
@@ -506,13 +583,40 @@ class AttemptFinalResultStore:
     def _dir(self) -> Path:
         return Path(str(self.root)) / "attempt-final-results"
 
-    def _path(self, identity: Tuple[str, str, int]) -> Path:
+    def _key(self, identity: Tuple[str, str, int]) -> str:
         raw = f"{identity[0]}\x00{identity[1]}\x00{identity[2]}".encode("utf-8")
-        key = hashlib.sha256(raw).hexdigest()[:32]
-        return self._dir() / f"{key}.json"
+        return hashlib.sha256(raw).hexdigest()[:32]
+
+    def _path(self, identity: Tuple[str, str, int]) -> Path:
+        return self._dir() / f"{self._key(identity)}.json"
+
+    def _closing_path(self, identity: Tuple[str, str, int]) -> Path:
+        """The durable sibling holding the child's closing message text.
+
+        It is written at the store *root* rather than inside the
+        ``attempt-final-results/`` directory: the sibling is a separate durable
+        artifact beside the record, not part of the record's own directory, so a
+        reader that enumerates the record directory never mistakes it for a
+        record.
+        """
+        return Path(str(self.root)) / f"{self._key(identity)}.closing.txt"
 
     def write(self, result: AttemptFinalResult) -> AttemptFinalResult:
-        """Write exactly one result per attempt identity (idempotent, atomic)."""
+        """Write exactly one result per attempt identity (idempotent, atomic).
+
+        When the record carries a closing message, the message *text* is written
+        to a durable sibling beside the record, and the record's ``closing_path``
+        field names it, so a later reader recovers the child's own words with no
+        raw stream at all. The sibling is written only with the record it
+        belongs to: a conflicting rewrite is refused before either is touched.
+        """
+        if self.root:
+            # The sibling location is *derived*, not caller-supplied: it depends
+            # only on the root and the identity. Fixing it before the comparison
+            # keeps the two producers idempotent, since each derives its own
+            # record through ``final_result_from_attempt`` (which cannot know
+            # the store root) and must converge on the same bytes.
+            result.closing_path = str(self._closing_path(result.identity))
         existing = self.read(*result.identity, missing_ok=True)
         if existing is not None:
             if existing.to_dict() == result.to_dict():
@@ -522,10 +626,41 @@ class AttemptFinalResultStore:
                 f"(verdict '{existing.verdict.value}'); refusing to overwrite it "
                 f"with verdict '{result.verdict.value}'"
             )
+        if self.root and result.closing_text:
+            # Persist the scrubbed text first, then the record that names it, so
+            # a record never names a sibling that does not yet exist. The text is
+            # scrubbed here as well as in ``__post_init__``: a hand-built record
+            # swapped into the store is scrubbed at the persistence seam too.
+            path = self._closing_path(result.identity)
+            text = scrub_secrets(result.closing_text)
+            result.closing_text = text
+            self._write_bytes_atomic(path, text.encode("utf-8"))
         self._records[result.identity] = result
         if self.root:
             self._write_atomic(self._path(result.identity), result.to_dict())
         return result
+
+    def read_closing_message(
+        self, run_id: str, task_id: str, attempt: int
+    ) -> Optional[str]:
+        """Read the child's persisted closing message, or ``None`` if none.
+
+        The message is read from the durable sibling, so it needs no raw stream
+        and no resume. A record that says it observed no closing message, or a
+        memory-only store, returns ``None`` — the explicit absence, never an
+        empty-string stand-in.
+        """
+        identity = (run_id, task_id, attempt)
+        result = self.read(run_id, task_id, attempt, missing_ok=True)
+        if result is not None and not result.closing_observed:
+            return None
+        if self.root:
+            path = self._closing_path(identity)
+            if path.exists():
+                return path.read_text(encoding="utf-8")
+        if result is not None and result.closing_text:
+            return result.closing_text
+        return None
 
     def read(
         self, run_id: str, task_id: str, attempt: int, *, missing_ok: bool = False
@@ -560,6 +695,15 @@ class AttemptFinalResultStore:
             os.fsync(handle.fileno())
         os.replace(tmp, path)
 
+    def _write_bytes_atomic(self, path: Path, data: bytes) -> None:
+        """Write raw bytes atomically (fsync + replace), like the record itself."""
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+
 
 def final_result_from_attempt(
     store: Any,
@@ -582,6 +726,14 @@ def final_result_from_attempt(
     duck-typed ``store`` (``fact`` / ``summary``). The evidence digest is the
     whole-observed-byte digest, so a retention-capped stream still yields the
     same evidence digest and the same verdict.
+
+    The child's *closing message* is bound here too (SW-1511A-RESULT-001,
+    finding F-1511A-01). Retention keeps the head of a stream and drops the
+    tail, so the record would otherwise carry only a digest of words a
+    controller can never read. The store captures a bounded tail at ingest
+    time; this reads it, scrubs it, and binds its digest and byte range into
+    the record as additive fields. A store or stream with no capture leaves the
+    record explicitly saying no closing message was observed.
     """
     fact = store.fact(attempt, run_id=run_id, task_id=task_id)
     if fact is None:
@@ -604,6 +756,10 @@ def final_result_from_attempt(
         artifacts_declared=artifacts_declared,
         artifacts_resolved=artifacts_resolved,
     )
+    excerpt = closing_excerpt_from_store(
+        store, run_id=run_id, task_id=task_id, attempt=attempt
+    )
+    closing = _closing_fields(excerpt)
     return AttemptFinalResult(
         run_id=run_id,
         task_id=task_id,
@@ -621,7 +777,33 @@ def final_result_from_attempt(
         hold_name=hold_name,
         hold_reason=hold_reason,
         observed_at=observed_at,
+        **closing,
     )
+
+
+def _closing_fields(excerpt: Optional[Mapping]) -> dict:
+    """The additive closing-message fields for a captured excerpt (or absence).
+
+    The text is already scrubbed by the stream store at capture time; it is
+    bound here by digest and byte range so a controller can verify that the
+    durable text it later reads is exactly the bytes the digest covers. Absence
+    is never silent: a record with no excerpt says so in ``closing_note``.
+    """
+    if not excerpt or not excerpt.get("observed"):
+        return {
+            "closing_observed": False,
+            "closing_note": "no closing message was observed in the retained streams",
+        }
+    text = scrub_secrets(str(excerpt.get("text") or ""))
+    return {
+        "closing_observed": True,
+        "closing_digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "closing_text": text,
+        "closing_byte_range_start": int(excerpt.get("byte_range_start", -1)),
+        "closing_byte_range_end": int(excerpt.get("byte_range_end", -1)),
+        "closing_stream": str(excerpt.get("stream") or ""),
+        "closing_note": "closing message recovered from the stream tail",
+    }
 
 
 # ── Legacy migration adapter (compatibility clause) ──────────────────────────
