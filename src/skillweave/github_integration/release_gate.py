@@ -113,7 +113,12 @@ class ReleaseReadinessGate:
         content = changelog.read_text()
         clean_ver = version.lstrip("v")
         escaped = re.escape(clean_ver)
-        pattern = rf"##\s*(?:\[)?{escaped}(?:\])?"
+        # This project writes ``## vX.Y.Z (date) — Title`` headings (every
+        # historical entry in CHANGELOG.md carries the ``v`` prefix), while
+        # some generators emit ``## X.Y.Z`` or ``## [X.Y.Z]``. Accept all three
+        # forms so the check recognises the tree's real heading instead of
+        # reporting "No version entries found" for a correctly-prepared release.
+        pattern = rf"##\s*\[?v?{escaped}\]?"
         if re.search(pattern, content):
             return GateCheck(
                 id="changelog-updated",
@@ -123,7 +128,7 @@ class ReleaseReadinessGate:
                 required=True,
             )
 
-        if re.search(r"##\s*\[\d+\.\d+\.\d+\]", content):
+        if re.search(r"##\s*\[?v?\d+\.\d+\.\d+\]?", content):
             return GateCheck(
                 id="changelog-updated",
                 name="CHANGELOG has version entry",
@@ -256,10 +261,26 @@ class ReleaseReadinessGate:
         )
 
     def check_release_version_matches_capabilities(self, current_version: str) -> GateCheck:
-        manifest_paths = [
-            self.repo_root / "capability.yaml",
-            *sorted((self.repo_root / "skills").glob("skillweave-*/capability.yaml")),
-        ]
+        """Release version vs the Capacium manifests, honouring the release policy.
+
+        The tree declares ``release_policy: decoupled_member_pins``: the
+        distribution bundle (root ``capability.yaml``) is a *required* release
+        surface whose version must equal the release version, while each member
+        skill artifact is *informational* and may lag the bundle (a
+        packaging-only bump moves neither the member file nor its bundle pin).
+        Forcing every member file to equal the release version -- as this check
+        previously did -- contradicts that policy, ``scripts/check-manifest.py``
+        and ``tests/unit/test_version_sync.py``.
+
+        What must still hold is that a member never contradicts its own bundle
+        pin: ``capabilities[]`` is a manifest promising which member version the
+        bundle ships, so a bundle pin that disagrees with the member file is a
+        real failure. Member files lagging the release version are not.
+        """
+        bundle_path = self.repo_root / "capability.yaml"
+        member_paths = sorted((self.repo_root / "skills").glob("skillweave-*/capability.yaml"))
+        manifest_paths = [bundle_path, *member_paths]
+
         missing = [path for path in manifest_paths if not path.exists()]
         if missing:
             preview = ", ".join(str(path.relative_to(self.repo_root)) for path in missing[:5])
@@ -274,12 +295,28 @@ class ReleaseReadinessGate:
         release_version = current_version.lstrip("v")
         mismatches = []
         try:
-            for path in manifest_paths:
-                manifest = yaml.safe_load(path.read_text()) or {}
-                manifest_version = str(manifest.get("version", "")).lstrip("v")
-                if manifest_version != release_version:
-                    rel_path = path.relative_to(self.repo_root)
-                    mismatches.append(f"{rel_path}={manifest_version or 'missing'}")
+            bundle = yaml.safe_load(bundle_path.read_text()) or {}
+            bundle_version = str(bundle.get("version", "")).lstrip("v")
+            if bundle_version != release_version:
+                mismatches.append(f"capability.yaml={bundle_version or 'missing'}")
+
+            pins = {
+                str(entry.get("name")): str(entry.get("version", "")).lstrip("v")
+                for entry in (bundle.get("capabilities") or [])
+                if isinstance(entry, dict)
+            }
+            for path in member_paths:
+                member = yaml.safe_load(path.read_text()) or {}
+                member_version = str(member.get("version", "")).lstrip("v")
+                name = str(member.get("name") or path.parent.name)
+                rel_path = path.relative_to(self.repo_root)
+                pin = pins.get(name)
+                if pin is None:
+                    mismatches.append(f"{rel_path}={member_version or 'missing'} (no bundle pin)")
+                elif member_version != pin:
+                    mismatches.append(
+                        f"{rel_path}={member_version or 'missing'} (bundle pin {pin})"
+                    )
         except Exception as exc:
             return GateCheck(
                 id="release-version-capabilities-match",
@@ -296,7 +333,7 @@ class ReleaseReadinessGate:
                 id="release-version-capabilities-match",
                 name="Release version matches capability manifests",
                 passed=False,
-                detail=f"Release version {release_version} differs from: {preview}{remainder}",
+                detail=f"Capability manifests disagree: {preview}{remainder}",
                 required=True,
             )
 
@@ -304,7 +341,11 @@ class ReleaseReadinessGate:
             id="release-version-capabilities-match",
             name="Release version matches capability manifests",
             passed=True,
-            detail=f"{len(manifest_paths)} capability manifest(s) match release version {release_version}",
+            detail=(
+                f"{len(manifest_paths)} capability manifest(s) consistent: "
+                f"bundle matches release version {release_version}, "
+                f"member files match their bundle pins"
+            ),
             required=True,
         )
 

@@ -23,8 +23,13 @@ DEFAULT_FRAMEWORKS = [target.name for target in AGENT_CONFIG]
 
 DEFAULT_LICENSE = "Apache-2.0"
 DEFAULT_AUTHOR = "SkillWeave Team"
-DEFAULT_OWNER = "LangeVC"
-DEFAULT_REPOSITORY = "https://github.com/LangeVC/skillweave"
+# The published Capacium identity. The project migrated from ``LangeVC`` to
+# ``SkillWeave-AI`` (see tests/unit/test_1510_publish_manifest.py); ``LangeVC``
+# is retained only as the declared ``replaces`` / ``previous_identities``
+# history. These defaults must name the *current* identity or the sync tool
+# would rewrite every manifest back to the retired owner.
+DEFAULT_OWNER = "SkillWeave-AI"
+DEFAULT_REPOSITORY = "https://github.com/SkillWeave-AI/skillweave"
 DEFAULT_HOMEPAGE = DEFAULT_REPOSITORY
 DEFAULT_BUNDLE_DESCRIPTION = "A complete 7-phase AI-assisted development lifecycle ecosystem."
 DEFAULT_BUNDLE_KEYWORDS = [
