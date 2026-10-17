@@ -486,10 +486,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         result_obj = execution["result"]
         receipt = execution["receipt"]
+        # Live-qualification finding F1 (SW-1511A-GATE-001 CLI lane): the
+        # printed top-level fields must report the *overall* Assay verdict,
+        # never a passing, advance-eligible state for a run whose native Assay
+        # PASS was withheld. The completion-contract gate is a separate,
+        # narrower fact and stays readable under a clearly named key rather than
+        # masquerading as the run's own gate. Both keys are preserved: nothing
+        # the existing caller reads is removed.
+        assay_block_for_summary = execution.get("assay")
+        held = (
+            isinstance(assay_block_for_summary, dict)
+            and assay_block_for_summary.get("outcome") == "hold"
+        )
+        completion_gate_state = execution["gate_state"]
+        if held:
+            overall_gate_state = "hold"
+            overall_state = "hold"
+        else:
+            overall_gate_state = execution["gate_state"]
+            overall_state = store.get_run(run_id).state
         result_dict = {
             "run_id": execution["run_id"],
-            "state": store.get_run(run_id).state,
-            "gate_state": execution["gate_state"],
+            "state": overall_state,
+            "gate_state": overall_gate_state,
+            "completion_gate_state": completion_gate_state,
             "raw_digest": execution["raw_digest"],
             "verification": execution["verification"],
             "methodology": execution["methodology"],

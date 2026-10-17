@@ -394,12 +394,15 @@ def test_output_root_does_not_disturb_the_record(tmp_path):
 
 
 def test_printed_output_and_exit_codes_are_unchanged_by_the_record(tmp_path):
-    """The record is additive: no new key in stdout, no changed exit code.
+    """The record is additive: no changed exit code, no *removed* public key.
 
     A caller that already reads ``skillweave run``'s JSON and its exit status
     must be unaffected by the repair. The record is *not* among the printed
-    keys, and each outcome keeps the wrapper exit code it had before -- which is
-    exactly the promise the finding's repair had to keep.
+    keys, each outcome keeps the wrapper exit code it had before, and every
+    public key the old caller read is still present with the same type. The
+    only addition is the repair's own ``completion_gate_state``, which names
+    the completion-contract gate explicitly rather than letting it stand in
+    for the run's overall gate.
     """
     cases = [
         # (label, child code, extra args, expected wrapper exit, pre-repair keys)
@@ -408,13 +411,15 @@ def test_printed_output_and_exit_codes_are_unchanged_by_the_record(tmp_path):
         ("signal", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)", [], 0, None),
         ("assay-hold", _phrase(), ["--methodology", "assay"], 1, {"assay"}),
     ]
-    # The public key set the wrapper printed before the repair, byte for byte.
-    # An assay run already printed its ``assay`` block before the repair, so
-    # that one key is part of the *existing* surface, not a new one.
+    # The public key set the wrapper prints. The repair's F1 clause adds the
+    # one clearly named key ``completion_gate_state`` (the completion-contract
+    # gate, kept distinct from the run's overall gate) and changes no existing
+    # key's presence or type, so every key the old caller read is still there.
     base_keys = {
         "run_id",
         "state",
         "gate_state",
+        "completion_gate_state",
         "raw_digest",
         "verification",
         "methodology",
@@ -589,6 +594,172 @@ def test_conflicting_rewrite_of_one_identity_is_still_refused(tmp_path):
             task_id="conflict-task",
             attempt=1,
         )
+
+
+# ── repair F-1511A-02: the MCP boundary itself ───────────────────────────────
+
+
+def test_mcp_boundary_named_hold_on_non_successful_child_never_raises(tmp_path):
+    """F-1511A-02: the *MCP tool handler* returns a named HOLD, never an isError.
+
+    The live defect: an Assay ``create_run`` with intentionally absent artifact
+    semantics on a child that did **not** succeed raised an uncaught
+    ``UndifferentiatedProcessFailureError`` at the MCP boundary, so the operator
+    saw an internal tool error and no durable record was written. The handler is
+    the real ``skillweave.mcp.control.create_run_payload`` -- the single ingress
+    the MCP ``create_run`` tool delegates to -- driven end to end on a fake
+    child (the running interpreter: no network, no provider, no credential).
+
+    Both non-successful shapes the live lane drove are pinned, because the
+    contract must treat each as an honest, named, non-failure outcome:
+
+    * the ``launch_failed`` shape (an *empty* command is never launched), and
+    * the *real but failing child* shape (the interpreter exits non-zero) --
+      the variant the lane recorded as "A: real command, no evidence -> RAISED".
+
+    In both, the Assay drill still runs and withholds its PASS for the absent
+    artifact proof graph, exactly as it did live, and derives ``inconclusive``.
+    """
+    from skillweave.mcp import control
+
+    for name, command, expected_reason, expected_child_exit in (
+        ("launch-failed", "", "launch_failed", None),
+        ("real-failing-child", f'{sys.executable} -c "import sys; sys.exit(3)"',
+         "child_exited", 3),
+    ):
+        tmp = os.path.join(str(tmp_path), name)
+        out = control.create_run_payload(
+            tool="mcp-assay-f1511a02",
+            model="opencode",
+            subject_repo="repo",
+            subject_commit="c0ffee",
+            command=command,
+            db_path=os.path.join(tmp, "store.db"),
+            artifacts_path=os.path.join(tmp, "artifacts"),
+            methodology="assay",
+            autonomy_policy="unicorn",
+            task_id="SW-1511A-RESULT-001",
+            attempt=1,
+            stream_root=os.path.join(tmp, "streams"),
+            artifact_evidence="",  # intentionally absent -> named hold
+            source_root=os.path.join(tmp, "source"),
+            analysis_root=os.path.join(tmp, "analysis"),
+        )
+
+        # The handler *returned* a payload: nothing escaped as an isError.
+        assert isinstance(out, dict), "the MCP boundary must return a payload, not raise"
+        assert out.get("error") is None
+        assay_block = out["assay"]
+        assert assay_block["outcome"] == "hold"
+        assert assay_block["artifact_evidence"]["admitted"] is False
+
+        # A durable attempt-final-result/v1 was written by the production
+        # reconciler and names the intentional absence as an inconclusive
+        # technical end -- the non-successful child is never flattened into a
+        # process failure.
+        records = _walk_records(_store_root(tmp))
+        assert len(records) == 1
+        record = records[0][1]
+        assert record["verdict"] == "inconclusive"
+        assert record["verdict"] != "fail"
+        assert record["artifact_semantics"] == "named_hold"
+        assert record["hold_name"] == "artifact-semantics"
+        assert record["terminal_reason"] == expected_reason
+        assert record["child_exit"] == expected_child_exit
+        assert record["assay_state"] == "hold"
+
+
+def test_contract_refuses_process_failure_on_a_non_successful_child(tmp_path):
+    """The refusal of a *genuinely* undifferentiated failure is preserved.
+
+    Criterion 2 is restored, not weakened: intentional absence is never a
+    process failure. A non-successful child with intentionally absent artifacts
+    must be ``inconclusive``; recording it as ``fail`` (or as a hold-shaped
+    success) is still refused, and the message no longer claims a successful
+    child.
+    """
+    from skillweave.trace.attempt_final_result import (
+        ArtifactSemantics,
+        AttemptFinalResult,
+        FinalVerdict,
+        UndifferentiatedProcessFailureError,
+    )
+
+    for wrong_verdict in (FinalVerdict.FAIL, FinalVerdict.HOLD, FinalVerdict.PASS):
+        with pytest.raises(UndifferentiatedProcessFailureError) as raised:
+            AttemptFinalResult(
+                run_id="r",
+                task_id="t",
+                attempt=1,
+                child_exit=None,
+                wrapper_exit=1,
+                verdict=wrong_verdict,
+                terminal_reason="launch_failed",
+                evidence_digest="d",
+                artifact_semantics=ArtifactSemantics.NAMED_HOLD,
+                hold_name="artifact-semantics",
+            )
+        message = str(raised.value)
+        # The honest descriptor: the child did not succeed, and the message
+        # says so, instead of the old claim about a "successful child".
+        assert "non-successful child" in message, (
+            "a non-successful child must be described as non-successful"
+        )
+        assert "a successful child" not in message
+        assert "never a process failure" in message
+
+    # The honest record for that same attempt is accepted, not refused.
+    ok = AttemptFinalResult(
+        run_id="r",
+        task_id="t",
+        attempt=2,
+        child_exit=None,
+        wrapper_exit=1,
+        verdict=FinalVerdict.INCONCLUSIVE,
+        terminal_reason="launch_failed",
+        evidence_digest="d",
+        artifact_semantics=ArtifactSemantics.NAMED_HOLD,
+        hold_name="artifact-semantics",
+        hold_reason="completion contract did not pass",
+        assay_state="hold",
+    )
+    assert ok.verdict is FinalVerdict.INCONCLUSIVE
+
+
+# ── repair F1: a held Assay run never prints a passing top-level gate ─────────
+
+
+def test_held_assay_cli_reports_hold_not_a_passing_advance_state(tmp_path):
+    """F1: the printed top-level gate/state reflect the *overall* Assay verdict.
+
+    The live defect: a withheld native Assay PASS printed top-level
+    ``gate_state: "pass"`` and ``state: "advance_or_stop"`` while
+    ``assay.outcome`` was ``"hold"`` and the exit code was 1 -- a passing,
+    advance-eligible summary for a held run. The completion-contract value stays
+    readable under its own clearly named key.
+    """
+    tmp = str(tmp_path)
+    rc, printed, _root = _run_cli(tmp, _phrase(), ["--methodology", "assay"])
+
+    assert rc == 1
+    assert isinstance(printed, dict)
+    assert printed["assay"]["outcome"] == "hold"
+
+    # The top-level fields agree with the held outcome: never a passing,
+    # advance-eligible summary for a run whose native PASS was withheld.
+    assert printed["gate_state"] == "hold"
+    assert printed["state"] != "advance_or_stop"
+    assert printed["state"] == "hold"
+
+    # The completion-contract-only value is preserved and clearly named.
+    assert printed["completion_gate_state"] == "pass"
+    assert printed["assay"]["completion_gate_state"] == "pass"
+
+    # Every key the old caller read is still readable, and the passing case is
+    # untouched (proved separately in the parity and exit-code tests).
+    for key in ("run_id", "raw_digest", "verification", "methodology",
+                "stream", "receipt"):
+        assert key in printed
 
 
 if __name__ == "__main__":  # pragma: no cover - manual runner

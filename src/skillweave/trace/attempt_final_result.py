@@ -123,11 +123,12 @@ class DuplicateFinalResultError(AttemptFinalResultError):
 
 
 class UndifferentiatedProcessFailureError(AttemptFinalResultError):
-    """A successful child with intentionally absent artifacts was flattened.
+    """Intentionally absent artifacts were flattened into a process failure.
 
-    The child succeeded and its artifact semantics were deliberately not
-    applicable: the record must say so as a named hold or a non-applicable
-    gate. Recording it as an undifferentiated process failure is refused.
+    Artifact semantics were deliberately not applicable, so the record must
+    say so: a named hold or a non-applicable gate on a *successful* child, or
+    ``INCONCLUSIVE`` on a child that did not succeed. Recording any of these as
+    an undifferentiated process failure is refused.
     """
 
 
@@ -213,6 +214,9 @@ class AttemptFinalResult:
     A successful child with intentionally absent artifact semantics can only be
     recorded as ``HOLD`` or ``NOT_APPLICABLE`` (criterion 2); an attempt to
     record ``FAIL`` there raises :class:`UndifferentiatedProcessFailureError`.
+    A *non-successful* child with the same intentional absence is
+    ``INCONCLUSIVE`` -- the attempt ended technically, never as a fabricated
+    ``FAIL`` -- and any process-failure verdict there is refused the same way.
     """
 
     run_id: str
@@ -313,11 +317,30 @@ class AttemptFinalResult:
                 raise AttemptFinalResultError(
                     "intentionally absent artifacts must be named"
                 )
-            if not child_succeeded and self.verdict is not FinalVerdict.INCONCLUSIVE:
-                raise AttemptFinalResultError(
-                    "artifact semantics may be intentionally absent only for a "
-                    "successful child"
-                )
+            if not child_succeeded:
+                # The child did NOT succeed, so the intentional absence of
+                # artifact evidence is *not* the TASK's decision -- there is no
+                # discharged task whose gate could hold. The only honest verdict
+                # is ``INCONCLUSIVE`` (matching ``derive_final_verdict``): the
+                # attempt ended technically, never as a fabricated ``FAIL``.
+                # This branch must never be reached with a process-failure
+                # verdict -- intentional absence is still never a process
+                # failure -- so a ``FAIL``/``PASS``/hold-shaped verdict on a
+                # non-successful child is refused as the same undifferentiated
+                # flattening, now with a message that tells the truth about the
+                # child that did not succeed.
+                if self.verdict is not FinalVerdict.INCONCLUSIVE:
+                    raise UndifferentiatedProcessFailureError(
+                        f"a non-successful child ({self.terminal_reason}) with "
+                        f"intentionally absent artifact semantics must be "
+                        f"'{FinalVerdict.INCONCLUSIVE.value}', not verdict "
+                        f"'{self.verdict.value}': intentional absence is never "
+                        f"a process failure"
+                    )
+                return
+            # The child succeeded: the intentional absence of artifacts is the
+            # task's own decision and can only be a named hold or a
+            # non-applicable gate, never an undifferentiated process failure.
             if self.verdict not in (FinalVerdict.HOLD, FinalVerdict.NOT_APPLICABLE):
                 raise UndifferentiatedProcessFailureError(
                     f"a successful child with intentionally absent artifact "
