@@ -3209,12 +3209,31 @@ class RunApplicationService:
         signalled: list[int] = []
         unknown_inflight = check.reason == REASON_NOT_ALIVE
         result = "unknown"
+        targets: list[int] = []
+        unrelated_untouched: list[int] = []
 
         if check.reason == REASON_MATCH:
             # The leader is verified (and, when the pgid still holds, so is the
             # whole group).  Signal every member of the owned group.
             targets = sorted({p for p in members if p} | {recorded_pid})
+            # SW-1511A-LIVENESS-001 (criterion 3): the owned group is proven
+            # before each signal.  A target whose *observed* process group is
+            # not the owned group is never signalled -- it is recorded as an
+            # unrelated process left untouched.  This is the causal evidence
+            # the final result carries, not a claim asserted after the fact.
+            capture_identity = _runtime_attr("process_identity", "capture")
+            owned_targets: list[int] = []
             for target in targets:
+                observed = capture_identity(target)
+                if (
+                    pgid is not None
+                    and observed is not None
+                    and observed.pgid != pgid
+                ):
+                    unrelated_untouched.append(target)
+                    continue
+                owned_targets.append(target)
+            for target in owned_targets:
                 try:
                     os.kill(target, _signal.SIGTERM)
                     signalled.append(target)
@@ -3222,10 +3241,10 @@ class RunApplicationService:
                     pass
             deadline = time.monotonic() + max(0.0, grace)
             while time.monotonic() < deadline:
-                if not any(is_alive(t) for t in targets):
+                if not any(is_alive(t) for t in owned_targets):
                     break
                 time.sleep(0.02)
-            remaining = [t for t in targets if is_alive(t)]
+            remaining = [t for t in owned_targets if is_alive(t)]
             for target in remaining:
                 try:
                     os.kill(target, _signal.SIGKILL)
@@ -3250,7 +3269,29 @@ class RunApplicationService:
                 "verification_reason": check.reason,
                 "signalled": [],
                 "group_members": [],
+                "unrelated_untouched": [],
                 "unknown_inflight": True,
+                "owned_process_cancel": {
+                    "schema": (
+                        "owned-process-cancel/v1 "
+                        "(skillweave // SW-1511A-LIVENESS-001)"
+                    ),
+                    "schema_version": "1.0.0",
+                    "run_id": run_id,
+                    "task_id": (run.metadata or {}).get("task_id") or run_id,
+                    "attempt": (run.metadata or {}).get("attempt", 1),
+                    "pid": recorded_pid,
+                    "pgid": recorded_pgid,
+                    "identity_verified": False,
+                    "identity_token": None,
+                    "creation_token": None,
+                    "reason": reason,
+                    "result": "unknown",
+                    "signalled": [],
+                    "group_members": [],
+                    "unrelated_untouched": [],
+                    "verification": check.to_dict(),
+                },
             }
             try:
                 self.journal.append(
@@ -3274,10 +3315,39 @@ class RunApplicationService:
                 "signalled": [],
                 "identity_verified": False,
                 "unknown_inflight": True,
+                "unrelated_untouched": [],
+                "owned_process_cancel": ack_payload["owned_process_cancel"],
                 "verification": check.to_dict(),
             }
 
         # ---- record the acknowledgement -----------------------------------
+        # SW-1511A-LIVENESS-001 (criterion 3, owned-process-cancel/v1): the
+        # causal evidence of the cancellation -- the identity-verified command,
+        # the owned descendants actually signalled, and the unrelated processes
+        # proven to belong to a different group and left untouched.  Bound to
+        # the exact run/attempt/group/fencing identities the contract requires.
+        owned_process_cancel = {
+            "schema": "owned-process-cancel/v1 (skillweave // SW-1511A-LIVENESS-001)",
+            "schema_version": "1.0.0",
+            "run_id": run_id,
+            "task_id": (run.metadata or {}).get("task_id") or run_id,
+            "attempt": (run.metadata or {}).get("attempt", 1),
+            "pid": recorded_pid,
+            "pgid": pgid,
+            "identity_verified": True,
+            "identity_token": (
+                check.current.identity_token if check.current is not None else None
+            ),
+            "creation_token": (
+                check.current.creation_token if check.current is not None else None
+            ),
+            "reason": reason,
+            "result": result,
+            "signalled": list(signalled),
+            "group_members": list(members),
+            "unrelated_untouched": list(unrelated_untouched),
+            "verification": check.to_dict(),
+        }
         ack_payload = {
             "run_id": run_id,
             "pid": recorded_pid,
@@ -3288,7 +3358,9 @@ class RunApplicationService:
             "verification_reason": check.reason,
             "signalled": signalled,
             "group_members": list(members),
+            "unrelated_untouched": list(unrelated_untouched),
             "unknown_inflight": False,
+            "owned_process_cancel": owned_process_cancel,
         }
         try:
             self.journal.append(
@@ -3310,8 +3382,13 @@ class RunApplicationService:
                     target_state="advance_or_stop",
                     lifecycle_update={"lifecycle_state": "killed"},
                     event_type="process_killed",
-                    event_payload={"pid": recorded_pid, "result": result,
-                                   "signalled": signalled},
+                    event_payload={
+                        "pid": recorded_pid,
+                        "result": result,
+                        "signalled": signalled,
+                        "unrelated_untouched": unrelated_untouched,
+                        "owned_process_cancel": owned_process_cancel,
+                    },
                     idempotency_key="cancel:" + run_id,
                     reason=reason,
                     stop_reason="operator_halt",
@@ -3336,6 +3413,8 @@ class RunApplicationService:
             "signalled": signalled,
             "identity_verified": check.reason == REASON_MATCH,
             "unknown_inflight": unknown_inflight,
+            "unrelated_untouched": unrelated_untouched,
+            "owned_process_cancel": owned_process_cancel,
             "verification": check.to_dict(),
         }
 
@@ -4318,6 +4397,14 @@ class RunApplicationService:
                 "task_id": task_id,
                 "stdout": out_summary.to_dict(),
                 "stderr": err_summary.to_dict(),
+                # SW-1511A-LIVENESS-001: the owned attempt's liveness report
+                # (state + per-state causal incident series) recorded by the
+                # supervision loop around this child.  Additive: absent when the
+                # recorder could not be produced, never reinterpreted.
+                "liveness": (
+                    result.metadata.get("liveness")
+                    if getattr(result, "metadata", None) else None
+                ),
             },
         )
 
