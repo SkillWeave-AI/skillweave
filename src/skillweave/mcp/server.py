@@ -1463,6 +1463,13 @@ def _admit_controller_handoff_offer(
     if isinstance(attestation_raw, dict):
         route = attestation_raw.get("configured_route") or {}
         caps = attestation_raw.get("capabilities") or {}
+        # The attestation's per-harness *evidence* (gateway counters observed,
+        # exit code, artifact) and its MCP config anchors are carried through
+        # admission verbatim: criterion 3 proves each harness's configured route
+        # with counters, so the record must keep what the harness actually
+        # observed.  The module's own ``HandoffAttestation.from_dict`` reads the
+        # same two fields, so a record admitted here and a record re-read from
+        # its durable form carry identical evidence.
         attestation = module.HandoffAttestation(
             client_id=str(attestation_raw.get("client_id") or ""),
             gateway_host=str(route.get("gateway_host") or ""),
@@ -1479,6 +1486,8 @@ def _admit_controller_handoff_offer(
             credential_binding=str(route.get("credential_binding") or ""),
             observed_at=str(attestation_raw.get("observed_at") or ""),
             max_age_seconds=int(attestation_raw.get("max_age_seconds") or 0),
+            mcp_config_anchors=tuple(caps.get("mcp_config_anchors") or ()),
+            evidence=dict(attestation_raw.get("evidence") or {}),
         )
 
     record = module.offer_handoff(

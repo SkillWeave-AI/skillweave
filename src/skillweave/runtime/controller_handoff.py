@@ -142,10 +142,12 @@ HANDOFF_HOLD_RELEASE_UNSUPPORTED = "HANDOFF_TERMINAL"
 #: Where the live handoff for a run is recorded in that run's durable metadata.
 HANDOFF_METADATA_KEY = "controller_handoff"
 
-#: The durable run-metadata key a provider-quota wait is recorded under -- the
-#: *same* key the native CMS flow qualification measures a wait with, so the two
-#: never disagree about what a recorded wait is.
-WAIT_METADATA_KEY = "wait"
+#: The durable run-metadata key a provider-quota wait is recorded under.  This
+#: is *imported* from the native CMS flow qualification -- the module that
+#: actually records a measured wait -- so the two can never disagree about which
+#: record is a recorded wait (a hand-typed copy would silently drift and the
+#: cancel-during-quota-wait guard would gap).
+from .cms_flow_qualification import WAIT_METADATA_KEY as WAIT_METADATA_KEY
 
 # ── the secret-shape refusal (never the value) ──────────────────────────────
 
