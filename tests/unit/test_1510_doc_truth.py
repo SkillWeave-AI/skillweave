@@ -47,6 +47,27 @@ _REPO = Path(__file__).resolve().parent.parent.parent
 _DOC = "docs/native-execution-support-1510.md"
 _CHECK = _REPO / "scripts" / "check-version-truth.py"
 
+
+def _run_check(repo: Path, *, extra_env: dict | None = None):
+    """Run the release-consistency check hermetically on ``repo``.
+
+    ``-S`` (no site) plus a popped ``PYTHONPATH`` are deliberate: they drop the
+    *ambient* interpreter's site-packages from the child so its ``installed``
+    fact reflects only what a caller plants via ``extra_env["PYTHONPATH"]``
+    (which ``-S`` still honours) -- never the harness venv's or host's own
+    installed skillweave. Without it the environment, not the tree, would
+    decide these assertions.
+    """
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [sys.executable, "-S", "-B", str(_CHECK), "--repo", str(repo)],
+        capture_output=True, text=True, env=env,
+    )
+
+
 # Release-facing material a public reader sees.
 _PUBLIC = ("README.md", _DOC) + tuple(
     f"examples/{p.name}"
@@ -556,10 +577,7 @@ def test_release_consistency_check_passes_on_the_tree(tmp_path):
     # shipped release face to the tag its release would carry, without mutating
     # the tree's own tags.
     repo = _scratch_repo_with_candidate_tag(tmp_path)
-    proc = subprocess.run(
-        [sys.executable, "-B", str(_CHECK), "--repo", str(repo)],
-        capture_output=True, text=True,
-    )
+    proc = _run_check(repo)
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     assert "check-version-truth: OK" in proc.stdout
 
@@ -573,10 +591,7 @@ def test_release_consistency_check_accepts_release_prep_before_tag(tmp_path):
     # The test asserts the behaviour of whichever check is present, so the file
     # is green both in this lane and on the RFX-001 composition.
     repo = _scratch_repo_pre_release(tmp_path)
-    proc = subprocess.run(
-        [sys.executable, "-B", str(_CHECK), "--repo", str(repo)],
-        capture_output=True, text=True,
-    )
+    proc = _run_check(repo)
     if _check_knows_release_prep():
         assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
         assert "check-version-truth: OK" in proc.stdout
@@ -613,13 +628,7 @@ def test_check_reports_installed_origin_from_the_real_distribution(tmp_path):
         r"badge/version-(\d+\.\d+\.\d+)", (repo / "README.md").read_text()
     ).group(1)
     site = _plant_installed(installed, badge, editable_dir="/repo/skillweave")
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
-    env["PYTHONPATH"] = str(site)
-    proc = subprocess.run(
-        [sys.executable, "-B", str(_CHECK), "--repo", str(repo)],
-        capture_output=True, text=True, env=env,
-    )
+    proc = _run_check(repo, extra_env={"PYTHONPATH": str(site)})
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     assert "installed identity" in proc.stdout
     assert "editable-checkout" in proc.stdout

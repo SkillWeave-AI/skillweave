@@ -36,6 +36,7 @@ real tree), pushes nothing, needs no network.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -160,9 +161,16 @@ def _post_tag_clone(dest: Path) -> Path:
 
 
 def _run_check(repo: Path, *extra: str):
+    # ``-S`` (no site) plus a popped PYTHONPATH are deliberate: they drop the
+    # *ambient* interpreter's site-packages from the child so its ``installed``
+    # fact is reported as "not installed" rather than as whatever skillweave
+    # some host venv happens to carry -- the environment, not the tree, would
+    # otherwise decide these assertions.
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
     return subprocess.run(
-        [sys.executable, "-B", str(_CHECK), "--repo", str(repo), *extra],
-        capture_output=True, text=True,
+        [sys.executable, "-S", "-B", str(_CHECK), "--repo", str(repo), *extra],
+        capture_output=True, text=True, env=env,
     )
 
 
