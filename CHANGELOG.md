@@ -1,15 +1,17 @@
 ## v1.5.11 (2026-10-17) — Control-Loop Hardening
 
-SkillWeave v1.5.11 delivers the control-loop hardening built since v1.5.10: a task lifecycle ledger, an unambiguous final attempt result, owned-attempt liveness and cancellation evidence, declared reproducible test environments with attestation, upstream model and quota evidence at the admission boundary, a cumulative role-safe integration gate, and an exactly-once controller handoff. Every entry below is derived from the accepted shipped commits and cites them. Live qualification is performed separately and is not claimed by this entry.
+SkillWeave v1.5.11 delivers the control-loop hardening built since v1.5.10: a task lifecycle ledger, an unambiguous final attempt result, owned-attempt liveness and cancellation evidence, declared reproducible test environments with attestation, upstream model and quota evidence at the admission boundary, a cumulative role-safe integration gate, and an exactly-once controller handoff. Every entry below is derived from the shipped commits and cites them. Live qualification is performed separately and is not claimed by this entry.
 
 ### Features
-- **Task Lifecycle Ledger**: an append-only task lifecycle ledger with a canonical 24-task 1.5.11 projection, recording each task's lifecycle state as durable evidence (SW-1511A-LEDGER-001).
-- **Unambiguous Final Attempt Result**: the child's closing message is preserved past the stream cap, so an attempt's final result is unambiguous and its closing message survives (SW-1511A-RESULT-001).
-- **Owned-Attempt Liveness & Cancellation Evidence**: owned-attempt liveness and owned-process cancellation produce source-bound evidence of the real outcome (SW-1511A-LIVENESS-001).
-- **Declared Reproducible Test Environments**: reproducible test environments are declared with a session guard and attestation receipts, wired into the release gate (SW-1511A-ENV-001).
-- **Upstream Model & Quota Evidence**: provider/model upstream attestation and quota truth are captured at the admission boundary of the provider attempt path (SW-1511A-UPSTREAM-001).
-- **Cumulative Role-Safe Integration Gate**: a cumulative, role-safe integration gate emitting the `integration-gate-result/v1` contract (SW-1511A-INTEGRATION-001).
-- **Exactly-Once Controller Handoff**: an exactly-once controller handoff contract with an MCP admission caller and a CLI `handoff_ref` (SW-1511A-HANDOFF-001).
+- **Task Lifecycle Ledger**: an append-only task lifecycle ledger with a canonical 24-task projection, recording each task's lifecycle state as durable evidence (16caeba, 4773d60).
+- **Unambiguous Final Attempt Result**: the attempt's final result is produced unambiguously, and the child's closing message is preserved past the stream cap (3e056c9, ede4204, 8c693fd, cb6c3f1, d5f3eed, 688e155).
+- **Owned-Attempt Liveness & Cancellation Evidence**: owned-attempt liveness and owned-process cancellation produce source-bound evidence of the real outcome (0311775).
+- **Upstream Model & Quota Evidence**: provider/model upstream attestation and quota truth are captured at the admission boundary of the provider attempt path, proven end-to-end (dda2b8b, 24e0632, b0d2b3b).
+- **Cumulative Role-Safe Integration Gate**: a cumulative, role-safe integration gate emitting the `integration-gate-result/v1` contract (87e39a3, 939df23).
+- **Exactly-Once Controller Handoff**: an exactly-once controller handoff contract with an MCP admission caller and a CLI `handoff_ref` (063cd56, b9df933, 2c71de0).
+
+### Infrastructure
+- **Declared Reproducible Test Environments**: reproducible test environments are declared with a session guard and attestation receipts, wired into the release gate (caafae2, 8e59a7a).
 
 
 ## v1.5.10 (2026-10-11) — Native Execution, Route-Lock, MCP Control & Trustworthy Publishing
