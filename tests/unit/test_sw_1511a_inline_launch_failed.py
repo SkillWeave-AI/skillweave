@@ -261,3 +261,154 @@ def test_lifecycle_observation_sees_start_and_terminal_for_a_refused_child(tmp_p
     assert all(handle is None for _, handle in seen)
     assert len(result.children) == 1
     assert result.children[0].outcome == "launch_failed"
+
+
+# ===========================================================================
+# SW-1511A-GATE-001 (repair C3): the spawn guard must NOT swallow a
+# verify_child_launch refusal.
+#
+# The guard added for F-1511A-04 originally wrapped *both* ``start_process``
+# and the MCP ``verify_child_launch`` step in one ``try/except Exception``. A
+# child that spawned but resolved a foreign/unobservable service therefore had
+# its ``ProcessServiceMismatchRefused`` (a security refusal) laundered into a
+# benign ``launch_failed`` result -- the refusal was recorded as a plain launch
+# failure rather than surfaced. These tests force exactly that path through the
+# *inline seam* and require the refusal to propagate unchanged, while a genuine
+# OS-level spawn failure stays typed.
+# ===========================================================================
+
+
+class _RefusalHandle:
+    """A live handle whose effective env can never satisfy the grant.
+
+    ``effective_env=None`` is the *unobservable* child: ``verify_child_launch``
+    refuses it. The handle records whether it was waited on, so the test can
+    also prove the already-started child is not silently reaped/observed when
+    the verification refuses (matching the parent revision's behaviour).
+    """
+
+    def __init__(self, effective_env=None):
+        self._sw_effective_env = effective_env
+        self.waited = False
+
+    def wait(self, timeout=None):  # pragma: no cover - must never be reached
+        self.waited = True
+        raise AssertionError("a refused child must never be waited on")
+
+
+def _grant_for(tmp_path: Path):
+    """A real, minimally-valid server-issued grant bound to a local service."""
+    from skillweave.mcp import bootstrap as boot
+
+    service = boot.HarnessProcessService(
+        authority="skillweave/repo-a",
+        db_path=str(tmp_path / "store.db"),
+        mailbox_path=str(tmp_path / "mailbox.jsonl"),
+        artifacts_path=str(tmp_path / "artifacts"),
+        stream_root=str(tmp_path / "stream"),
+    )
+    return boot.HarnessMcpSessionGrant(
+        schema_id=boot.HARNESS_MCP_SESSION_GRANT_SCHEMA_ID,
+        schema_version=boot.HARNESS_MCP_SESSION_GRANT_SCHEMA_VERSION,
+        run_id="run-x",
+        task_id="task-x",
+        attempt=1,
+        transport="stdio",
+        session_token="server-minted-token-abc",
+        service=service,
+        start_scope="task-x/attempt-1",
+        role="worker",
+    )
+
+
+def test_a_verify_child_launch_refusal_propagates_through_the_inline_seam(
+    tmp_path, monkeypatch
+):
+    """An unobservable child refuses; it is NOT degraded to launch_failed.
+
+    Adversarial: on the pre-repair head the wide guard turned the
+    ``ProcessServiceMismatchRefused`` raised by ``verify_child_launch`` into a
+    typed ``launch_failed`` result, so this seam returned normally with a bogus
+    benign outcome. The refusal is a security boundary and must propagate.
+    """
+    from skillweave.dispatch.application import _default_inline_seam
+    from skillweave.mcp import bootstrap as boot
+    from skillweave.runtime import runner_adapter
+
+    handle = _RefusalHandle(effective_env=None)
+    monkeypatch.setattr(runner_adapter, "start_process", lambda *a, **k: handle)
+
+    seen: list[tuple[str, object]] = []
+
+    def _observe(*, child_key, dispatch_id, phase, handle):
+        seen.append((phase, handle))
+
+    grant = _grant_for(tmp_path)
+    with pytest.raises(boot.ProcessServiceMismatchRefused):
+        _default_inline_seam(
+            ["/bin/true"],
+            run_id="run-x",
+            subject_repo="skillweave/repo-a",
+            subject_commit="a" * 40,
+            tool="worker",
+            model="faigate/dispatch-fixture-model",
+            mcp_grant=grant,
+            on_child_lifecycle=_observe,
+        )
+    # The child spawned, so no ``started``/``terminal`` observation is emitted
+    # from the refusal path, and the live handle is never waited on -- the same
+    # shape the parent revision has.
+    assert seen == []
+    assert handle.waited is False
+
+
+def test_a_spawn_permission_error_is_still_a_typed_launch_failed_outcome(
+    tmp_path, monkeypatch
+):
+    """The narrow guard still degrades an OS spawn failure to launch_failed.
+
+    Companion to the refusal test: narrowing the guard must not reopen
+    F-1511A-04. A ``start_process`` that raises ``PermissionError`` is degraded
+    to the typed outcome with the complete ``started``/``terminal`` lifecycle,
+    and ``verify_child_launch`` is never reached (there is no handle).
+    """
+    from skillweave.dispatch.application import _default_inline_seam
+    from skillweave.mcp import bootstrap as boot
+    from skillweave.runtime import runner_adapter
+
+    verify_calls: list[object] = []
+
+    def _boom(*a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runner_adapter, "start_process", _boom)
+    monkeypatch.setattr(
+        boot, "verify_child_launch",
+        lambda grant, handle: verify_calls.append(handle) or handle,
+    )
+
+    seen: list[tuple[str, object]] = []
+
+    def _observe(*, child_key, dispatch_id, phase, handle):
+        seen.append((phase, handle))
+
+    grant = _grant_for(tmp_path)
+    result = _default_inline_seam(
+        ["/nope/worker"],
+        run_id="run-x",
+        subject_repo="skillweave/repo-a",
+        subject_commit="a" * 40,
+        tool="worker",
+        model="faigate/dispatch-fixture-model",
+        mcp_grant=grant,
+        on_child_lifecycle=_observe,
+    )
+
+    # Typed, complete lifecycle for a never-started child -- F-1511A-04 intact.
+    assert [phase for phase, _ in seen] == ["started", "terminal"]
+    assert all(handle is None for _, handle in seen)
+    assert len(result.children) == 1
+    assert result.children[0].outcome == "launch_failed"
+    assert result.children[0].result.exit_code is None
+    # Verification is never consulted when the spawn itself failed.
+    assert verify_calls == []

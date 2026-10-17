@@ -761,12 +761,16 @@ def _default_inline_seam(
             handle=handle,
         )
 
-    # A launch refusal (a command that exists but is not executable, a missing
-    # interpreter, any OS-level spawn failure) must be a *typed* outcome on this
-    # seam exactly as it already is on the fan-out path -- never an uncaught
-    # exception that aborts the whole wave with no durable record. The window is
-    # deliberately wide (start + MCP verification): a child that spawns but whose
-    # launch cannot be verified is likewise a launch failure, not a crash.
+    # Only an OS-level *spawn* failure of ``start_process`` (a command that
+    # exists but is not executable, a missing interpreter, any spawn error) is
+    # degraded to a typed ``launch_failed`` outcome on this seam, exactly as the
+    # fan-out path already does -- never an uncaught exception that aborts the
+    # whole wave with no durable record. The window is deliberately *narrow*: it
+    # covers the spawn only. A refusal raised by ``verify_child_launch`` (an
+    # unobservable child, a missing granted token, a child resolving a foreign
+    # service -- ``ProcessServiceMismatchRefused`` and the other typed refusals)
+    # is a security refusal and must propagate unchanged: a child that *did*
+    # spawn is never laundered into a launch failure.
     start_error: Optional[BaseException] = None
     try:
         handle = runner_adapter.start_process(
@@ -780,8 +784,6 @@ def _default_inline_seam(
             env=extra_env,
             env_allowlist=allowlist,
         )
-        if mcp_grant is not None:
-            handle = _mcp_bootstrap.verify_child_launch(mcp_grant, handle)
     except Exception as exc:  # noqa: BLE001
         start_error = exc
         result = _launch_failed_result(
@@ -801,6 +803,11 @@ def _default_inline_seam(
         _notify("started", None)
         _notify("terminal", None)
     else:
+        # The child started: verification runs *outside* the spawn guard so a
+        # refusal propagates unchanged (the already started handle is left
+        # un-waited / un-notified, exactly as on the parent revision).
+        if mcp_grant is not None:
+            handle = _mcp_bootstrap.verify_child_launch(mcp_grant, handle)
         _notify("started", handle)
         try:
             result = handle.wait(timeout=timeout)
