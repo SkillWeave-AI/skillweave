@@ -3080,6 +3080,41 @@ class RunApplicationService:
             "lineage": lineage,
         }
 
+    @staticmethod
+    def _terminal_cancel_result(
+        run_id: str, run: Any, recorded_identity: Any = None,
+    ) -> dict[str, Any]:
+        """The cancel result for an *already-terminal* run (SW-1511A-GATE-001 5b-ii).
+
+        A terminal run has nothing left to cancel, so no signal is ever sent.
+        Unlike a non-terminal run whose process can no longer be observed
+        (``unknown`` / ``unknown_inflight``), this result is *definite*: it
+        reports ``result='already_terminal'`` and the durable lifecycle the
+        store already holds (``state``/``lifecycle_state``), so a caller can
+        tell "the run I asked to cancel is already finished" apart from "the
+        run's in-flight state is unknown".
+        """
+        lifecycle_state = (run.metadata or {}).get(
+            "runlifecycle", {}).get("lifecycle_state")
+        return {
+            "run_id": run_id,
+            "pid": (
+                recorded_identity.pid if recorded_identity is not None else None
+            ),
+            "pgid": (
+                recorded_identity.pgid if recorded_identity is not None else None
+            ),
+            "state": lifecycle_state or run.state,
+            "lane_state": run.state,
+            "lifecycle_state": lifecycle_state,
+            "result": "already_terminal",
+            "signalled": [],
+            "identity_verified": False,
+            "unknown_inflight": False,
+            "unrelated_untouched": [],
+            "verification": None,
+        }
+
     def cancel_process(
         self,
         run_id: str,
@@ -3144,6 +3179,30 @@ class RunApplicationService:
         recorded_identity = _runtime_attr("process_identity", "ProcessIdentity").from_dict(recorded)
         recorded_pid = recorded_identity.pid if recorded_identity is not None else pid
 
+        # SW-1511A-GATE-001 (5b-i): a caller-supplied ``pid`` is a *hint* the
+        # caller believes is the target.  When an identity was recorded, the
+        # hint must equal the recorded identity's PID -- any mismatch is a
+        # recycled-PID refusal, raised *before* any signal boundary (nothing is
+        # ever signalled) so the documented contract holds.  The case where no
+        # identity was recorded is unchanged: there the caller's ``pid`` (or the
+        # absence of one) is what the identity check reports as *no_record*.
+        if recorded_identity is not None and pid is not None and pid != recorded_pid:
+            reason = _runtime_attr("process_identity", "REASON_RECYCLED")
+            raise _runtime_attr("errors", "ProcessIdentityError")(
+                run_id, pid, reason,
+                verification={
+                    "ok": False,
+                    "reason": reason,
+                    "recorded_pid": recorded_pid,
+                    "current_pid": None,
+                    "detail": (
+                        f"recorded pid {recorded_pid} does not match the "
+                        f"requested pid {pid}"
+                    ),
+                    "current_identity": None,
+                },
+            )
+
         # ---- durable cancellation intent before the signal boundary -------
         # Recorded first so a crash at/after the signal is recoverable by a
         # later ``resume_run`` pass.  A genuine terminal winner is preserved.
@@ -3151,6 +3210,14 @@ class RunApplicationService:
         already_terminal = (
             run.state != "preflight" and RunStateModel.is_terminal(run.state)
         )
+        # SW-1511A-GATE-001 (5b-ii): a terminal run has nothing left to cancel.
+        # Report the *already-terminal* result consistent with the durable
+        # lifecycle -- distinct from the non-terminal-but-unobservable
+        # ``unknown`` path below -- and never fall through to the not_alive
+        # branch that would (wrongly) report a terminal run as unknown in-flight.
+        if already_terminal:
+            return self._terminal_cancel_result(run_id, run, recorded_identity)
+
         reconcile_cancellation_intent = getattr(
             self.store, "reconcile_cancellation_intent", None)
         if not already_terminal and reconcile_cancellation_intent is not None:
