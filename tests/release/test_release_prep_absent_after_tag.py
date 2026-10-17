@@ -16,14 +16,21 @@ This module proves the post-tag contract:
 * re-introducing the flag on that same tree is *fails closed*: the check exits
   non-zero and names ``release-prep-ahead`` / ``DRIFT``.
 
+State-aware: while the candidate is still a *release in preparation* (its own
+``vX.Y.Z`` tag does not yet exist), ``release_prep`` is present by design and the
+post-tag contract is exercised on an ephemeral scratch clone that models the
+tagged tree (the candidate tag created, the flag dropped) -- never on the real
+tree, which is never tagged. The branch is derived from the repository's tags,
+never a literal version, so the file is green both before and after the owner
+creates the tag.
+
 The negative control mutates an ephemeral scratch clone (``git clone`` into the
 pytest ``tmp_path``), never the real tree, and the candidate/tag are derived
 from the repository -- never a literal version or hash -- so the assertion holds
 for whichever release train the tree carries.
 
-Hermetic: reads the tree, tags nothing, pushes nothing, needs no network. The
-scratch clone inherits the repository's annotated ``v1.5.10`` tag, which is the
-tag this lane's post-tag contract is about.
+Hermetic: reads the tree, tags nothing (the scratch clone is tagged, not the
+real tree), pushes nothing, needs no network.
 """
 
 from __future__ import annotations
@@ -105,14 +112,50 @@ def _set_release_prep(repo: Path, version: str) -> None:
 def _scratch_clone(dest: Path) -> Path:
     """An ephemeral clone of this checkout carrying its tags.
 
-    ``git clone`` copies the annotated product tags, so the clone is a faithful
-    post-tag tree. The real tree is never mutated or tagged.
+    ``git clone`` copies the annotated product tags. The real tree is never
+    mutated or tagged.
     """
     repo = dest / "skillweave"
     subprocess.run(
         ["git", "clone", "-q", "--no-hardlinks", str(_REPO), str(repo)],
         check=True, capture_output=True, text=True,
     )
+    return repo
+
+
+def _drop_release_prep(repo: Path) -> None:
+    """Remove the top-level ``release_prep`` scalar, as the owner does at tagging."""
+    vf = repo / ".version.yaml"
+    kept = [
+        ln for ln in vf.read_text(encoding="utf-8").splitlines(keepends=True)
+        if not re.match(r"\s*release_prep\s*:", ln)
+    ]
+    vf.write_text("".join(kept), encoding="utf-8")
+
+
+def _post_tag_clone(dest: Path) -> Path:
+    """An ephemeral clone modelling the POST-tag tree.
+
+    The candidate's own annotated ``vX.Y.Z`` tag is created on the clone's HEAD
+    and the ``release_prep`` flag is dropped, exactly as the owner does once the
+    tag exists -- so the clone is a faithful post-tag tree regardless of whether
+    the real tree is still a release in preparation. The real tree is never
+    mutated or tagged.
+    """
+    repo = _scratch_clone(dest)
+    candidate = _candidate(repo)
+    tag = "v" + candidate
+    exists = subprocess.run(
+        ["git", "-C", str(repo), "tag", "--list", tag],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    if not exists:
+        subprocess.run(
+            ["git", "-C", str(repo), "tag", "-a", tag, "-m",
+             f"SkillWeave {candidate}"],
+            check=True, capture_output=True, text=True,
+        )
+    _drop_release_prep(repo)
     return repo
 
 
@@ -126,25 +169,33 @@ def _run_check(repo: Path, *extra: str):
 # -- the post-tag contract ---------------------------------------------------
 
 
-def test_shipped_tree_omits_release_prep_after_its_tag_exists():
-    # Precondition of this lane: the candidate's own tag exists, so the tree is
-    # a *released* tree (not a release-preparation commit). Derived, not literal.
+def test_shipped_tree_omits_release_prep_after_its_tag_exists(tmp_path):
+    # State-aware. Once the candidate's own tag exists the SHIPPED tree is the
+    # released tree: it carries no release_prep and the check passes cleanly.
+    # While the candidate is a release in preparation (its tag does not yet
+    # exist) the post-tag contract is modelled on an ephemeral post-tag clone,
+    # because the real tree legitimately still carries the flag. Derived from
+    # the repository's tags, never a literal.
     tag = _latest_release_tag(_REPO)
     candidate = _candidate(_REPO)
-    assert tag == "v" + candidate, (
-        f"this test speaks the post-tag contract; latest tag {tag} != candidate "
-        f"v{candidate}"
-    )
-    # A released tree carries no release_prep flag and no release-prep *key*;
-    # the candidate equals the released fact.
-    assert _release_prep(_REPO) is None, (
-        "release_prep must be absent once the candidate's tag exists"
-    )
-    assert not re.search(r"^release_prep\s*:", _read(_REPO, ".version.yaml"), re.M), (
-        "a top-level release_prep key must not exist in the released tree"
-    )
-    # And the composed read-only check agrees: released tree, no drift.
-    proc = _run_check(_REPO)
+    if tag == "v" + candidate:
+        tree = _REPO
+        assert _release_prep(_REPO) is None, (
+            "release_prep must be absent once the candidate's tag exists"
+        )
+        assert not re.search(
+            r"^release_prep\s*:", _read(_REPO, ".version.yaml"), re.M
+        ), "a top-level release_prep key must not exist in the released tree"
+    else:
+        # Release in preparation: the post-tag tree is modelled on a clone.
+        tree = _post_tag_clone(tmp_path)
+        assert _latest_release_tag(tree) == "v" + _candidate(tree)
+        assert _release_prep(tree) is None
+        assert not re.search(
+            r"^release_prep\s*:", _read(tree, ".version.yaml"), re.M
+        ), "the post-tag clone must carry no release_prep key"
+    # The composed read-only check agrees: released tree, no drift.
+    proc = _run_check(tree)
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     assert "check-version-truth: OK" in proc.stdout
     assert "DRIFT" not in proc.stdout
@@ -159,7 +210,7 @@ def test_reintroducing_release_prep_after_the_tag_fails_closed(tmp_path):
         "the composed check does not implement the release-prep-ahead rule"
     )
 
-    repo = _scratch_clone(tmp_path)
+    repo = _post_tag_clone(tmp_path)
     tag = _latest_release_tag(repo)
     candidate = _candidate(repo)
     assert tag == "v" + candidate, (

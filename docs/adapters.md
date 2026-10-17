@@ -1,6 +1,6 @@
 # Adapters, the extension registry, and the search/tool facade
 
-SkillWeave 1.5.10 — SW-ADAPT-001.
+SkillWeave 1.5.11 — SW-ADAPT-001.
 
 This document is a pointer, not evidence: every claim here is backed by a
 machine check under `tests/contract/` (see the *Conformance* section for the

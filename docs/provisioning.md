@@ -113,7 +113,7 @@ python -c "import sys; print(sys.prefix)"
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install /path/to/skillweave-1.5.10-py3-none-any.whl
+python -m pip install /path/to/skillweave-1.5.11-py3-none-any.whl
 ```
 
 This pulls the base dependencies (`PyYAML`, `skillweave-sdk==0.3.0`) from the
@@ -122,7 +122,7 @@ wheels instead of the network:
 
 ```bash
 python -m pip install --no-index --find-links /path/to/wheelhouse \
-    skillweave-1.5.10-py3-none-any.whl PyYAML>=6.0 skillweave-sdk==0.3.0
+    skillweave-1.5.11-py3-none-any.whl PyYAML>=6.0 skillweave-sdk==0.3.0
 ```
 
 ### Editable dev install (checkout)
@@ -172,7 +172,7 @@ pip. Each also has a module equivalent that needs no console-script wrapper.
 
 ```bash
 uv venv
-uv pip install /path/to/skillweave-1.5.10-py3-none-any.whl
+uv pip install /path/to/skillweave-1.5.11-py3-none-any.whl
 uv run skillweave --help
 ```
 
@@ -180,7 +180,7 @@ uv run skillweave --help
 environment (no global symlink into a shared Desktop install):
 
 ```bash
-pipx install /path/to/skillweave-1.5.10-py3-none-any.whl
+pipx install /path/to/skillweave-1.5.11-py3-none-any.whl
 skillweave --help
 ```
 

@@ -1,7 +1,7 @@
-# Native execution & support matrix (SkillWeave 1.5.10)
+# Native execution & support matrix (SkillWeave 1.5.11)
 
 This document is the **release-facing execution/support matrix** for the
-SkillWeave 1.5.10 train. It answers one question for an operator, a reviewer or
+SkillWeave 1.5.11 train. It answers one question for an operator, a reviewer or
 an integrating agent:
 
 > Which execution and support surfaces exist, what each one actually does, and
@@ -32,7 +32,7 @@ Three acceptance criteria drive it:
 
 There is **no single file named "release manifest"** in the tree. The *qualified
 release manifest* is the composed set of the declared, machine-checked release
-surfaces that this 1.5.10 checkout actually carries. Each row below names the
+surfaces that this 1.5.11 checkout actually carries. Each row below names the
 file that is its authority and the consumer that projects it into this page:
 
 | Release surface | Authority (source of truth) | How this page derives it |
@@ -54,8 +54,8 @@ read from exactly these authorities; none of them re-derives a second set.
 
 ### The two required version surfaces agree
 
-- candidate (product) — `pyproject.toml`: **1.5.10**
-- bundle — `capability.yaml`: **1.5.10**
+- candidate (product) — `pyproject.toml`: **1.5.11**
+- bundle — `capability.yaml`: **1.5.11**
 
 `.version.yaml` declares `release_policy: decoupled_member_pins`: the *runtime
 product* and the *distribution bundle* carry the train version, while every
@@ -82,9 +82,11 @@ page — the value is derived from the repository at read time, so it cannot go
 stale here. The full rule is in `docs/version-truth.md`, enforced by
 `scripts/check-version-truth.py`.
 
-`1.5.10` is this page's **candidate and bundle** version and a **released
-version**: its `v1.5.10` tag exists in the repository. The released identity is
-the tag's peeled commit, as derived below.
+`1.5.11` is this page's **candidate and bundle** version: the release **in
+preparation**, which is **not yet released** — its `v1.5.11` tag does not yet
+exist in the repository, and `docs/version-truth.md` records the distinction.
+The released identity is the latest canonical annotated tag's peeled commit, as
+derived below.
 
 ---
 
