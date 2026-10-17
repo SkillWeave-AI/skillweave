@@ -75,14 +75,32 @@ _INTERPRETER_BASENAMES = ("python", "python3", "uv", "uvx")
 #: npm-style launchers that fetch-and-run a *remote* package when handed a bare
 #: package spec. ``npx -y <pkg>`` installs whatever the registry resolves at run
 #: time -- the same floating-install hazard as ``git+``/``http(s)``/unpinned
-#: ``uvx`` -- so an unpinned spec must be refused.
-_NPX_BASENAMES = ("npx", "npx.cmd")
+#: ``uvx`` -- so an unpinned spec must be refused. ``pnpm dlx``, ``bunx`` /
+#: ``bun x`` and ``yarn dlx`` are the same publish-registry fetch at run time,
+#: so they are refused on identical terms: the documented policy is *refused*.
+#: The launcher is the command basename plus the subcommand that selects the
+#: fetch: ``("npx", ())`` fires on the token right after ``npx``, while
+#: ``("pnpm", ("dlx",))`` fires only when ``dlx`` follows ``pnpm`` (so a plain
+#: ``pnpm install`` is untouched). ``pnpm exec`` (and, by the same standard,
+#: ``yarn exec`` / ``yarn node`` / bare ``yarn <script>``) is deliberately NOT
+#: listed: it runs an already-resolved local binary or project script and never
+#: reaches the registry for a package spec, so an unpinned argument to it is a
+#: local name, not a fetch.
+_NPM_FETCH_LAUNCHERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("npx", ()),
+    ("npx.cmd", ()),
+    ("pnpm", ("dlx",)),
+    ("bunx", ()),
+    ("bun", ("x",)),
+    ("yarn", ("dlx",)),
+)
 
-#: Prefixes that name a *local* artifact (a path), which npx runs in place
-#: rather than fetching remotely -- an exact local provenance, never floating.
+#: Prefixes that name a *local* artifact (a path), which an npm fetcher runs in
+#: place rather than fetching remotely -- an exact local provenance, never
+#: floating.
 _NPX_LOCAL_PREFIXES = ("./", "../", "/", "~/", "\\", "file:")
 
-#: Suffixes naming an explicit local program or tarball handed to npx.
+#: Suffixes naming an explicit local program or tarball handed to a fetcher.
 _NPX_LOCAL_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".tgz", ".tar.gz")
 
 
@@ -216,20 +234,39 @@ def _effective_spec(part: str) -> str:
     return text
 
 
-def _npx_target(command: Sequence[str]) -> Optional[str]:
-    """The npm package token of an ``npx``-style command, or ``None``.
+def _npm_fetch_subcommands(basename: str) -> Optional[tuple[str, ...]]:
+    """The subcommand path that makes ``basename`` a remote fetch, or ``None``.
 
-    The first non-option token *after* the launcher is the package to run
-    (``npx -y <pkg>``). ``None`` when the command is not an npx launch at all,
-    so the caller applies no npx rule.
+    ``()`` means the bare launcher fetches (``npx``/``bunx``); ``("dlx",)`` /
+    ``("x",)`` require that subcommand. ``None`` means the basename is not a
+    fetch launcher at all (so no fetch rule applies to it).
+    """
+    for name, subcommands in _NPM_FETCH_LAUNCHERS:
+        if basename == name:
+            return subcommands
+    return None
+
+
+def _npx_target(command: Sequence[str]) -> Optional[str]:
+    """The remote package token of an npm fetch command, or ``None``.
+
+    The first non-option token *after* the launcher subcommand is the package to
+    run (``npx -y <pkg>``, ``pnpm dlx <pkg>``, ``bunx <pkg>``, ``bun x <pkg>``,
+    ``yarn dlx <pkg>``). ``None`` when the command is not an npm fetch at all,
+    so the caller applies no fetch rule.
     """
     parts = [str(p) for p in command]
     if not parts:
         return None
-    basename = parts[0].rsplit("/", 1)[-1]
-    if basename not in _NPX_BASENAMES:
+    subcommands = _npm_fetch_subcommands(parts[0].rsplit("/", 1)[-1])
+    if subcommands is None:
         return None
-    for token in parts[1:]:
+    index = 1
+    for subcommand in subcommands:
+        if index >= len(parts) or parts[index] != subcommand:
+            return None
+        index += 1
+    for token in parts[index:]:
         if token.startswith("-"):
             continue
         return token
@@ -237,13 +274,14 @@ def _npx_target(command: Sequence[str]) -> Optional[str]:
 
 
 def _npx_spec_is_floating(spec: str) -> bool:
-    """Whether an npx package token would install floating (remote) code.
+    """Whether an npm fetch package token would install floating (remote) code.
 
     A local artifact (an explicit path/program, a tarball, or a ``file:`` URL)
     is not a remote fetch, so it is never floating. An explicit ``http(s)``/
     ``git+`` URL is itself floating and is left to the marker scan. Anything
     else is a *package spec*: it is admissible only when exactly pinned
-    (``foo@1.2.3`` or ``@scope/foo@1.2.3``).
+    (``foo@1.2.3`` or ``@scope/foo@1.2.3``). The same rule governs every npm
+    fetch launcher (``npx``, ``pnpm dlx``, ``bunx``/``bun x``, ``yarn dlx``).
     """
     if spec.startswith(_NPX_LOCAL_PREFIXES):
         return False
@@ -258,10 +296,11 @@ def is_floating_command(
     """Whether a launch command would install floating code.
 
     A ``git+``/``http(s)`` marker anywhere in the *effective* spec, an unpinned
-    ``uvx`` package spec, or an unpinned ``npx`` package spec is floating. An
-    explicit ``-f``/``--from`` hint is stripped before the marker scan, and a
-    local target handed to npx (a path, tarball or ``file:`` URL) is an exact
-    local provenance rather than a remote fetch.
+    ``uvx`` package spec, or an unpinned npm fetch spec (``npx``, ``pnpm dlx``,
+    ``bunx``/``bun x``, ``yarn dlx``) is floating. An explicit ``-f``/``--from``
+    hint is stripped before the marker scan, and a local target handed to a
+    fetcher (a path, tarball or ``file:`` URL) is an exact local provenance
+    rather than a remote fetch.
     """
     for part in command:
         effective = _effective_spec(part)
