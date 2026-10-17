@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from .capability_sync import CapaciumManifestSync
+from skillweave.gates import integration_gate_result
 from skillweave.release import environment_attestation
 
 
@@ -38,6 +39,7 @@ class ReleaseGateResult:
     candidate_sha: str = ""
     base_sha: str = ""
     environment_attestation: dict = field(default_factory=dict)
+    integration_gate_result: dict = field(default_factory=dict)
 
     @property
     def passed_count(self) -> int:
@@ -550,6 +552,152 @@ class ReleaseReadinessGate:
         )
         return check, session_attestation, receipts
 
+    def check_integration_gate(
+        self,
+        *,
+        candidate_sha: str = "",
+        base_sha: str = "",
+        expected_candidate_sha: str | None = None,
+        base_root: Path | str | None = None,
+        diff_paths: Iterable[str] = (),
+        prior_surfaces: Iterable[str] = (),
+        source_suite: Any = None,
+        installed_wheel: Any = None,
+        environment_digest: str = "",
+        tasks: Iterable[str] = (),
+        review_probe: Optional[Callable[[], None]] = None,
+        artifacts_root: Path | str | None = None,
+    ) -> tuple[GateCheck, dict]:
+        """The SW-1511A-INTEGRATION-001 cumulative gate seam.
+
+        It (a) *derives* the cumulative test manifest from the frozen base, the
+        candidate diff and the prior accepted surfaces, (b) *binds* the result
+        to the exact candidate -- a complete-suite result for another SHA is
+        refused, so final-head integration cannot proceed without an attested
+        complete-suite result for this candidate, and (c) *proves* review was
+        read-only: when ``review_probe`` is supplied, the candidate tree (and
+        the evidence artifacts) are digested around it and a change is a
+        refusal.
+
+        Every observation is an injection seam (``source_suite``,
+        ``installed_wheel``, ``environment_digest``); nothing here launches a
+        suite, reaches the network, names a provider or reads a credential.
+        Red-proof and destructive checks belong in
+        :func:`skillweave.gates.integration_gate_result.disposable_worktree`,
+        never on the candidate. Returns ``(check, result_dict)``.
+        """
+        refusals: list[str] = []
+        candidate = str(candidate_sha).strip().lower()
+        base = str(base_sha).strip().lower()
+
+        for label, value in (("candidate_sha", candidate), ("base_sha", base)):
+            if not value or not re.fullmatch(r"[0-9a-f]{40}", value):
+                refusals.append(f"{label} is not a full 40-hex SHA: {value!r}")
+
+        # Source-binding: the record must name the *exact* candidate the gate
+        # is authorizing. A result for a different SHA never authorizes this one.
+        if expected_candidate_sha is not None:
+            expected = str(expected_candidate_sha).strip().lower()
+            if expected != candidate:
+                refusals.append(
+                    f"source-binding: the result names candidate {candidate or '<absent>'} "
+                    f"but final-head integration requires the exact candidate {expected}"
+                )
+
+        manifest = integration_gate_result.derive_test_manifest(
+            candidate_root=self.repo_root,
+            base_root=base_root,
+            diff_paths=diff_paths,
+            prior_surfaces=prior_surfaces,
+        )
+        if not manifest:
+            refusals.append(
+                "the cumulative manifest is empty: no test file is bound to the "
+                "base, the candidate diff and the prior accepted surfaces"
+            )
+
+        def _totals(value: Any, label: str):
+            if value is None:
+                refusals.append(f"no attested {label} result was supplied")
+                return integration_gate_result.SuiteTotals()
+            if isinstance(value, integration_gate_result.SuiteTotals):
+                return value
+            try:
+                return integration_gate_result.SuiteTotals.from_mapping(value)
+            except integration_gate_result.IntegrationGateError as exc:
+                refusals.append(f"{label}: {exc}")
+                return integration_gate_result.SuiteTotals()
+
+        source = _totals(source_suite, "source-suite")
+        wheel = _totals(installed_wheel, "installed-wheel")
+
+        env_digest = str(environment_digest).strip()
+        if not env_digest:
+            refusals.append(
+                "no environment digest: the result cannot bind to an attested "
+                "execution environment"
+            )
+
+        # Read-only review: digest the candidate (and its evidence artifacts)
+        # around the review action. Any change is a refusal, never a silent pass.
+        review_read_only = False
+        if review_probe is not None:
+            before = integration_gate_result.tree_digest(self.repo_root)
+            artifacts_before = (
+                integration_gate_result.tree_digest(artifacts_root)
+                if artifacts_root is not None
+                else None
+            )
+            review_probe()
+            after = integration_gate_result.tree_digest(self.repo_root)
+            artifacts_after = (
+                integration_gate_result.tree_digest(artifacts_root)
+                if artifacts_root is not None
+                else None
+            )
+            review_read_only = before == after and artifacts_before == artifacts_after
+            if not review_read_only:
+                refusals.append(
+                    "review mutated the candidate or its evidence artifacts "
+                    "(tree or artifact digest changed across review)"
+                )
+
+        verdict = (
+            integration_gate_result.VERDICT_REFUSED
+            if refusals
+            else integration_gate_result.VERDICT_PASS
+        )
+        result = integration_gate_result.IntegrationGateResult(
+            candidate_sha=candidate or "0" * 40,
+            base_sha=base or "0" * 40,
+            manifest=manifest,
+            source_suite=source,
+            installed_wheel=wheel,
+            environment_digest=env_digest,
+            verdict=verdict,
+            tasks=tuple(str(t) for t in tasks),
+            review_read_only=review_read_only,
+            refusals=tuple(refusals),
+        )
+
+        check = GateCheck(
+            id="integration-gate-result",
+            name="Cumulative integration gate",
+            passed=not refusals,
+            detail=(
+                (
+                    f"{len(manifest)} cumulative test file(s); source "
+                    f"{source.total} ({source.skipped} skipped), wheel "
+                    f"{wheel.total} ({wheel.skipped} skipped); env "
+                    f"{env_digest[:12]}; candidate {candidate[:12]}"
+                )
+                if not refusals
+                else "refused: " + "; ".join(refusals)
+            ),
+            required=True,
+        )
+        return check, result.to_dict()
+
     def evaluate(
         self,
         current_version: str,
@@ -563,6 +711,7 @@ class ReleaseReadinessGate:
         session_python: Path | str | None = None,
         sdk_dir: Path | str | None = None,
         receipt: Mapping[str, Any] | None = None,
+        integration: Mapping[str, Any] | None = None,
     ) -> ReleaseGateResult:
         result = ReleaseGateResult(
             timestamp=datetime.utcnow().isoformat() + "Z",
@@ -588,6 +737,17 @@ class ReleaseReadinessGate:
             )
             result.checks.append(env_check)
             result.environment_attestation = env_receipt
+
+        if integration is not None:
+            # The cumulative integration gate (SW-1511A-INTEGRATION-001) is an
+            # additive seam. ``candidate``/``base`` default to the assessed
+            # result so the gate binds to the exact candidate it is authorizing.
+            integration_kwargs = dict(integration)
+            integration_kwargs.setdefault("candidate_sha", result.candidate_sha)
+            integration_kwargs.setdefault("base_sha", result.base_sha)
+            int_check, int_result = self.check_integration_gate(**integration_kwargs)
+            result.checks.append(int_check)
+            result.integration_gate_result = int_result
 
         result.all_required_passed = len(result.required_failed) == 0
         result.can_release = result.all_required_passed
@@ -644,6 +804,7 @@ class ReleaseReadinessGate:
             ],
             "errors": result.errors,
             "environment_attestation": result.environment_attestation,
+            "integration_gate_result": result.integration_gate_result,
         }, indent=2)
 
 
@@ -655,6 +816,7 @@ def run_cli(
     environments: Optional[Iterable[str]] = None,
     session_python: Optional[Path | str] = None,
     receipt: Optional[Mapping[str, Any]] = None,
+    integration: Optional[Mapping[str, Any]] = None,
 ) -> int:
     """CLI entry for GitHub Actions: reads env vars, runs gate, writes outputs.
 
@@ -699,20 +861,27 @@ def run_cli(
         if declaration is not None and environments is None:
             attest_env["environments"] = gate._gate_environments(declaration)
 
+    # The candidate/base identity the gate binds the integration result to. In
+    # Action runs these are provided by GitHub; locally they may be absent, in
+    # which case keep them empty rather than fabricate a value.
+    candidate_sha = os.environ.get("GITHUB_SHA", os.environ.get("CANDIDATE_SHA", ""))
+    base_sha = os.environ.get("GITHUB_BASE_SHA", "") or candidate_sha
+    if integration is not None:
+        integration = dict(integration)
+        integration.setdefault("candidate_sha", candidate_sha)
+        integration.setdefault("base_sha", base_sha)
+
     result = gate.evaluate(
         current_version=version,
         latest_tag=latest_tag,
         wip_scan_paths=["src", "README.md", "CHANGELOG.md"],
+        integration=integration,
         **attest_env,
     )
     # The gate always records which commit it inspected so a rework brief can
-    # later point at the exact candidate/base pair. In Action runs these are
-    # provided by GitHub; locally they may be absent, in which case keep them
-    # empty rather than fabricate a value.
-    result.candidate_sha = os.environ.get(
-        "GITHUB_SHA", os.environ.get("CANDIDATE_SHA", "")
-    )
-    result.base_sha = os.environ.get("GITHUB_BASE_SHA", "") or result.candidate_sha
+    # later point at the exact candidate/base pair.
+    result.candidate_sha = candidate_sha
+    result.base_sha = base_sha
 
     markdown = gate.generate_markdown(result)
     with open("release-gate-report.md", "w") as f:

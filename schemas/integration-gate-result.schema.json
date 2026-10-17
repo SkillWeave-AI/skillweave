@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skillweave.dev/schemas/integration-gate-result/v1",
+  "title": "Cumulative Integration Gate Result Schema",
+  "description": "integration-gate-result/v1 (SW-1511A-INTEGRATION-001). The product schema that replaces the controller-measured interim integration-gate-result.json. One source-bound decision: a cumulative test manifest, the source-suite and installed-wheel totals with their skips, the environment digest and the candidate SHA. A complete-suite result for a different candidate SHA can never authorize final-head integration.",
+  "type": "object",
+  "required": [
+    "schema",
+    "candidate_sha",
+    "base_sha",
+    "manifest",
+    "source_suite",
+    "installed_wheel",
+    "environment_digest",
+    "verdict"
+  ],
+  "properties": {
+    "schema": {
+      "const": "integration-gate-result/v1",
+      "description": "The exact product schema identity. Anything else is refused."
+    },
+    "schema_version": {
+      "type": "string",
+      "description": "Contract version of this result."
+    },
+    "candidate_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Canonical lowercase full 40-hex SHA of the exact candidate under integration."
+    },
+    "base_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "The frozen base the candidate diff is taken against."
+    },
+    "manifest": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The cumulative test manifest: the union of base, diff-derived and prior-accepted-surface test files."
+    },
+    "manifest_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_suite": { "$ref": "#/$defs/suiteTotals" },
+    "installed_wheel": { "$ref": "#/$defs/suiteTotals" },
+    "test_totals": {
+      "type": "object",
+      "description": "Derived total counts, never hand-written.",
+      "properties": {
+        "source_suite": { "type": "integer", "minimum": 0 },
+        "installed_wheel": { "type": "integer", "minimum": 0 },
+        "combined": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "skips": {
+      "type": "object",
+      "description": "Skip counts kept explicit and separate from passes.",
+      "properties": {
+        "source_suite": { "type": "integer", "minimum": 0 },
+        "installed_wheel": { "type": "integer", "minimum": 0 },
+        "combined": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "environment_digest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The digest binding this result to the attested execution environment (the execution-environment-attestation/v1 dependency-lock digest)."
+    },
+    "tasks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The accepted task surfaces the cumulative manifest folds in."
+    },
+    "review_read_only": {
+      "type": "boolean",
+      "description": "True only when the candidate tree digest was unchanged across review: review mutated nothing."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["pass", "refused"],
+      "description": "pass authorizes final-head integration for candidate_sha; refused never does."
+    },
+    "refusals": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The named reasons a refused result is not authorized. A passing result carries none."
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "suiteTotals": {
+      "type": "object",
+      "required": ["passed", "failed", "skipped", "total"],
+      "properties": {
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    }
+  }
+}
