@@ -132,31 +132,52 @@ class TestLivenessClassificationFromSemanticProgress:
         same path ``skillweave run`` uses, because only there is the retain cap
         a real parameter; the child is a fake process (no network, no provider,
         no credential).
+
+        The child is driven by a *byte target*, not a wall-clock window: it
+        keeps writing until it has emitted the bytes this test needs, so a
+        loaded machine slows the child down but never changes how much it
+        writes.  A generous upper time bound is kept only as a safety net
+        against a hung child, never as the stopping condition -- a fixed time
+        window would make the observed byte count a function of the CPU the
+        child happened to get.
         """
-        # A self-matching event, the same signature every line, emitted for long
-        # enough to be sampled mid-flight while the retained prefix is capped so
-        # only its head survives.
+        # A self-matching event, the same signature every line, emitted until the
+        # byte target is reached while the retained prefix is capped so only its
+        # head survives.  The parent's supervision loop samples liveness
+        # repeatedly while the child streams, so the stalled classification is
+        # observed mid-flight; the safety-net deadline only fires if the child
+        # cannot make progress at all.
+        wanted = 2_000_000
         code = (
             "import json, sys, time\n"
             "line = json.dumps({'kind':'tick','step':'same'}) + '\\n'\n"
-            "end = time.time() + 1.2\n"
-            "while time.time() < end:\n"
+            f"target = {wanted}\n"
+            "deadline = time.time() + 60.0\n"
+            "written = 0\n"
+            "while written < target and time.time() < deadline:\n"
             "    sys.stdout.write(line)\n"
             "    sys.stdout.flush()\n"
+            "    written += len(line)\n"
         )
         result = _run_streaming(tmp_path, code, stdout_retain_limit=1024)
-        # The cap really bit: far more bytes observed than retained.
-        assert result.stdout_observed_bytes > 1_000_000
+        # The cap really bit: far more bytes observed than retained, and the
+        # child reached its byte target rather than running out of time.
+        assert result.stdout_observed_bytes >= wanted
+        assert len(result.stdout_text) <= 1024
         assert len(result.stdout_text) < result.stdout_observed_bytes
         report = result.metadata["liveness"]
+        series = report["series"]
         states = {
             record["state"]
-            for series in report["series"].values()
-            for record in series
+            for records in series.values()
+            for record in records
         }
         # The stalled classification must appear: a self-matching event is not
         # advancing progress, no matter how many bytes the capped stream grew.
         assert "stalled" in states
+        # ... and it is never misread as working: emission without advancing
+        # progress is exactly the capped-stream blindness the criterion names.
+        assert "working" not in states
         # And the terminal observation is the recorded completed outcome, not a
         # byte-derived guess.
         assert report["state"] == "completed"
