@@ -61,9 +61,29 @@ FLOATING_MARKERS: tuple[str, ...] = ("git+", "http://", "https://")
 _PIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[^\]]+\])?==[^=\s]+$")
 _AT_PIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[^\]]+\])?@[^@\s]+$")
 
+#: A *scoped* npm spec pinned by ``@version``: ``@scope/name@version``. The
+#: unscoped ``_AT_PIN_RE`` above cannot match it (the spec starts with ``@``),
+#: so an npm/npx package token needs its own exact-pin test.
+_SCOPED_AT_PIN_RE = re.compile(
+    r"^@[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*@[^@\s]+$"
+)
+
 #: Interpreters that may front a ``-m module`` launch; only these are treated
 #: as the launcher when a module is named.
 _INTERPRETER_BASENAMES = ("python", "python3", "uv", "uvx")
+
+#: npm-style launchers that fetch-and-run a *remote* package when handed a bare
+#: package spec. ``npx -y <pkg>`` installs whatever the registry resolves at run
+#: time -- the same floating-install hazard as ``git+``/``http(s)``/unpinned
+#: ``uvx`` -- so an unpinned spec must be refused.
+_NPX_BASENAMES = ("npx", "npx.cmd")
+
+#: Prefixes that name a *local* artifact (a path), which npx runs in place
+#: rather than fetching remotely -- an exact local provenance, never floating.
+_NPX_LOCAL_PREFIXES = ("./", "../", "/", "~/", "\\", "file:")
+
+#: Suffixes naming an explicit local program or tarball handed to npx.
+_NPX_LOCAL_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".tgz", ".tar.gz")
 
 
 class LauncherResolutionError(ValueError):
@@ -196,14 +216,52 @@ def _effective_spec(part: str) -> str:
     return text
 
 
+def _npx_target(command: Sequence[str]) -> Optional[str]:
+    """The npm package token of an ``npx``-style command, or ``None``.
+
+    The first non-option token *after* the launcher is the package to run
+    (``npx -y <pkg>``). ``None`` when the command is not an npx launch at all,
+    so the caller applies no npx rule.
+    """
+    parts = [str(p) for p in command]
+    if not parts:
+        return None
+    basename = parts[0].rsplit("/", 1)[-1]
+    if basename not in _NPX_BASENAMES:
+        return None
+    for token in parts[1:]:
+        if token.startswith("-"):
+            continue
+        return token
+    return None
+
+
+def _npx_spec_is_floating(spec: str) -> bool:
+    """Whether an npx package token would install floating (remote) code.
+
+    A local artifact (an explicit path/program, a tarball, or a ``file:`` URL)
+    is not a remote fetch, so it is never floating. An explicit ``http(s)``/
+    ``git+`` URL is itself floating and is left to the marker scan. Anything
+    else is a *package spec*: it is admissible only when exactly pinned
+    (``foo@1.2.3`` or ``@scope/foo@1.2.3``).
+    """
+    if spec.startswith(_NPX_LOCAL_PREFIXES):
+        return False
+    if spec.endswith(_NPX_LOCAL_SUFFIXES):
+        return False
+    return not (_is_pinned(spec) or bool(_SCOPED_AT_PIN_RE.match(spec)))
+
+
 def is_floating_command(
     command: Sequence[str], *, uvx_spec: Optional[str] = None
 ) -> bool:
     """Whether a launch command would install floating code.
 
-    A ``git+``/``http(s)`` marker anywhere in the *effective* spec, or an
-    unpinned ``uvx`` package spec, is floating. An explicit ``-f``/``--from``
-    hint is stripped before the marker scan.
+    A ``git+``/``http(s)`` marker anywhere in the *effective* spec, an unpinned
+    ``uvx`` package spec, or an unpinned ``npx`` package spec is floating. An
+    explicit ``-f``/``--from`` hint is stripped before the marker scan, and a
+    local target handed to npx (a path, tarball or ``file:`` URL) is an exact
+    local provenance rather than a remote fetch.
     """
     for part in command:
         effective = _effective_spec(part)
@@ -214,6 +272,9 @@ def is_floating_command(
         spec = _effective_spec(uvx_spec)
         if not _is_pinned(spec):
             return True
+    npx_target = _npx_target(command)
+    if npx_target is not None and _npx_spec_is_floating(npx_target):
+        return True
     return False
 
 

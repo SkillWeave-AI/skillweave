@@ -31,6 +31,7 @@ import importlib
 import os
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -729,6 +730,7 @@ def _default_inline_seam(
     from skillweave.fanout.dispatch import (
         FanOutChild,
         FanOutResult,
+        _launch_failed_result,
         _make_receipt_reference,
         _resolve_outcome,
         _store_child_bytes,
@@ -759,24 +761,51 @@ def _default_inline_seam(
             handle=handle,
         )
 
-    handle = runner_adapter.start_process(
-        list(command),
-        run_id=child_run_id,
-        subject_repo=subject_repo,
-        subject_commit=subject_commit,
-        tool=tool,
-        model=resolved_model,
-        cwd=cwd,
-        env=extra_env,
-        env_allowlist=allowlist,
-    )
-    if mcp_grant is not None:
-        handle = _mcp_bootstrap.verify_child_launch(mcp_grant, handle)
-    _notify("started", handle)
+    # A launch refusal (a command that exists but is not executable, a missing
+    # interpreter, any OS-level spawn failure) must be a *typed* outcome on this
+    # seam exactly as it already is on the fan-out path -- never an uncaught
+    # exception that aborts the whole wave with no durable record. The window is
+    # deliberately wide (start + MCP verification): a child that spawns but whose
+    # launch cannot be verified is likewise a launch failure, not a crash.
+    start_error: Optional[BaseException] = None
     try:
-        result = handle.wait(timeout=timeout)
-    finally:
-        _notify("terminal", handle)
+        handle = runner_adapter.start_process(
+            list(command),
+            run_id=child_run_id,
+            subject_repo=subject_repo,
+            subject_commit=subject_commit,
+            tool=tool,
+            model=resolved_model,
+            cwd=cwd,
+            env=extra_env,
+            env_allowlist=allowlist,
+        )
+        if mcp_grant is not None:
+            handle = _mcp_bootstrap.verify_child_launch(mcp_grant, handle)
+    except Exception as exc:  # noqa: BLE001
+        start_error = exc
+        result = _launch_failed_result(
+            list(command),
+            run_id=child_run_id,
+            repo=subject_repo,
+            commit=subject_commit,
+            tool=tool,
+            model=resolved_model,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            message=f"{type(exc).__name__}: {exc}",
+        )
+    if start_error is not None:
+        # Mirror the fan-out path's lifecycle shape for a never-started child:
+        # a ``started`` observation with no handle, then a ``terminal`` one, so
+        # the typed lifecycle is complete rather than truncated at the start.
+        _notify("started", None)
+        _notify("terminal", None)
+    else:
+        _notify("started", handle)
+        try:
+            result = handle.wait(timeout=timeout)
+        finally:
+            _notify("terminal", handle)
     outcome = _resolve_outcome(result)
     child = FanOutChild(
         child_run_id=child_run_id,
