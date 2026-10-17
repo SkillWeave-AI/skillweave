@@ -1264,6 +1264,7 @@ def handoff_adapter(
     run_id: str = "",
     db_path: str = ".skillweave/store.db",
     session_token: str = "",
+    handoff_offer: str = "",
 ) -> str:
     """Select and return the qualified transport adapter for *client_id*.
 
@@ -1306,6 +1307,20 @@ def handoff_adapter(
     :func:`restart_session` does), so a store outside the authenticated
     principal's bound roots is refused by the authority roots guard *before* the
     tool opens it -- never read and then trusted.
+
+    SW-1511A-HANDOFF-001 criterion 1: when the caller presents a
+    ``handoff_offer`` (a JSON ``controller-handoff/v2`` offer carrying the
+    destination's ``harness-controller-attestation/v1``), the server *admits*
+    the offer through the real
+    :mod:`~skillweave.runtime.controller_handoff` state machine and records the
+    resulting typed handoff durably on the run.  Admission is fail-closed on the
+    four attested axes (attestation present, fresh, configured-route match,
+    recipient-principal match) and on the two exactly-once axes (no second live
+    handoff for the scope, no controller transfer while a provider-quota wait is
+    recorded); every refusal is a named ``status: "hold"`` carrying the hold
+    ``code``, never a silent success and never a downgraded transfer.  A handoff
+    carrying a provider credential is refused by shape, so the lease transfer
+    never carries a credential.
     """
     gate_principal, refusal = gate_operation(
         "read_run", session_token, run_id=run_id, db_path=db_path,
@@ -1322,6 +1337,20 @@ def handoff_adapter(
         )
     except _authority_module().MCPAuthError as exc:
         return _auth_error_payload(exc)
+
+    # SW-1511A-HANDOFF-001: admit a presented controller-handoff offer *before*
+    # transport selection -- an offer that cannot carry the lease is a named
+    # HOLD, and a caller never gets a "ok" selection that hides a refused
+    # transfer.  Absent an offer this is a no-op, so the pre-existing transport
+    # selection is unchanged.
+    admitted: dict | None = None
+    if handoff_offer:
+        try:
+            admitted = _admit_controller_handoff_offer(
+                handoff_offer, db_path=db_path, run_id=run_id,
+            )
+        except _controller_handoff_module().ControllerHandoffRefused as exc:
+            return json.dumps({"status": "hold", **exc.to_dict()})
 
     requested = [r.strip() for r in recipients.split(",") if r.strip()]
     if not requested:
@@ -1362,6 +1391,10 @@ def handoff_adapter(
         "adapter": adapter.to_dict(),
         "authority_contract": contract.to_dict(),
     }
+    if admitted is not None:
+        # The typed handoff this offer admitted (state ``offered``): the actual
+        # durable ``controller-handoff/v2`` record a destination reads.
+        payload["controller_handoff"] = admitted
     if run_id:
         # The recovered controller's continuation decision, driven by the
         # *attested* capability (never assumed) and the *durably recorded* prior
@@ -1384,6 +1417,120 @@ def handoff_adapter(
         )
         payload["continuation_persisted"] = persisted
     return json.dumps(payload)
+
+
+def _controller_handoff_module():
+    """The controller-handoff authority module (import seam, never global)."""
+    from skillweave.runtime import controller_handoff as module
+
+    return module
+
+
+def _admit_controller_handoff_offer(
+    handoff_offer: str, *, db_path: str, run_id: str
+) -> dict:
+    """Admit a presented ``controller-handoff/v2`` offer through the real machine.
+
+    This is the production caller of
+    :mod:`skillweave.runtime.controller_handoff` for criterion 1: the server
+    parses the caller's offer, admits it (four attested axes + the exactly-once
+    axes) and records the typed handoff durably on the run.  Every refusal
+    propagates as a :class:`~skillweave.runtime.controller_handoff.
+    ControllerHandoffRefused` carrying its named hold -- this function never
+    silently downgrades an offer into a success.
+
+    The offer's ``fencing_generation`` is **re-read from the durable controller
+    lease** through the run store (never taken from the caller's blob): a caller
+    cannot *assert* the generation its offer carries, it must be the generation
+    the lease actually holds.
+    """
+    module = _controller_handoff_module()
+    try:
+        offer = json.loads(handoff_offer) if isinstance(handoff_offer, str) else handoff_offer
+    except (TypeError, ValueError) as exc:
+        raise module.ControllerHandoffRefused(
+            module.HANDOFF_HOLD_ATTESTATION_ABSENT,
+            f"the presented handoff offer is not readable JSON: {exc}",
+        ) from exc
+    if not isinstance(offer, dict):
+        raise module.ControllerHandoffRefused(
+            module.HANDOFF_HOLD_ATTESTATION_ABSENT,
+            "the presented handoff offer is not a controller-handoff/v2 object",
+        )
+
+    attestation_raw = offer.get("destination_attestation")
+    attestation = None
+    if isinstance(attestation_raw, dict):
+        route = attestation_raw.get("configured_route") or {}
+        caps = attestation_raw.get("capabilities") or {}
+        attestation = module.HandoffAttestation(
+            client_id=str(attestation_raw.get("client_id") or ""),
+            gateway_host=str(route.get("gateway_host") or ""),
+            gateway_port=int(route.get("gateway_port") or 0),
+            recipient_principal=str(attestation_raw.get("recipient_principal") or ""),
+            notifications=bool(caps.get("notifications")),
+            session_resume=bool(caps.get("session_resume")),
+            can_accept_controller_handoff=bool(
+                caps.get("can_accept_controller_handoff", True)
+            ),
+            adapter_kind=str(attestation_raw.get("adapter_kind") or ""),
+            route=str(route.get("route") or ""),
+            alias=str(route.get("alias") or ""),
+            credential_binding=str(route.get("credential_binding") or ""),
+            observed_at=str(attestation_raw.get("observed_at") or ""),
+            max_age_seconds=int(attestation_raw.get("max_age_seconds") or 0),
+        )
+
+    record = module.offer_handoff(
+        from_holder=str(offer.get("from_holder") or ""),
+        destination_principal=str(offer.get("destination_principal") or ""),
+        scope=str(offer.get("scope") or run_id or ""),
+        destination_attestation=attestation,
+        # The observed route is the route the *server* observed: absent a
+        # server-observed route the offer is admitted on its attested route
+        # alone (the route-match axis is only enforced when the server has an
+        # observation to compare against, never by inventing one).
+        observed_route=None,
+        credential_binding=str(offer.get("credential_binding") or ""),
+        handoff_id=str(offer.get("handoff_id") or ""),
+    )
+
+    store = _get_store(db_path)
+    if run_id:
+        # Re-read the offering controller's generation from the *durable* lease:
+        # a caller-supplied generation is never trusted.
+        try:
+            generation = int(store.current_fencing_token())
+        except Exception:  # pragma: no cover - a store without the lease table
+            generation = int(offer.get("fencing_generation") or 1)
+        if generation >= 1:
+            record = module.bind_offered_generation(record, generation)
+
+        # Exactly-once: a second live handoff for the scope is refused, and a
+        # controller transfer during a recorded provider-quota wait is refused.
+        held = module.live_handoff_scope_hold(
+            store, record.scope, exclude_run_id=run_id
+        )
+        if held is not None:
+            raise module.ControllerHandoffRefused(
+                module.HANDOFF_HOLD_LIVE_HANDOFF,
+                f"the scope {record.scope!r} is already carried live by run "
+                f"{held!r}; a second live handoff would be a second continuator",
+                scope=record.scope,
+                held_run_id=held,
+            )
+        wait = module.quota_wait_hold(store, run_id)
+        if wait is not None:
+            raise module.ControllerHandoffRefused(
+                module.HANDOFF_HOLD_QUOTA_WAIT,
+                f"run {run_id!r} has a recorded provider-quota wait ({wait!r}): "
+                f"it is a live continuation of the same owned attempt, so a "
+                f"controller transfer now would be a second continuation",
+                run_id=run_id,
+                wait_decision=wait,
+            )
+        record = module.record_handoff(store, record, run_id=run_id)
+    return record.to_dict()
 
 
 def _recorded_session_for_run(db_path: str, run_id: str) -> tuple[str, str]:

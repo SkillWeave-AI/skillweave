@@ -1449,6 +1449,15 @@ class DriveResult:
     #: tool persisted, verbatim as the reader returned it.  ``None`` on a fresh
     #: drive -- the controller never derives or invents the decision.
     continuation: Optional[dict[str, Any]] = None
+    #: SW-1511A-HANDOFF-001 criterion 3: the typed ``controller-handoff/v2``
+    #: reference this drive continues under -- ``{"handoff_id", "from_holder",
+    #: "destination_principal", "scope", "fencing_generation", "resulting_
+    #: generation", "state"}`` -- read from the run's *durable* handoff record
+    #: (never a caller field).  It carries the handoff ID and the fencing
+    #: generation so an Ops→Review→Integration receipt chain can be tied back to
+    #: the exact lease transfer that produced it.  ``None`` when the run carries
+    #: no recorded handoff (a fresh, non-handoff drive).
+    handoff_ref: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1464,6 +1473,7 @@ class DriveResult:
             "reviews": list(self.reviews),
             "adoption": self.adoption,
             "continuation": self.continuation,
+            "handoff_ref": self.handoff_ref,
         }
 
 
@@ -2348,6 +2358,39 @@ def _persist_transition_checkpoint(svc: Any, *, step: str, intent_id: str) -> No
         )
 
 
+def _read_controller_handoff_ref(store: Any, run_id: str) -> Optional[dict]:
+    """The durable ``controller-handoff/v2`` reference for *run_id*, or ``None``.
+
+    SW-1511A-HANDOFF-001 criterion 3: the drive's receipts reference handoff ID
+    and fencing generation.  The reference is read from the run's own durable
+    handoff record through :func:`skillweave.runtime.controller_handoff.
+    read_handoff` -- the *same* record the real handoff admission entry point
+    (``mcp.server.handoff_adapter``) wrote -- never from a caller field and
+    never invented.  A run with no recorded handoff yields ``None`` (a fresh,
+    non-handoff drive), which is not an error.
+    """
+    try:
+        from skillweave.runtime import controller_handoff as _ch
+    except Exception:  # pragma: no cover - the module ships with this release
+        return None
+    record = _ch.read_handoff(store, run_id)
+    if record is None:
+        return None
+    return {
+        "handoff_id": record.handoff_id,
+        "from_holder": record.from_holder,
+        "destination_principal": record.destination_principal,
+        "scope": record.scope,
+        "fencing_generation": int(record.fencing_generation),
+        "resulting_generation": (
+            int(record.resulting_generation)
+            if record.resulting_generation is not None
+            else None
+        ),
+        "state": record.state,
+    }
+
+
 def _require_recorded_verdict(store: Any, run_id: str, *, expected: str) -> str:
     """Read the *durable* review verdict the MCP review tool recorded.
 
@@ -3227,6 +3270,10 @@ def _run_state_driven(
     reviews.append(recorded)
 
     accepted = decision.verdict == gr.GATE_PASS and decision.accepted
+    # SW-1511A-HANDOFF-001 criterion 3: read the durable handoff reference once,
+    # so every receipt this drive emits (review, integration) can be tied back
+    # to the exact handoff ID and fencing generation the lease transfer carries.
+    handoff_ref = _read_controller_handoff_ref(store, run_id)
 
     if recorded == REVIEW_FAIL and not accepted:
         # Step 3 -- repair: a failing review leads to a repair round.  The
@@ -3265,6 +3312,7 @@ def _run_state_driven(
                 released_dependents=(),
                 integration="none",
                 reviews=tuple(reviews),
+                handoff_ref=handoff_ref,
             )
 
     if not accepted:
@@ -3281,6 +3329,7 @@ def _run_state_driven(
             released_dependents=(),
             integration="none",
             reviews=tuple(reviews),
+            handoff_ref=handoff_ref,
         )
 
     # Acceptance through the frozen gate-receipt path: the artifact is the
@@ -3344,6 +3393,7 @@ def _run_state_driven(
         released_dependents=tuple(released),
         integration=integration,
         reviews=tuple(reviews),
+        handoff_ref=handoff_ref,
     )
 
 
