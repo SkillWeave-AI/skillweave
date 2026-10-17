@@ -151,9 +151,25 @@ HANDOFF_HOLD_EVIDENCE_UNVERIFIED = "HANDOFF_EVIDENCE_UNVERIFIED"
 #: but its form is not one the MCP authority can mint.  The claim is refused --
 #: no server-issued identity is invented to satisfy it.
 HANDOFF_HOLD_PRINCIPAL_NOT_SERVER_ISSUED = "PRINCIPAL_NOT_SERVER_ISSUED"
+#: A route claim's observed gateway request count went *backwards*: the offer
+#: reports fewer requests for a run/route than the server's last recorded
+#: observation for that same run and route.  A gateway counter is monotonic
+#: across observations of one run, so a lower one is a named HOLD -- never
+#: silently admitted as a newer, smaller observation.
+HANDOFF_HOLD_COUNTER_REGRESSION = "HANDOFF_GATEWAY_COUNTER_REGRESSION"
 
 #: Where the live handoff for a run is recorded in that run's durable metadata.
 HANDOFF_METADATA_KEY = "controller_handoff"
+
+#: Where the *last observed* gateway request count per run/route is recorded in
+#: the run's durable metadata.  This is the cross-observation memory criterion 3
+#: needs to refuse a counter that goes backwards: the arbiter is the store, not
+#: a process's memory, so the observation survives a restart.
+HANDOFF_COUNTER_METADATA_KEY = "controller_handoff_gateway_counter"
+#: The schema tag of the durable counter observation blob.  A blob under
+#: :data:`HANDOFF_COUNTER_METADATA_KEY` that does not carry it is *unreadable*
+#: and is refused by name rather than read as "no prior observation".
+HANDOFF_COUNTER_SCHEMA = "handoff-gateway-counter/v1"
 
 #: The durable run-metadata key a provider-quota wait is recorded under.  This
 #: is *imported* from the native CMS flow qualification -- the module that
@@ -558,6 +574,100 @@ def read_handoff(store: Any, run_id: str) -> Optional[ControllerHandoffRecord]:
     if not isinstance(raw, dict):
         return None
     return ControllerHandoffRecord.from_dict(raw)
+
+
+class GatewayCounterObservationError(Exception):
+    """The durable counter observation could not be *read* (fail closed).
+
+    A stored value that is present but unreadable is neither "no prior
+    observation" nor "some prior observation": it is an observation the server
+    cannot trust, so the boundary refuses by name rather than falling open onto
+    the stored bytes.
+    """
+
+
+def read_gateway_counter_observation(
+    store: Any, run_id: str, route: str
+) -> Optional[int]:
+    """The last *durably recorded* observed count for ``(run_id, route)``.
+
+    ``None`` means the server holds **no** prior observation for this run and
+    route, so a first observation is admitted exactly as before.  A stored value
+    that is unreadable -- not a tagged mapping, or whose count is not a positive
+    integer -- raises :class:`GatewayCounterObservationError`: unreadable is
+    never silently "no prior observation" (that would fail *open*), and it is
+    never silently "some prior observation" (that would refuse an honest first
+    offer).  The reader returns only the integer stored under this run's own
+    route key, so no other run's or route's value can leak into this series.
+    """
+    if store is None or not run_id or not route:
+        return None
+    record = store.get_run(run_id)
+    if record is None:
+        return None
+    raw = (getattr(record, "metadata", None) or {}).get(HANDOFF_COUNTER_METADATA_KEY)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or raw.get("schema") != HANDOFF_COUNTER_SCHEMA:
+        raise GatewayCounterObservationError(
+            f"the durable gateway-counter observation for {run_id!r} is not a "
+            f"{HANDOFF_COUNTER_SCHEMA!r} record; an unreadable prior observation "
+            f"is refused rather than read as absent"
+        )
+    routes = raw.get("routes")
+    if not isinstance(routes, dict):
+        raise GatewayCounterObservationError(
+            f"the durable gateway-counter observation for {run_id!r} carries no "
+            f"routes mapping; it is unreadable and the claim is refused"
+        )
+    if route not in routes:
+        # A *different* route has no stored value: its counters are an
+        # independent series and never interfere with this one.
+        return None
+    value = routes[route]
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise GatewayCounterObservationError(
+            f"the durable gateway-counter observation for route {route!r} on "
+            f"{run_id!r} is not a positive integer; it is unreadable and the "
+            f"claim is refused"
+        )
+    return value
+
+
+def record_gateway_counter_observation(
+    store: Any, run_id: str, route: str, count: int
+) -> None:
+    """Durably record *count* as the last observation for ``(run_id, route)``.
+
+    Only the integer is stored (plus its route key and the schema tag): the
+    observed count is not a secret, and nothing else from the caller's evidence
+    blob is written here, so the durable observation can never carry a
+    credential.  The write is keyed by run and route, so one run/route's series
+    never overwrites another's.
+    """
+    if store is None or not run_id or not route:
+        return
+    record = store.get_run(run_id)
+    existing = (getattr(record, "metadata", None) or {}).get(
+        HANDOFF_COUNTER_METADATA_KEY
+    )
+    routes: dict[str, int] = {}
+    if isinstance(existing, dict) and existing.get("schema") == HANDOFF_COUNTER_SCHEMA:
+        carried = existing.get("routes")
+        if isinstance(carried, dict):
+            for key, value in carried.items():
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    routes[str(key)] = value
+    routes[route] = int(count)
+    store.update_metadata(
+        run_id,
+        **{
+            HANDOFF_COUNTER_METADATA_KEY: {
+                "schema": HANDOFF_COUNTER_SCHEMA,
+                "routes": routes,
+            }
+        },
+    )
 
 
 def live_handoff_scope_hold(

@@ -1453,7 +1453,12 @@ def _handoff_gateway_count(raw: Any) -> Optional[int]:
 
 
 def _verify_handoff_evidence(
-    module: Any, evidence: dict, *, observed_route: Optional[str]
+    module: Any,
+    evidence: dict,
+    *,
+    observed_route: Optional[str],
+    store: Any = None,
+    run_id: str = "",
 ) -> dict:
     """Verify a harness's route claim before it is admitted (F-1511A-01).
 
@@ -1484,6 +1489,20 @@ def _verify_handoff_evidence(
     Claude Desktop / OpenCode proof this criterion also asks for remains
     labelled NOT PERFORMED: this boundary never asserts a live qualification it
     did not perform.
+
+    **Monotonicity across observations** (the SW-1511A-HANDOFF-001 accepted
+    limitation, resolved here): the observed count for a run/route is a counter,
+    so a later observation of the *same* run and route can never be lower than
+    the last one.  When a durable prior observation is readable and the present
+    count is lower, the claim is refused as a named
+    :data:`~skillweave.runtime.controller_handoff.HANDOFF_HOLD_COUNTER_REGRESSION`
+    HOLD.  The prior observation is read from, and the admitted count written
+    back to, the *durable* run metadata (so it survives a restart); a run/route
+    the server has no prior observation for is a first observation and is
+    admitted exactly as before.  An **unreadable** stored value fails closed:
+    the boundary refuses rather than reading it as absent (fail-open) or
+    trusting it.  A different run or route has its own series and never
+    interferes.
     """
     claimed_route = str(evidence.get("gateway_route") or "")
     if not claimed_route:
@@ -1522,8 +1541,39 @@ def _verify_handoff_evidence(
             evidence_route=claimed_route,
             observed_route=observed_route,
         )
+    # Monotonicity across observations: a gateway request count advances; a
+    # lower one for the same run and route is a contradiction, not a new
+    # observation.  The prior value is the server's own durable record for this
+    # run/route (never the caller's), captured before this observation is
+    # admitted, and an unreadable prior value fails closed by name.
+    prior: Optional[int] = None
+    if store is not None and run_id:
+        try:
+            prior = module.read_gateway_counter_observation(store, run_id, claimed_route)
+        except module.GatewayCounterObservationError as exc:
+            raise module.ControllerHandoffRefused(
+                module.HANDOFF_HOLD_COUNTER_REGRESSION,
+                f"the durable prior observation for route {claimed_route!r} on "
+                f"run {run_id!r} is unreadable ({exc}); the count is refused "
+                f"rather than read as absent",
+                route_claim=claimed_route,
+                run_id=run_id,
+            ) from exc
+        if prior is not None and count < prior:
+            raise module.ControllerHandoffRefused(
+                module.HANDOFF_HOLD_COUNTER_REGRESSION,
+                f"the attestation reports {count} observed gateway requests for "
+                f"route {claimed_route!r}, lower than the {prior} the server last "
+                f"observed for that run and route; a gateway counter advances "
+                f"across observations, so a lower one is a named HOLD",
+                observed_gateway_request_count=count,
+                prior_gateway_request_count=prior,
+                route_claim=claimed_route,
+            )
+        module.record_gateway_counter_observation(store, run_id, claimed_route, count)
     return {
         "gateway_request_count_observed": count,
+        "prior_gateway_request_count": prior,
         "route_claim": claimed_route,
         "cross_checked_with_server_record": observed_route is not None,
         # The live proof this criterion also asks for is NOT performed here: no
@@ -1716,7 +1766,11 @@ def _admit_controller_handoff_offer(
     observed_endpoint, observed_route = _handoff_observations(store, run_id)
     if attestation is not None:
         verification = _verify_handoff_evidence(
-            module, attestation.evidence, observed_route=observed_route
+            module,
+            attestation.evidence,
+            observed_route=observed_route,
+            store=store,
+            run_id=run_id,
         )
         attestation = _replace_attestation(
             attestation,
