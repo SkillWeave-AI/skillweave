@@ -70,6 +70,7 @@ contracts:
   - schemas/evidence.schema.json
   - schemas/gate-1312-manifest.schema.json
   - schemas/harness-capability.schema.json
+  - schemas/integration-gate-result.schema.json
   - schemas/prompt-sequence.schema.json
   - schemas/run-state.schema.json
   - schemas/transfer-entry.schema.json

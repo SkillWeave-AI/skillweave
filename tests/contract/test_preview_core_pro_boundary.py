@@ -75,6 +75,7 @@ CORE_OWNED_SCHEMA_FILENAMES = (
     "dual-review-attestation.schema.json",
     "gate-1312-manifest.schema.json",
     "harness-capability.schema.json",
+    "integration-gate-result.schema.json",
     "launch-receipt.schema.json",
     "prompt-sequence.schema.json",
     "run-state.schema.json",
