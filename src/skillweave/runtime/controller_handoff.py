@@ -38,6 +38,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
+from skillweave.redaction import contains_secret, scrub_secrets
+
 __all__ = [
     "CONTROLLER_HANDOFF_SCHEMA_ID",
     "CONTROLLER_HANDOFF_SCHEMA_VERSION",
@@ -61,6 +63,8 @@ __all__ = [
     "HANDOFF_HOLD_NOT_OFFERED",
     "HANDOFF_HOLD_ORIGINAL_CONTROLLER",
     "HANDOFF_HOLD_RELEASE_UNSUPPORTED",
+    "HANDOFF_HOLD_EVIDENCE_UNVERIFIED",
+    "HANDOFF_HOLD_PRINCIPAL_NOT_SERVER_ISSUED",
     "HANDOFF_METADATA_KEY",
     "WAIT_METADATA_KEY",
     "ControllerHandoffRefused",
@@ -138,6 +142,15 @@ HANDOFF_HOLD_STALE_GENERATION = "STALE_FENCING_GENERATION"
 HANDOFF_HOLD_ORIGINAL_CONTROLLER = "ORIGINAL_CONTROLLER_RECOVERY_REFUSED"
 #: The record is terminal, so it can never be released again.
 HANDOFF_HOLD_RELEASE_UNSUPPORTED = "HANDOFF_TERMINAL"
+#: The attestation claims a configured route with gateway counters the server
+#: could not verify (an absent or zero observed request count, an upstream the
+#: evidence itself records as failed, or a route that contradicts the route the
+#: server observed).  A route claim the server cannot verify is a named HOLD.
+HANDOFF_HOLD_EVIDENCE_UNVERIFIED = "HANDOFF_EVIDENCE_UNVERIFIED"
+#: The destination principal claims to be server-issued (an ``mcp:`` principal)
+#: but its form is not one the MCP authority can mint.  The claim is refused --
+#: no server-issued identity is invented to satisfy it.
+HANDOFF_HOLD_PRINCIPAL_NOT_SERVER_ISSUED = "PRINCIPAL_NOT_SERVER_ISSUED"
 
 #: Where the live handoff for a run is recorded in that run's durable metadata.
 HANDOFF_METADATA_KEY = "controller_handoff"
@@ -154,6 +167,13 @@ from .cms_flow_qualification import WAIT_METADATA_KEY as WAIT_METADATA_KEY
 #: A credential binding that *looks like* a secret is refused.  This is a shape
 #: check: it never needs to read a secret, only to recognise one, so a credential
 #: value can neither be carried by the lease transfer nor echoed into an error.
+#:
+#: SW-1511A-HANDOFF-001 finding F-1511A-03 (review-001): the anchored shapes
+#: below are retained, but the ``^``-anchor alone missed an ``env``-file line
+#: (``PROVIDER_API_KEY=abc123``) -- the identifier characters *before* the
+#: keyword suppressed the match.  Refusal therefore also consults the **shared**
+#: secret rule set in :mod:`skillweave.redaction` (imported, never restated), so
+#: a secret is masked by exactly one rule and this copy cannot drift from it.
 _SECRET_SHAPES: Tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*bearer\s+\S+", re.IGNORECASE),
     re.compile(r"^sk-[A-Za-z0-9_-]{8,}$"),
@@ -180,10 +200,19 @@ class ControllerHandoffRefused(Exception):
 
 
 def looks_like_secret(value: Any) -> bool:
-    """True when ``value`` has the shape of a credential (bindings must not)."""
+    """True when ``value`` has the shape of a credential (bindings must not).
+
+    Two questions, one answer: the anchored ``_SECRET_SHAPES`` (this module's
+    own, historical shapes) *or* the shared :mod:`skillweave.redaction` rule
+    set.  The shared rule is the single source of truth (finding F-1511A-03),
+    so an ``env``-file line the child could print -- ``PROVIDER_API_KEY=abc123``
+    -- is refused here too, rather than only in the trace/stream seam.
+    """
     if not isinstance(value, str):
         return False
-    return any(pattern.match(value) for pattern in _SECRET_SHAPES)
+    if any(pattern.match(value) for pattern in _SECRET_SHAPES):
+        return True
+    return contains_secret(value)
 
 
 # ── the destination attestation (criterion 3 admission) ─────────────────────

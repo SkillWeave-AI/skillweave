@@ -32,11 +32,25 @@ SECRET_MASK = "[REDACTED_SECRET]"
 
 #: The secret denominations scrubbed from a captured message. Case-insensitive:
 #: a secret denomination is a secret regardless of the case the child used.
+#:
+#: SW-1511A-HANDOFF-001 finding F-1511A-03: an ``env``-file line such as
+#: ``PROVIDER_API_KEY=abc123`` is a credential the child can print, and a bare
+#: ``sk-...`` prefix is a provider key with no ``bearer``/``key=`` keyword at
+#: all. The keyword alternative therefore admits an **identifier-character
+#: prefix/suffix** (``PROVIDER_API_KEY``, ``MY_TOKEN``, ``AUTH_TOKEN``) -- the
+#: word-boundary form the rule carried before let the ``_`` before the keyword
+#: suppress the match, so the env-file line was never masked. A ``sk-``
+#: alternative covers the provider-style key a harness can echo verbatim.
+#: Deliberately *not* a general ``[:=]\S+`` rule: that would mask every
+#: ``scheme://host`` reference (``gateway://127.0.0.1:8090``), which is a
+#: non-secret binding, not a credential.
 SECRET_RE = re.compile(
     r"(?i)"
     r"(?:bearer\s+[A-Za-z0-9._\-]{8,})"
-    r"|(?:\b(?:api[_-]?key|secret|token|password|passwd|pwd|credential|auth)"
-    r"\s*[:=]\s*\S+)"
+    r"|(?<![\w.\-])[A-Za-z0-9_\-]*"
+    r"(?:api[_-]?key|secret|token|password|passwd|pwd|credential|auth)"
+    r"[A-Za-z0-9_\-]*\s*[:=]\s*\S+"
+    r"|(?:\bsk-[A-Za-z0-9_\-]{8,})"
     r"|(?:-----BEGIN[^-]*PRIVATE KEY-----)"
 )
 

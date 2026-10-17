@@ -35,7 +35,7 @@ unapproved provider.
 import json
 import os
 import sys
-from typing import Sequence
+from typing import Any, Optional, Sequence
 
 from skillweave.mcp import control
 
@@ -1426,6 +1426,216 @@ def _controller_handoff_module():
     return module
 
 
+#: The server-owned evidence key carrying the *conclusion* this boundary reached
+#: about a harness's counters.  It is written by the server (never read from the
+#: caller's evidence) so the durable record states what was actually verified --
+#: and, when nothing could be verified, says so instead of implying a pass.
+_HANDOFF_EVIDENCE_VERIFICATION_KEY = "server_verification"
+
+
+def _replace_attestation(attestation: Any, **changes: Any) -> Any:
+    """A copy of *attestation* with *changes* applied (frozen dataclass)."""
+    from dataclasses import replace
+
+    return replace(attestation, **changes)
+
+
+def _handoff_gateway_count(raw: Any) -> Optional[int]:
+    """The client's observed gateway request count, or ``None`` when unreadable.
+
+    ``None`` is **not** "zero requests": a missing/non-numeric count is an
+    *unverifiable* claim, which is refused by name -- never silently treated as
+    a satisfied one.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw
+
+
+def _verify_handoff_evidence(
+    module: Any, evidence: dict, *, observed_route: Optional[str]
+) -> dict:
+    """Verify a harness's route claim before it is admitted (F-1511A-01).
+
+    Criterion 3 requires a harness to *prove its configured route with gateway
+    counters*.  A bare ``dict`` passthrough proves nothing, so the boundary
+    verifies the claim before it is recorded.
+
+    The gate is the **route claim itself**: an attestation that names a
+    ``configured_route.route`` is asserting it observed that route, and an
+    assertion must be backed by a positive observed count.  An attestation that
+    names no route makes no such assertion, so there is nothing to verify and it
+    is admitted exactly as before (an additive change -- the pre-existing
+    route-less fixtures are untouched).
+
+    For a named route the three refusals are:
+
+    * **zero or absent observed gateway requests** -- the client claims a route
+      it made no request on, so it has proven nothing;
+    * **an upstream the evidence itself reports as failed** (a non-zero exit
+      code) -- the run that claims to prove the route did not succeed;
+    * **a route contradicting the route the server observed** -- when the server
+      *has* a genuine observation (a recorded dispatch route or an upstream
+      receipt), an evidence route naming a different one is refused.
+
+    When no server-side observation exists the counters are still required to be
+    positive, and the record carries an explicit ``server_verification``
+    conclusion stating that the route could not be cross-checked.  The *live*
+    Claude Desktop / OpenCode proof this criterion also asks for remains
+    labelled NOT PERFORMED: this boundary never asserts a live qualification it
+    did not perform.
+    """
+    claimed_route = str(evidence.get("gateway_route") or "")
+    if not claimed_route:
+        return {
+            "route_claim": None,
+            "cross_checked_with_server_record": False,
+            "live_qualification": "NOT PERFORMED",
+        }
+    count = _handoff_gateway_count(evidence.get("gateway_request_count"))
+    if count is None or count <= 0:
+        raise module.ControllerHandoffRefused(
+            module.HANDOFF_HOLD_EVIDENCE_UNVERIFIED,
+            f"the attestation claims gateway route {claimed_route!r} but its "
+            f"observed gateway request count is {count!r}; a route claim with no "
+            f"observed requests proves nothing and is a named HOLD, never "
+            f"recorded as a proven route",
+            observed_gateway_request_count=count,
+            route_claim=claimed_route,
+        )
+    exit_code = evidence.get("exit_code")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+        raise module.ControllerHandoffRefused(
+            module.HANDOFF_HOLD_EVIDENCE_UNVERIFIED,
+            f"the attestation's own evidence records exit_code {exit_code}: the "
+            f"run that claims to prove route {claimed_route!r} did not succeed, "
+            f"so the counter it reports proved nothing",
+            exit_code=exit_code,
+            route_claim=claimed_route,
+        )
+    if observed_route is not None and claimed_route != observed_route:
+        raise module.ControllerHandoffRefused(
+            module.HANDOFF_HOLD_EVIDENCE_UNVERIFIED,
+            f"the attestation's evidence names route {claimed_route!r} but the "
+            f"server observed {observed_route!r}; a route claim that "
+            f"contradicts the observed route is a named HOLD",
+            evidence_route=claimed_route,
+            observed_route=observed_route,
+        )
+    return {
+        "gateway_request_count_observed": count,
+        "route_claim": claimed_route,
+        "cross_checked_with_server_record": observed_route is not None,
+        # The live proof this criterion also asks for is NOT performed here: no
+        # real Claude Desktop or OpenCode process was launched and no gateway
+        # request was made.  The boundary records the verified claim and labels
+        # the live qualification honestly.
+        "live_qualification": "NOT PERFORMED",
+    }
+
+
+def _validate_destination_principal(module: Any, principal: str) -> None:
+    """Refuse a destination principal the *server* could not have issued (F-1511A-04).
+
+    Criterion 1 asks the lease to move to a **server-issued** destination
+    principal.  An `mcp:`-shaped principal is a claim that the MCP authority
+    minted it: ``mcp:<role>:<client_id>`` with ``<role>`` drawn from the
+    server-owned :data:`~skillweave.runtime.authority.MCP_ROLE_SCOPES` registry.
+    A principal in that shape whose role is not a real registry role is a
+    caller-declared authority claim and is refused by name -- it is *not*
+    admitted, and no server-issued identity is invented for it.
+
+    A principal that is *not* `mcp:`-shaped carries no server-issued claim at
+    all: it is the documented in-process / self-named path (exactly as the
+    mailbox tools admit), and it is admitted on the same authority the tool was
+    already gated on.  The check is therefore conditional on the claim being
+    made, never a blanket refusal of the existing contract.
+    """
+    if not principal.startswith("mcp:"):
+        return
+    from skillweave.runtime.authority import MCP_ROLE_SCOPES
+
+    parts = principal.split(":")
+    role = parts[1] if len(parts) == 3 else ""
+    if len(parts) == 3 and role in MCP_ROLE_SCOPES:
+        return
+    raise module.ControllerHandoffRefused(
+        module.HANDOFF_HOLD_PRINCIPAL_NOT_SERVER_ISSUED,
+        f"the destination principal {principal!r} claims to be server-issued "
+        f"(an 'mcp:' principal) but its form is not one the MCP authority can "
+        f"mint; the server refuses the claim rather than inventing a "
+        f"server-issued identity for it",
+        destination_principal=principal,
+    )
+
+
+def _endpoint_host_port(endpoint: str) -> Optional[tuple[str, int]]:
+    """The ``(host, port)`` of a ``scheme://host:port`` gateway endpoint."""
+    if not endpoint:
+        return None
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(endpoint)
+    except ValueError:
+        return None
+    if not parsed.hostname:
+        return None
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    return (parsed.hostname, int(port))
+
+
+def _handoff_observations(
+    store: Any, run_id: str
+) -> tuple[Optional[tuple[str, int]], Optional[str]]:
+    """The gateway facts the *server* genuinely observed for *run_id*.
+
+    Criterion 3's route axis is enforced against an observation, never an
+    invention.  Two durable, server-written sources are consulted -- nothing a
+    caller can set in the offer:
+
+    * the newest non-empty **dispatch-intent route** the server recorded for the
+      run (the route the owned attempt was dispatched on); and
+    * the newest **upstream receipt** the server recorded for the run (the
+      endpoint host:port the gateway actually answered on, and its route).
+
+    Returns ``(endpoint, route)`` where ``endpoint`` is the observed
+    ``(host, port)`` the module's route axis compares against the attestation's
+    *configured* gateway, and ``route`` is the observed route string the
+    evidence cross-check compares against the evidence's claimed route.  Either
+    is ``None`` when the server has no such observation: the axis is then simply
+    not enforced, exactly as before -- the boundary never fabricates an
+    observation (the owner's *configured* gateway ``127.0.0.1:8090`` pin is a
+    configuration, not an observation, and is never used here).
+    """
+    if not run_id or store is None:
+        return (None, None)
+    route = ""
+    endpoint: Optional[tuple[str, int]] = None
+    try:
+        for intent in store.list_dispatch_intents(run_id):
+            candidate = str(getattr(intent, "route", "") or "")
+            if candidate:
+                route = candidate
+    except Exception:  # pragma: no cover - a store without the intent table
+        route = ""
+    try:
+        for receipt in store.list_evidence(run_id):
+            recorded = (getattr(receipt, "metadata", None) or {}).get("receipt")
+            if isinstance(recorded, dict):
+                candidate = str(recorded.get("route") or "")
+                if candidate:
+                    route = candidate
+                observed = _endpoint_host_port(str(recorded.get("gateway_endpoint") or ""))
+                if observed is not None:
+                    endpoint = observed
+    except Exception:  # pragma: no cover - a store without the evidence table
+        pass
+    return (endpoint, route or None)
+
+
 def _admit_controller_handoff_offer(
     handoff_offer: str, *, db_path: str, run_id: str
 ) -> dict:
@@ -1443,6 +1653,12 @@ def _admit_controller_handoff_offer(
     lease** through the run store (never taken from the caller's blob): a caller
     cannot *assert* the generation its offer carries, it must be the generation
     the lease actually holds.
+
+    The **observed route** handed to the admission is computed here from the
+    server's own durable records (:func:`_observed_handoff_route`), so the
+    route-match axis is enforced at the real boundary whenever the server has an
+    observation to compare against -- it is no longer hardcoded away (review
+    finding F-1511A-02).
     """
     module = _controller_handoff_module()
     try:
@@ -1490,21 +1706,44 @@ def _admit_controller_handoff_offer(
             evidence=dict(attestation_raw.get("evidence") or {}),
         )
 
+    store = _get_store(db_path)
+
+    # F-1511A-01: the evidence is *verified* before it is admitted, never
+    # passed through.  The verification's own conclusion is written back under
+    # a server-owned key so the durable record states what was checked (and
+    # that the live qualification was NOT PERFORMED) rather than implying a
+    # proof the server did not perform.
+    observed_endpoint, observed_route = _handoff_observations(store, run_id)
+    if attestation is not None:
+        verification = _verify_handoff_evidence(
+            module, attestation.evidence, observed_route=observed_route
+        )
+        attestation = _replace_attestation(
+            attestation,
+            evidence={**attestation.evidence, _HANDOFF_EVIDENCE_VERIFICATION_KEY: verification},
+        )
+
+    destination_principal = str(offer.get("destination_principal") or "")
+    # F-1511A-04: an `mcp:`-shaped destination principal claims the MCP
+    # authority issued it; the boundary refuses a claim in that shape whose role
+    # is not a real server-owned role, instead of inventing an issuance source.
+    _validate_destination_principal(module, destination_principal)
+
     record = module.offer_handoff(
         from_holder=str(offer.get("from_holder") or ""),
-        destination_principal=str(offer.get("destination_principal") or ""),
+        destination_principal=destination_principal,
         scope=str(offer.get("scope") or run_id or ""),
         destination_attestation=attestation,
-        # The observed route is the route the *server* observed: absent a
-        # server-observed route the offer is admitted on its attested route
-        # alone (the route-match axis is only enforced when the server has an
-        # observation to compare against, never by inventing one).
-        observed_route=None,
+        # The observed route is the gateway endpoint the *server* observed, read
+        # from its own durable records (F-1511A-02).  Absent a genuine
+        # observation the route-match axis is not enforced -- never by inventing
+        # a route (the owner's configured pin is a configuration, not an
+        # observation).
+        observed_route=observed_endpoint,
         credential_binding=str(offer.get("credential_binding") or ""),
         handoff_id=str(offer.get("handoff_id") or ""),
     )
 
-    store = _get_store(db_path)
     if run_id:
         # Re-read the offering controller's generation from the *durable* lease:
         # a caller-supplied generation is never trusted.

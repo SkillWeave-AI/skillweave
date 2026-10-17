@@ -218,8 +218,16 @@ def test_claude_desktop_proves_its_configured_route_with_gateway_counters(
     assert att.client_id == "claude-desktop"
     assert att.gateway_host == "127.0.0.1" and att.gateway_port == 8090
     assert att.route == "faigate/deepseek-v4"
-    assert att.evidence == attestation["evidence"]
+    # The client's own counters survive verbatim; the server additionally
+    # records *what it verified* under its own key (F-1511A-01), so the record
+    # is the caller's evidence plus the boundary's conclusion -- never the
+    # caller's blob alone.
+    assert {
+        k: v for k, v in att.evidence.items() if k != "server_verification"
+    } == attestation["evidence"]
     assert att.evidence["gateway_request_count"] == 37
+    assert att.evidence["server_verification"]["gateway_request_count_observed"] == 37
+    assert att.evidence["server_verification"]["live_qualification"] == "NOT PERFORMED"
     # The anchor is the section key the shipped Claude Desktop config writes.
     assert att.mcp_config_anchors == tuple(
         attestation["capabilities"]["mcp_config_anchors"]
@@ -242,8 +250,11 @@ def test_isolated_opencode_proves_its_configured_route_with_gateway_counters(
     assert att.client_id == "opencode"
     assert att.gateway_port == 8091
     assert att.route == "faigate/anthropic-sonnet"
-    assert att.evidence == attestation["evidence"]
+    assert {
+        k: v for k, v in att.evidence.items() if k != "server_verification"
+    } == attestation["evidence"]
     assert att.evidence["gateway_request_count"] == 12
+    assert att.evidence["server_verification"]["gateway_request_count_observed"] == 12
     # The anchor is the section key the shipped OpenCode config writes -- the
     # ``mcp`` section, distinct from Claude Desktop's ``mcpServers``.
     assert att.mcp_config_anchors == ("mcp",)

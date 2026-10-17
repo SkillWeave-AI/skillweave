@@ -46,6 +46,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional, Sequence, Tuple
 
+from skillweave.redaction import contains_secret
+
 # ── Contract identity ────────────────────────────────────────────────────────
 
 UPSTREAM_OBSERVATION_SCHEMA_ID = (
@@ -129,6 +131,13 @@ class ObservationError(UpstreamObservationError):
 #: A binding that *looks like* a secret (an inline bearer token or a
 #: provider-style API key) is refused. This is a shape check: it never needs to
 #: read the real secret, only to recognise that a value is one.
+#:
+#: SW-1511A-HANDOFF-001 finding F-1511A-03 (review-001): these anchored shapes
+#: are retained, and the **shared** rule set in :mod:`skillweave.redaction` is
+#: consulted as well -- the ``^``-anchor alone missed an ``env``-file line
+#: (``PROVIDER_API_KEY=abc123``), whose identifier characters before the keyword
+#: suppressed the match. Importing the shared rule (never restating it) keeps
+#: this copy from drifting away from the trace/stream seam.
 _SECRET_SHAPES: Tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*bearer\s+\S+", re.IGNORECASE),
     re.compile(r"^sk-[A-Za-z0-9_-]{8,}$"),
@@ -140,7 +149,9 @@ def looks_like_secret(value: str) -> bool:
     """True when ``value`` has the shape of a secret (bindings must not)."""
     if not isinstance(value, str):
         return False
-    return any(pattern.match(value) for pattern in _SECRET_SHAPES)
+    if any(pattern.match(value) for pattern in _SECRET_SHAPES):
+        return True
+    return contains_secret(value)
 
 
 def _provider_of(route: str) -> str:
