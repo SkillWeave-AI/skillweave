@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skillweave.dev/schemas/assessment-receipt/v1",
+  "title": "Assessment Receipt Schema",
+  "description": "Structured, tamper-evident assessment receipt (SW-157-ASSESS-001). A receipt represents an available or unavailable assessment result, the full 40-hex SHA of the subject under assessment, the sources inspected, the commands and their exit codes, the findings, the explicit limits of the assessment, the provenance of the assessor, and a sha256 content digest over the canonical receipt. Unknown keys are rejected at every level so a misspelled or smuggled field can never be silently ignored, and a recomputed digest is required so any post-hoc mutation of a digested field fails closed.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "result",
+    "subject",
+    "sources",
+    "commands",
+    "findings",
+    "limits",
+    "provenance",
+    "digest"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Receipt schema version. Only v1 exists."
+    },
+    "result": {
+      "type": "object",
+      "required": ["status"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["available", "unavailable"],
+          "description": "available = the assessment ran and produced a decision; unavailable = it could not be completed and must be read with its limits."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional one-line statement of the assessment outcome."
+        }
+      }
+    },
+    "subject": {
+      "type": "object",
+      "required": ["full_sha"],
+      "additionalProperties": false,
+      "properties": {
+        "full_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "Canonical lowercase full 40-hex SHA of the immutable subject under assessment."
+        },
+        "repo": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "description": "Ordered sources inspected. Order is significant and digested.",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "description": "Canonical lowercase sha256 of the source content as inspected."
+          }
+        }
+      }
+    },
+    "commands": {
+      "type": "array",
+      "description": "Ordered commands run and their exit codes. Order is significant and digested.",
+      "items": {
+        "type": "object",
+        "required": ["command", "exit"],
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "exit": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "description": "Ordered findings. Order is significant and digested.",
+      "items": {
+        "type": "object",
+        "required": ["id", "severity", "summary"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["info", "low", "medium", "high", "critical"]
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "array",
+      "description": "Explicit limits of the assessment: what it could not establish.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["assessor", "run_id", "produced_at"],
+      "additionalProperties": false,
+      "properties": {
+        "assessor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "produced_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "Canonical lowercase sha256 over the receipt with this field excluded; recomputed and compared on ingestion."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "result": {
+            "properties": {
+              "status": { "const": "unavailable" }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "limits": { "minItems": 1 }
+        }
+      },
+      "else": {
+        "properties": {
+          "sources": { "minItems": 1 },
+          "commands": { "minItems": 1 }
+        }
+      }
+    }
+  ]
+}

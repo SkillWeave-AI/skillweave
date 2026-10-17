@@ -75,11 +75,21 @@ REQUIRED_RESULT_FIELDS: Tuple[str, ...] = (
 VERDICT_PASS = "pass"
 VERDICT_REFUSED = "refused"
 
-_SCHEMA_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "schemas"
-    / "integration-gate-result.schema.json"
-)
+_SCHEMA_FILENAME = "integration-gate-result.schema.json"
+
+
+def _schema_path() -> Path:
+    """Resolve the shipped schema from installed package data.
+
+    The schema travels as ``skillweave/assets/schemas/`` package data, so an
+    installed wheel resolves it from inside the package. Anchoring to
+    ``__file__`` (never ``parents[3] / "schemas"``) means the load succeeds
+    from a source checkout and from an installed wheel alike, and a packaging
+    regression fails closed naming the resolved path.
+    """
+    from ..assets import packaged_schema_path
+
+    return packaged_schema_path(_SCHEMA_FILENAME)
 
 
 class IntegrationGateError(Exception):
@@ -407,7 +417,7 @@ def read_result(path: Path | str) -> IntegrationGateResult:
 
 def load_schema() -> dict[str, Any]:
     """Return the shipped ``integration-gate-result/v1`` JSON schema, verbatim."""
-    return json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    return json.loads(_schema_path().read_text(encoding="utf-8"))
 
 
 __all__ = [

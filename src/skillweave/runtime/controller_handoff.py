@@ -934,11 +934,14 @@ def release_handoff(
 
 
 def load_handoff_schema(which: str = "handoff") -> dict[str, Any]:
-    """Load a controller-handoff schema from the Core ``schemas/`` directory.
+    """Load a controller-handoff schema from the shipped package data.
 
-    ``which`` is ``handoff`` (the default) or ``attestation``.
+    ``which`` is ``handoff`` (the default) or ``attestation``. The schema is
+    resolved from ``skillweave/assets/schemas/`` package data, so an installed
+    wheel resolves it from inside the package rather than reaching for a
+    repository-root ``schemas/`` directory that does not exist once installed.
     """
-    from pathlib import Path
+    from ..assets import packaged_schema_path
 
     names = {
         "handoff": "controller-handoff.schema.json",
@@ -950,6 +953,6 @@ def load_handoff_schema(which: str = "handoff") -> dict[str, Any]:
         raise ValueError(
             f"unknown schema {which!r}; expected one of {sorted(names)}"
         ) from None
-    path = Path(__file__).resolve().parents[3] / "schemas" / filename
+    path = packaged_schema_path(filename)
     with path.open(encoding="utf-8") as handle:
         return json.load(handle)

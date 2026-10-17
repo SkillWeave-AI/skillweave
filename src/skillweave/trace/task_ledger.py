@@ -123,6 +123,29 @@ CANONICAL_1511_TASK_IDS: Tuple[str, ...] = (
     "SW-1511-SEARCH-ALIGN",
 )
 
+#: The eight ``SW-1511A-*`` addendum task identities of the 1.5.11 addendum
+#: PRD, in PRD order. These are a *separate* set: the parent 24-task projection
+#: and its counts are unchanged, and the addendum is reported **additively**
+#: (see :class:`TaskLedgerProjection`) so a reader can tell the two sets apart
+#: rather than seeing one merged, inflated task count.
+ADDENDUM_1511A_TASK_IDS: Tuple[str, ...] = (
+    "SW-1511A-LEDGER-001",
+    "SW-1511A-RESULT-001",
+    "SW-1511A-LIVENESS-001",
+    "SW-1511A-ENV-001",
+    "SW-1511A-UPSTREAM-001",
+    "SW-1511A-INTEGRATION-001",
+    "SW-1511A-HANDOFF-001",
+    "SW-1511A-GATE-001",
+)
+
+#: The identities the ledger will accept a receipt for: the frozen parent 24
+#: plus the addendum 8. Any other id is still refused fail-closed, so the
+#: accepted surface grows only by whole, declared sets — never one id at a time.
+LEDGER_KNOWN_TASK_IDS: Tuple[str, ...] = (
+    CANONICAL_1511_TASK_IDS + ADDENDUM_1511A_TASK_IDS
+)
+
 
 # ── Exceptions (fail closed, never silently folded) ──────────────────────────
 
@@ -172,10 +195,11 @@ class TaskLifecycleReceipt:
     schema_version: str = TASK_LIFECYCLE_RECEIPT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.task_id not in CANONICAL_1511_TASK_IDS:
+        if self.task_id not in LEDGER_KNOWN_TASK_IDS:
             raise UnknownCanonicalTaskError(
                 f"task '{self.task_id}' is not one of the "
-                f"{len(CANONICAL_1511_TASK_IDS)} canonical 1.5.11 task identities"
+                f"{len(CANONICAL_1511_TASK_IDS)} canonical 1.5.11 task identities "
+                f"or the {len(ADDENDUM_1511A_TASK_IDS)} SW-1511A addendum identities"
             )
         if self.axis not in AXIS_STATES:
             raise UnknownAxisError(f"unknown lifecycle axis '{self.axis}'")
@@ -315,29 +339,47 @@ class TaskLedgerRow:
 
 @dataclass(frozen=True)
 class TaskLedgerProjection:
-    """The deterministic projection of the ledger over the canonical set."""
+    """The deterministic projection of the ledger over the task identity sets.
+
+    ``rows`` are the frozen parent 24 canonical tasks and their counts
+    (:attr:`accepted_count`, :attr:`open_count`, :meth:`open_task_ids`) are
+    over exactly those rows — the parent contract is unchanged. The eight
+    ``SW-1511A-*`` addendum rows travel separately in ``addendum_rows`` and are
+    reported **additively** (:attr:`addendum_accepted_count`,
+    :attr:`addendum_open_count`), so the addendum is visible without inflating
+    or re-keying the parent 24.
+    """
 
     rows: Tuple[TaskLedgerRow, ...]
     observations: Tuple[LedgerObservation, ...] = ()
     rejected: Tuple[LedgerOutcome, ...] = ()
+    addendum_rows: Tuple[TaskLedgerRow, ...] = ()
 
     @property
     def task_ids(self) -> Tuple[str, ...]:
         return tuple(r.task_id for r in self.rows)
 
     def row(self, task_id: str) -> TaskLedgerRow:
-        for r in self.rows:
+        for r in (*self.rows, *self.addendum_rows):
             if r.task_id == task_id:
                 return r
         raise UnknownCanonicalTaskError(f"no ledger row for task '{task_id}'")
 
     def open_task_ids(self) -> Tuple[str, ...]:
-        """The task ids whose acceptance axis is not ``accepted``.
+        """The parent task ids whose acceptance axis is not ``accepted``.
 
         Derived, never hand-counted: the caller reads this instead of
         reconstructing progress from stale status files.
         """
         return tuple(r.task_id for r in self.rows if not r.accepted)
+
+    def addendum_task_ids(self) -> Tuple[str, ...]:
+        """The addendum task ids projected, in addendum PRD order."""
+        return tuple(r.task_id for r in self.addendum_rows)
+
+    def addendum_open_task_ids(self) -> Tuple[str, ...]:
+        """The addendum task ids whose acceptance axis is not ``accepted``."""
+        return tuple(r.task_id for r in self.addendum_rows if not r.accepted)
 
     def is_open(self, task_id: str) -> bool:
         return not self.row(task_id).accepted
@@ -350,6 +392,14 @@ class TaskLedgerProjection:
     def open_count(self) -> int:
         return len(self.rows) - self.accepted_count
 
+    @property
+    def addendum_accepted_count(self) -> int:
+        return sum(1 for r in self.addendum_rows if r.accepted)
+
+    @property
+    def addendum_open_count(self) -> int:
+        return len(self.addendum_rows) - self.addendum_accepted_count
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema": TASK_LIFECYCLE_RECEIPT_SCHEMA_ID,
@@ -361,6 +411,11 @@ class TaskLedgerProjection:
             "accepted_count": self.accepted_count,
             "open_count": self.open_count,
             "open_task_ids": list(self.open_task_ids()),
+            "addendum_task_count": len(ADDENDUM_1511A_TASK_IDS),
+            "addendum_rows": [r.to_dict() for r in self.addendum_rows],
+            "addendum_accepted_count": self.addendum_accepted_count,
+            "addendum_open_count": self.addendum_open_count,
+            "addendum_open_task_ids": list(self.addendum_open_task_ids()),
         }
 
 
@@ -480,7 +535,7 @@ class TaskLedger:
         authority: it is always retained as an observation and never applied,
         so it can never overwrite a newer authoritative state.
         """
-        if task_id not in CANONICAL_1511_TASK_IDS:
+        if task_id not in LEDGER_KNOWN_TASK_IDS:
             raise UnknownCanonicalTaskError(
                 f"status snapshot names non-canonical task '{task_id}'"
             )
@@ -543,15 +598,11 @@ class TaskLedger:
 
     # -- projection ----------------------------------------------------------
 
-    def project(self) -> TaskLedgerProjection:
-        """Project the ledger over the canonical 24-task set (criterion 3).
-
-        Every canonical task identity gets exactly one row — including tasks
-        with no receipt yet, which project their axis defaults — so the ledger
-        *reproduces all 24 task states* deterministically and in PRD order.
-        """
+    def _project_rows(
+        self, task_ids: Sequence[str]
+    ) -> Tuple[TaskLedgerRow, ...]:
         rows: List[TaskLedgerRow] = []
-        for task_id in CANONICAL_1511_TASK_IDS:
+        for task_id in task_ids:
             states = dict(_AXIS_DEFAULT)
             hold_reason = ""
             refs: List[str] = []
@@ -582,10 +633,24 @@ class TaskLedger:
                     receipt_refs=tuple(refs),
                 )
             )
+        return tuple(rows)
+
+    def project(self) -> TaskLedgerProjection:
+        """Project the ledger over the canonical 24 + addendum 8 sets
+        (criterion 3).
+
+        Every canonical task identity gets exactly one row — including tasks
+        with no receipt yet, which project their axis defaults — so the ledger
+        *reproduces all 24 task states* deterministically and in PRD order. The
+        eight ``SW-1511A-*`` addendum identities are projected separately into
+        ``addendum_rows`` and reported additively; they never enter ``rows`` and
+        so never alter the parent 24-task counts.
+        """
         return TaskLedgerProjection(
-            rows=tuple(rows),
+            rows=self._project_rows(CANONICAL_1511_TASK_IDS),
             observations=tuple(self._observations),
             rejected=tuple(self._rejected),
+            addendum_rows=self._project_rows(ADDENDUM_1511A_TASK_IDS),
         )
 
 
@@ -615,6 +680,8 @@ __all__ = [
     "LEDGER_AXES",
     "AXIS_STATES",
     "CANONICAL_1511_TASK_IDS",
+    "ADDENDUM_1511A_TASK_IDS",
+    "LEDGER_KNOWN_TASK_IDS",
     "TaskLedgerError",
     "UnknownCanonicalTaskError",
     "UnknownAxisError",
