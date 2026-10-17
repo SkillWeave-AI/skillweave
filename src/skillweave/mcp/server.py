@@ -1265,6 +1265,11 @@ def handoff_adapter(
     db_path: str = ".skillweave/store.db",
     session_token: str = "",
     handoff_offer: str = "",
+    action: str = "offer",
+    handoff_action: str = "",
+    handoff_id: str = "",
+    reason: str = "",
+    principal: str = "",
 ) -> str:
     """Select and return the qualified transport adapter for *client_id*.
 
@@ -1321,6 +1326,20 @@ def handoff_adapter(
     ``code``, never a silent success and never a downgraded transfer.  A handoff
     carrying a provider credential is refused by shape, so the lease transfer
     never carries a credential.
+
+    SW-1511A-HANDOFF-001 finding F3: the state machine's four *transitions* also
+    have their production entry point here, driven by the ``action`` argument
+    (``offer`` -- the default, unchanged -- ``accept``, ``activate``,
+    ``release``, ``reject``).  ``accept``/``activate``/``reject`` may be driven
+    only by the **destination principal** the handoff is addressed to, and
+    ``release`` only by the **current controller holder**; ``activate`` takes
+    the destination's real lease so the generation it acquires is exactly the
+    offered generation + 1 (a superseded generation is a named HOLD).  Every
+    response carries a ``handoff_ref`` (handoff id, fencing generation,
+    destination principal, scope, state) and every refusal is a named
+    ``status: "hold"``.  The action is never a caller-declared authority: the
+    identity rules are checked against the durable record and the store's live
+    lease holder.
     """
     gate_principal, refusal = gate_operation(
         "read_run", session_token, run_id=run_id, db_path=db_path,
@@ -1331,12 +1350,62 @@ def handoff_adapter(
     from skillweave.runtime import handoff as _handoff
 
     try:
+        # The actor is this boundary's authenticated principal when an authority
+        # is bound; a direct in-process caller with no bound authority names its
+        # own principal (exactly as ``mailbox_post`` admits), so the identity
+        # rules of a handoff transition remain enforceable there.  The
+        # no-authority/no-name path stays the historic ``"in-process"`` actor.
         principal = (
-            _message_principal(gate_principal, "") if gate_principal is not None
-            else "in-process"
+            _message_principal(gate_principal, principal)
+            if gate_principal is not None
+            else (principal or "in-process")
         )
     except _authority_module().MCPAuthError as exc:
         return _auth_error_payload(exc)
+
+    # SW-1511A-HANDOFF-001 finding F3: the four *transitions* the state machine
+    # owns (accept/activate/release/reject) now have a production entry point at
+    # this boundary, driven by the ``action`` argument.  ``offer`` is the
+    # default, so every pre-existing call (which passes no ``action``) keeps its
+    # exact behaviour.  A transition is resolved and persisted durably before
+    # transport selection, exactly as the offer admission is.
+    requested_action = (handoff_action or action or "offer").strip()
+    if requested_action != "offer" or handoff_offer:
+        module = _controller_handoff_module()
+        try:
+            record = _drive_controller_handoff_action(
+                module,
+                action=requested_action,
+                handoff_offer=handoff_offer,
+                db_path=db_path,
+                run_id=run_id,
+                handoff_id=handoff_id,
+                reason=reason,
+                actor=principal,
+            )
+        except module.ControllerHandoffRefused as exc:
+            return json.dumps({"status": "hold", **exc.to_dict()})
+        except module.HandoffReleaseRefused as exc:
+            return json.dumps({
+                "status": "hold",
+                "code": module.HANDOFF_HOLD_RELEASE_UNSUPPORTED,
+                "reason": exc.reason,
+                **exc.context,
+            })
+        payload = {
+            "status": "ok",
+            "action": requested_action,
+            "controller_handoff": record.to_dict(),
+            "handoff_ref": {
+                "handoff_id": record.handoff_id,
+                "fencing_generation": record.fencing_generation,
+                "destination_principal": record.destination_principal,
+                "scope": record.scope,
+                "state": record.state,
+                "resulting_generation": record.resulting_generation,
+            },
+        }
+        return json.dumps(payload)
 
     # SW-1511A-HANDOFF-001: admit a presented controller-handoff offer *before*
     # transport selection -- an offer that cannot carry the lease is a named
@@ -1833,6 +1902,77 @@ def _admit_controller_handoff_offer(
             )
         record = module.record_handoff(store, record, run_id=run_id)
     return record.to_dict()
+
+
+def _drive_controller_handoff_action(
+    module: Any,
+    *,
+    action: str,
+    handoff_offer: str,
+    db_path: str,
+    run_id: str,
+    handoff_id: str,
+    reason: str,
+    actor: str,
+) -> Any:
+    """Drive one handoff action at the real MCP boundary (finding F3).
+
+    ``offer`` (the default) keeps the pre-existing attested admission and
+    returns the *offered* record; the four transitions are delegated to
+    :func:`skillweave.runtime.controller_handoff.drive_handoff`, whose ``actor``
+    is the **authenticated/attributed principal** this boundary resolved --
+    never a caller field.  The destination/original-controller identity rules
+    are enforced inside that driver against the durable record and the store's
+    live lease holder, so this boundary never re-implements a move.
+
+    ``activate`` supplies the destination's **real** lease acquisition (the
+    durable store's own ``acquire_controller_lease`` under the destination
+    principal), so the exactly-once generation arithmetic is arbitrated by the
+    store: no activation without a durably acquired generation ``offered + 1``.
+    ``release`` yields the lease the *current holder* actually holds -- the
+    holder over the offered generation, or the generation the destination
+    acquired on activation -- so a stale generation is never released.
+
+    Returns the durable record the transition reached; every refusal propagates
+    as the named :class:`ControllerHandoffRefused` (or the module's
+    :class:`HandoffReleaseRefused`) -- never a silent success.
+    """
+    if action == module.HANDOFF_ACTION_OFFER:
+        return module.ControllerHandoffRecord.from_dict(
+            _admit_controller_handoff_offer(handoff_offer, db_path=db_path, run_id=run_id)
+        )
+    store = _get_store(db_path)
+
+    def _acquire():
+        # The destination's own real acquisition, under the principal the
+        # server-issued handoff is addressed to.
+        return store.acquire_controller_lease(actor or "controller")
+
+    release_lease = None
+    if action == module.HANDOFF_ACTION_RELEASE:
+        held = module.read_handoff(store, run_id)
+        if held is not None:
+            # The generation to yield: the destination's acquired generation
+            # once active, else the offering holder's generation still held.
+            generation = (
+                held.resulting_generation
+                if held.resulting_generation is not None
+                else held.fencing_generation
+            )
+
+            def release_lease() -> None:
+                store.release_controller_lease(int(generation))
+
+    return module.drive_handoff(
+        store,
+        action=action,
+        run_id=run_id,
+        handoff_id=handoff_id,
+        reason=reason,
+        actor=actor,
+        acquire=_acquire,
+        release=release_lease,
+    )
 
 
 def _recorded_session_for_run(db_path: str, run_id: str) -> tuple[str, str]:

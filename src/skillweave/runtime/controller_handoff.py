@@ -65,11 +65,20 @@ __all__ = [
     "HANDOFF_HOLD_RELEASE_UNSUPPORTED",
     "HANDOFF_HOLD_EVIDENCE_UNVERIFIED",
     "HANDOFF_HOLD_PRINCIPAL_NOT_SERVER_ISSUED",
+    "HANDOFF_HOLD_UNKNOWN_ACTION",
+    "HANDOFF_ACTION_OFFER",
+    "HANDOFF_ACTION_ACCEPT",
+    "HANDOFF_ACTION_ACTIVATE",
+    "HANDOFF_ACTION_RELEASE",
+    "HANDOFF_ACTION_REJECT",
+    "HANDOFF_ACTIONS",
     "HANDOFF_METADATA_KEY",
     "WAIT_METADATA_KEY",
     "ControllerHandoffRefused",
     "ControllerHandoffRecord",
     "HandoffAttestation",
+    "HandoffReleaseRefused",
+    "drive_handoff",
     "live_handoff_scope_hold",
     "load_handoff_schema",
 ]
@@ -157,6 +166,44 @@ HANDOFF_HOLD_PRINCIPAL_NOT_SERVER_ISSUED = "PRINCIPAL_NOT_SERVER_ISSUED"
 #: across observations of one run, so a lower one is a named HOLD -- never
 #: silently admitted as a newer, smaller observation.
 HANDOFF_HOLD_COUNTER_REGRESSION = "HANDOFF_GATEWAY_COUNTER_REGRESSION"
+#: The caller asked the handoff boundary to drive an *action* it does not own.
+#: The action vocabulary is the state machine's own (below), so an unowned
+#: action is refused by name rather than silently falling through to an offer --
+#: never a fabricated transition.
+HANDOFF_HOLD_UNKNOWN_ACTION = "HANDOFF_UNKNOWN_ACTION"
+
+# ── the action vocabulary (each typed transition's production entry point) ──
+#
+# The state machine's moves are *driven* by a caller naming one of these
+# actions at the MCP boundary (``handoff_adapter``'s ``action`` argument).  The
+# module owns the vocabulary -- alongside ``_LEGAL_TRANSITIONS`` -- so a ledger
+# of the typed moves can never drift from the moves themselves, and the boundary
+# never hand-types the strings.
+
+#: Offer the lease to the destination principal (the admission default).
+HANDOFF_ACTION_OFFER = "offer"
+#: The destination accepts the offer (``offered`` -> ``accepted``).
+HANDOFF_ACTION_ACCEPT = "accept"
+#: The destination activates against its own durably acquired lease.
+HANDOFF_ACTION_ACTIVATE = "activate"
+#: The current holder releases the active handoff (``active`` -> ``released``).
+HANDOFF_ACTION_RELEASE = "release"
+#: The destination rejects the handoff before activation (terminal).
+HANDOFF_ACTION_REJECT = "reject"
+
+#: Every action the state machine can be driven by.  ``offer`` is the
+#: admission's default so every pre-existing ``handoff_adapter`` call keeps its
+#: exact behaviour; the other four are the moves that previously had no
+#: production entry point (finding F3).
+HANDOFF_ACTIONS = frozenset(
+    {
+        HANDOFF_ACTION_OFFER,
+        HANDOFF_ACTION_ACCEPT,
+        HANDOFF_ACTION_ACTIVATE,
+        HANDOFF_ACTION_RELEASE,
+        HANDOFF_ACTION_REJECT,
+    }
+)
 
 #: Where the live handoff for a run is recorded in that run's durable metadata.
 HANDOFF_METADATA_KEY = "controller_handoff"
@@ -574,6 +621,196 @@ def read_handoff(store: Any, run_id: str) -> Optional[ControllerHandoffRecord]:
     if not isinstance(raw, dict):
         return None
     return ControllerHandoffRecord.from_dict(raw)
+
+
+class HandoffReleaseRefused(Exception):
+    """The store's own refusal of the holder's release -- surfaced unchanged.
+
+    ``release_controller_lease`` raises its own typed refusal (a stale fencing
+    token, or a lease not held).  The store is the arbiter of the release, so
+    its refusal is never converted into a success; the module re-raises it under
+    this name so the production driver can turn it into a *named* HOLD without
+    importing the store's exception types (the module deliberately never learns
+    the store's native types).
+    """
+
+    def __init__(self, reason: str, **context: Any):
+        self.reason = reason
+        self.context = context
+        super().__init__(reason)
+
+
+def drive_handoff(
+    store: Any,
+    *,
+    action: str,
+    run_id: str,
+    handoff_id: str = "",
+    reason: str = "",
+    actor: str = "",
+    acquire: Any = None,
+    release: Any = None,
+    timestamp: str = "",
+) -> ControllerHandoffRecord:
+    """Drive one typed handoff transition on behalf of the MCP boundary (F3).
+
+    This is the **production driver** the state machine was missing: the MCP
+    boundary authorizes the caller, resolves the *identity* rules it alone can
+    enforce (the store's live lease holder) and then drives the module-owned
+    transition here -- the boundary never re-implements a move.
+
+    ``action`` is one of :data:`HANDOFF_ACTIONS` (refused by name otherwise).
+    ``offer`` is *not* handled here: an offer needs the attested admission the
+    boundary performs, so it is driven through
+    :func:`offer_handoff`/:func:`record_handoff` at the boundary and this driver
+    refuses it explicitly (never a silent no-op).
+
+    The record is read from the run's **durable** metadata (never a caller
+    blob), so a restart sees the same state.  The three identity rules are
+    enforced against what only the store knows:
+
+    * **only the destination may accept/activate/reject** -- a different actor
+      is :data:`HANDOFF_HOLD_ATTESTATION_PRINCIPAL`;
+    * **only the current holder may release** -- a different actor is
+      :data:`HANDOFF_HOLD_ORIGINAL_CONTROLLER`;
+    * an optional ``handoff_id`` must name the durable record, so a caller
+      cannot transition a handoff it did not name.
+
+    Each successful move is persisted durably at the *same* ``handoff_id``
+    (a state advance is not a second handoff, so ``record_handoff``'s
+    idempotency must not swallow it -- the advanced record is written
+    directly).  Every refusal is a named
+    :class:`ControllerHandoffRefused`; the store's own acquisition/release
+    refusals are surfaced by name, never converted into a success.
+    """
+    if action not in HANDOFF_ACTIONS:
+        raise ControllerHandoffRefused(
+            HANDOFF_HOLD_UNKNOWN_ACTION,
+            f"the handoff boundary does not own the action {action!r}; the "
+            f"actions it can drive are {sorted(HANDOFF_ACTIONS)}",
+            action=str(action),
+        )
+    if action == HANDOFF_ACTION_OFFER:
+        raise ControllerHandoffRefused(
+            HANDOFF_HOLD_UNKNOWN_ACTION,
+            "the 'offer' action is driven by the attested offer admission, not "
+            "by the transition driver",
+            action=action,
+        )
+    if not run_id:
+        raise ControllerHandoffRefused(
+            HANDOFF_HOLD_NOT_OFFERED,
+            "a handoff transition must name the run whose durable handoff it "
+            "advances",
+            action=action,
+        )
+    record = read_handoff(store, run_id)
+    if record is None:
+        raise ControllerHandoffRefused(
+            HANDOFF_HOLD_NOT_OFFERED,
+            f"run {run_id!r} has no recorded controller handoff to advance",
+            run_id=run_id,
+            action=action,
+        )
+    if handoff_id and handoff_id != record.handoff_id:
+        raise ControllerHandoffRefused(
+            HANDOFF_HOLD_NOT_OFFERED,
+            f"the run {run_id!r} carries handoff {record.handoff_id!r}, not "
+            f"{handoff_id!r}; a transition cannot name a handoff the run does "
+            f"not carry",
+            run_id=run_id,
+            action=action,
+            requested_handoff_id=handoff_id,
+            recorded_handoff_id=record.handoff_id,
+        )
+
+    if action in (HANDOFF_ACTION_ACCEPT, HANDOFF_ACTION_ACTIVATE, HANDOFF_ACTION_REJECT):
+        # Only the destination principal that the handoff is addressed to may
+        # move it forward (or reject it): that principal is the one the server
+        # issued the handoff to.
+        if actor != record.destination_principal:
+            raise ControllerHandoffRefused(
+                HANDOFF_HOLD_ATTESTATION_PRINCIPAL,
+                f"the handoff {record.handoff_id!r} is addressed to "
+                f"{record.destination_principal!r}; {actor or 'an unnamed actor'!r} "
+                f"cannot perform {action!r} on it",
+                handoff_id=record.handoff_id,
+                destination_principal=record.destination_principal,
+                actor=actor,
+                action=action,
+            )
+
+    if action == HANDOFF_ACTION_ACCEPT:
+        updated = accept_handoff(record, timestamp=timestamp)
+    elif action == HANDOFF_ACTION_REJECT:
+        updated = reject_handoff(record, reason=reason, timestamp=timestamp)
+    elif action == HANDOFF_ACTION_ACTIVATE:
+        if acquire is None:
+            raise ControllerHandoffRefused(
+                HANDOFF_HOLD_STALE_GENERATION,
+                "an activation must carry the destination's real lease "
+                "acquisition; an activation without one transfers no lease",
+                handoff_id=record.handoff_id,
+            )
+        try:
+            updated = activate_handoff(record, acquire=acquire, timestamp=timestamp)
+        except ControllerHandoffRefused:
+            raise
+        except Exception as exc:
+            # The store's own acquisition refusal (a live controller still holds
+            # the lease) is surfaced *by name*, never converted into a success.
+            raise ControllerHandoffRefused(
+                HANDOFF_HOLD_STALE_GENERATION,
+                f"the destination could not durably acquire the controller "
+                f"lease ({type(exc).__name__}: {exc}); the store refused the "
+                f"acquisition, so the handoff is not activated",
+                handoff_id=record.handoff_id,
+            ) from exc
+    else:  # HANDOFF_ACTION_RELEASE
+        holder = ""
+        try:
+            lease = store.get_controller_lease()
+            holder = str(getattr(lease, "holder", "") or "")
+        except Exception:  # pragma: no cover - a store without the lease table
+            holder = ""
+        if actor != holder:
+            raise ControllerHandoffRefused(
+                HANDOFF_HOLD_ORIGINAL_CONTROLLER,
+                f"only the current controller holder ({holder or 'none'!r}) may "
+                f"release the handoff {record.handoff_id!r}; "
+                f"{actor or 'an unnamed actor'!r} is not the holder",
+                handoff_id=record.handoff_id,
+                holder=holder,
+                actor=actor,
+            )
+        try:
+            if release is not None:
+                release()
+        except Exception as exc:
+            raise HandoffReleaseRefused(
+                f"the holder {holder!r} could not release the controller lease "
+                f"({type(exc).__name__}: {exc})",
+                handoff_id=record.handoff_id,
+                holder=holder,
+            ) from exc
+        updated = release_handoff(record, timestamp=timestamp)
+
+    # Persist the advanced record at the same identity.  ``record_handoff`` is
+    # idempotent at the same ``handoff_id`` (it would return the *existing*
+    # record unchanged), so the advanced state is written directly -- exactly
+    # the durable seam the state machine already uses -- and re-read.
+    store.update_metadata(run_id, **{HANDOFF_METADATA_KEY: updated.to_dict()})
+    reread = read_handoff(store, run_id)
+    if reread is None:  # pragma: no cover - the write above would have raised
+        raise ControllerHandoffRefused(
+            HANDOFF_HOLD_NOT_OFFERED,
+            f"the handoff {updated.handoff_id!r} did not survive in the durable "
+            f"run metadata for {run_id!r}; an unrecorded transition is not a "
+            f"transition",
+            run_id=run_id,
+            action=action,
+        )
+    return reread
 
 
 class GatewayCounterObservationError(Exception):
