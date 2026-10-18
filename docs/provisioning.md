@@ -113,12 +113,15 @@ python -c "import sys; print(sys.prefix)"
 
 ```bash
 python -m pip install --upgrade pip
+python -m pip install "git+https://github.com/SkillWeave-AI/skillweave-sdk.git@v0.3.0"
 python -m pip install /path/to/skillweave-1.5.11-py3-none-any.whl
 ```
 
-This pulls the base dependencies (`PyYAML`, `skillweave-sdk==0.3.0`) from the
-configured index. For an offline/hermetic install, point pip at a directory of
-wheels instead of the network:
+`PyYAML` comes from the configured index. `skillweave-sdk==0.3.0` does not:
+it is not published to a package index, so it is installed first from its
+public `v0.3.0` tag (the first command). Without that step pip fails with "No
+matching distribution found for skillweave-sdk==0.3.0". For an offline/hermetic
+install, point pip at a directory of wheels instead of the network:
 
 ```bash
 python -m pip install --no-index --find-links /path/to/wheelhouse \

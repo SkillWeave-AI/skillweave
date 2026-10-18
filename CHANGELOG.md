@@ -604,35 +604,35 @@ bundle version moves because its composition did.
 
 ## v1.3.0 (2026-08-12) — Runtime Foundation
 
-Der dokumentierte Lifecycle war bis hierher nicht durchsetzbar: `executor.py`
-war laut eigenem Kommentar eine Simulation, die State Machine lag im
-Arbeitsspeicher, der Event Logger verschluckte I/O-Fehler, die Gate Policy
-kannte keine Rollen. Diese Version schliesst genau diese Luecke.
+Until this version the documented lifecycle could not be enforced: `executor.py`
+was, by its own comment, a simulation; the state machine lived in memory; the
+event logger swallowed I/O errors; and the gate policy knew no roles. This
+release closes exactly that gap.
 
-- Autoritative Run State Machine mit Persistenz
-- Schreibvalidierung des Statusvokabulars; ein Wert ausserhalb des Enums wird
-  abgewiesen statt geschrieben
-- Append-only Event Journal mit Persist-before-Ack
-- Rollen- und Transition-Autoritaet; Selbstfreigabe wird strukturell verhindert
-- Session Envelope und Preflight gegen produktfremde Prompts
-- Immutable Artifact und Evidence Registry
-- Typed Handoff Broker mit `cold_start_bundle`
-- Checkpoint und Resume mit Revalidierung der Umgebung
-- Observer Runtime mit Offset und Lease
-- Cross-Run Gate Reconciliation
-- Verifizierbare Kontextbeschaffung; Prosa wird als Kontextquelle abgewiesen
-- Conformance-Readiness des Kerndatenmodells
-- Neun Golden Negative Fixtures, jede aus einem real aufgetretenen Fehler der
-  Welle CP-OPT-2026-08-05-W1 abgeleitet
+- **FEATURE**: Authoritative run state machine with persistence.
+- **FEATURE**: Write validation of the status vocabulary — a value outside the enum is rejected instead of written.
+- **FEATURE**: Append-only event journal with persist-before-ack.
+- **FEATURE**: Role and transition authority; self-approval is structurally prevented.
+- **FEATURE**: Session envelope and preflight against prompts that do not belong to the product.
+- **FEATURE**: Immutable artifact and evidence registry.
+- **FEATURE**: Typed handoff broker with `cold_start_bundle`.
+- **FEATURE**: Checkpoint and resume with revalidation of the environment.
+- **FEATURE**: Observer runtime with offset and lease.
+- **FEATURE**: Cross-run gate reconciliation.
+- **FEATURE**: Verifiable context acquisition — prose is rejected as a context source.
+- **FEATURE**: Conformance readiness of the core data model.
+- **TESTS**: Nine golden negative fixtures, each derived from a failure that actually occurred in wave `CP-OPT-2026-08-05-W1`.
 
-Der Degradationsdetektor liegt als eigenstaendiges Modul `skillweave_degraded`
-neben dem Package, damit er erreichbar bleibt, wenn `skillweave.runtime` fehlt.
-Sein `fallback_version` bleibt bewusst auf `v1.2.0` — das ist die letzte
-Version ohne Runtime.
+The degradation detector ships as the standalone module `skillweave_degraded`,
+next to the package, so it stays reachable when `skillweave.runtime` is missing.
+Its `fallback_version` deliberately stays at `v1.2.0`, the last version without
+the runtime.
 
-Bekannte Einschraenkung: Der GNF-Gegenbeweis dokumentiert die Abwesenheit des
-Schutzes auf `v1.2.0`, demonstriert aber nicht, dass die Fixtures den Defekt
-fangen. Verfolgt als `SW-SCOPE-003`.
+### Known issues
+
+The golden-negative counter-proof documents that the protection is absent on
+`v1.2.0`, but it does not demonstrate that the fixtures catch the defect.
+Tracked as `SW-SCOPE-003`.
 
 ## v1.2.0 (2026-08-11) — Branch Topology Consolidation
 

@@ -113,8 +113,14 @@ cap install skillweave
 ### From a built wheel
 
 ```bash
+python -m pip install "git+https://github.com/SkillWeave-AI/skillweave-sdk.git@v0.3.0"
 python -m pip install ./skillweave-1.5.11-py3-none-any.whl
 ```
+
+The wheel pins `skillweave-sdk==0.3.0`, and the SDK is not published to a
+package index. Install it first from its public `v0.3.0` tag, as above;
+otherwise pip stops with "No matching distribution found for
+skillweave-sdk==0.3.0".
 
 `skillweave` declares `requires-python >=3.9`; Python 3.9 is the supported
 floor. See [docs/provisioning.md](docs/provisioning.md) for the tested-Python
