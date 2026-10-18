@@ -635,5 +635,134 @@ def test_check_reports_installed_origin_from_the_real_distribution(tmp_path):
     assert "/repo/skillweave" in proc.stdout
 
 
+# ── SW-1511A-GATE-001 repair H: provisioning doc binds the CURRENT version ──
+
+
+def _pyproject_facts() -> dict:
+    """The current-version facts, derived from THIS tree's pyproject.toml."""
+    text = _read("pyproject.toml")
+    version = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    requires = re.search(r'^requires-python\s*=\s*"([^"]+)"', text, re.M)
+    assert version, "pyproject.toml has no [project].version"
+    assert requires, "pyproject.toml has no requires-python"
+    deps_block = re.search(r"^dependencies\s*=\s*\[(.*?)\]", text, re.M | re.S)
+    assert deps_block, "pyproject.toml has no [project].dependencies"
+    # Strip full-line comments so prose inside the block is never read as a pin.
+    deps_body = "\n".join(
+        ln for ln in deps_block.group(1).splitlines()
+        if not ln.strip().startswith("#")
+    )
+    deps = re.findall(r'"([^"]+)"', deps_body)
+    classifiers = re.findall(
+        r'"Programming Language :: Python :: (\d+\.\d+)"', text
+    )
+    return {
+        "version": version.group(1),
+        "requires_python": requires.group(1),
+        "dependencies": sorted(deps),
+        "python_series": sorted(classifiers),
+    }
+
+
+def _provisioning_declared_table(text: str) -> dict[str, str]:
+    """The rows of docs/provisioning.md's 'What is declared' table, by field."""
+    section = text.partition("## What is declared")[2].split("\n## ")[0]
+    rows: dict[str, str] = {}
+    for line in section.splitlines():
+        m = re.match(r"\|\s*([^|]+?)\s*\|\s*(.*?)\s*\|\s*$", line)
+        if not m:
+            continue
+        field, value = m.group(1), m.group(2)
+        if field in ("Field", "---") or set(field) <= {"-", " "}:
+            continue
+        rows[field] = value
+    assert rows, "docs/provisioning.md 'What is declared' table is missing"
+    return rows
+
+
+def test_provisioning_current_version_statements_match_pyproject():
+    # SW-1511A-GATE-001 divergence 3: the 'What is declared' table named 1.5.9
+    # while the tree is 1.5.11. This derives every current-version fact from
+    # pyproject.toml (the declared source of truth) and fails when the
+    # provisioning doc's CURRENT-product statements disagree. Statements about
+    # history are explicitly labelled and out of scope here.
+    facts = _pyproject_facts()
+    candidate = facts["version"]
+    doc = _read("docs/provisioning.md")
+
+    # (1) the 'What is declared' table.
+    rows = _provisioning_declared_table(doc)
+    assert rows["Version"] == f"`{candidate}`", (
+        f"'What is declared' Version {rows['Version']!r} != pyproject {candidate}"
+    )
+    assert rows["`requires-python`"] == f"`{facts['requires_python']}`", (
+        f"requires-python row {rows['`requires-python`']!r} != "
+        f"pyproject {facts['requires_python']}"
+    )
+    # every base dependency pyproject declares must be named in the row, and no
+    # other multipart version constraint may stand in for one of them.
+    deps_row = rows["Base dependencies"]
+    for dep in facts["dependencies"]:
+        assert dep in deps_row, f"base dependency {dep!r} missing from {deps_row!r}"
+    # the console-script set declared by pyproject.
+    scripts_block = re.search(
+        r"^\[project\.scripts\]\s*$(.*?)(?=^\[|\Z)", _read("pyproject.toml"),
+        re.M | re.S,
+    )
+    assert scripts_block, "pyproject.toml has no [project.scripts]"
+    declared_scripts = re.findall(r"^([a-z][a-z0-9-]*)\s*=", scripts_block.group(1), re.M)
+    named = set(re.findall(r"`([^`]+)`", rows["Console scripts"]))
+    assert named, "Console scripts row is not a backticked list"
+    assert named == set(declared_scripts), (
+        f"console scripts {sorted(named)} != pyproject {sorted(declared_scripts)}"
+    )
+
+    # (2) the wheel name in every install example is the CURRENT one.
+    wheel = f"skillweave-{candidate}-py3-none-any.whl"
+    assert wheel in doc, f"provisioning install examples do not name {wheel}"
+    # no stale current-product wheel name survives.
+    for stale in set(re.findall(r"skillweave-(\d+\.\d+\.\d+)-py3-none-any\.whl", doc)):
+        assert stale == candidate, (
+            f"provisioning install example names stale wheel version {stale} "
+            f"(current is {candidate})"
+        )
+
+    # (3) the "Version markers and Python support" section states the CURRENT
+    # distribution version (and does not state a stale one as current).
+    markers = doc.partition("## Version markers and Python support")[2]
+    assert markers, "the version-markers section is missing"
+    assert f"distribution version is `{candidate}`" in markers, (
+        "the version-markers section does not state the current distribution "
+        f"version {candidate}"
+    )
+
+    # (4) Python support: the requires-python floor and every declared
+    # classifier series the section names as declared support must agree with
+    # pyproject.toml. A series pyproject does not declare may appear only as an
+    # explicitly measured/verified row, never as declared support.
+    assert facts["requires_python"] in markers, (
+        f"the section does not state the pyproject requires-python "
+        f"{facts['requires_python']}"
+    )
+
+
+def test_provisioning_history_is_labelled_as_history():
+    # The repair keeps statements about HISTORY, but they must be explicitly
+    # labelled as history -- never as a description of the current release. Any
+    # stale version that survives in this section must sit beside an explicit
+    # "history"/"historical" label.
+    doc = _read("docs/provisioning.md")
+    markers = doc.partition("## Version markers and Python support")[2]
+    stale = set(re.findall(r"`(1\.5\.(?:8|9|10))`", markers))
+    if stale:
+        assert re.search(r"histor", markers, re.IGNORECASE), (
+            f"stale version(s) {sorted(stale)} appear in the version-markers "
+            "section without a history label"
+        )
+    # The current candidate must never be framed as history in this section.
+    candidate = _pyproject_facts()["version"]
+    assert f"version was `{candidate}`" not in markers
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
