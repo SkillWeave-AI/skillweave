@@ -65,7 +65,7 @@ from __future__ import annotations
 
 import shlex
 from dataclasses import dataclass
-from typing import Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 from skillweave.routing.profile import ToolSpec
 from skillweave.routing.modelspec import ModelSpec
@@ -386,6 +386,11 @@ def fan_out(
     tool: str,
     created_at: Optional[str] = None,
     cwd: Optional[str] = None,
+    process_service: Optional[Any] = None,
+    db_path: Optional[str] = None,
+    mailbox_path: Optional[str] = None,
+    artifacts_path: Optional[str] = None,
+    stream_root: Optional[str] = None,
 ):
     """Fan out independent commands as overlapping real processes (SW-FANOUT-001).
 
@@ -400,8 +405,30 @@ def fan_out(
     compatible) is lifted to ``concrete(model)`` for every child. Nothing here
     branches on the tool, the launch command, the arguments, or the work: it
     passes all of them through to the same path.
+
+    ``process_service`` (optional, criterion 2): when a process service is
+    configured (``process_service`` truthy, or one of the binding paths named),
+    this mints a controller session grant for the fan-out's run scope and
+    threads it into :func:`fan_out_dispatch`, so each child is launched with the
+    granted MCP configuration and verified from its own resolved environment.
+    Omitting it (the default) preserves the historical pass-through exactly.
     """
     from skillweave.fanout import fan_out_dispatch
+
+    mcp_grant = None
+    if process_service is not None or any(
+        p is not None for p in (db_path, mailbox_path, artifacts_path, stream_root)
+    ):
+        from skillweave.fanout.dispatch import mint_fanout_grant
+
+        mcp_grant = mint_fanout_grant(
+            run_id=run_id,
+            client_id="routing-fanout",
+            db_path=db_path,
+            mailbox_path=mailbox_path,
+            artifacts_path=artifacts_path,
+            stream_root=stream_root,
+        )
 
     return fan_out_dispatch(
         commands,
@@ -413,4 +440,5 @@ def fan_out(
         models=models,
         created_at=created_at,
         cwd=cwd,
+        mcp_grant=mcp_grant,
     )

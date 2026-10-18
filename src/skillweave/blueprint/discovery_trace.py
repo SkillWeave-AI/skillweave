@@ -90,7 +90,11 @@ _CORE_KEYS = (
 #: Every key a graph may carry. Anything else is rejected.
 _TOP_LEVEL_KEYS = frozenset(_CORE_KEYS) | {"digest"}
 
-_SCHEMA_PATH = Path(__file__).resolve().parents[3] / "schemas" / "discovery-trace.schema.json"
+def _schema_path() -> Path:
+    """Resolve the shipped discovery-trace schema from installed package data."""
+    from ..assets import packaged_schema_path
+
+    return packaged_schema_path("discovery-trace.schema.json")
 
 
 # ── Exception hierarchy ──────────────────────────────────────────────────────
@@ -950,7 +954,7 @@ def parse_human_mapping(text: str) -> dict[str, Any]:
 
 def load_schema() -> dict[str, Any]:
     """Return the shipped discovery-trace JSON schema, verbatim."""
-    return json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    return json.loads(_schema_path().read_text(encoding="utf-8"))
 
 
 #: Forward references for the public builder signatures.

@@ -7,8 +7,8 @@ binary is executed, in a fixed, auditable precedence:
     1. an **explicit launcher config** (``SearchConfig.mcp_command``) -- the
        caller names the command; it wins over everything;
     2. a **registered compatible runtime** -- a package registered with this
-       resolver (Capacium supplies **launcher metadata only**), whose exact
-       distribution/version is pinned;
+       resolver (by id, or through the resolver's registration seam), whose
+       exact distribution/version is pinned;
     3. a **verified installed binary** -- a console script resolved on ``PATH``
        whose distribution, version and origin are read from installed metadata
        and recorded as provenance;
@@ -61,9 +61,47 @@ FLOATING_MARKERS: tuple[str, ...] = ("git+", "http://", "https://")
 _PIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[^\]]+\])?==[^=\s]+$")
 _AT_PIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[^\]]+\])?@[^@\s]+$")
 
+#: A *scoped* npm spec pinned by ``@version``: ``@scope/name@version``. The
+#: unscoped ``_AT_PIN_RE`` above cannot match it (the spec starts with ``@``),
+#: so an npm/npx package token needs its own exact-pin test.
+_SCOPED_AT_PIN_RE = re.compile(
+    r"^@[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*@[^@\s]+$"
+)
+
 #: Interpreters that may front a ``-m module`` launch; only these are treated
 #: as the launcher when a module is named.
 _INTERPRETER_BASENAMES = ("python", "python3", "uv", "uvx")
+
+#: npm-style launchers that fetch-and-run a *remote* package when handed a bare
+#: package spec. ``npx -y <pkg>`` installs whatever the registry resolves at run
+#: time -- the same floating-install hazard as ``git+``/``http(s)``/unpinned
+#: ``uvx`` -- so an unpinned spec must be refused. ``pnpm dlx``, ``bunx`` /
+#: ``bun x`` and ``yarn dlx`` are the same publish-registry fetch at run time,
+#: so they are refused on identical terms: the documented policy is *refused*.
+#: The launcher is the command basename plus the subcommand that selects the
+#: fetch: ``("npx", ())`` fires on the token right after ``npx``, while
+#: ``("pnpm", ("dlx",))`` fires only when ``dlx`` follows ``pnpm`` (so a plain
+#: ``pnpm install`` is untouched). ``pnpm exec`` (and, by the same standard,
+#: ``yarn exec`` / ``yarn node`` / bare ``yarn <script>``) is deliberately NOT
+#: listed: it runs an already-resolved local binary or project script and never
+#: reaches the registry for a package spec, so an unpinned argument to it is a
+#: local name, not a fetch.
+_NPM_FETCH_LAUNCHERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("npx", ()),
+    ("npx.cmd", ()),
+    ("pnpm", ("dlx",)),
+    ("bunx", ()),
+    ("bun", ("x",)),
+    ("yarn", ("dlx",)),
+)
+
+#: Prefixes that name a *local* artifact (a path), which an npm fetcher runs in
+#: place rather than fetching remotely -- an exact local provenance, never
+#: floating.
+_NPX_LOCAL_PREFIXES = ("./", "../", "/", "~/", "\\", "file:")
+
+#: Suffixes naming an explicit local program or tarball handed to a fetcher.
+_NPX_LOCAL_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".tgz", ".tar.gz")
 
 
 class LauncherResolutionError(ValueError):
@@ -82,8 +120,8 @@ class LauncherResolutionError(ValueError):
 class Registration:
     """A known-compatible MCP launcher runtime, registered by a provider.
 
-    ``launch`` is the base command (e.g. ``["capacium-mcp"]`` or
-    ``["python3", "-m", "capacium_mcp.server"]``). ``distribution`` /
+    ``launch`` is the base command (e.g. ``["example-mcp"]`` or
+    ``["python3", "-m", "example_mcp.server"]``). ``distribution`` /
     ``version`` name the exact installed distribution the base command belongs
     to -- never a floating version directory. ``distribution`` is optional for
     an explicitly-registered local runtime whose provenance the caller owns.
@@ -196,14 +234,73 @@ def _effective_spec(part: str) -> str:
     return text
 
 
+def _npm_fetch_subcommands(basename: str) -> Optional[tuple[str, ...]]:
+    """The subcommand path that makes ``basename`` a remote fetch, or ``None``.
+
+    ``()`` means the bare launcher fetches (``npx``/``bunx``); ``("dlx",)`` /
+    ``("x",)`` require that subcommand. ``None`` means the basename is not a
+    fetch launcher at all (so no fetch rule applies to it).
+    """
+    for name, subcommands in _NPM_FETCH_LAUNCHERS:
+        if basename == name:
+            return subcommands
+    return None
+
+
+def _npx_target(command: Sequence[str]) -> Optional[str]:
+    """The remote package token of an npm fetch command, or ``None``.
+
+    The first non-option token *after* the launcher subcommand is the package to
+    run (``npx -y <pkg>``, ``pnpm dlx <pkg>``, ``bunx <pkg>``, ``bun x <pkg>``,
+    ``yarn dlx <pkg>``). ``None`` when the command is not an npm fetch at all,
+    so the caller applies no fetch rule.
+    """
+    parts = [str(p) for p in command]
+    if not parts:
+        return None
+    subcommands = _npm_fetch_subcommands(parts[0].rsplit("/", 1)[-1])
+    if subcommands is None:
+        return None
+    index = 1
+    for subcommand in subcommands:
+        if index >= len(parts) or parts[index] != subcommand:
+            return None
+        index += 1
+    for token in parts[index:]:
+        if token.startswith("-"):
+            continue
+        return token
+    return None
+
+
+def _npx_spec_is_floating(spec: str) -> bool:
+    """Whether an npm fetch package token would install floating (remote) code.
+
+    A local artifact (an explicit path/program, a tarball, or a ``file:`` URL)
+    is not a remote fetch, so it is never floating. An explicit ``http(s)``/
+    ``git+`` URL is itself floating and is left to the marker scan. Anything
+    else is a *package spec*: it is admissible only when exactly pinned
+    (``foo@1.2.3`` or ``@scope/foo@1.2.3``). The same rule governs every npm
+    fetch launcher (``npx``, ``pnpm dlx``, ``bunx``/``bun x``, ``yarn dlx``).
+    """
+    if spec.startswith(_NPX_LOCAL_PREFIXES):
+        return False
+    if spec.endswith(_NPX_LOCAL_SUFFIXES):
+        return False
+    return not (_is_pinned(spec) or bool(_SCOPED_AT_PIN_RE.match(spec)))
+
+
 def is_floating_command(
     command: Sequence[str], *, uvx_spec: Optional[str] = None
 ) -> bool:
     """Whether a launch command would install floating code.
 
-    A ``git+``/``http(s)`` marker anywhere in the *effective* spec, or an
-    unpinned ``uvx`` package spec, is floating. An explicit ``-f``/``--from``
-    hint is stripped before the marker scan.
+    A ``git+``/``http(s)`` marker anywhere in the *effective* spec, an unpinned
+    ``uvx`` package spec, or an unpinned npm fetch spec (``npx``, ``pnpm dlx``,
+    ``bunx``/``bun x``, ``yarn dlx``) is floating. An explicit ``-f``/``--from``
+    hint is stripped before the marker scan, and a local target handed to a
+    fetcher (a path, tarball or ``file:`` URL) is an exact local provenance
+    rather than a remote fetch.
     """
     for part in command:
         effective = _effective_spec(part)
@@ -214,6 +311,9 @@ def is_floating_command(
         spec = _effective_spec(uvx_spec)
         if not _is_pinned(spec):
             return True
+    npx_target = _npx_target(command)
+    if npx_target is not None and _npx_spec_is_floating(npx_target):
+        return True
     return False
 
 
@@ -279,26 +379,26 @@ def clear_registrations() -> None:
 
 
 def default_registrations() -> list[Registration]:
-    """The source-owned known-compatible runtimes.
+    """The source-owned known-compatible runtimes -- currently **none**.
 
-    Capacium appears here as **launcher metadata only**: the id, the real
-    console script, and the distribution/version its installed metadata must
-    match. Nothing from Capacium is imported to build this list.
+    A launcher is never trusted because a provider advertises one: an installed
+    console script can exist while its distribution is absent or its module
+    unimportable, so a default registration would resolve to a command that
+    cannot serve the Perplexity tool. The resolver therefore ships **no**
+    default registration and fails closed (``asset="launcher"``) unless a caller
+    supplies an explicit ``mcp_command``, a registration id / candidate that the
+    caller owns, or an installed binary it has verified.
+
+    A registration, when supplied, is still verified against its pinned
+    distribution version *before* its command is executed (see
+    :func:`_verify_registration`).
     """
-    return [
-        Registration(
-            id="capacium-mcp",
-            launch=("capacium-mcp",),
-            distribution="capacium-mcp",
-            version="0.3.0",
-            transport="mcp-stdio",
-            source="capacium:launcher-metadata",
-        ),
-    ]
+    return []
 
 
-for _registration in default_registrations():
-    register(_registration)
+# No ambient/automatic registration: the module registers nothing on import, so
+# ``resolve_launcher()`` with no explicit input fails closed rather than
+# trusting an installed-but-unverified launcher.
 
 
 # ── resolution ─────────────────────────────────────────────────────────────
@@ -309,7 +409,7 @@ def _with_resolved_launcher(
 ) -> tuple[str, ...]:
     """Substitute the *resolved* launcher path for the bare launcher token.
 
-    A registration declares a bare console-script name (``"capacium-mcp"``); the
+    A registration declares a bare console-script name (``"example-mcp"``); the
     resolver located a concrete path for it. Executing the path (never the bare
     name, which can pick up a different ``PATH``) is the point of "verified
     installed binary".
@@ -433,7 +533,9 @@ def resolve_launcher(
     elif registrations is not None:
         candidates = list(registrations)
     else:
-        candidates = [r for r in _REGISTRY.values() if r.id == "capacium-mcp"]
+        # No ambient default: the module registry is empty unless a caller has
+        # explicitly registered a runtime it owns.
+        candidates = list(_REGISTRY.values())
 
     for registration in candidates:
         verified = _verify_registration(

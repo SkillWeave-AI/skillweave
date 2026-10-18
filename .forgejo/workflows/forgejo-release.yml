@@ -287,6 +287,157 @@ jobs:
       # — there is no PyPI claim, and distribution to the Capacium Exchange runs
       # from the mirror side. The directory is created and left empty so the
       # engine attaches nothing, rather than failing on a missing path.
+      #
+      # Ops CORE-ZR-026: the release assets are built in the step below, in this
+      # same job, so the "left empty" note above predates it — the directory now
+      # carries the wheel, the sdist and SHA256SUMS and the engine attaches them.
+      # The build is deterministic: the wheel honours SOURCE_DATE_EPOCH and the
+      # sdist is rewritten to carry the same epoch, so two builds of one tag are
+      # byte-identical and a download is verified with `sha256sum -c SHA256SUMS`.
+      - name: Build the release assets
+        env:
+          TAG_NAME: "${{ github.event.inputs.tag_name || github.ref_name }}"
+        run: |
+          set -euo pipefail
+
+          rm -rf release-assets
+
+          # The build runs in a venv so --no-isolation still finds the PEP 639
+          # floor setuptools>=77 that the build backend declares; the directory
+          # stays out of the source tree so it is never itself packaged.
+          BUILD_VENV="$(mktemp -d)/build-venv"
+          python3 -m venv "$BUILD_VENV"
+          "$BUILD_VENV/bin/python" -m pip install --quiet \
+            --disable-pip-version-check --use-pep517 build "setuptools>=77" wheel
+
+          # SOURCE_DATE_EPOCH is the tag commit time — one instant for both the
+          # annotated tag and the commit it names, so a rebuild is identical.
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "${TAG_NAME}^{}")"
+
+          "$BUILD_VENV/bin/python" - "${TAG_NAME}" <<'BUILD_PY'
+          import gzip
+          import io
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tarfile
+          import zipfile
+
+          tag = sys.argv[1]
+
+          def project_fields(text):
+              """Read name/version from the [project] table, nothing else."""
+              in_project = False
+              fields = {}
+              for raw in text.splitlines():
+                  line = raw.split("#", 1)[0].strip()
+                  if line.startswith("[") and line.endswith("]"):
+                      in_project = line == "[project]"
+                      continue
+                  if not in_project:
+                      continue
+                  key, sep, value = line.partition("=")
+                  if sep and key.strip() in ("name", "version"):
+                      fields[key.strip()] = value.strip().strip("\"'")
+              return fields
+
+          fields = project_fields(
+              open("pyproject.toml", encoding="utf-8").read()
+          )
+          name = fields.get("name", "")
+          version = fields.get("version", "")
+          if not name or not version:
+              sys.stderr.write(
+                  "ReleaseVersionError: pyproject.toml [project] declares no "
+                  "name/version; refusing to build release assets for %s.\n" % tag
+              )
+              sys.exit(2)
+          if tag != "v" + version:
+              sys.stderr.write(
+                  "ReleaseVersionMismatchError: tag %s but pyproject.toml "
+                  "declares version %s; refusing to build release assets that "
+                  "do not name the tag they claim.\n" % (tag, version)
+              )
+              sys.exit(2)
+
+          dist = "release-assets"
+          subprocess.run(
+              [sys.executable, "-m", "build", "--no-isolation",
+               "--sdist", "--wheel", "--outdir", dist],
+              check=True,
+          )
+
+          # The wheel honours SOURCE_DATE_EPOCH through setuptools; the sdist
+          # does not, so it is rewritten to carry the epoch on every member and
+          # in the gzip header. Without this, two builds differ.
+          epoch = int(os.environ["SOURCE_DATE_EPOCH"])
+          sdist = os.path.join(dist, "%s-%s.tar.gz" % (name, version))
+          with tarfile.open(sdist, "r:gz") as src:
+              members = [
+                  (m, src.extractfile(m).read() if m.isreg() else None)
+                  for m in src.getmembers()
+              ]
+          buf = io.BytesIO()
+          with tarfile.open(fileobj=buf, mode="w",
+                            format=tarfile.GNU_FORMAT) as out:
+              for member, data in members:
+                  member.mtime = epoch
+                  member.uid = member.gid = 0
+                  member.uname = member.gname = ""
+                  out.addfile(
+                      member, io.BytesIO(data) if data is not None else None
+                  )
+          with open(sdist, "wb") as fh:
+              fh.write(gzip.compress(buf.getvalue(), mtime=epoch))
+
+          # The artifact must name the version its own manifest declares, and
+          # the directory must hold exactly the declared set — nothing extra,
+          # nothing missing. Either check fails closed and leaves no files.
+          wheel = os.path.join(
+              dist, "%s-%s-py3-none-any.whl" % (name, version)
+          )
+          with zipfile.ZipFile(wheel) as zf:
+              meta = zf.read(
+                  "%s-%s.dist-info/METADATA" % (name, version)
+              ).decode("utf-8")
+          built = re.search(r"(?m)^Version:\s*(\S+)\s*$", meta)
+          if built is None or built.group(1) != version:
+              got = built.group(1) if built else "(absent)"
+              sys.stderr.write(
+                  "ReleaseVersionMismatchError: the built wheel records version "
+                  "%s but pyproject.toml declares %s; refusing release assets "
+                  "whose artifact disagrees with its own manifest.\n"
+                  % (got, version)
+              )
+              shutil.rmtree(dist, ignore_errors=True)
+              sys.exit(2)
+
+          expected = {
+              "%s-%s.tar.gz" % (name, version),
+              "%s-%s-py3-none-any.whl" % (name, version),
+          }
+          actual = set(os.listdir(dist))
+          if actual != expected:
+              sys.stderr.write(
+                  "UnexpectedReleaseAssetError: release-assets holds %s but the "
+                  "declared release assets are %s; refusing a directory that "
+                  "carries anything other than the declared artifacts.\n"
+                  % (sorted(actual), sorted(expected))
+              )
+              shutil.rmtree(dist, ignore_errors=True)
+              sys.exit(2)
+          sys.stdout.write(
+              "built release assets for %s: %s\n"
+              % (version, ", ".join(sorted(expected)))
+          )
+          BUILD_PY
+
+          # Relative names: the checksum file travels with the assets it lists.
+          (cd release-assets && sha256sum *.tar.gz *.whl > SHA256SUMS)
+          (cd release-assets && sha256sum -c SHA256SUMS)
       - name: Publish the release to every destination
         env:
           TAG_NAME: "${{ github.event.inputs.tag_name || github.ref_name }}"
@@ -519,3 +670,25 @@ jobs:
 
           asyncio.run(main())
           PUBLISH_PY
+
+      # Publication is not verification. The step above proves the engine
+      # accepted the release; it cannot prove that the release a consumer
+      # downloads carries the assets this job built. A partially uploaded
+      # attachment, an extra file, or bytes that do not match the reviewed
+      # SHA256SUMS all publish "successfully". Re-read the release object from
+      # the forge and hold the run red, by name, if the attached set is not the
+      # set SHA256SUMS declares.
+      - name: Verify the published release attachments
+        env:
+          TAG_NAME: "${{ github.event.inputs.tag_name || github.ref_name }}"
+          FORGEJO_REPOSITORY: "${{ github.repository }}"
+          FORGEJO_BASE_URL: "${{ github.server_url }}"
+          FORGEJO_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          set -euo pipefail
+
+          python3 scripts/verify-release-attachments.py \
+            --tag "$TAG_NAME" \
+            --base-url "$FORGEJO_BASE_URL" \
+            --repository "$FORGEJO_REPOSITORY" \
+            --assets-dir release-assets

@@ -431,6 +431,7 @@ class RunApplicationService:
         raw_artifacts: RawArtifactStore,
         stream_store: Optional[Any] = None,
         reservation_store: Optional[Any] = None,
+        final_result_root: Optional[str] = None,
     ):
         self.store = store
         self.journal = journal
@@ -468,6 +469,13 @@ class RunApplicationService:
             except Exception:  # noqa: BLE001 - other init failure
                 raise
         self.reservation_store = reservation_store
+        # SW-1511A-RESULT-001: the directory the child result reconciler writes
+        # the attempt-final-result/v1 record into. It is configuration, not
+        # authority: when unset the reconciler derives a durable location beside
+        # the stream root, so a composed caller (the run wrapper, the native
+        # controller, the MCP entry) and the wrapper's own confirmation write
+        # one record instead of two.
+        self._final_result_root_override = final_result_root
 
     def execute(
         self,
@@ -691,6 +699,15 @@ class RunApplicationService:
                         f"route {model!r} is not an approved BytePlus route; "
                         f"refusing unapproved route (HOLD: {exc})",
                     ) from exc
+            # SW-1511A-UPSTREAM-001: attest the provider attempt on the launch
+            # path before any worker starts. The allowed route, actual upstream,
+            # answering identity and credential binding must all be attestable
+            # without exposing a secret; the gate fails closed with a typed,
+            # auditable refusal otherwise.
+            if model is not None:
+                self._admit_provider_launch(
+                    model, route_policy=route_policy, route_proof=route_proof
+                )
             # Criterion 2: egress gateway check and OS confinement
             # (may require sandbox-exec).  This runs after the pure-logic
             # checks so that on a host without sandbox-exec the named HOLD
@@ -1672,6 +1689,56 @@ class RunApplicationService:
                 f"proof is supplied, but it is not available on this host; "
                 f"refusing to launch an unconfined worker (HOLD)",
             )
+
+    def _admit_provider_launch(
+        self,
+        resolved_route: str,
+        *,
+        route_policy: Optional[Any] = None,
+        route_proof: Optional[Any] = None,
+    ) -> dict:
+        """Attest the provider attempt before a worker is launched (SW-1511A-UPSTREAM-001).
+
+        This is the attempt-launch caller of the ``upstream-observation/v1``
+        contract's :func:`admit_provider_attempt`: the allowed route is the
+        proof's ``tier_routes`` (falling back to the proof's
+        ``approved_routes``, then the owner policy), the actual upstream is the
+        approved gateway the attempt will speak to, the answering identity is
+        the requested route's model, and the credential binding is the approved
+        gateway location — a *reference*, never a token.
+
+        A refusal is the same named HOLD the rest of this gate produces: stage
+        ``route_lock_direct_provider`` for an unattestable route/upstream/
+        binding, so a direct-provider bypass or a secret-shaped binding never
+        reaches a launched process. When no route proof is supplied this gate
+        does not run (legacy paths keep their behaviour).
+        """
+        if route_proof is None:
+            return {}
+        routes: set[str] = set()
+        for tier, tier_routes in getattr(route_proof, "tier_routes", {}).items():
+            routes.update(tier_routes)
+        if not routes:
+            routes.update(getattr(route_proof, "approved_routes", frozenset()))
+        if not routes and route_policy is not None:
+            routes.update(route_policy.approved_routes)
+        from skillweave.routing.faigate_adapter import admit_provider_launch
+
+        host = getattr(route_proof, "approved_gateway_host", "")
+        port = getattr(route_proof, "approved_gateway_port", None)
+        binding = f"gateway://{host}:{port}" if host and port else ""
+        try:
+            return admit_provider_launch(
+                resolved_route,
+                allowed_routes=routes,
+                credential_binding=binding,
+            )
+        except Exception as exc:
+            raise RunIntegrationError(
+                "route_lock_direct_provider",
+                f"provider attempt for route {resolved_route!r} is not "
+                f"attestable; refusing before launch (HOLD: {exc})",
+            ) from exc
 
     def _verify_route_proof_against_pin(
         self,
@@ -2766,6 +2833,11 @@ class RunApplicationService:
                         f"route {route!r} is not an approved BytePlus route; "
                         f"refusing unapproved route (HOLD: {exc})",
                     ) from exc
+                # SW-1511A-UPSTREAM-001: attest the provider attempt before the
+                # worker starts (same fail-closed admission as the launch path).
+                self._admit_provider_launch(
+                    route, route_policy=route_policy, route_proof=route_proof
+                )
             # Criterion 2: egress gateway check and OS confinement
             # (may require sandbox-exec).  This runs after the pure-logic
             # checks so that on a host without sandbox-exec the named HOLD
@@ -3008,6 +3080,41 @@ class RunApplicationService:
             "lineage": lineage,
         }
 
+    @staticmethod
+    def _terminal_cancel_result(
+        run_id: str, run: Any, recorded_identity: Any = None,
+    ) -> dict[str, Any]:
+        """The cancel result for an *already-terminal* run (SW-1511A-GATE-001 5b-ii).
+
+        A terminal run has nothing left to cancel, so no signal is ever sent.
+        Unlike a non-terminal run whose process can no longer be observed
+        (``unknown`` / ``unknown_inflight``), this result is *definite*: it
+        reports ``result='already_terminal'`` and the durable lifecycle the
+        store already holds (``state``/``lifecycle_state``), so a caller can
+        tell "the run I asked to cancel is already finished" apart from "the
+        run's in-flight state is unknown".
+        """
+        lifecycle_state = (run.metadata or {}).get(
+            "runlifecycle", {}).get("lifecycle_state")
+        return {
+            "run_id": run_id,
+            "pid": (
+                recorded_identity.pid if recorded_identity is not None else None
+            ),
+            "pgid": (
+                recorded_identity.pgid if recorded_identity is not None else None
+            ),
+            "state": lifecycle_state or run.state,
+            "lane_state": run.state,
+            "lifecycle_state": lifecycle_state,
+            "result": "already_terminal",
+            "signalled": [],
+            "identity_verified": False,
+            "unknown_inflight": False,
+            "unrelated_untouched": [],
+            "verification": None,
+        }
+
     def cancel_process(
         self,
         run_id: str,
@@ -3072,6 +3179,30 @@ class RunApplicationService:
         recorded_identity = _runtime_attr("process_identity", "ProcessIdentity").from_dict(recorded)
         recorded_pid = recorded_identity.pid if recorded_identity is not None else pid
 
+        # SW-1511A-GATE-001 (5b-i): a caller-supplied ``pid`` is a *hint* the
+        # caller believes is the target.  When an identity was recorded, the
+        # hint must equal the recorded identity's PID -- any mismatch is a
+        # recycled-PID refusal, raised *before* any signal boundary (nothing is
+        # ever signalled) so the documented contract holds.  The case where no
+        # identity was recorded is unchanged: there the caller's ``pid`` (or the
+        # absence of one) is what the identity check reports as *no_record*.
+        if recorded_identity is not None and pid is not None and pid != recorded_pid:
+            reason = _runtime_attr("process_identity", "REASON_RECYCLED")
+            raise _runtime_attr("errors", "ProcessIdentityError")(
+                run_id, pid, reason,
+                verification={
+                    "ok": False,
+                    "reason": reason,
+                    "recorded_pid": recorded_pid,
+                    "current_pid": None,
+                    "detail": (
+                        f"recorded pid {recorded_pid} does not match the "
+                        f"requested pid {pid}"
+                    ),
+                    "current_identity": None,
+                },
+            )
+
         # ---- durable cancellation intent before the signal boundary -------
         # Recorded first so a crash at/after the signal is recoverable by a
         # later ``resume_run`` pass.  A genuine terminal winner is preserved.
@@ -3079,6 +3210,14 @@ class RunApplicationService:
         already_terminal = (
             run.state != "preflight" and RunStateModel.is_terminal(run.state)
         )
+        # SW-1511A-GATE-001 (5b-ii): a terminal run has nothing left to cancel.
+        # Report the *already-terminal* result consistent with the durable
+        # lifecycle -- distinct from the non-terminal-but-unobservable
+        # ``unknown`` path below -- and never fall through to the not_alive
+        # branch that would (wrongly) report a terminal run as unknown in-flight.
+        if already_terminal:
+            return self._terminal_cancel_result(run_id, run, recorded_identity)
+
         reconcile_cancellation_intent = getattr(
             self.store, "reconcile_cancellation_intent", None)
         if not already_terminal and reconcile_cancellation_intent is not None:
@@ -3137,12 +3276,31 @@ class RunApplicationService:
         signalled: list[int] = []
         unknown_inflight = check.reason == REASON_NOT_ALIVE
         result = "unknown"
+        targets: list[int] = []
+        unrelated_untouched: list[int] = []
 
         if check.reason == REASON_MATCH:
             # The leader is verified (and, when the pgid still holds, so is the
             # whole group).  Signal every member of the owned group.
             targets = sorted({p for p in members if p} | {recorded_pid})
+            # SW-1511A-LIVENESS-001 (criterion 3): the owned group is proven
+            # before each signal.  A target whose *observed* process group is
+            # not the owned group is never signalled -- it is recorded as an
+            # unrelated process left untouched.  This is the causal evidence
+            # the final result carries, not a claim asserted after the fact.
+            capture_identity = _runtime_attr("process_identity", "capture")
+            owned_targets: list[int] = []
             for target in targets:
+                observed = capture_identity(target)
+                if (
+                    pgid is not None
+                    and observed is not None
+                    and observed.pgid != pgid
+                ):
+                    unrelated_untouched.append(target)
+                    continue
+                owned_targets.append(target)
+            for target in owned_targets:
                 try:
                     os.kill(target, _signal.SIGTERM)
                     signalled.append(target)
@@ -3150,10 +3308,10 @@ class RunApplicationService:
                     pass
             deadline = time.monotonic() + max(0.0, grace)
             while time.monotonic() < deadline:
-                if not any(is_alive(t) for t in targets):
+                if not any(is_alive(t) for t in owned_targets):
                     break
                 time.sleep(0.02)
-            remaining = [t for t in targets if is_alive(t)]
+            remaining = [t for t in owned_targets if is_alive(t)]
             for target in remaining:
                 try:
                     os.kill(target, _signal.SIGKILL)
@@ -3178,7 +3336,29 @@ class RunApplicationService:
                 "verification_reason": check.reason,
                 "signalled": [],
                 "group_members": [],
+                "unrelated_untouched": [],
                 "unknown_inflight": True,
+                "owned_process_cancel": {
+                    "schema": (
+                        "owned-process-cancel/v1 "
+                        "(skillweave // SW-1511A-LIVENESS-001)"
+                    ),
+                    "schema_version": "1.0.0",
+                    "run_id": run_id,
+                    "task_id": (run.metadata or {}).get("task_id") or run_id,
+                    "attempt": (run.metadata or {}).get("attempt", 1),
+                    "pid": recorded_pid,
+                    "pgid": recorded_pgid,
+                    "identity_verified": False,
+                    "identity_token": None,
+                    "creation_token": None,
+                    "reason": reason,
+                    "result": "unknown",
+                    "signalled": [],
+                    "group_members": [],
+                    "unrelated_untouched": [],
+                    "verification": check.to_dict(),
+                },
             }
             try:
                 self.journal.append(
@@ -3202,10 +3382,39 @@ class RunApplicationService:
                 "signalled": [],
                 "identity_verified": False,
                 "unknown_inflight": True,
+                "unrelated_untouched": [],
+                "owned_process_cancel": ack_payload["owned_process_cancel"],
                 "verification": check.to_dict(),
             }
 
         # ---- record the acknowledgement -----------------------------------
+        # SW-1511A-LIVENESS-001 (criterion 3, owned-process-cancel/v1): the
+        # causal evidence of the cancellation -- the identity-verified command,
+        # the owned descendants actually signalled, and the unrelated processes
+        # proven to belong to a different group and left untouched.  Bound to
+        # the exact run/attempt/group/fencing identities the contract requires.
+        owned_process_cancel = {
+            "schema": "owned-process-cancel/v1 (skillweave // SW-1511A-LIVENESS-001)",
+            "schema_version": "1.0.0",
+            "run_id": run_id,
+            "task_id": (run.metadata or {}).get("task_id") or run_id,
+            "attempt": (run.metadata or {}).get("attempt", 1),
+            "pid": recorded_pid,
+            "pgid": pgid,
+            "identity_verified": True,
+            "identity_token": (
+                check.current.identity_token if check.current is not None else None
+            ),
+            "creation_token": (
+                check.current.creation_token if check.current is not None else None
+            ),
+            "reason": reason,
+            "result": result,
+            "signalled": list(signalled),
+            "group_members": list(members),
+            "unrelated_untouched": list(unrelated_untouched),
+            "verification": check.to_dict(),
+        }
         ack_payload = {
             "run_id": run_id,
             "pid": recorded_pid,
@@ -3216,7 +3425,9 @@ class RunApplicationService:
             "verification_reason": check.reason,
             "signalled": signalled,
             "group_members": list(members),
+            "unrelated_untouched": list(unrelated_untouched),
             "unknown_inflight": False,
+            "owned_process_cancel": owned_process_cancel,
         }
         try:
             self.journal.append(
@@ -3238,8 +3449,13 @@ class RunApplicationService:
                     target_state="advance_or_stop",
                     lifecycle_update={"lifecycle_state": "killed"},
                     event_type="process_killed",
-                    event_payload={"pid": recorded_pid, "result": result,
-                                   "signalled": signalled},
+                    event_payload={
+                        "pid": recorded_pid,
+                        "result": result,
+                        "signalled": signalled,
+                        "unrelated_untouched": unrelated_untouched,
+                        "owned_process_cancel": owned_process_cancel,
+                    },
                     idempotency_key="cancel:" + run_id,
                     reason=reason,
                     stop_reason="operator_halt",
@@ -3264,6 +3480,8 @@ class RunApplicationService:
             "signalled": signalled,
             "identity_verified": check.reason == REASON_MATCH,
             "unknown_inflight": unknown_inflight,
+            "unrelated_untouched": unrelated_untouched,
+            "owned_process_cancel": owned_process_cancel,
             "verification": check.to_dict(),
         }
 
@@ -3771,6 +3989,7 @@ class RunApplicationService:
         source_resolver: Optional[Any] = None,
         analysis_reader: Optional[Callable[[str], Optional[bytes]]] = None,
         route_proof: Optional[Any] = None,
+        final_result_root: Optional[str] = None,
     ) -> dict[str, Any]:
         """Protected native execution whose output is durably streamed.
 
@@ -3846,6 +4065,12 @@ class RunApplicationService:
 
         created_at = created_at or datetime.now(timezone.utc).isoformat()
 
+        # SW-1511A-RESULT-001: one ``observed_at`` for the whole attempt, minted
+        # once at ingest. It is the run wrapper's own value too, so the
+        # reconciler's record and the wrapper's *idempotent* confirmation of it
+        # carry one timestamp and cannot be read as two disagreeing writers.
+        final_result_observed_at = created_at
+
         # Where an exact-source binding exists, the receipt must match the base
         # that binding pins -- exactly as the bounded ``execute`` path checks,
         # at the same point in the preflight order (after the methodology/
@@ -3892,6 +4117,11 @@ class RunApplicationService:
                         f"route {model!r} is not an approved BytePlus route; "
                         f"refusing unapproved route (HOLD: {exc})",
                     ) from exc
+                # SW-1511A-UPSTREAM-001: attest the provider attempt before the
+                # worker starts (same fail-closed admission as the launch path).
+                self._admit_provider_launch(
+                    model, route_policy=route_policy, route_proof=route_proof
+                )
             # Criterion 2: egress gateway check and OS confinement
             # (may require sandbox-exec).  This runs after the pure-logic
             # checks so that on a host without sandbox-exec the named HOLD
@@ -4234,6 +4464,14 @@ class RunApplicationService:
                 "task_id": task_id,
                 "stdout": out_summary.to_dict(),
                 "stderr": err_summary.to_dict(),
+                # SW-1511A-LIVENESS-001: the owned attempt's liveness report
+                # (state + per-state causal incident series) recorded by the
+                # supervision loop around this child.  Additive: absent when the
+                # recorder could not be produced, never reinterpreted.
+                "liveness": (
+                    result.metadata.get("liveness")
+                    if getattr(result, "metadata", None) else None
+                ),
             },
         )
 
@@ -4439,7 +4677,127 @@ class RunApplicationService:
         }
         if assay_block is not None:
             out["assay"] = assay_block
+
+        # SW-1511A-RESULT-001: the child result reconciler. Every launched
+        # attempt gets exactly one ``attempt-final-result/v1`` reconciled from
+        # the *same* durable facts and stream summaries the stages above wrote
+        # (child exit/signal/termination, whole-observed-byte evidence digest,
+        # assay state), so a controller never infers the outcome from the
+        # wrapper's exit code or from a retained raw stream. The reconciler
+        # fails closed -- a contract refusal propagates -- but never widens the
+        # method's existing public return surface for its callers.
+        reconciled = self._reconcile_attempt_final_result(
+            run_id=run_id,
+            task_id=task_id or run_id,
+            attempt=int(attempt),
+            # The wrapper's *own* exit code is the only value that belongs in
+            # this dimension: a withheld native Assay PASS is the sole non-zero
+            # wrapper exit (a failed child or a failed gate still exits 0 with
+            # the failure reported in the result), so the record never reports a
+            # wrapper exit the wrapper did not return.
+            wrapper_exit=(
+                1
+                if isinstance(assay_block, dict)
+                and assay_block.get("outcome") == "hold"
+                else 0
+            ),
+            observed_at=final_result_observed_at,
+            assay_block=assay_block,
+            final_result_root=final_result_root,
+        )
+        out["final_result"] = reconciled.to_dict()
         return out
+
+    def _final_result_root(self) -> Optional[str]:
+        """The directory final-result records are written to, if one is durable.
+
+        It sits beside the durable stream root so the record outlives the
+        retention-capped stream bytes. The contract's own store nests each
+        record under ``<root>/attempt-final-results/``, so the derived root is
+        the stream root's parent and this matches the wrapper's
+        ``_default_final_result_root`` exactly: both producers name one
+        directory for one launched attempt. No stream store (or a memory-only
+        one) means no durable location, and the reconciler stays memory-only
+        rather than inventing a path.
+
+        The derived root is the stream root's parent, so it spans every attempt
+        whose evidence lands under that stream root. The store keys each record
+        by the full ``(run_id, task_id, attempt)`` identity, so two genuinely
+        different attempts never collide even though they share a directory;
+        only a *reused* identity with different content is refused, which is
+        the exactly-one guarantee and must not be weakened. A caller that drives
+        the service against a shared stream root therefore still owns the
+        uniqueness of its own identities -- the store's job is to refuse a
+        conflicting rewrite of one identity, not to invent a per-caller scope.
+        A caller-named ``final_result_root`` (the ``skillweave run`` wrapper
+        always names one) pins the location explicitly and wins here.
+        """
+        if self._final_result_root_override:
+            return str(self._final_result_root_override)
+        root = getattr(self.stream_store, "root", None)
+        if not root:
+            return None
+        return os.path.dirname(os.path.abspath(str(root))) or "."
+
+    def _reconcile_attempt_final_result(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        wrapper_exit: int,
+        observed_at: str,
+        final_result_root: Optional[str],
+        assay_block: Optional[dict[str, Any]],
+    ) -> Any:
+        """Reconcile one launched attempt's unambiguous final result (fail-closed).
+
+        The record separates the child's raw machine outcome from the wrapper's
+        exit code, names an intentionally absent artifact case as a hold rather
+        than a process failure, and takes its evidence digest from the
+        whole-observed-byte stream summary so the verdict survives retention.
+        """
+        from skillweave.trace.attempt_final_result import (
+            ArtifactSemantics,
+            AttemptFinalResultStore,
+            final_result_from_attempt,
+        )
+
+        semantics = ArtifactSemantics.APPLICABLE
+        hold_name = ""
+        hold_reason = ""
+        if isinstance(assay_block, dict):
+            declared = assay_block.get("artifact_evidence")
+            if isinstance(declared, dict) and declared.get("admitted") is False:
+                semantics = ArtifactSemantics.NAMED_HOLD
+                hold_name = "artifact-semantics"
+                hold_reason = str(
+                    assay_block.get("reason") or "artifact-specific semantics refused"
+                )
+        assay_state = "artifact_verify"
+        if isinstance(assay_block, dict):
+            outcome = assay_block.get("outcome")
+            if outcome == "pass":
+                assay_state = "pass"
+            elif outcome == "hold":
+                assay_state = "hold"
+
+        result = final_result_from_attempt(
+            self.stream_store,
+            run_id=run_id,
+            task_id=task_id,
+            attempt=int(attempt),
+            wrapper_exit=int(wrapper_exit),
+            assay_state=assay_state,
+            artifact_semantics=semantics,
+            hold_name=hold_name,
+            hold_reason=hold_reason,
+            observed_at=observed_at,
+        )
+        AttemptFinalResultStore(
+            root=final_result_root if final_result_root else self._final_result_root()
+        ).write(result)
+        return result
 
     # -- narrow collector interface for the owning composed lane ------------
     #

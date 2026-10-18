@@ -1,7 +1,7 @@
-# Native execution & support matrix (SkillWeave 1.5.10)
+# Native execution & support matrix (SkillWeave 1.5.11)
 
 This document is the **release-facing execution/support matrix** for the
-SkillWeave 1.5.10 train. It answers one question for an operator, a reviewer or
+SkillWeave 1.5.11 train. It answers one question for an operator, a reviewer or
 an integrating agent:
 
 > Which execution and support surfaces exist, what each one actually does, and
@@ -32,7 +32,7 @@ Three acceptance criteria drive it:
 
 There is **no single file named "release manifest"** in the tree. The *qualified
 release manifest* is the composed set of the declared, machine-checked release
-surfaces that this 1.5.10 checkout actually carries. Each row below names the
+surfaces that this 1.5.11 checkout actually carries. Each row below names the
 file that is its authority and the consumer that projects it into this page:
 
 | Release surface | Authority (source of truth) | How this page derives it |
@@ -54,8 +54,8 @@ read from exactly these authorities; none of them re-derives a second set.
 
 ### The two required version surfaces agree
 
-- candidate (product) — `pyproject.toml`: **1.5.10**
-- bundle — `capability.yaml`: **1.5.10**
+- candidate (product) — `pyproject.toml`: **1.5.11**
+- bundle — `capability.yaml`: **1.5.11**
 
 `.version.yaml` declares `release_policy: decoupled_member_pins`: the *runtime
 product* and the *distribution bundle* carry the train version, while every
@@ -82,9 +82,11 @@ page — the value is derived from the repository at read time, so it cannot go
 stale here. The full rule is in `docs/version-truth.md`, enforced by
 `scripts/check-version-truth.py`.
 
-`1.5.10` is this page's **candidate and bundle** version and a **released
-version**: its `v1.5.10` tag exists in the repository. The released identity is
-the tag's peeled commit, as derived below.
+`1.5.11` is this page's **candidate and bundle** version: the release **in
+preparation**, which is **not yet released** — its `v1.5.11` tag does not yet
+exist in the repository, and `docs/version-truth.md` records the distinction.
+The released identity is the latest canonical annotated tag's peeled commit, as
+derived below.
 
 ---
 
@@ -142,8 +144,16 @@ which speaks the `run-snapshot-v1` public contract. The rows below are the table
 | `kill` | operate | supported | `skillweave.runlifecycle.cli:main_kill` |
 | `cancel` | operate | supported | `skillweave.runlifecycle.cli:main_cancel` |
 | `resume` | operate | supported | `skillweave.runlifecycle.cli:main_resume` |
+| `native-controller` | execute | supported | `skillweave.cli.native_controller:main` |
 | `mcp` | operate | supported | `skillweave.mcp.server` |
 | `dispatch` | legacy | legacy | `skillweave.dispatch.cli:main` |
+
+`native-controller` is a first-class **source** surface: the router mounts the
+subcommand and `skillweave.cli.support` publishes the row above. Its **live**
+qualification -- a real controller run that acquires the lease and drives an
+owned attempt against a real store -- is **NOT PERFORMED** in this checkout, so
+the row is source support only and is never read as a claim that the live
+in-process loop has been exercised end to end.
 
 The interpretation of a state is **shared by construction**: it is *projected*
 from the one authority each part already lives in (`RunStateModel` canonical
@@ -244,12 +254,14 @@ an empty name, never mistaken for a declaration. The four canonical names are
 MCP is an **optional extra** (`skillweave[mcp]`), never a base dependency; the
 base install runs without it and reports an actionable hint when it is
 requested while absent (`python -m skillweave.scripts.check_optional_capability
-mcp`). The server exposes exactly these **11** tools (read from the live
+mcp`). The server exposes exactly these **19** tools (read from the live
 `@mcp.tool()` registry in `src/skillweave/mcp/server.py`):
 
-`create_run`, `status_run`, `cancel_run`, `resume_run`, `get_evidence`,
-`review_run`, `mailbox_post`, `mailbox_read`, `mailbox_replay`, `mailbox_ack`,
-`agent_capabilities`.
+`create_run`, `status_run`, `cancel_run`, `resume_run`, `restart_session`,
+`get_evidence`, `review_run`, `mailbox_post`, `mailbox_read`, `mailbox_replay`,
+`mailbox_ack`, `agent_capabilities`, `harness_session_grant`, `handoff_adapter`,
+`read_continuation_decision`, `review_action`, `register_child_harness_capability`,
+`qualified_harness_continuation`, `recover_owned_attempt`.
 
 The six control tools keep their names/signatures and delegate to
 `skillweave.mcp.control`, which composes the *same* `RunApplicationService` the

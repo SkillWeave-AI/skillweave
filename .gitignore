@@ -44,3 +44,11 @@ release-gate-report.md
 
 # Coverage
 .coverage.worktrees/
+
+# Repo-root hygiene (CORE-ZR-022). Scratch logs, ad-hoc scripts and the local
+# evidence directories the verify harnesses write are never tracked. Anchored
+# with a leading slash so a same-named tracked path deeper in the tree (for
+# example the tests/fixtures substrate) is never swallowed by accident.
+/*.log
+/tests_output/
+/tests_output_rework.txt

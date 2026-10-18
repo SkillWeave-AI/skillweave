@@ -1,0 +1,22 @@
+# The single declared input for reproducible release-gate test environments
+# (SW-1511A-ENV-001, contract execution-environment-attestation/v1).
+#
+# One declaration builds the complete, non-editable environment for every
+# declared interpreter. Invalidating a pin (any field below) changes the
+# dependency-lock digest and therefore requires a new attestation.
+schema = "test-environments/v1"
+
+python = ["3.11", "3.12", "3.14"]
+
+non_editable = true
+
+# Backend plus the assertions the full unit suite needs to collect.
+collection_dependencies = ["build", "jsonschema", "mcp", "setuptools", "wheel"]
+
+# Needed to run the suite rather than merely collect it.
+runner_dependencies = ["pytest", "pytest-asyncio", "PyYAML"]
+
+# Exact pin; must agree with pyproject.toml. Never "latest" or a range.
+sdk = "skillweave-sdk==0.3.0"
+
+unit_suite = "tests/unit"

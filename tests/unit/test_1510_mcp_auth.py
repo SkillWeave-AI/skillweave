@@ -392,6 +392,12 @@ class TestEveryToolIsGated:
             "status_run": lambda: mcp_server.status_run("run-1", db_path=db),
             "cancel_run": lambda: mcp_server.cancel_run("run-1", db_path=db),
             "resume_run": lambda: mcp_server.resume_run("run-1", db_path=db),
+            # SW-1511-MCP-BOOTSTRAP: the restart/reconnect tool a restarted main
+            # session calls is gated at the same seam -- an unauthenticated
+            # principal is refused before any service/child is re-verified.
+            "restart_session": lambda: mcp_server.restart_session(
+                "run-1", db_path=db
+            ),
             "get_evidence": lambda: mcp_server.get_evidence("run-1", db_path=db),
             "review_run": lambda: mcp_server.review_run(
                 "run-1", "pass", "ok", db_path=db
@@ -406,6 +412,25 @@ class TestEveryToolIsGated:
             "mailbox_replay": lambda: mcp_server.mailbox_replay(recipient="worker-1"),
             "mailbox_ack": lambda: mcp_server.mailbox_ack("m-1"),
             "agent_capabilities": lambda: mcp_server.agent_capabilities(),
+            # SW-1511-MCP-BOOTSTRAP: the scoped session-grant minting tool is
+            # gated at the same seam -- an unauthenticated principal is refused
+            # before any process service is resolved or token minted.
+            "harness_session_grant": lambda: mcp_server.harness_session_grant(),
+            # ...as are the two SW-1511 seams: transport-adapter selection
+            # (criterion 5) and the independent-Review round trip (criterion 4).
+            "handoff_adapter": lambda: mcp_server.handoff_adapter(),
+            # ...as is the SW-1511 recovered-controller reader (criterion 2's C
+            # fix): the persisted decision is refused before the mailbox opens.
+            "read_continuation_decision": lambda: mcp_server.read_continuation_decision(),
+            "review_action": lambda: mcp_server.review_action("read"),
+            # SW-1511-RECOVERY: the two-harness qualification, the child-
+            # capability recording and the one recovered owned attempt are
+            # gated at the same seam.
+            "register_child_harness_capability": lambda: mcp_server.register_child_harness_capability(),
+            "qualified_harness_continuation": lambda: mcp_server.qualified_harness_continuation(),
+            "recover_owned_attempt": lambda: mcp_server.recover_owned_attempt(
+                "recover", run_id="run-1", db_path=db,
+            ),
         }
         assert set(calls) == set(_control.LEGACY_TOOLS) | set(_control.MCP_AGENT_TOOLS)
         for name, call in calls.items():
@@ -542,23 +567,45 @@ class TestStdioSupervisorIdentity:
         assert mcp_server.require_supervisor_identity() == "supervisor:ops-1"
 
     def test_main_refuses_before_serving_when_dependency_or_authority_absent(
-        self, monkeypatch
+        self, monkeypatch, capsys
     ):
         """The serving entry checks the dependency first (naming the missing
         package), then the stdio supervisor identity -- a local stdio client is
-        never implicitly trusted."""
+        never implicitly trusted.
+
+        ``main`` is the entry the built wheel's console script actually calls,
+        so *both* refusals are converted there into the documented one-line
+        diagnostic and :data:`mcp_server.EXIT_REFUSED` -- a scriptable exit
+        code, never a propagated traceback. The typed-exception contract at the
+        stdio seam is covered directly by
+        :meth:`test_stdio_requires_an_explicit_supervisor_identity`, which calls
+        :func:`require_supervisor_identity` rather than the exit-converting
+        ``main``.
+        """
         monkeypatch.delenv(mcp_server.SUPERVISOR_ENV, raising=False)
         monkeypatch.setattr(mcp_server, "_AUTHORITY", None)
         from skillweave.mcp import control as _control
 
-        if not _control.mcp_available():
-            with pytest.raises(_control.McpDependencyUnavailable):
-                mcp_server.main()
-            return
-        # With the real dependency present, the supervisor identity is the
-        # next gate.
-        with pytest.raises(UnauthenticatedPrincipal):
+        with pytest.raises(SystemExit) as refusal:
             mcp_server.main()
+
+        assert refusal.value.code == mcp_server.EXIT_REFUSED == 3
+        err = capsys.readouterr().err
+        assert "Traceback" not in err
+        lines = [line for line in err.splitlines() if line.strip()]
+        assert len(lines) == 1, err
+
+        if not _control.mcp_available():
+            # The dependency gate fires first: the missing package is named.
+            assert lines[0].startswith("skillweave-mcp unavailable:")
+            assert _control.DEGRADED_REASON in lines[0]
+            return
+
+        # With the real dependency present, the supervisor identity is the
+        # next gate: the refusal is explicit and names the variable to set.
+        assert lines[0].startswith("skillweave-mcp refused:")
+        assert mcp_server.SUPERVISOR_ENV in lines[0]
+        assert "explicit supervisor identity" in lines[0]
 
 
 class TestHttpAuthorizationControls:

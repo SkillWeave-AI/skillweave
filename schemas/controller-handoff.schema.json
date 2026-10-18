@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skillweave.dev/schemas/controller-handoff/v2",
+  "title": "Controller Handoff Schema",
+  "description": "controller-handoff/v2 (SW-1511A-HANDOFF-001 criterion 1). A typed offered/accepted/active/released-or-rejected state machine that transfers the single controller lease to a server-issued destination principal without carrying provider credentials. The offer records the fencing generation the current controller holds; activation only commits once the destination has acquired a *strictly higher* generation, so a stale or superseded handoff can never carry the lease. v1 manual packages remain readable as offered-only; activation requires v2 acknowledgement.",
+  "type": "object",
+  "required": [
+    "schema",
+    "handoff_id",
+    "from_holder",
+    "destination_principal",
+    "scope",
+    "fencing_generation",
+    "state"
+  ],
+  "properties": {
+    "schema": {
+      "const": "controller-handoff/v2",
+      "description": "The exact contract identity. Anything else is refused."
+    },
+    "schema_version": {
+      "type": "string",
+      "description": "Contract version of this record."
+    },
+    "handoff_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The opaque handoff identity a receipt references."
+    },
+    "from_holder": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The controller releasing the lease."
+    },
+    "destination_principal": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The server-issued destination principal that receives the lease. Never a caller-supplied authority claim: the server owns this value and the destination must present the same principal to accept."
+    },
+    "destination_attestation": {
+      "$ref": "#/$defs/attestationRef",
+      "description": "The destination harness's configured-route and recipient-principal attestation (harness-controller-attestation/v1). Absent or stale attestation is a named HOLD."
+    },
+    "scope": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The exactly-once scope the single living attempt continues. A second live handoff for the same scope is refused."
+    },
+    "fencing_generation": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The lease fencing generation the offering controller holds. Activation commits only against a strictly higher generation, so a stale handoff can never carry the lease."
+    },
+    "resulting_generation": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "The fencing generation the destination acquired on activation (strictly greater than fencing_generation); null before activation."
+    },
+    "credential_binding": {
+      "type": "string",
+      "description": "A non-secret reference to how the destination reaches its own route (for example gateway://host:port). A provider credential value here is a refusal, never a carried secret; the lease transfer carries no provider credentials."
+    },
+    "state": {
+      "type": "string",
+      "enum": ["offered", "accepted", "active", "released", "rejected"],
+      "description": "The legal states. activated is spelled 'active'; a rejected or released handoff is terminal and can never reactivate."
+    },
+    "rejected_reason": {
+      "type": ["string", "null"],
+      "description": "The named reason a rejected (or cancelled) handoff did not transfer the lease."
+    },
+    "offered_at": { "type": ["string", "null"] },
+    "accepted_at": { "type": ["string", "null"] },
+    "activated_at": { "type": ["string", "null"] },
+    "released_at": { "type": ["string", "null"] },
+    "rejected_at": { "type": ["string", "null"] },
+    "metadata": {
+      "type": "object",
+      "description": "Non-authoritative annotations. Never a place to smuggle a credential."
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "attestationRef": {
+      "type": ["object", "null"],
+      "description": "A harness-controller-attestation/v1 record (or null when not carried as a sub-object).",
+      "properties": {
+        "schema": { "const": "harness-controller-attestation/v1" }
+      },
+      "required": ["schema"],
+      "additionalProperties": true
+    }
+  }
+}

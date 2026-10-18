@@ -48,6 +48,7 @@ from skillweave.dispatch import cli as dispatch
 from skillweave.cli import observe as observe_mod
 from skillweave.cli import planning_sync as planning_sync_mod
 from skillweave.cli import assess as assess_mod
+from skillweave.cli import native_controller as native_controller_mod
 from skillweave.cli import support as support_mod
 from skillweave.runlifecycle import cli as runlifecycle_cli
 
@@ -205,6 +206,17 @@ def _build_parser(prog: str = "skillweave") -> argparse.ArgumentParser:
         add_help=False,
     )
 
+    # `native-controller` subcommand -- the production entry point that
+    # constructs the native process service on the durable store and drives one
+    # owned attempt (SW-SCOPE-010, unit A). Additive and opt-in.
+    subparsers.add_parser(
+        "native-controller",
+        help="Drive the native process service: acquire the controller lease "
+             "and run one owned attempt through the declared six steps",
+        parents=[native_controller_mod.build_parser()],
+        add_help=False,
+    )
+
     # `support` subcommand -- the versioned support table + shared state
     # interpretation (SW-1510-CLI criterion 2). Read-only.
     subparsers.add_parser(
@@ -269,6 +281,8 @@ def main(
         return runlifecycle_cli.main_cancel(subcommand_argv(args_list))
     elif args.command == "resume":
         return runlifecycle_cli.main_resume(subcommand_argv(args_list))
+    elif args.command == "native-controller":
+        return native_controller_mod.main(subcommand_argv(args_list))
     elif args.command == "support":
         return support_mod.main(subcommand_argv(args_list))
     else:
@@ -284,7 +298,7 @@ def subcommand_argv(args_list: Sequence[str]) -> list:
     from the subcommand's own index is correct for both call styles.
     """
     for index, token in enumerate(args_list):
-        if token in ("onboard", "entry", "dispatch", "run", "rework", "planning-sync", "assess", "start", "inspect", "kill", "cancel", "resume", "support"):
+        if token in ("onboard", "entry", "dispatch", "run", "rework", "planning-sync", "assess", "start", "inspect", "kill", "cancel", "resume", "native-controller", "support"):
             return list(args_list[index + 1:])
     return []
 

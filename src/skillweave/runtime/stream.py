@@ -67,6 +67,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
+from skillweave.redaction import scrub_secrets
+
 #: Default number of bytes retained per stream as evidence (1 MiB), matching the
 #: runner's historical output ceiling. Retaining is bounded independently of how
 #: much the child writes; the exact digest still covers every observed byte.
@@ -77,6 +79,16 @@ DEFAULT_RETAIN_LIMIT = 1024 * 1024
 #: digest stays exact) but no new frame is emitted; the stream is typed
 #: ``metadata_limit_reached`` when sealed.
 DEFAULT_MAX_FRAMES = 65536
+
+#: Default size of the bounded *closing* excerpt kept per stream (SW-1511A-
+#: RESULT-001, finding F-1511A-01). Retention keeps the *head* of a stream and
+#: drops the tail, so a child's closing message — the last stream-json
+#: ``result`` event, or simply the final line it wrote — is exactly what a
+#: retention cap loses. This excerpt is captured at *ingest* time, independently
+#: of retention, so the tail survives the cap and can be bound into the attempt's
+#: final result. It is a bounded excerpt, never the whole tail: the digest
+#: remains the whole-observed-byte evidence.
+DEFAULT_CLOSING_EXCERPT_LIMIT = 4 * 1024
 
 #: Event kinds carried by a durable stream frame.
 FRAME_CHUNK = "chunk"
@@ -342,18 +354,26 @@ class StreamSpool:
         stream: str,
         retain_limit: int = DEFAULT_RETAIN_LIMIT,
         max_frames: int = DEFAULT_MAX_FRAMES,
+        closing_excerpt_limit: int = DEFAULT_CLOSING_EXCERPT_LIMIT,
     ) -> None:
         if retain_limit < 0:
             raise StreamError("retain_limit must be non-negative")
         if max_frames < 1:
             raise StreamError("max_frames must be >= 1")
+        if closing_excerpt_limit < 0:
+            raise StreamError("closing_excerpt_limit must be non-negative")
         self.run_id = run_id
         self.task_id = task_id
         self.attempt = attempt
         self.stream = stream
         self.retain_limit = retain_limit
         self.max_frames = max_frames
+        self.closing_excerpt_limit = closing_excerpt_limit
         self._retained = bytearray()
+        #: The bounded tail kept *independently of retention*. Only the last
+        #: ``closing_excerpt_limit`` bytes are ever held, so a child that writes
+        #: without bound cannot grow the spool's memory through this buffer.
+        self._closing_tail = bytearray()
         self._hasher = hashlib.sha256()
         self._observed = 0
         self._frame_count = 0
@@ -440,6 +460,7 @@ class StreamSpool:
             return 0, b""
         self._observed += len(chunk)
         self._hasher.update(chunk)
+        self._note_closing_tail(chunk)
         room = self.retain_limit - len(self._retained)
         if room > 0:
             retained = bytes(chunk[:room])
@@ -456,6 +477,35 @@ class StreamSpool:
             self._metadata_limited = True
             return 0, retained
         return 1, retained
+
+    def _note_closing_tail(self, chunk: bytes) -> None:
+        """Keep the last ``closing_excerpt_limit`` observed bytes, at ingest time.
+
+        This is deliberately *outside* retention: the retained prefix is capped
+        and keeps the head, so the tail — where a child's closing message lives —
+        would otherwise be dropped. Trimming per chunk keeps the buffer bounded
+        no matter how much the child writes.
+        """
+        limit = self.closing_excerpt_limit
+        if limit <= 0:
+            return
+        self._closing_tail.extend(chunk)
+        if len(self._closing_tail) > limit:
+            del self._closing_tail[: len(self._closing_tail) - limit]
+
+    def closing_tail(self) -> bytes:
+        """The bounded trailing excerpt observed so far (b"" if none observed)."""
+        return bytes(self._closing_tail)
+
+    def closing_byte_range(self) -> tuple[int, int]:
+        """The byte range of the observed stream the closing tail covers.
+
+        ``(start, end)`` are offsets into the *observed* byte sequence, so the
+        excerpt's position is exact even though retention dropped everything
+        around it. An unobserved stream yields the empty range ``(0, 0)``.
+        """
+        end = self._observed
+        return (max(0, end - len(self._closing_tail)), end)
 
     def mark_interrupted(self) -> None:
         """Record that collection stopped before the stream was fully drained."""
@@ -509,6 +559,7 @@ class StreamSpool:
             "stream": self.stream,
             "retain_limit": self.retain_limit,
             "max_frames": self.max_frames,
+            "closing_excerpt_limit": self.closing_excerpt_limit,
             "observed_bytes": self._observed,
             "digest": self._hasher.hexdigest(),
             "frame_count": self._frame_count,
@@ -529,6 +580,7 @@ class StreamSpool:
         retained: bytes,
         *,
         digest_override: Optional[str] = None,
+        closing_tail: bytes = b"",
     ) -> "StreamSpool":
         """Rebuild a spool from persisted state and its retained bytes.
 
@@ -544,8 +596,12 @@ class StreamSpool:
             stream=state["stream"],
             retain_limit=int(state.get("retain_limit", DEFAULT_RETAIN_LIMIT)),
             max_frames=int(state.get("max_frames", DEFAULT_MAX_FRAMES)),
+            closing_excerpt_limit=int(
+                state.get("closing_excerpt_limit", DEFAULT_CLOSING_EXCERPT_LIMIT)
+            ),
         )
         spool._retained = bytearray(retained)
+        spool._closing_tail = bytearray(closing_tail)
         spool._observed = int(state.get("observed_bytes", len(retained)))
         spool._frame_count = int(state.get("frame_count", 0))
         spool._cursor_start = state.get("cursor_start")
@@ -682,7 +738,9 @@ class DurableStreamStore:
                 continue
             raw_path = state_path.with_suffix(".raw")
             retained = raw_path.read_bytes() if raw_path.exists() else b""
-            spool = StreamSpool.restore(state, retained)
+            closing_path = state_path.with_suffix(".closing")
+            closing_tail = closing_path.read_bytes() if closing_path.exists() else b""
+            spool = StreamSpool.restore(state, retained, closing_tail=closing_tail)
             key = identity_key(spool.run_id, spool.task_id, spool.attempt)
             self._spools.setdefault(key, {})[spool.stream] = spool
         self._log = []
@@ -793,6 +851,10 @@ class DurableStreamStore:
             spool.run_id, f"{spool.task_id}\x00{spool.stream}", spool.attempt
         )
         self._write_bytes_atomic(base.with_suffix(".raw"), spool.read_retained())
+        # The closing excerpt is durable beside the spool it belongs to, so a
+        # second process recovers the child's tail even though retention dropped
+        # it. It is written independently of the retained prefix.
+        self._write_bytes_atomic(base.with_suffix(".closing"), spool.closing_tail())
         self._write_json_atomic(base.with_suffix(".json"), spool.persisted_state())
 
     # -- identity -----------------------------------------------------------
@@ -1165,6 +1227,60 @@ class DurableStreamStore:
         spool.retain_limit = limit
         self._persist_spool(spool)
 
+    # -- the retained closing excerpt (SW-1511A-RESULT-001, F-1511A-01) -----
+
+    def closing_excerpt(
+        self,
+        attempt: int,
+        stream: str,
+        *,
+        run_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """The bounded *tail* of one stream, captured independently of retention.
+
+        Retention keeps the head of a stream and drops the tail, so the child's
+        closing message is precisely what a cap loses. This excerpt is kept at
+        ingest time (see :meth:`StreamSpool._note_closing_tail`), so it survives
+        the cap. It is reported as data, never as the evidence:
+
+        * ``observed`` is explicitly ``False`` when no byte was observed at all,
+          so a caller can never read a missing tail as an empty message;
+        * ``byte_range_start``/``byte_range_end`` locate the excerpt exactly in
+          the observed byte sequence (``end`` equals ``observed_bytes``);
+        * ``digest`` is the sha256 over *this excerpt's* bytes, so the bound
+          record can be checked against the durable excerpt text;
+        * secret-shaped content is scrubbed in ``text`` (and the digest is taken
+          over that scrubbed text), through the shared
+          :mod:`skillweave.redaction` rule set. The spool's durable bytes stay
+          raw evidence, exactly as the retained prefix does; it is the excerpt
+          *handed out* here that is safe to persist into a human-readable
+          record, so a credential the child printed in its closing line never
+          leaves this method.
+        """
+        spool = self.spool(attempt, stream, run_id=run_id, task_id=task_id)
+        tail = spool.closing_tail()
+        start, end = spool.closing_byte_range()
+        observed = bool(tail)
+        text = scrub_secrets(tail.decode("utf-8", errors="replace"))
+        scrubbed = text.encode("utf-8")
+        return {
+            "attempt": attempt,
+            "stream": stream,
+            "observed": observed,
+            "text": text,
+            "bytes": len(scrubbed),
+            "digest": hashlib.sha256(scrubbed).hexdigest() if observed else "",
+            "byte_range_start": start,
+            "byte_range_end": end,
+            "observed_bytes": spool.observed_bytes,
+            "note": (
+                "tail of the observed stream"
+                if observed
+                else "no bytes were observed on this stream"
+            ),
+        }
+
     # -- preview (never the raw evidence) -----------------------------------
 
     def preview(
@@ -1319,6 +1435,7 @@ def _subtype_for(termination: str) -> str:
 
 __all__ = [
     "AttemptFact",
+    "DEFAULT_CLOSING_EXCERPT_LIMIT",
     "DEFAULT_MAX_FRAMES",
     "DEFAULT_RETAIN_LIMIT",
     "DurableStreamStore",

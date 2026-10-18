@@ -74,9 +74,16 @@ _REDACTED = "[REDACTED]"
 
 
 def is_floating_command(command: Sequence[str]) -> bool:
-    """Whether a launch command would install floating code."""
-    joined = " ".join(str(part) for part in command)
-    return any(marker in joined for marker in FLOATING_MARKERS)
+    """Whether a launch command would install floating code.
+
+    Delegates to the canonical launcher detector so this client and the
+    resolver agree on *every* floating form -- the marker scan plus the
+    unpinned ``uvx`` and unpinned ``npx`` rules -- rather than the markers
+    alone. The import is local to keep the module's import cycle broken.
+    """
+    from skillweave.council.launcher import is_floating_command as _canonical
+
+    return _canonical(command)
 
 
 def redact_text(

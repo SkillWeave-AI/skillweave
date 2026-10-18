@@ -545,6 +545,7 @@ def run_process_streaming(
     timeout: Optional[float] = None,
     cwd: Optional[str] = None,
     wrap_command: Optional[Any] = None,
+    liveness_recorder: Optional[Any] = None,
 ) -> StreamingResult:
     """Spawn ``cmd`` and durably stream its stdout/stderr into ``store``.
 
@@ -559,6 +560,11 @@ def run_process_streaming(
       actually ended.
     * ``secrets`` redact the returned convenience text only; the durable bytes
       and their digests stay exact.
+    * ``liveness_recorder`` is the owned-attempt liveness watcher
+      (``SW-1511A-LIVENESS-001``): when omitted a recorder is built for the
+      launched child, sampled from this supervision loop and finished with the
+      attempt's typed fact.  Liveness evidence is additive -- it is attached to
+      the result's metadata and never changes the outcome of the attempt.
 
     A launch failure is recorded as its own subtype; it does not raise out of
     this collector with a fabricated exit code.
@@ -624,6 +630,20 @@ def run_process_streaming(
         )
 
     pid = proc.pid
+
+    # Owned-attempt liveness (SW-1511A-LIVENESS-001).  The recorder observes this
+    # child through the same store it streams into; it is built here, around the
+    # launched child, and its evidence is additive.  Any failure to build it is
+    # swallowed: an observation failure must never become an attempt failure.
+    if liveness_recorder is None:
+        try:
+            liveness_mod = importlib.import_module("skillweave.runtime.liveness")
+            liveness_recorder = liveness_mod.LivenessRecorder.for_store(
+                store, run_id=run_id, task_id=task_id, attempt=attempt, pid=pid,
+            )
+        except Exception:  # noqa: BLE001 - liveness is additive evidence
+            liveness_recorder = None
+
     timed_out = False
     cancelled = False
     storage_failed = False
@@ -662,6 +682,14 @@ def run_process_streaming(
                     break
             if storage_failed:
                 break
+
+            # Sample the child's liveness from this loop.  Rate-limited inside
+            # the recorder; failures are swallowed there.
+            if liveness_recorder is not None:
+                try:
+                    liveness_recorder.sample()
+                except Exception:  # noqa: BLE001 - liveness is additive evidence
+                    pass
 
             if timeout is not None and (time.monotonic() - start_monotonic) > timeout:
                 timed_out = True
@@ -743,9 +771,19 @@ def run_process_streaming(
     message = ""
     if storage_failed:
         message = f"durable stream storage failed: {storage_error}"
-    return _result_from_store(
+    liveness_report = None
+    if liveness_recorder is not None:
+        try:
+            liveness_recorder.finish(fact)
+            liveness_report = liveness_recorder.report()
+        except Exception:  # noqa: BLE001 - liveness is additive evidence
+            liveness_report = None
+    result = _result_from_store(
         store, cmd, attempt, run_id, task_id, fact, secrets, message=message,
     )
+    if liveness_report is not None:
+        result.metadata["liveness"] = liveness_report
+    return result
 
 
 def _result_from_store(

@@ -56,7 +56,11 @@ _REVIEWER_KEYS: frozenset[str] = frozenset(
     {"reviewer_id", "class", "verdict", "subject_sha"}
 )
 
-_SCHEMA_PATH = Path(__file__).resolve().parents[3] / "schemas" / "dual-review-attestation.schema.json"
+def _schema_path() -> Path:
+    """Resolve the shipped attestation schema from installed package data."""
+    from ..assets import packaged_schema_path
+
+    return packaged_schema_path("dual-review-attestation.schema.json")
 
 
 class AttestationError(ValueError):
@@ -222,7 +226,7 @@ def validate(evidence: Mapping[str, Any]) -> DualReviewAttestation:
 
 def load_schema() -> dict[str, Any]:
     """Return the shipped dual-review attestation JSON schema, verbatim."""
-    return json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    return json.loads(_schema_path().read_text(encoding="utf-8"))
 
 
 __all__ = [

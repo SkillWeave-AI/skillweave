@@ -28,8 +28,10 @@ wave the caller names) and makes no claim of stable 1.4 transport compatibility.
 from __future__ import annotations
 
 import importlib
+import os
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -686,6 +688,8 @@ def _default_inline_seam(
     artifact_store: Optional[Any] = None,
     on_child_lifecycle: Optional[Callable[..., None]] = None,
     env: Optional[dict[str, str]] = None,
+    env_allowlist: Optional[Sequence[str]] = None,
+    mcp_grant: Optional[Any] = None,
 ) -> Any:
     """Run a single lane through the single-process seam, never the fan-out path.
 
@@ -707,12 +711,26 @@ def _default_inline_seam(
 
     ``env`` (optional) is forwarded to ``start_process`` so the subprocess
     inherits extra environment variables (e.g. the message channel path).
+
+    ``env_allowlist`` (optional) constrains the child environment to exactly
+    those keys, so an ambient provider credential can never leak into the
+    child. ``mcp_grant`` (optional) is a
+    :class:`skillweave.mcp.bootstrap.HarnessMcpSessionGrant`: when supplied the
+    adapter provisions the effective MCP configuration (server-issued session
+    token + the one process service's store/mailbox/artifacts/stream roots)
+    *inside the actual child launch* and then verifies the child genuinely
+    resolved that same authority/state service. A child that lands on a
+    different (isolated) store is refused — the grant never degrades to the
+    interactive harness profile alone. Both parameters are additive: omitting
+    them preserves the historical launch exactly.
     """
+    from skillweave.mcp import bootstrap as _mcp_bootstrap
     from skillweave.routing.modelspec import from_value
     from skillweave.routing.faigate_adapter import resolve_model_spec
     from skillweave.fanout.dispatch import (
         FanOutChild,
         FanOutResult,
+        _launch_failed_result,
         _make_receipt_reference,
         _resolve_outcome,
         _store_child_bytes,
@@ -722,6 +740,16 @@ def _default_inline_seam(
 
     child_run_id = f"{run_id}-0"
     resolved_model = resolve_model_spec(from_value(model))
+
+    extra_env: Optional[dict[str, str]] = dict(env) if env else None
+    allowlist = list(env_allowlist) if env_allowlist is not None else None
+    if mcp_grant is not None:
+        grant_env = _mcp_bootstrap.grant_child_env(mcp_grant)
+        _mcp_bootstrap.assert_no_ambient_credentials(grant_env)
+        extra_env = dict(extra_env or {})
+        extra_env.update(grant_env)
+        # the provisioned keys must be permitted into the child.
+        allowlist = list(set(allowlist or ()) | set(grant_env))
 
     def _notify(phase: str, handle: Any) -> None:
         if on_child_lifecycle is None:
@@ -733,21 +761,58 @@ def _default_inline_seam(
             handle=handle,
         )
 
-    handle = runner_adapter.start_process(
-        list(command),
-        run_id=child_run_id,
-        subject_repo=subject_repo,
-        subject_commit=subject_commit,
-        tool=tool,
-        model=resolved_model,
-        cwd=cwd,
-        env=env,
-    )
-    _notify("started", handle)
+    # Only an OS-level *spawn* failure of ``start_process`` (a command that
+    # exists but is not executable, a missing interpreter, any spawn error) is
+    # degraded to a typed ``launch_failed`` outcome on this seam, exactly as the
+    # fan-out path already does -- never an uncaught exception that aborts the
+    # whole wave with no durable record. The window is deliberately *narrow*: it
+    # covers the spawn only. A refusal raised by ``verify_child_launch`` (an
+    # unobservable child, a missing granted token, a child resolving a foreign
+    # service -- ``ProcessServiceMismatchRefused`` and the other typed refusals)
+    # is a security refusal and must propagate unchanged: a child that *did*
+    # spawn is never laundered into a launch failure.
+    start_error: Optional[BaseException] = None
     try:
-        result = handle.wait(timeout=timeout)
-    finally:
-        _notify("terminal", handle)
+        handle = runner_adapter.start_process(
+            list(command),
+            run_id=child_run_id,
+            subject_repo=subject_repo,
+            subject_commit=subject_commit,
+            tool=tool,
+            model=resolved_model,
+            cwd=cwd,
+            env=extra_env,
+            env_allowlist=allowlist,
+        )
+    except Exception as exc:  # noqa: BLE001
+        start_error = exc
+        result = _launch_failed_result(
+            list(command),
+            run_id=child_run_id,
+            repo=subject_repo,
+            commit=subject_commit,
+            tool=tool,
+            model=resolved_model,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            message=f"{type(exc).__name__}: {exc}",
+        )
+    if start_error is not None:
+        # Mirror the fan-out path's lifecycle shape for a never-started child:
+        # a ``started`` observation with no handle, then a ``terminal`` one, so
+        # the typed lifecycle is complete rather than truncated at the start.
+        _notify("started", None)
+        _notify("terminal", None)
+    else:
+        # The child started: verification runs *outside* the spawn guard so a
+        # refusal propagates unchanged (the already started handle is left
+        # un-waited / un-notified, exactly as on the parent revision).
+        if mcp_grant is not None:
+            handle = _mcp_bootstrap.verify_child_launch(mcp_grant, handle)
+        _notify("started", handle)
+        try:
+            result = handle.wait(timeout=timeout)
+        finally:
+            _notify("terminal", handle)
     outcome = _resolve_outcome(result)
     child = FanOutChild(
         child_run_id=child_run_id,
@@ -772,6 +837,26 @@ def _default_inline_seam(
 # ── Tee sink (observer replay) ──────────────────────────────────────────────
 
 
+def _guard_worker_credentials(line: str) -> str:
+    """Redact any ambient worker credential value from a teed output line.
+
+    The dispatch/child-launch output path writes to a caller-supplied sink, so
+    a worker's provider credential must never be observable there.  The guard
+    runs on the actual line being written (never on a caller-supplied blob):
+    a credential-shaped value is replaced with the explicit redaction marker,
+    and any residual value is refused rather than forwarded.  The bootstrap
+    module is imported lazily so this module stays free of a hard MCP import.
+    """
+    try:
+        from skillweave.mcp import bootstrap as _bootstrap
+    except Exception:  # pragma: no cover - import boundary must never break output
+        return line
+    environ = os.environ
+    redacted = _bootstrap.redact_worker_credentials(line, environ)
+    _bootstrap.assert_worker_credentials_not_in_logs(redacted, environ)
+    return redacted
+
+
 class _TeeSink:
     """A text sink that forwards to a caller sink while recording emitted lines.
 
@@ -779,6 +864,11 @@ class _TeeSink:
     wave produced — not a copy owned by the observer. The tee is transparent to
     the caller: every write and flush is forwarded immediately, so the live
     consumer still sees ``wave_started`` before the first worker launch.
+
+    This is a real output path for a launched child and its dispatch lifecycle,
+    so every line is passed through the worker-credential guard before it
+    reaches the caller sink — a worker's provider credential is redacted here,
+    on the actual write, never merely assumed absent.
     """
 
     def __init__(self, caller_sink: Any) -> None:
@@ -786,8 +876,9 @@ class _TeeSink:
         self._lines: list[str] = []
 
     def write(self, s: str) -> int:
-        self._lines.append(s)
-        return self._caller.write(s)
+        guarded = _guard_worker_credentials(str(s))
+        self._lines.append(guarded)
+        return self._caller.write(guarded)
 
     def flush(self) -> None:
         self._caller.flush()
@@ -1216,12 +1307,23 @@ class OperatorDispatchApplication:
         strict_adapter: Optional[HarnessAdapterProfile] = None,
         strict_skill_digests: Optional[Mapping[str, str]] = None,
         env: Optional[dict[str, str]] = None,
+        mcp_grant: Optional[Any] = None,
     ) -> DispatchRun:
         """Execute one wave and return a machine-readable run identifier.
 
         ``sink`` is the JSONL text stream the event stream appends to (defaults
         to ``sys.stdout``). Returns a :class:`DispatchRun` whose ``run_id`` is
         the machine-readable identifier.
+
+        ``mcp_grant`` (optional) is a
+        :class:`skillweave.mcp.bootstrap.HarnessMcpSessionGrant` threaded into
+        the *actual* child launch of every worker lane (both the single-lane
+        inline seam and the parallel fan-out seam): the adapter provisions the
+        granted MCP configuration into that child's environment and verifies,
+        from the child's own resolved environment, that it reaches the same
+        authority/state service. A child that lands elsewhere is refused, so a
+        grant never degrades to the interactive harness profile. Omitting it
+        (``None``, the default) preserves the historical launch exactly.
 
         ``gate_input`` (optional) carries the observed topology/integration facts
         (explicit integration lanes, a semantic conflict, per-lane eligibility).
@@ -1373,6 +1475,7 @@ class OperatorDispatchApplication:
                         round_=0,
                         provisioned=provisioned,
                         env=env,
+                        mcp_grant=mcp_grant,
                     )
                 else:
                     self._fanout_group(
@@ -1385,6 +1488,7 @@ class OperatorDispatchApplication:
                         round_=0,
                         provisioned=provisioned,
                         env=env,
+                        mcp_grant=mcp_grant,
                     )
 
             # Failure policy applied to typed failures; the legacy/untyped
@@ -1928,6 +2032,7 @@ class OperatorDispatchApplication:
         round_: int,
         provisioned: Optional[dict[str, ProvisionedWorkspace]] = None,
         env: Optional[dict[str, str]] = None,
+        mcp_grant: Optional[Any] = None,
     ) -> bool:
         stream.lane_started(wave=wave, lane_id=lane.id)
         command = self._command_for(lane, resolved)
@@ -2002,6 +2107,7 @@ class OperatorDispatchApplication:
                 artifact_store=self._active_store,
                 on_child_lifecycle=lifecycle,
                 env=env,
+                mcp_grant=mcp_grant,
             )
             children = _fanout_children(result)
             self._record_child_results(lane, children, round_=round_)
@@ -2052,6 +2158,7 @@ class OperatorDispatchApplication:
         round_: int,
         provisioned: Optional[dict[str, ProvisionedWorkspace]] = None,
         env: Optional[dict[str, str]] = None,
+        mcp_grant: Optional[Any] = None,
     ) -> None:
         # Start every lane in the group at once (overlap), then record per-lane.
         commands = [self._command_for(lane, resolved) for lane in group]
@@ -2143,6 +2250,7 @@ class OperatorDispatchApplication:
                 artifact_store=self._active_store,
                 on_child_lifecycle=lifecycle,
                 env=env,
+                mcp_grant=mcp_grant,
             )
             children = getattr(result, "children", None) or []
             for lane, child, dispatch_id in zip(group, children, dispatch_ids):

@@ -29,8 +29,6 @@ __all__ = [
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 
-_FLOATING_MARKERS = ("git+", "http://", "https://")
-
 
 class McpClientError(RuntimeError):
     """An MCP lifecycle or call error, carrying the JSON-RPC error code."""
@@ -41,13 +39,18 @@ class McpClientError(RuntimeError):
 
 
 def _assert_not_floating(command: Sequence[str]) -> None:
-    """Refuse a launch command that would install floating dependencies."""
-    joined = " ".join(str(part) for part in command)
-    for marker in _FLOATING_MARKERS:
-        if marker in joined:
-            raise McpClientError(
-                f"refusing a floating install launch: {marker!r} found in {command!r}"
-            )
+    """Refuse a launch command that would install floating dependencies.
+
+    Uses the canonical launcher detector so this client refuses the same forms
+    the resolver does -- the ``git+``/``http(s)`` markers plus an unpinned
+    ``uvx``/``npx`` package spec -- not the markers alone.
+    """
+    from skillweave.council.launcher import is_floating_command as _canonical
+
+    if _canonical(command):
+        raise McpClientError(
+            f"refusing a floating install launch: {list(command)!r}"
+        )
 
 
 class McpStdioClient:

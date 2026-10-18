@@ -1,0 +1,38 @@
+{
+ "task": "SW-1511A-RESULT-001",
+ "state": "ACCEPTED-SOURCE",
+ "accepted_head": "688e155a55c0fd834738457b4c5128931a462dc4",
+ "tree_sha": "447596f68cdbfb564f726db2ee68522c6d472007",
+ "base": "4773d60f82c4260e0407ff1b5bee532aa8f2da3d",
+ "candidate": "525caeca3da9a18341df5440aee88b02d61520ac",
+ "ops": {
+  "attempts": [
+   "ops-001 (4)",
+   "repair-001 (15) hermetic roots",
+   "repair-003 (22) closing message past stream cap"
+  ],
+  "route": "byteplus-deepseek-flash-41"
+ },
+ "review": {
+  "first": "review-001 REPAIR (no production caller)",
+  "second": "review-002 PASS on b207933",
+  "hermetic": "review-003 PASS on 1c9598b",
+  "stream_cap": "review-004 GAP-IN-CRITERION (F-1511A-01), review-005 PASS on 525caec",
+  "route": "byteplus-deepseek-pro"
+ },
+ "integration": {
+  "attempt": 24,
+  "route": "byteplus-deepseek-flash",
+  "patch_id_check": "d5f3eed == 1c9598b",
+  "conflicts": []
+ },
+ "cumulative_gate": {
+  "result": "gates/RESULT-001/integration-gate-result.json",
+  "summary": "5920 passed, 30 skipped, 0 failed, twice in a row on the default temp dir"
+ },
+ "findings": [
+  "F-1511A-01 fixed in 1.5.11 by owner decision: closing message preserved past the 1 MiB stream cap (schema 1.1.0, 1.0.0 still reads)",
+  "suite not repeatable on b207933 (shared temp dir collision) fixed in 1c9598b"
+ ],
+ "live": "NOT PERFORMED"
+}

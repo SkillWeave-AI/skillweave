@@ -75,9 +75,9 @@ def temp_project_full():
         "description: temp bundle\n"
         "author: SkillWeave Team\n"
         "license: Apache-2.0\n"
-        "owner: LangeVC\n"
-        "repository: https://github.com/LangeVC/skillweave\n"
-        "homepage: https://github.com/LangeVC/skillweave\n"
+        "owner: SkillWeave-AI\n"
+        "repository: https://github.com/SkillWeave-AI/skillweave\n"
+        "homepage: https://github.com/SkillWeave-AI/skillweave\n"
         "frameworks:\n"
         "  - opencode\n"
         "  - claude-code\n"
@@ -94,9 +94,9 @@ def temp_project_full():
         "description: temp skill\n"
         "author: SkillWeave Team\n"
         "license: Apache-2.0\n"
-        "owner: LangeVC\n"
-        "repository: https://github.com/LangeVC/skillweave\n"
-        "homepage: https://github.com/LangeVC/skillweave\n"
+        "owner: SkillWeave-AI\n"
+        "repository: https://github.com/SkillWeave-AI/skillweave\n"
+        "homepage: https://github.com/SkillWeave-AI/skillweave\n"
         "frameworks:\n"
         "  - opencode\n"
         "  - claude-code\n"
@@ -550,6 +550,27 @@ class TestReleaseReadinessGate:
         check = gate.check_changelog("0.2.0")
         assert check.passed is True
 
+    def test_check_changelog_accepts_v_prefixed_heading(self, temp_project_full):
+        # The project's real CHANGELOG headings are ``## vX.Y.Z``; the check
+        # must recognise that form, not just ``## X.Y.Z`` / ``## [X.Y.Z]``.
+        changelog = temp_project_full / "CHANGELOG.md"
+        changelog.write_text("# Changelog\n\n## v0.2.0 (2026-04-27) — Release\n### Added\n- Foo\n")
+        gate = ReleaseReadinessGate(repo_root=str(temp_project_full))
+        check = gate.check_changelog("0.2.0")
+        assert check.passed is True, check.detail
+        assert "0.2.0" in check.detail
+
+    def test_check_changelog_reports_other_entries_exist(self, temp_project_full):
+        # A version entry in the project's v-prefixed form must be seen as an
+        # *other* entry (not "No version entries found") when the requested
+        # version is genuinely absent.
+        changelog = temp_project_full / "CHANGELOG.md"
+        changelog.write_text("# Changelog\n\n## v0.2.0 (2026-04-27) — Release\n### Added\n- Foo\n")
+        gate = ReleaseReadinessGate(repo_root=str(temp_project_full))
+        check = gate.check_changelog("9.9.9")
+        assert check.passed is False
+        assert "other entries exist" in check.detail
+
     def test_check_changelog_missing_entry(self, temp_project_full):
         gate = ReleaseReadinessGate(repo_root=str(temp_project_full))
         check = gate.check_changelog("9.9.9")
@@ -616,13 +637,38 @@ class TestReleaseReadinessGate:
         assert check.passed is True
         assert "2 capability manifest" in check.detail
 
-    def test_check_release_version_blocks_skill_manifest_mismatch(self, temp_project_full):
+    def test_check_release_version_passes_when_member_lags_release(self, temp_project_full):
+        # decoupled_member_pins: a member file and its bundle pin may lag the
+        # release version together (a packaging-only bump). That is not a
+        # release-version mismatch, so the check stays green.
+        pyproject = temp_project_full / "pyproject.toml"
+        pyproject.write_text(pyproject.read_text().replace('version = "0.2.0"', 'version = "0.3.0"'))
+        root = temp_project_full / "capability.yaml"
+        root.write_text(root.read_text().replace("version: 0.2.0", "version: 0.3.0", 1))
+        gate = ReleaseReadinessGate(repo_root=str(temp_project_full))
+        check = gate.check_release_version_matches_capabilities("0.3.0")
+        assert check.passed is True, check.detail
+        assert "0.3.0" in check.detail
+
+    def test_check_release_version_blocks_skill_manifest_pin_mismatch(self, temp_project_full):
+        # A member file contradicting its own bundle pin is a real failure:
+        # the pin promises which member version the bundle ships.
         drifted = temp_project_full / "skills" / "skillweave-blueprint" / "capability.yaml"
         drifted.write_text(drifted.read_text().replace("version: 0.2.0", "version: 0.1.0"))
         gate = ReleaseReadinessGate(repo_root=str(temp_project_full))
         check = gate.check_release_version_matches_capabilities("0.2.0")
         assert check.passed is False
         assert "skillweave-blueprint/capability.yaml" in check.detail
+
+    def test_check_release_version_blocks_bundle_version_mismatch(self, temp_project_full):
+        # The distribution bundle is a required release surface: it must carry
+        # the release version.
+        root = temp_project_full / "capability.yaml"
+        root.write_text(root.read_text().replace("version: 0.2.0", "version: 0.1.0", 1))
+        gate = ReleaseReadinessGate(repo_root=str(temp_project_full))
+        check = gate.check_release_version_matches_capabilities("0.2.0")
+        assert check.passed is False
+        assert "capability.yaml=0.1.0" in check.detail
 
     def test_evaluate_passes(self, temp_project_full):
         gate = ReleaseReadinessGate(repo_root=str(temp_project_full))

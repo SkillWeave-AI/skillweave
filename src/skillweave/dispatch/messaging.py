@@ -590,6 +590,18 @@ class AgentMailbox:
                 return record
         return None
 
+    def get(self, message_id: str) -> Optional[dict[str, Any]]:
+        """Return one stored record by id, or ``None`` when it is absent.
+
+        Unlike :meth:`read` this is *not* scoped to a recipient/principal: it is
+        the provenance seam, used to load a review result by the id a reference
+        names.  The record is still contract-validated (a drifted/tampered
+        record is a named refusal, never returned), and loading is pure -- it
+        does not consume, acknowledge or reveal an unaddressed message to a
+        reader that is not entitled to it.
+        """
+        return self._find(message_id)
+
     # -- durable post -------------------------------------------------------
 
     def post(self, message: AgentMessage) -> dict[str, Any]:

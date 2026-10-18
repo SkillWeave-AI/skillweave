@@ -1,0 +1,31 @@
+{
+ "task": "SW-1511A-ENV-001",
+ "state": "ACCEPTED-SOURCE",
+ "accepted_head": "8e59a7a29e65b0d9cf9b9c4652a925a02dbbcbe3",
+ "tree_sha": "e8d17107fedb1657f2a5c72ca8b52aab555e0782",
+ "candidate": "f7b2a5de0948fe928397e1e9ac0c07b735e2fa6e",
+ "base": "4773d60f82c4260e0407ff1b5bee532aa8f2da3d",
+ "ops": {
+  "attempts": [
+   "ops-001",
+   "repair-001 (16) production caller in release_gate.run_cli"
+  ],
+  "route": "byteplus-deepseek-flash-41"
+ },
+ "review": {
+  "first": "review-001 REPAIR (no production caller)",
+  "second": "review-002 PASS on f7b2a5d; callers release_gate.py:650/553/365",
+  "route": "byteplus-deepseek-pro"
+ },
+ "integration": {
+  "standalone": "integration-001 tree-equal on LEDGER base",
+  "cumulative": "integration-002 on 688e155 -> 8e59a7a, no conflicts",
+  "route": "byteplus-deepseek-flash"
+ },
+ "cumulative_gate": {
+  "result": "gates/ENV-001/integration-gate-result.json",
+  "summary": "5936 passed, 30 skipped, 0 failed (one run, isolated TMPDIR)"
+ },
+ "unexplained": "the 4 installed-version tests of LEDGER receipt pass in the fully provisioned env; attestation now records the environment",
+ "live": "NOT PERFORMED"
+}

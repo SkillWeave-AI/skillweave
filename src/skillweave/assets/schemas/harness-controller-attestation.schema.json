@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skillweave.dev/schemas/harness-controller-attestation/v1",
+  "title": "Harness Controller Attestation Schema",
+  "description": "harness-controller-attestation/v1 (SW-1511A-HANDOFF-001 boundary). The producer is the installed Claude Desktop path and the isolated OpenCode adapter path; the consumer is handoff admission and the independent qualification gate. An attestation names the configured route (as gateway counters observe it) and the recipient principal the harness would accept a controller handoff as. Capabilities are explicit: absence, a stale attestation, or a route that is not the configured one remains an unsupported named HOLD -- it is never inferred from a written name or a parent process.",
+  "type": "object",
+  "required": [
+    "schema",
+    "client_id",
+    "configured_route",
+    "recipient_principal",
+    "capabilities"
+  ],
+  "properties": {
+    "schema": {
+      "const": "harness-controller-attestation/v1",
+      "description": "The exact contract identity. Anything else is refused."
+    },
+    "schema_version": {
+      "type": "string",
+      "description": "Contract version of this record."
+    },
+    "client_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The harness the attestation is about (for example claude-desktop or opencode)."
+    },
+    "adapter_kind": {
+      "type": ["string", "null"],
+      "description": "The transport adapter this harness would accept a handoff over (notification or polling). Absent means unknown, which is a HOLD, never a default."
+    },
+    "configured_route": {
+      "type": "object",
+      "required": ["gateway_host", "gateway_port"],
+      "properties": {
+        "gateway_host": { "type": "string", "minLength": 1 },
+        "gateway_port": { "type": "integer", "minimum": 1 },
+        "route": { "type": ["string", "null"] },
+        "alias": { "type": ["string", "null"] },
+        "credential_binding": {
+          "type": ["string", "null"],
+          "description": "A non-secret reference to how the harness reaches the gateway (for example gateway://host:port). A provider credential value here is a refusal; the attestation never carries a secret."
+        }
+      },
+      "additionalProperties": true
+    },
+    "recipient_principal": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The principal the server-issued handoff must be addressed to for this harness to accept it. A handoff addressed to another principal is refused."
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["session_resume", "notifications"],
+      "properties": {
+        "session_resume": { "type": "boolean" },
+        "notifications": { "type": "boolean" },
+        "mcp_config_anchors": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "observed_at": {
+      "type": ["string", "null"],
+      "description": "When the attestation was produced. A stale attestation (older than the configured max age) is a named HOLD, never silently trusted."
+    },
+    "max_age_seconds": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "The freshness window the producer asserts for this attestation."
+    },
+    "evidence": {
+      "type": "object",
+      "description": "Actual per-harness real-run evidence (gateway counters observed, exit code, artifact). Never a transport-parity claim."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Non-authoritative annotations. Never a place to smuggle a credential."
+    }
+  },
+  "additionalProperties": true
+}
