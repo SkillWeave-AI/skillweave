@@ -37,9 +37,8 @@ SkillWeave orchestrates AI-assisted product development from idea to post-releas
   gate (`integration-gate-result/v1`) and an exactly-once controller handoff.
 
 See the [1.5.11 changelog](CHANGELOG.md#v1511-2026-10-17--control-loop-hardening)
-for the full release contract. `1.5.11` is the release in preparation — **not
-yet released** until its `v1.5.11` tag exists. Live qualification is performed
-separately and is not claimed here. Earlier release notes remain in the
+for the full release contract. `1.5.11` is a released version: its `v1.5.11`
+tag exists in the repository. Earlier release notes remain in the
 [changelog](CHANGELOG.md) as history.
 
 ---
@@ -378,11 +377,10 @@ number. The declared, machine-checked inventory is
 | **candidate** | `[project].version` in `pyproject.toml` (the source of truth) and the bundle `capability.yaml` | `1.5.11` |
 | **released** | the latest canonical **annotated** product tag, by its **peeled commit** (`git rev-parse '<tag>^{}'`) | the tag rule above, printed in full by [docs/version-truth.md](docs/version-truth.md) |
 | **installed** | the distribution metadata of a local install (`importlib.metadata`) | `1.5.11` (may be absent) |
-| **advertised early** | a version named in docs/README before it ships | `1.5.11` (the release in preparation; **not yet released** until its `v1.5.11` tag exists) |
+| **advertised early** | a version named in docs/README before it ships | none — no version is named ahead of its tag; `1.5.11` is released |
 
-The version badge above advertises the candidate `1.5.11`, the release **in
-preparation** — it is deliberately **not** presented as released until its
-`v1.5.11` tag exists. The released fact, whenever it is
+The version badge above advertises the released version `1.5.11`, whose
+`v1.5.11` tag exists in the repository. The released fact, whenever it is
 needed, is derived by
 the peeled-tag rule from the repository rather than printed here. Historical
 versions (for example the `1.4.0` note in *Host-Neutral Scope*) appear only as

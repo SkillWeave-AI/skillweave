@@ -82,11 +82,9 @@ page — the value is derived from the repository at read time, so it cannot go
 stale here. The full rule is in `docs/version-truth.md`, enforced by
 `scripts/check-version-truth.py`.
 
-`1.5.11` is this page's **candidate and bundle** version: the release **in
-preparation**, which is **not yet released** — its `v1.5.11` tag does not yet
-exist in the repository, and `docs/version-truth.md` records the distinction.
-The released identity is the latest canonical annotated tag's peeled commit, as
-derived below.
+`1.5.11` is this page's **candidate and bundle** version and a **released
+version**: its `v1.5.11` tag exists in the repository. The released identity is
+the tag's peeled commit, as derived below.
 
 ---
 
