@@ -1681,16 +1681,81 @@ def _verify_handoff_evidence(
     }
 
 
+def _minted_stdio_principal() -> str:
+    """The principal the server *actually minted* for its bound stdio session.
+
+    The production stdio seam (:func:`startup_and_bind_stdio`) mints one
+    ``controller`` session and holds only its opaque token
+    (:data:`_READY_SESSION_TOKEN`) in host memory.  Resolving that token
+    through the bound authority returns the principal string the authority
+    stored -- ``mcp:<role>:<client_id>`` where ``client_id`` is the supervisor
+    identity exactly as it was supplied (colons and all).  This is the ground
+    truth the boundary compares a claimed ``mcp:`` principal against: it is not
+    a re-derived shape, it is the issued value.
+
+    Returns ``""`` when no session was minted, when no authority is bound, or
+    when the held token no longer verifies -- in which case the boundary falls
+    back to the shape grammar below rather than trusting a stale claim.
+    """
+    token = _READY_SESSION_TOKEN or ""
+    authority = _bound_authority()
+    if not token or authority is None:
+        return ""
+    try:
+        return authority.verify_session(token).principal
+    except Exception:  # noqa: BLE001 - an unverifiable held token is "no issued value"
+        return ""
+
+
+def _supervisor_segment_is_wellformed(segment: str) -> bool:
+    """Whether a supervisor identity segment is one the authority could mint.
+
+    The segment after the role is the supervisor identity.  ``issue_session``
+    requires a non-empty ``client_id`` and stores it verbatim, so the authority
+    can mint any non-empty string that carries no whitespace or control
+    character.  This predicate is exactly that: non-empty, no ``str.isspace()``
+    character, and no C0/DEL control character.  It deliberately does **not**
+    guess a length -- the supervisor identity may itself contain colons.
+    """
+    if not segment:
+        return False
+    return not any(
+        ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in segment
+    )
+
+
 def _validate_destination_principal(module: Any, principal: str) -> None:
     """Refuse a destination principal the *server* could not have issued (F-1511A-04).
 
     Criterion 1 asks the lease to move to a **server-issued** destination
     principal.  An `mcp:`-shaped principal is a claim that the MCP authority
     minted it: ``mcp:<role>:<client_id>`` with ``<role>`` drawn from the
-    server-owned :data:`~skillweave.runtime.authority.MCP_ROLE_SCOPES` registry.
-    A principal in that shape whose role is not a real registry role is a
-    caller-declared authority claim and is refused by name -- it is *not*
-    admitted, and no server-issued identity is invented for it.
+    server-owned :data:`~skillweave.runtime.authority.MCP_ROLE_SCOPES` registry
+    and ``<client_id>`` the supervisor identity the authority was handed.
+
+    The claim is validated **the way it is issued** (repair G).  The authority
+    mints the principal by string concatenation -- ``f"mcp:{role}:{client_id}"``
+    (:meth:`MCPPrincipalAuthority.issue_session`) -- with a *verbatim*
+    ``client_id``, so a supervisor identity such as
+    ``supervisor:andrelange:claude-code`` mints
+    ``mcp:controller:supervisor:andrelange:claude-code``.  The validator
+    therefore splits on the **first two** colons only (``split(":", 2)``):
+
+    * the segment after ``mcp:`` is the role and must be in ``MCP_ROLE_SCOPES``;
+    * the remainder (which may itself contain colons) is the supervisor
+      identity and must be non-empty and free of whitespace/control chars.
+
+    No length is guessed: a three-part split is exactly the minting grammar,
+    whether or not the supervisor identity contains colons.
+
+    Before any shape matching the boundary prefers an **exact comparison**: the
+    principal the server actually minted for its own bound session
+    (:func:`_minted_stdio_principal`) is admitted by identity, because it is
+    the issued value itself rather than a re-derived claim.  The shape check is
+    kept for principals the server cannot compare -- a destination that is not
+    this session -- and it still refuses an unknown role, an empty remainder, a
+    remainder with whitespace/control characters, and any other form the
+    authority could not mint.
 
     A principal that is *not* `mcp:`-shaped carries no server-issued claim at
     all: it is the documented in-process / self-named path (exactly as the
@@ -1702,9 +1767,18 @@ def _validate_destination_principal(module: Any, principal: str) -> None:
         return
     from skillweave.runtime.authority import MCP_ROLE_SCOPES
 
-    parts = principal.split(":")
-    role = parts[1] if len(parts) == 3 else ""
-    if len(parts) == 3 and role in MCP_ROLE_SCOPES:
+    # Exact comparison first: this is the value the server itself issued for
+    # its bound session, so it is server-issued by identity, not by shape.
+    issued = _minted_stdio_principal()
+    if issued and principal == issued:
+        return
+
+    parts = principal.split(":", 2)
+    if (
+        len(parts) == 3
+        and parts[1] in MCP_ROLE_SCOPES
+        and _supervisor_segment_is_wellformed(parts[2])
+    ):
         return
     raise module.ControllerHandoffRefused(
         module.HANDOFF_HOLD_PRINCIPAL_NOT_SERVER_ISSUED,
