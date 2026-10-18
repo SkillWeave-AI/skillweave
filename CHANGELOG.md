@@ -773,36 +773,36 @@ Reconstructed from the immutable `v0.8.0` tag.
 
 ## v0.7.0 (2026-04-27)
 - **FEATURE**: 6 new agent-facing skills after promptchain pattern (SKILL.md + capability.yaml + sequence_type)
-  - `skillweave-lifecycle` (plan): Bundle-Navigator, Phasen-Status, Entry-Point-Detection
-  - `skillweave-discovery` (plan): Problemdefinition, User Research, Empathy Mapping, 11 Prompts
-  - `skillweave-design` (mixed): Design-Thinking-Lens, Briefanalyse, Token-Extraktion, Evaluation
-  - `skillweave-launch` (build): Pre-Launch-Check, Deployment-Koordination, Announce, Metrics-Vergleich
-  - `skillweave-post-release` (mixed): Retrospektive, Feedback-Sammlung, Iterationsplanung
-  - `skillweave-repo-health` (plan): Inventory-Scan, 5-Class-Klassifikation, Archive, Dedup, Hygiene-Report
-  - `skillweave-observe` (plan): Execution Reports, Timing, Events, Memory — Read-Only Observability
+  - `skillweave-lifecycle` (plan): bundle navigator, phase status, entry-point detection
+  - `skillweave-discovery` (plan): problem definition, user research, empathy mapping, 11 prompts
+  - `skillweave-design` (mixed): design-thinking lens, brief analysis, token extraction, evaluation
+  - `skillweave-launch` (build): pre-launch check, deployment coordination, announce, metrics comparison
+  - `skillweave-post-release` (mixed): retrospective, feedback collection, iteration planning
+  - `skillweave-repo-health` (plan): inventory scan, 5-class classification, archive, dedup, hygiene report
+  - `skillweave-observe` (plan): execution reports, timing, events, memory — read-only observability
 - **FEATURE**: Launch infrastructure (src/skillweave/launch/)
-  - `deployment.py`: GitHub Actions workflow_dispatch-Trigger, Health-Check, Rollback-Plan
-  - `announce.py`: Release Notes Generator aus CHANGELOG.md, Multi-Channel-Formatting
-  - `metrics.py`: Pre/Post-Launch-Metriken, Snapshot-Vergleich mit Delta-Report
+  - `deployment.py`: GitHub Actions workflow_dispatch trigger, health check, rollback plan
+  - `announce.py`: release notes generator from CHANGELOG.md, multi-channel formatting
+  - `metrics.py`: pre/post-launch metrics, snapshot comparison with delta report
 - **FEATURE**: Post-Release infrastructure (src/skillweave/post_release/)
-  - `retrospective.py`: Strukturierte Retro-Vorlage (Went Well / To Improve / Action Items P1-P3)
-  - `feedback.py`: GitHub Issues-Feedback-Sammlung, Kategorisierung (bug/feature/improvement/question)
-  - `iteration.py`: Backlog-Generator aus Retro + Feedback, Prioritäts-Scoring
+  - `retrospective.py`: structured retro template (Went Well / To Improve / Action Items P1-P3)
+  - `feedback.py`: GitHub Issues feedback collection, categorization (bug/feature/improvement/question)
+  - `iteration.py`: backlog generator from retro + feedback, priority scoring
 - **FEATURE**: Repo-Health infrastructure (src/skillweave/repo_health/)
-  - `scanner.py`: Inventory-Scan mit Typ, Größe, last_modified
+  - `scanner.py`: inventory scan with type, size, last_modified
   - `classifier.py`: 5-category rules-based classification (Active Core / Consolidation / Legacy / Deprecated / Needs Review)
-  - `dedup.py`: MD5-Exact + Fuzzy-Content-Duplikatserkennung
-  - `archive.py`: Move + Restore mit JSON-Manifest, dry_run-Pflicht
-  - `report.py`: Hygiene-Score (A-F) mit konkreten Empfehlungen
-- **FEATURE**: phases.yaml — alle 7 Phasen mit Skills + promptchain_types + global_skills-Sektion
-- **FEATURE**: bundles.yaml — 5 Bundles mit sequence_types_used + entry_requires + estimated_effort
-- **FEATURE**: Installer auf 13 Skills aktualisiert (12 SkillWeave + frontend-design)
-- **FEATURE**: Design-Skill references: 5 UX-Prinzipien, 6 Workshop-Regeln, Token-Format, Elementify-Integration
-- **FEATURE**: Lifecycle-Skill references: 7 Phasen mit Entry/Exit-Conditions, 5 Bundles mit Recommendation-Matrix
-- **IMPROVEMENT**: Alle neuen Skills haben sequence_type (plan/mixed/build) für promptchain-generate-Kompatibilität
-- **IMPROVEMENT**: Discovery-Skill mit 11 Prompts in 4 Gruppen (Empathy, Research, Framing, Output)
-- **IMPROVEMENT**: Legacy prompt-chain aus Installer-Tabelle entfernt (nie existiert, kein Effekt)
-- **IMPROVEMENT**: Release-Naming-Convention in auto-tag-release.yml enforced (SkillWeave vX.Y.Z)
+  - `dedup.py`: exact (MD5) and fuzzy content duplicate detection
+  - `archive.py`: move and restore with a JSON manifest, dry_run required
+  - `report.py`: hygiene score (A-F) with concrete recommendations
+- **FEATURE**: phases.yaml — all 7 phases with skills + promptchain_types + a global_skills section
+- **FEATURE**: bundles.yaml — 5 bundles with sequence_types_used + entry_requires + estimated_effort
+- **FEATURE**: Installer updated to 13 skills (12 SkillWeave + frontend-design)
+- **FEATURE**: Design skill references: 5 UX principles, 6 workshop rules, token format, Elementify integration
+- **FEATURE**: Lifecycle skill references: 7 phases with entry/exit conditions, 5 bundles with a recommendation matrix
+- **IMPROVEMENT**: All new skills declare sequence_type (plan/mixed/build) for promptchain-generate compatibility
+- **IMPROVEMENT**: Discovery skill with 11 prompts in 4 groups (Empathy, Research, Framing, Output)
+- **IMPROVEMENT**: Legacy prompt-chain removed from the installer table (it never existed, no effect)
+- **IMPROVEMENT**: Release naming convention enforced in auto-tag-release.yml (SkillWeave vX.Y.Z)
 
 ## v0.6.0 (2026-04-27)
 - **FEATURE**: 7-phase lifecycle model with entry/exit conditions and bundle system (Initiative 01)
