@@ -1340,6 +1340,16 @@ def handoff_adapter(
     ``status: "hold"``.  The action is never a caller-declared authority: the
     identity rules are checked against the durable record and the store's live
     lease holder.
+
+    ``offer`` -- whether it is the default, an explicit ``action="offer"`` or a
+    ``handoff_offer`` payload -- is **not** a transition and does **not** return
+    early: it runs the attested admission and then the transport selection and
+    continuation persistence, so its response is the pre-existing combined shape
+    (``client_id``, ``contract``, ``adapter``, ``authority_contract``,
+    ``controller_handoff``, ``continuation``, ``continuation_persisted``) with
+    the ``action``/``handoff_ref`` keys added additively.  Only ``accept``,
+    ``activate``, ``release`` and ``reject`` return early with their own
+    action-scoped shape.
     """
     gate_principal, refusal = gate_operation(
         "read_run", session_token, run_id=run_id, db_path=db_path,
@@ -1367,10 +1377,15 @@ def handoff_adapter(
     # owns (accept/activate/release/reject) now have a production entry point at
     # this boundary, driven by the ``action`` argument.  ``offer`` is the
     # default, so every pre-existing call (which passes no ``action``) keeps its
-    # exact behaviour.  A transition is resolved and persisted durably before
-    # transport selection, exactly as the offer admission is.
+    # exact behaviour -- and so does a call that presents a ``handoff_offer``
+    # payload: the offer is an *admission*, not a transition, so it runs the
+    # attested admission and then the transport selection and continuation
+    # persistence below, returning the same combined shape as before (the new
+    # ``action`` and ``handoff_ref`` keys are additive).
+    #
+    # Only a real transition returns early, with its own action-scoped shape.
     requested_action = (handoff_action or action or "offer").strip()
-    if requested_action != "offer" or handoff_offer:
+    if requested_action != "offer":
         module = _controller_handoff_module()
         try:
             record = _drive_controller_handoff_action(
@@ -1462,8 +1477,21 @@ def handoff_adapter(
     }
     if admitted is not None:
         # The typed handoff this offer admitted (state ``offered``): the actual
-        # durable ``controller-handoff/v2`` record a destination reads.
+        # durable ``controller-handoff/v2`` record a destination reads.  The
+        # offer path keeps the pre-existing combined shape (transport selection
+        # + continuation persistence below); ``action`` and ``handoff_ref`` are
+        # added *additively* so an offer response is shaped like a transition
+        # response without dropping a single historic key.
         payload["controller_handoff"] = admitted
+        payload["action"] = requested_action
+        payload["handoff_ref"] = {
+            "handoff_id": admitted.get("handoff_id"),
+            "fencing_generation": admitted.get("fencing_generation"),
+            "destination_principal": admitted.get("destination_principal"),
+            "scope": admitted.get("scope"),
+            "state": admitted.get("state"),
+            "resulting_generation": admitted.get("resulting_generation"),
+        }
     if run_id:
         # The recovered controller's continuation decision, driven by the
         # *attested* capability (never assumed) and the *durably recorded* prior
