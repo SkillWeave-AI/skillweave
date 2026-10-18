@@ -66,6 +66,24 @@ def _rev_parse(repo: Path, ref: str) -> str | None:
     return result.stdout.strip()
 
 
+def _pin_is_ancestor(repo: Path, ancestor_sha: str, descendant_ref: str) -> bool:
+    """The ancestry predicate the baseline guard is built on.
+
+    True iff ``ancestor_sha`` is an ancestor of (or equal to)
+    ``descendant_ref`` in ``repo`` — the exact ``git merge-base --is-ancestor``
+    semantics the pin checks assert on. A git error (exit > 1: corrupt or absent
+    object) raises rather than reading as "not an ancestor", so a broken object
+    can never pass as a satisfied pin.
+    """
+    result = _git(repo, "merge-base", "--is-ancestor", ancestor_sha, descendant_ref)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(
+            f"merge-base --is-ancestor {ancestor_sha} {descendant_ref} errored "
+            f"with exit {result.returncode}: {result.stderr.strip()}"
+        )
+    return result.returncode == 0
+
+
 def _sdk_repo() -> Path:
     import os
 
@@ -132,35 +150,79 @@ def test_core_pins_match_live_refs() -> None:
         # The pinned SHA must be an ancestor of (or equal to) the live ref.
         # This proves the released baseline is still part of the history
         # without requiring an exact match (HEAD moves with every commit).
-        result = _git(REPO_ROOT, "merge-base", "--is-ancestor", expected, actual)
-        assert result.returncode in (0, 1), (
-            f"ancestry check for pin {key} ({expected} vs ref {ref} -> {actual}) "
-            f"failed with exit {result.returncode}: {result.stderr.strip()}"
-        )
-        assert result.returncode == 0, (
+        assert _pin_is_ancestor(REPO_ROOT, expected, actual), (
             f"pinned SHA {expected} for {key} is not an ancestor of ref {ref} "
             f"(resolved to {actual}). The released baseline is no longer "
             f"trustworthy."
         )
 
 
-def test_non_ancestor_pin_is_rejected() -> None:
+def test_non_ancestor_pin_is_rejected(tmp_path) -> None:
     """A pin naming a SHA that exists but is not an ancestor of HEAD fails.
 
-    This negative control proves the ancestry assertion has teeth. If the test
-    is ever weakened to an existence-only check, this will catch the regression.
+    This negative control builds the *divergent commits it needs* in a scratch
+    repository it creates itself, so it carries no repository-specific object
+    and passes in a fresh ``git clone`` of Forgejo main that holds no
+    unpublished object. It proves the ancestry assertion has teeth: a
+    weakened, existence-only check (the mutation this guards against) would
+    accept the divergent SHA, while the same ancestry check the baseline uses
+    rejects it. If the ancestry assertion is ever weakened to existence-only,
+    this fails.
     """
-    # SDK tag v0.1.0 commit exists in this repo but is NOT an ancestor of HEAD.
-    non_ancestor = "ec764279f7f817bba22810847793f423ef8d62f0"
-    assert (
-        _git(REPO_ROOT, "cat-file", "-e", f"{non_ancestor}^{{commit}}").returncode
-        == 0
-    ), "negative control SHA must exist in this repo"
-    # Confirm it is not an ancestor of HEAD.
-    result = _git(REPO_ROOT, "merge-base", "--is-ancestor", non_ancestor, "HEAD")
-    assert result.returncode != 0, (
-        f"negative control SHA {non_ancestor} should not be an ancestor of HEAD"
+    repo = tmp_path / "divergent"
+    repo.mkdir()
+
+    def commit(message: str) -> str:
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t",
+             "commit", "--allow-empty", "-m", message],
+            cwd=str(repo), capture_output=True, check=True,
+        )
+        sha = _rev_parse(repo, "HEAD")
+        assert sha is not None, "scratch commit must resolve to a SHA"
+        return sha
+
+    subprocess.run(
+        ["git", "init", "-q"], cwd=str(repo), capture_output=True, check=True
     )
+    head_branch = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    base = commit("base")
+
+    # A divergent commit on its own branch: it exists in the repo, but forks off
+    # `base` and is never merged into the HEAD line -- so it is neither an
+    # ancestor nor a descendant of HEAD.
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "divergent", base],
+        cwd=str(repo), capture_output=True, check=True,
+    )
+    non_ancestor = commit("divergent work")
+    subprocess.run(
+        ["git", "checkout", "-q", head_branch],
+        cwd=str(repo), capture_output=True, check=True,
+    )
+    head = commit("head work")
+    assert head != non_ancestor and base != non_ancestor
+
+    # The SHA exists as a valid commit -- so a weakened, existence-only check
+    # would *accept* it. This is exactly the regression the ancestry assertion
+    # must catch.
+    assert (
+        _git(repo, "cat-file", "-e", f"{non_ancestor}^{{commit}}").returncode == 0
+    ), "the divergent control SHA must exist in this scratch repo"
+
+    # The same shared ancestry predicate the baseline pins assert on rejects it:
+    # this SHA is not an ancestor of HEAD.
+    assert not _pin_is_ancestor(repo, non_ancestor, head), (
+        f"divergent SHA {non_ancestor} must not be an ancestor of {head}; "
+        f"an existence-only check would have accepted it."
+    )
+
+    # Positive control in the same scratch repo: an ancestor *is* accepted, so
+    # the rejection above is the ancestry fact, not a broken check.
+    assert _pin_is_ancestor(repo, base, head)
 
 
 def test_ancestry_error_branch_is_rejected() -> None:
@@ -241,12 +303,7 @@ def test_sdk_pins_match_live_refs_when_sdk_present() -> None:
             f"pinned SDK SHA {expected} for {key} is not a valid commit"
         )
         # The pinned SHA must be an ancestor of (or equal to) the live ref.
-        result = _git(sdk, "merge-base", "--is-ancestor", expected, actual)
-        assert result.returncode in (0, 1), (
-            f"ancestry check for SDK pin {key} ({expected} vs ref {ref} -> {actual}) "
-            f"failed with exit {result.returncode}: {result.stderr.strip()}"
-        )
-        assert result.returncode == 0, (
+        assert _pin_is_ancestor(sdk, expected, actual), (
             f"SDK ref {ref} moved: baseline pinned {expected}, live is {actual}. "
             f"The pinned SHA is not an ancestor of the current ref."
         )
@@ -280,10 +337,10 @@ def test_local_sdk_preview_is_protected_evidence() -> None:
 
     # It must NOT be reachable from SDK main.
     sdk_main = baseline["pins"]["sdk_main"]["sha"]
-    result = _git(sdk, "merge-base", "--is-ancestor", preview_sha, sdk_main)
-    if result.returncode not in (0, 1):
+    probe = _git(sdk, "merge-base", "--is-ancestor", preview_sha, sdk_main)
+    if probe.returncode not in (0, 1):
         pytest.skip("cannot compute SDK ancestry in this clone")
-    assert result.returncode == 1, (
+    assert not _pin_is_ancestor(sdk, preview_sha, sdk_main), (
         f"local preview {preview_sha} is now an ancestor of SDK main {sdk_main}; "
         f"it was promoted without a publication decision."
     )

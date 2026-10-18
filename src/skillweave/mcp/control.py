@@ -77,6 +77,7 @@ LEGACY_TOOLS: tuple[str, ...] = (
     "status_run",
     "cancel_run",
     "resume_run",
+    "restart_session",
     "get_evidence",
     "review_run",
 )
@@ -93,6 +94,13 @@ MCP_AGENT_TOOLS: tuple[str, ...] = (
     "mailbox_replay",
     "mailbox_ack",
     "agent_capabilities",
+    "harness_session_grant",
+    "handoff_adapter",
+    "read_continuation_decision",
+    "review_action",
+    "register_child_harness_capability",
+    "qualified_harness_continuation",
+    "recover_owned_attempt",
 )
 
 
@@ -393,6 +401,22 @@ def current_http_token() -> str:
     return _CURRENT_HTTP_TOKEN.get()
 
 
+def _emit_http_refusal(message: str) -> str:
+    """Emit an HTTP refusal line through the server's log-emission boundary.
+
+    The refusal line carries no token by construction (it names only the
+    failure reason), but it is still emitted through
+    :func:`skillweave.mcp.server.emit_log` -- the redact-then-verify boundary --
+    so the credential-never-in-logs property holds for *every* real emission
+    path, this one included, rather than only for a caller-supplied blob. The
+    import is deferred (GLE-020) so importing this module never forces the
+    server's optional closure.
+    """
+    from skillweave.mcp import server as _server
+
+    return _server.emit_log(message)
+
+
 def _load_asgi_http_types():
     """The Starlette request/response types the HTTP middleware uses.
 
@@ -440,9 +464,10 @@ def _make_http_auth_middleware(token: str, *, authority: Any = None):
                 presented = check_http_authorization(request.headers, token)
             except HttpRequestUnauthorized as exc:
                 # No token in the log line; the reason names only the failure.
-                print(
-                    f"skillweave-mcp http refused: {exc.reason}", file=sys.stderr
-                )
+                # The line goes through the server's real log-emission boundary
+                # (redact-then-verify) so a credential-shaped header can never
+                # reach stderr from the HTTP refusal path either.
+                _emit_http_refusal(f"skillweave-mcp http refused: {exc.reason}")
                 response = response_cls(
                     HTTP_UNAUTHENTICATED_BODY.decode("utf-8"),
                     status_code=401,
@@ -491,6 +516,21 @@ def _load_fastmcp() -> Any:
     return require_mcp()
 
 
+def _set_package_version(server: Any) -> Any:
+    """Bind the handshake to Core's version, not the optional MCP library.
+
+    FastMCP 1.x exposes no version constructor argument; its low-level server
+    owns the public version used in initialize. Transport-only test doubles
+    and the degraded placeholder have no protocol server to configure.
+    """
+    protocol_server = getattr(server, "_mcp_server", None)
+    if protocol_server is not None:
+        from skillweave.cli.main import product_version
+
+        protocol_server.version = product_version()
+    return server
+
+
 def _build_server(fastmcp: Any):
     """Build the real ``FastMCP`` server carrying the complete served surface.
 
@@ -501,7 +541,7 @@ def _build_server(fastmcp: Any):
     surface the other lacks -- and every tool carries the module's own
     ``gate_operation`` authorization gate, over the same host-bound authority.
     """
-    server = fastmcp.FastMCP(SERVER_NAME)
+    server = _set_package_version(fastmcp.FastMCP(SERVER_NAME))
     for spec in (*legacy_tool_specs(), *mcp_agent_tool_specs()):
         server.tool()(spec.handler)
     return server
@@ -745,6 +785,73 @@ def artifact_evidence_list(artifact_evidence: str):
     if isinstance(payload, list):
         return payload
     raise ValueError("artifact_evidence must be a JSON object or a list of objects")
+
+
+def service_for_binding(
+    db_path: str = ".skillweave/store.db",
+    *,
+    mailbox_path: str = "",
+    artifacts_path: str = ".skillweave/artifacts",
+    stream_root: Optional[str] = None,
+    authority: str = "skillweave-process-service",
+) -> Any:
+    """The :class:`HarnessProcessService` the *real* serving seam resolves to.
+
+    This is the composition of the single durable process service the scoped
+    HTTP server and the dispatch adapter both drive: the run store, the durable
+    mailbox, the artifacts store and the stream root. It is derived from the
+    same inputs ``get_run_service`` uses, so a caller can prove that a local
+    path and a scoped HTTP path reach the *same* authority/state service rather
+    than an isolated default store.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    if not mailbox_path:
+        mailbox_path = default_mailbox_path()
+    if stream_root is None:
+        stream_root = default_stream_root(db_path)
+    return _bootstrap.HarnessProcessService(
+        authority=authority,
+        db_path=db_path,
+        mailbox_path=mailbox_path,
+        artifacts_path=artifacts_path,
+        stream_root=stream_root,
+    )
+
+
+def verify_serving_reaches_same_service(
+    *,
+    db_path: str = ".skillweave/store.db",
+    mailbox_path: str = "",
+    artifacts_path: str = ".skillweave/artifacts",
+    stream_root: Optional[str] = None,
+    expected_service: Any,
+) -> None:
+    """Refuse a binding that names an isolated controller/default store.
+
+    Criterion 3: the supported multi-client deployment (scoped HTTP with a
+    loopback default) and the local stdio path must *demonstrably* reach the
+    same authority/state service. This resolves the serving seam's actual
+    service and refuses by identity when it is a different store -- so an
+    independently initialized per-harness controller or an isolated default
+    store is never silently admitted as the shared service.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    observed = service_for_binding(
+        db_path,
+        mailbox_path=mailbox_path,
+        artifacts_path=artifacts_path,
+        stream_root=stream_root,
+    )
+    _bootstrap.refuse_isolated_controller(expected_service, observed)
+
+
+def default_mailbox_path() -> str:
+    """The durable mailbox the single process service owns by default."""
+    from skillweave.mcp import server as _server
+
+    return _server.default_mailbox_path()
 
 
 def source_binding(source_root: str, subject_commit: str):
@@ -1379,6 +1486,7 @@ def legacy_tool_specs() -> list[ToolSpec]:
         "status_run": _server.status_run,
         "cancel_run": _server.cancel_run,
         "resume_run": _server.resume_run,
+        "restart_session": _server.restart_session,
         "get_evidence": _server.get_evidence,
         "review_run": _server.review_run,
     }
@@ -1405,6 +1513,13 @@ def mcp_agent_tool_specs() -> list[ToolSpec]:
         "mailbox_replay": _server.mailbox_replay,
         "mailbox_ack": _server.mailbox_ack,
         "agent_capabilities": _server.agent_capabilities,
+        "harness_session_grant": _server.harness_session_grant,
+        "handoff_adapter": _server.handoff_adapter,
+        "read_continuation_decision": _server.read_continuation_decision,
+        "review_action": _server.review_action,
+        "register_child_harness_capability": _server.register_child_harness_capability,
+        "qualified_harness_continuation": _server.qualified_harness_continuation,
+        "recover_owned_attempt": _server.recover_owned_attempt,
     }
     return [
         ToolSpec(name=n, version="agents", description=n, handler=names[n])
@@ -1451,6 +1566,7 @@ __all__ = [
     "create_run_payload",
     "current_http_principal",
     "current_http_token",
+    "default_mailbox_path",
     "default_stream_root",
     "get_run_service",
     "http_authority",
@@ -1465,6 +1581,7 @@ __all__ = [
     "serve_legacy_stdio",
     "serve_scoped_http",
     "server_capabilities",
+    "service_for_binding",
     "snapshot_v1",
     "source_binding",
     "strip_bearer_scheme",
@@ -1473,4 +1590,5 @@ __all__ = [
     "tool_schema",
     "transport_profile",
     "unavailable_payload",
+    "verify_serving_reaches_same_service",
 ]

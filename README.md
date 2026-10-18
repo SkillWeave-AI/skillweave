@@ -1,7 +1,7 @@
 # SkillWeave
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.5.10-blue)](https://github.com/SkillWeave-AI/skillweave/releases/tag/v1.5.10)
+[![Version](https://img.shields.io/badge/version-1.5.11-blue)](https://github.com/SkillWeave-AI/skillweave/releases/tag/v1.5.11)
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![Skills](https://img.shields.io/badge/skills-15-blue)](skills/)
 [![Status](https://img.shields.io/badge/status-production--stable-green)](https://github.com/SkillWeave-AI/skillweave)
@@ -19,20 +19,27 @@ SkillWeave orchestrates AI-assisted product development from idea to post-releas
 
 ---
 
-## What's new in 1.5.10
+## What's new in 1.5.11
 
-- **Native execution surfaces**: an identity-verified lifecycle store and
-  durable execution stream, native Assay, and Scope, Skills, Verify, Cancel and
-  Budget enforcement through the authoritative run path.
-- **Route-lock and MCP control/authority**: the `route-decision-v1` payload with
-  egress confinement, a server-owned MCP authority that gates every tool, and a
-  durable harness-neutral agent mailbox served over both transports.
-- **Trustworthy publishing**: one honest publish identity carried to both
-  forges, with the Core/SDK contracts qualified against the installed wheel.
+- **Task lifecycle ledger**: an append-only task lifecycle ledger with a
+  canonical 24-task 1.5.11 projection, recording each task's lifecycle state as
+  durable evidence.
+- **Unambiguous final result**: an attempt's final result is unambiguous and the
+  child's closing message is preserved past the stream cap.
+- **Liveness & cancellation evidence**: owned-attempt liveness and owned-process
+  cancellation produce source-bound evidence of the real outcome.
+- **Reproducible environments & attestation**: reproducible test environments
+  are declared with a session guard and attestation receipts, wired into the
+  release gate.
+- **Upstream model & quota evidence**: provider/model upstream attestation and
+  quota truth are captured at the admission boundary.
+- **Cumulative integration gate & handoff**: a cumulative, role-safe integration
+  gate (`integration-gate-result/v1`) and an exactly-once controller handoff.
 
-See the [1.5.10 changelog](CHANGELOG.md#v1510-2026-10-11--native-execution-route-lock-mcp-control--trustworthy-publishing)
-for the full release contract. `1.5.10` is a released version: its `v1.5.10`
-tag exists in the repository. Earlier release notes remain in the
+See the [1.5.11 changelog](CHANGELOG.md#v1511-2026-10-17--control-loop-hardening)
+for the full release contract. `1.5.11` is the release in preparation — **not
+yet released** until its `v1.5.11` tag exists. Live qualification is performed
+separately and is not claimed here. Earlier release notes remain in the
 [changelog](CHANGELOG.md) as history.
 
 ---
@@ -107,7 +114,7 @@ cap install skillweave
 ### From a built wheel
 
 ```bash
-python -m pip install ./skillweave-1.5.10-py3-none-any.whl
+python -m pip install ./skillweave-1.5.11-py3-none-any.whl
 ```
 
 `skillweave` declares `requires-python >=3.9`; Python 3.9 is the supported
@@ -368,13 +375,14 @@ number. The declared, machine-checked inventory is
 
 | Fact | Meaning | Current value |
 |------|---------|---------------|
-| **candidate** | `[project].version` in `pyproject.toml` (the source of truth) and the bundle `capability.yaml` | `1.5.10` |
+| **candidate** | `[project].version` in `pyproject.toml` (the source of truth) and the bundle `capability.yaml` | `1.5.11` |
 | **released** | the latest canonical **annotated** product tag, by its **peeled commit** (`git rev-parse '<tag>^{}'`) | the tag rule above, printed in full by [docs/version-truth.md](docs/version-truth.md) |
-| **installed** | the distribution metadata of a local install (`importlib.metadata`) | `1.5.10` (may be absent) |
-| **advertised early** | a version named in docs/README before it ships | none — no version is named ahead of its tag; `1.5.10` is released |
+| **installed** | the distribution metadata of a local install (`importlib.metadata`) | `1.5.11` (may be absent) |
+| **advertised early** | a version named in docs/README before it ships | `1.5.11` (the release in preparation; **not yet released** until its `v1.5.11` tag exists) |
 
-The version badge above advertises the released version `1.5.10`, whose
-`v1.5.10` tag exists in the repository. The released fact, whenever it is
+The version badge above advertises the candidate `1.5.11`, the release **in
+preparation** — it is deliberately **not** presented as released until its
+`v1.5.11` tag exists. The released fact, whenever it is
 needed, is derived by
 the peeled-tag rule from the repository rather than printed here. Historical
 versions (for example the `1.4.0` note in *Host-Neutral Scope*) appear only as

@@ -349,7 +349,7 @@ _NON_FORWARDABLE_ROUTES = frozenset({"passthrough", "echo", "reflect"})
 #: ``reviewer`` is refused -- the role is read from the registry, not the wire.
 MCP_ROLE_SCOPES: dict[str, dict[str, Any]] = {
     "worker": {
-        "operations": frozenset({"read_run", "write_own_artifact", "start_own_attempt"}),
+        "operations": frozenset({"read_run", "write_own_artifact", "start_own_attempt", "attach_harness"}),
         "can_review": False,
         "can_approve": False,
         "can_mutate_run_state": False,
@@ -365,7 +365,7 @@ MCP_ROLE_SCOPES: dict[str, dict[str, Any]] = {
         "requires_run_binding": True,
     },
     "reviewer": {
-        "operations": frozenset({"read_run", "review_run", "approve_gate"}),
+        "operations": frozenset({"read_run", "review_run", "approve_gate", "attach_harness"}),
         "can_review": True,
         "can_approve": True,
         "can_mutate_run_state": False,
@@ -375,7 +375,8 @@ MCP_ROLE_SCOPES: dict[str, dict[str, Any]] = {
     "controller": {
         "operations": frozenset(
             {"read_run", "write_run_state", "start_run", "cancel_run",
-             "resume_run", "admit_gate", "forward"}
+             "resume_run", "restart_session", "admit_gate", "forward",
+             "attach_harness", "start_own_attempt", "write_own_artifact"}
         ),
         "can_review": False,
         "can_approve": False,
@@ -383,6 +384,28 @@ MCP_ROLE_SCOPES: dict[str, dict[str, Any]] = {
         "read_only": False,
         "requires_run_binding": False,
     },
+}
+
+#: Which child role each role may **attach** (criterion 1's delegation model).
+#: The ``operations``-subset rule is *not* the right primitive: Main
+#: (``controller``) deliberately does **not** hold ``review_run``/``approve_gate``
+#: -- that is the whole point of a *distinct* Reviewer principal -- so a subset
+#: test would wrongly refuse ``controller -> reviewer``. What actually bounds a
+#: child is (a) that the parent holds the delegation capability
+#: (``attach_harness``) and (b) that the child carries no authority beyond
+#: **its own role definition**, which issuance enforces from
+#: :data:`MCP_ROLE_SCOPES` regardless of the parent. So Main may attach the
+#: distinct Ops (``worker``) and Reviewer (``reviewer``) principals it is
+#: *forbidden to embody itself*; every other role may attach only a peer of its
+#: own role. ``controller`` is deliberately absent from every set: there is
+#: exactly one dispatch root (one controller lease), so no principal attaches a
+#: second controller. A role missing from this map (or an unlisted child)
+#: defaults to own-role-only -- fail-closed, never "attach anything".
+MCP_ATTACHABLE_ROLES: dict[str, frozenset] = {
+    "controller": frozenset({"worker", "reviewer", "observer"}),
+    "worker": frozenset({"worker"}),
+    "reviewer": frozenset({"reviewer"}),
+    "observer": frozenset({"observer"}),
 }
 
 MCP_ROLE_SCOPE_VERSION = "1.0.0"
@@ -1190,6 +1213,48 @@ class MCPPrincipalAuthority:
             action="escalate",
             extra={"requested_role": requested_role, "actual_role": principal.role},
         )
+
+    def refuse_child_role_escalation(
+        self, principal: MCPPrincipal, child_role: str
+    ) -> None:
+        """Refuse attaching a child role the principal is not permitted to attach.
+
+        This governs what a principal may **mint**. The rule is the explicit
+        delegation model in :data:`MCP_ATTACHABLE_ROLES`, *not* an
+        operations-subset test: Main (``controller``) is deliberately forbidden
+        to review, so ``review_run``/``approve_gate`` are not in its operation
+        set -- yet attaching a distinct Reviewer is exactly what it must do.
+        The subset test would wrongly refuse ``controller -> reviewer``.
+
+        What actually bounds the minted child is that its authority is read from
+        :data:`MCP_ROLE_SCOPES` at issuance, so a child never carries authority
+        beyond what its role defines, whatever the parent. On top of that, a
+        principal may attach only the roles in its own set; every role may
+        attach at most a peer of its own role, and ``controller`` is attachable
+        by no one (exactly one dispatch root). An unknown role, or a role not
+        listed for the parent, is refused -- fail-closed to own-role-only, never
+        "attach anything".
+        """
+        if child_role not in MCP_ROLE_SCOPES:
+            raise RoleEscalationRefused(
+                f"unknown child role {child_role!r}; expected one of "
+                f"{sorted(MCP_ROLE_SCOPES)}",
+                role=principal.role,
+                action="attach",
+                extra={"child_role": child_role},
+            )
+        attachable = MCP_ATTACHABLE_ROLES.get(principal.role, frozenset({principal.role}))
+        if child_role not in attachable:
+            raise RoleEscalationRefused(
+                f"principal {principal.principal!r} is role {principal.role!r} "
+                f"and may not attach a {child_role!r} child",
+                role=principal.role,
+                action="attach",
+                extra={
+                    "child_role": child_role,
+                    "attachable_roles": sorted(attachable),
+                },
+            )
 
 
 def _record_fields(record: _MCPSessionRecord) -> dict[str, Any]:

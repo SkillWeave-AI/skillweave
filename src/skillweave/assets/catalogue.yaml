@@ -62,6 +62,7 @@ role_defaults:
 
 contracts:
   - schemas/assessment-receipt.schema.json
+  - schemas/controller-handoff.schema.json
   - schemas/discovery-trace.schema.json
   - schemas/dispatch-handoff.schema.json
   - schemas/dispatch-sequence.schema.json
@@ -70,6 +71,8 @@ contracts:
   - schemas/evidence.schema.json
   - schemas/gate-1312-manifest.schema.json
   - schemas/harness-capability.schema.json
+  - schemas/harness-controller-attestation.schema.json
+  - schemas/integration-gate-result.schema.json
   - schemas/prompt-sequence.schema.json
   - schemas/run-state.schema.json
   - schemas/transfer-entry.schema.json

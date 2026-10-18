@@ -24,11 +24,11 @@ truth; `importlib.metadata` reports the installed copy):
 | Field | Value |
 |---|---|
 | Distribution | `skillweave` |
-| Version | `1.5.9` |
+| Version | `1.5.11` |
 | `requires-python` | `>=3.9` |
 | Base dependencies | `PyYAML>=6.0`, `skillweave-sdk==0.3.0` (pinned exact) |
 | Optional extras | `dev`, `mcp` |
-| Console scripts | `skillweave`, `skillweave-install`, `skillweave-risk-mode`, `skillweave-interactive-mode` |
+| Console scripts | `skillweave`, `skillweave-install`, `skillweave-risk-mode`, `skillweave-interactive-mode`, `skillweave-mcp` |
 
 `skillweave-sdk` is pinned **exactly** (`==0.3.0`). It owns the contract bytes
 (JSON Schemas + taxonomy); Core consumes the pinned artifact and never copies the
@@ -113,7 +113,7 @@ python -c "import sys; print(sys.prefix)"
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install /path/to/skillweave-1.5.10-py3-none-any.whl
+python -m pip install /path/to/skillweave-1.5.11-py3-none-any.whl
 ```
 
 This pulls the base dependencies (`PyYAML`, `skillweave-sdk==0.3.0`) from the
@@ -122,7 +122,7 @@ wheels instead of the network:
 
 ```bash
 python -m pip install --no-index --find-links /path/to/wheelhouse \
-    skillweave-1.5.10-py3-none-any.whl PyYAML>=6.0 skillweave-sdk==0.3.0
+    skillweave-1.5.11-py3-none-any.whl PyYAML>=6.0 skillweave-sdk==0.3.0
 ```
 
 ### Editable dev install (checkout)
@@ -158,7 +158,7 @@ python -m pip wheel --no-deps -w dist /path/to/skillweave
 
 ## Entrypoint options
 
-All four console scripts are declared in `[project.scripts]` and are created by
+All five console scripts are declared in `[project.scripts]` and are created by
 pip. Each also has a module equivalent that needs no console-script wrapper.
 
 | Console script | Module equivalent |
@@ -167,12 +167,13 @@ pip. Each also has a module equivalent that needs no console-script wrapper.
 | `skillweave-install` | `python -m skillweave.installer` |
 | `skillweave-risk-mode` | `python -m skillweave.scripts.resolve_risk_mode` |
 | `skillweave-interactive-mode` | `python -m skillweave.scripts.interactive_mode` |
+| `skillweave-mcp` | `python -m skillweave.mcp.server` |
 
 **uv** — install into a uv-managed environment, then run via `uv run`:
 
 ```bash
 uv venv
-uv pip install /path/to/skillweave-1.5.10-py3-none-any.whl
+uv pip install /path/to/skillweave-1.5.11-py3-none-any.whl
 uv run skillweave --help
 ```
 
@@ -180,7 +181,7 @@ uv run skillweave --help
 environment (no global symlink into a shared Desktop install):
 
 ```bash
-pipx install /path/to/skillweave-1.5.10-py3-none-any.whl
+pipx install /path/to/skillweave-1.5.11-py3-none-any.whl
 skillweave --help
 ```
 
@@ -210,7 +211,7 @@ The `tests/packaging/test_install_provisioning.py` suite automates exactly this
 against a freshly built wheel and a freshly created editable install, asserting:
 
 1. the base distribution's `Requires-Dist` is `PyYAML>=6.0` + `skillweave-sdk==0.3.0`;
-2. all four console-script targets import and expose a callable `main`;
+2. all five console-script targets import and expose a callable `main`;
 3. `skillweave.<module>` resolves under the *installed* location, not `src/`;
 4. the base install imports and runs with no MCP SDK present;
 5. **every non-optional runtime module under `skillweave` imports** in the base
@@ -310,10 +311,14 @@ reason**. It is never reported as a fabricated pass.
 
 `pyproject.toml` declares `requires-python = ">=3.9"` and classifiers for Python
 3.9–3.12; both are preserved by this ticket (no breaking support change). The
-distribution version is `1.5.9`; release-facing claims about a future `1.5.10`
-are owned by the separate SW-DOC-004 version-truth ticket and are not made here.
-Apache license metadata is preserved as-is; PEP 639 SPDX normalization is owned
-by the separate LICENSE task and is not performed here.
+distribution version is `1.5.11` — read from `pyproject.toml`, the declared
+source of truth, and asserted by
+`tests/unit/test_1510_doc_truth.py::test_provisioning_current_version_statements_match_pyproject`.
+Historical note: when this ticket (SW-ENV-001) was written the current
+distribution version was `1.5.9`, and `1.5.10` was a future release owned by the
+separate SW-DOC-004 version-truth ticket; both are history, not a description of
+this tree. Apache license metadata is preserved as-is; PEP 639 SPDX normalization
+is owned by the separate LICENSE task and is not performed here.
 
 ### Tested Python versions
 
@@ -327,7 +332,7 @@ explicitly so the gap is visible rather than implied:
 | 3.10 | declared only | no interpreter available in this environment |
 | 3.11 | **verified host**   | built-wheel install + runtime-surface sweep in this lane |
 | 3.12 | verified by CI    | CI pins 3.12 for the suite |
-| 3.13 | declared only | no interpreter available in this environment |
+| 3.13 | not declared | no classifier in `pyproject.toml`; no interpreter available in this environment |
 | 3.14 | **verified host**   | built-wheel install + full composed CLI smoke on the controller host |
 
 "Verified host" means the provisioning suite (build, install, entrypoint and —

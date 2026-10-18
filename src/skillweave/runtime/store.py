@@ -8,6 +8,53 @@ from .errors import InvalidTransitionError, VersionConflictError
 from .checkpoint import Checkpoint, EnvironmentFingerprint
 from .registry import ArtifactReceipt, EvidenceQuality
 from .handoff import ColdStartBundle, HandoffOffer
+from .native_process import (
+    LEASE_KEY,
+    INTENT_CLAIMING_STATES,
+    INTENT_FAILED,
+    INTENT_LAUNCHED,
+    INTENT_STATES,
+    ControllerLease,
+    DispatchIntent,
+    DuplicateDispatchError,
+    IntentStateConflictError,
+    LeaseNotHeldError,
+    LeaseRefusedError,
+    # SW-1511-RECOVERY criterion 1: the resumed-controller seam.  A controller
+    # that takes over the lease through the durable store re-exports the native
+    # process service so the surviving controller -- not just a direct import of
+    # the module -- resumes the one verified owned attempt instead of replaying
+    # the predecessor's pending launch intent.
+    NativeProcessService,
+    # SW-1511-RECOVERY criterion 2: the ``harness-continuation-v1`` decision.
+    # Re-exported through the same store seam so the recovered controller (via
+    # ``NativeProcessService.resume``) continues an owned attempt with an
+    # actual session resume *only* for an attested harness capability, and
+    # otherwise a named-limitation checkpoint continuation.
+    HARNESS_CONTINUATION_SCHEMA_ID,
+    HARNESS_SESSION_RESUME_CAPABILITY,
+    CONTINUATION_SESSION_RESUME,
+    CONTINUATION_CHECKPOINT,
+    HarnessContinuation,
+    plan_harness_continuation,
+    # SW-1511-RECOVERY criterion 3: the ``owned-child-drain-v1`` report.
+    # Re-exported through the same store seam so the recovered controller (via
+    # ``NativeProcessService.resume``/``drain_background_probe_children``)
+    # drains the predecessor's background probe children *by owned identity*
+    # and reports a heartbeat-only stalled child as a useful-slot exemption --
+    # never counting heartbeat traffic as useful slot occupancy.
+    CHILD_DRAIN_SCHEMA_ID,
+    CHILD_DRAINED,
+    CHILD_DRAIN_REFUSED,
+    CHILD_PROBE,
+    CHILD_HEARTBEAT_ONLY,
+    USEFUL_SLOT_OCCUPIED,
+    USEFUL_SLOT_EXEMPT_STALLED,
+    USEFUL_SLOT_FREED,
+    OwnedChildDrain,
+    plan_child_drain,
+    StaleFencingTokenError,
+)
 
 import sqlite3
 import json
@@ -319,6 +366,119 @@ class SQLiteRunStore(RunStore):
             CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency
                 ON events(run_id, idempotency_key)
                 WHERE idempotency_key IS NOT NULL;
+            -- SW-ORCH-001 criterion 2: the SINGLE controller lease with a
+            -- monotonically increasing fencing token.  ``lease_key`` is the
+            -- primary key so at most one row per lease lane exists; the token
+            -- strictly increases on every acquisition, so a recovering
+            -- controller reads a higher token than its predecessor and any
+            -- write presented with a superseded token is refused.
+            CREATE TABLE IF NOT EXISTS controller_lease (
+                lease_key TEXT PRIMARY KEY,
+                holder TEXT NOT NULL,
+                fencing_token INTEGER NOT NULL,
+                acquired_at TEXT NOT NULL,
+                lease_until TEXT,
+                released_at TEXT
+            );
+            -- SW-ORCH-001 criterion 2: durable dispatch intents.  One row per
+            -- owned attempt; the partial unique index below makes a SECOND
+            -- claiming intent for the same execution scope impossible at the
+            -- storage layer, so a duplicate launch cannot start a second
+            -- worker even across processes.
+            CREATE TABLE IF NOT EXISTS dispatch_intents (
+                intent_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                execution_scope TEXT NOT NULL,
+                step TEXT NOT NULL,
+                state TEXT NOT NULL,
+                fencing_token INTEGER NOT NULL,
+                route TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL DEFAULT '',
+                process_identity TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dispatch_intents_run
+                ON dispatch_intents(run_id);
+            CREATE INDEX IF NOT EXISTS idx_dispatch_intents_scope
+                ON dispatch_intents(execution_scope);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_intents_claiming_scope
+                ON dispatch_intents(execution_scope)
+                WHERE state IN ('launched', 'reviewing', 'repairing', 'integrating');
+            -- SW-ORCH-001 criterion 4: the last compact changed-state view
+            -- served for a run.  Persisting it lets a reattached controller
+            -- resume from the durable cursor instead of re-reading the
+            -- transcript: the newest row per run is the view an unchanged poll
+            -- returns.  Additive and opt-in; no existing table changes.
+            CREATE TABLE IF NOT EXISTS evidence_deltas (
+                delta_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                journal_cursor INTEGER NOT NULL,
+                accepted_gates TEXT NOT NULL DEFAULT '[]',
+                required_gates TEXT NOT NULL DEFAULT '[]',
+                new_evidence TEXT NOT NULL DEFAULT '[]',
+                observed_at TEXT NOT NULL,
+                record TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_evidence_deltas_run
+                ON evidence_deltas(run_id, delta_id);
+            -- SW-ORCH-001 criterion 5: a controlled content transaction (CMS
+            -- integration) for a non-repository subject.  Keyed by
+            -- (run_id, txn_id) so a reattached controller reads the applied /
+            -- verified transaction rather than re-applying it.  No Git merge
+            -- participates.  Additive and opt-in.
+            CREATE TABLE IF NOT EXISTS content_transactions (
+                run_id TEXT NOT NULL,
+                txn_id TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                subject_kind TEXT NOT NULL,
+                baseline TEXT NOT NULL,
+                applied_digest TEXT NOT NULL,
+                readback_digest TEXT NOT NULL DEFAULT '',
+                applied INTEGER NOT NULL DEFAULT 0,
+                verified INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                record TEXT NOT NULL,
+                PRIMARY KEY (run_id, txn_id)
+            );
+            -- SW-1511-CMS-TRANSACTION criteria 1-3: a *managed* CMS
+            -- transaction (cms-transaction-receipt-v1) driven by one owner
+            -- through baseline -> draft/dry-run -> apply/readback -> restore
+            -- over a neutral capability contract.  Keyed by (run_id, txn_id) so
+            -- a reattached controller resumes the transaction from the stage it
+            -- reached rather than re-applying it.  Additive and opt-in; no
+            -- existing table changes.
+            CREATE TABLE IF NOT EXISTS cms_transactions (
+                run_id TEXT NOT NULL,
+                txn_id TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                subject_kind TEXT NOT NULL,
+                subject_revision TEXT NOT NULL,
+                adapter TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                baseline_semantic TEXT NOT NULL,
+                baseline_render TEXT NOT NULL,
+                restored INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                record TEXT NOT NULL,
+                PRIMARY KEY (run_id, txn_id)
+            );
+            -- SW-1511-CMS-TRANSACTION criterion 5: a candidate-bound milestone
+            -- receipt stored *before* any runtime CMS apply.  Keyed by
+            -- candidate_sha so a missing, changed, stale or foreign receipt is
+            -- refused fail-closed.  Additive and opt-in; no existing table
+            -- changes.
+            CREATE TABLE IF NOT EXISTS cms_milestone_receipts (
+                candidate_sha TEXT PRIMARY KEY,
+                cli_assay_proof TEXT NOT NULL,
+                mcp_assay_proof TEXT NOT NULL,
+                stored_at TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                record TEXT NOT NULL
+            );
         """)
         self._conn.commit()
         self._migrate_legacy_states()
@@ -990,6 +1150,671 @@ class SQLiteRunStore(RunStore):
             )
             self._conn.commit()
         return claim_ids
+
+    # ---- Controller lease with fencing (SW-ORCH-001 criterion 2) ----
+
+    def _controller_lease_row(self):
+        return self._conn.execute(
+            "SELECT * FROM controller_lease WHERE lease_key = ?", (LEASE_KEY,)
+        ).fetchone()
+
+    def _row_to_controller_lease(self, row) -> ControllerLease:
+        return ControllerLease(
+            holder=row["holder"],
+            fencing_token=row["fencing_token"],
+            lease_until=row["lease_until"],
+            acquired_at=row["acquired_at"],
+            released_at=row["released_at"],
+        )
+
+    def get_controller_lease(self) -> Optional[ControllerLease]:
+        """Return the single controller lease, or ``None`` if never acquired."""
+        row = self._controller_lease_row()
+        return None if row is None else self._row_to_controller_lease(row)
+
+    def acquire_controller_lease(
+        self, holder: str, ttl_seconds: int = 300
+    ) -> ControllerLease:
+        """Acquire the single controller lease, or refuse a live one.
+
+        Exactly one controller holds the lease.  The fencing token strictly
+        increases on every acquisition (takeover or re-acquire after release),
+        so a recovering controller that takes over reads a *higher* token than
+        the controller it replaced.  A live (held, unexpired) lease is refused
+        with :class:`LeaseRefusedError` -- never silently stolen.
+
+        A takeover of an expired lease trusts a new holder *only* for the
+        token; the caller must still re-verify any recorded process identity
+        (:func:`process_identity.verify`) before trusting or signalling a live
+        worker.  This method arbitrates the token alone.
+        """
+        from .write_scope import default_lease_until
+        now = datetime.now(timezone.utc).isoformat()
+        lease_until = default_lease_until(now, ttl_seconds)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._controller_lease_row()
+            if row is not None and row["released_at"] is None:
+                # A held lease with an unexpired (or undatable) deadline is
+                # live: refuse rather than steal.
+                deadline = row["lease_until"]
+                if deadline is None or deadline > now:
+                    self._conn.rollback()
+                    raise LeaseRefusedError(row["holder"], deadline)
+            current_token = row["fencing_token"] if row is not None else 0
+            token = current_token + 1
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO controller_lease "
+                    "(lease_key, holder, fencing_token, acquired_at, lease_until, "
+                    " released_at) VALUES (?, ?, ?, ?, ?, NULL)",
+                    (LEASE_KEY, holder, token, now, lease_until),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE controller_lease SET holder = ?, fencing_token = ?, "
+                    "acquired_at = ?, lease_until = ?, released_at = NULL "
+                    "WHERE lease_key = ?",
+                    (holder, token, now, lease_until, LEASE_KEY),
+                )
+            self._conn.commit()
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return ControllerLease(
+            holder=holder,
+            fencing_token=token,
+            lease_until=lease_until,
+            acquired_at=now,
+            released_at=None,
+        )
+
+    def heartbeat_controller_lease(
+        self, holder: str, fencing_token: int, ttl_seconds: int = 300
+    ) -> bool:
+        """Renew the lease from now; refuse a stale token or wrong holder.
+
+        Returns True when the lease was renewed.  A caller presenting a
+        superseded token is refused (:class:`StaleFencingTokenError`), as is a
+        caller who is not the current holder (:class:`LeaseNotHeldError`): a
+        controller that lost the lease cannot renew it.
+        """
+        from .write_scope import default_lease_until
+        now = datetime.now(timezone.utc).isoformat()
+        lease_until = default_lease_until(now, ttl_seconds)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._controller_lease_row()
+            if row is None or row["released_at"] is not None:
+                self._conn.rollback()
+                raise LeaseNotHeldError(
+                    fencing_token, None if row is None else row["holder"]
+                )
+            if row["fencing_token"] != fencing_token:
+                self._conn.rollback()
+                raise StaleFencingTokenError(fencing_token, row["fencing_token"])
+            if row["holder"] != holder:
+                self._conn.rollback()
+                raise LeaseNotHeldError(fencing_token, row["holder"])
+            self._conn.execute(
+                "UPDATE controller_lease SET lease_until = ? WHERE lease_key = ?",
+                (lease_until, LEASE_KEY),
+            )
+            self._conn.commit()
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return True
+
+    def release_controller_lease(self, fencing_token: int) -> bool:
+        """Release the lease; refuse a stale token.
+
+        Returns True when the held lease carrying ``fencing_token`` was
+        released.  A superseded token is refused rather than releasing a lease
+        the caller no longer owns.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        row = self._controller_lease_row()
+        if row is None or row["released_at"] is not None:
+            raise LeaseNotHeldError(fencing_token, None if row is None else row["holder"])
+        if row["fencing_token"] != fencing_token:
+            raise StaleFencingTokenError(fencing_token, row["fencing_token"])
+        cur = self._conn.execute(
+            "UPDATE controller_lease SET released_at = ? "
+            "WHERE lease_key = ? AND released_at IS NULL AND fencing_token = ?",
+            (now, LEASE_KEY, fencing_token),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def current_fencing_token(self) -> int:
+        """The current fencing token (``0`` when the lease was never taken)."""
+        row = self._controller_lease_row()
+        return 0 if row is None else row["fencing_token"]
+
+    def last_journal_sequence(self, run_id: str) -> int:
+        """The highest journal ``events.sequence`` for *run_id* (``0`` if none).
+
+        The durable journal cursor a recovering controller resumes from: a
+        ``native-process-checkpoint-v1`` records this so a fresh controller
+        continues the run's logical journal without replaying or skipping.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return int(row[0])
+
+    # ---- Read projections for the compact view / content transactions ----
+
+    def list_journal_events(self, run_id: str, after_sequence: int = 0) -> list[dict]:
+        """Journal events for *run_id* with ``sequence > after_sequence``.
+
+        A read-only projection of the shared ``events`` table in journal order.
+        The compact evidence view consumes exactly the changed window (events
+        strictly after its cursor), so an unchanged poll reads nothing new.
+        """
+        rows = self._conn.execute(
+            "SELECT sequence, run_id, event_type, payload, correlation_id, "
+            "causation_id, idempotency_key, timestamp, version "
+            "FROM events WHERE run_id = ? AND sequence > ? ORDER BY sequence",
+            (run_id, after_sequence),
+        ).fetchall()
+        events: list[dict] = []
+        for row in rows:
+            data = dict(row)
+            payload = data.get("payload")
+            if isinstance(payload, str):
+                try:
+                    data["payload"] = json.loads(payload)
+                except (ValueError, TypeError):
+                    data["payload"] = {}
+            events.append(data)
+        return events
+
+    def list_evidence(self, run_id: Optional[str] = None) -> list[ArtifactReceipt]:
+        """Evidence receipts, in insertion order (optionally scoped to a run).
+
+        ``ArtifactReceipt`` has no run column, so *run_id* is matched against
+        the receipt's ``metadata['run_id']`` when supplied; with no *run_id* the
+        full content-addressed set is returned.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM evidence ORDER BY rowid"
+        ).fetchall()
+        receipts = [self._row_to_evidence(r) for r in rows]
+        if run_id is None:
+            return receipts
+        return [
+            r for r in receipts
+            if (r.metadata or {}).get("run_id") == run_id
+        ]
+
+    def save_evidence_delta(self, delta: Any) -> Any:
+        """Persist one ``evidence-view-v1`` compact view (append, never update).
+
+        The newest row per run is the view a reattached controller resumes from;
+        the whole frozen record is retained so a recovering controller resumes
+        from a durable cursor rather than re-reading the transcript.
+        """
+        record = delta.to_dict()
+        self._conn.execute(
+            """INSERT INTO evidence_deltas
+               (run_id, journal_cursor, accepted_gates, required_gates,
+                new_evidence, observed_at, record)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record["run_id"],
+                int(record["journal_cursor"]),
+                json.dumps(list(record.get("accepted_gates") or [])),
+                json.dumps(list(record.get("required_gates") or [])),
+                json.dumps(list(record.get("new_evidence") or [])),
+                record.get("observed_at", ""),
+                json.dumps(record),
+            ),
+        )
+        self._conn.commit()
+        return delta
+
+    def get_evidence_delta(self, run_id: str) -> Optional[dict]:
+        """The newest persisted compact view for *run_id* (or ``None``)."""
+        row = self._conn.execute(
+            "SELECT record FROM evidence_deltas WHERE run_id = ? "
+            "ORDER BY delta_id DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["record"])
+
+    def save_content_transaction(self, txn: Any) -> Any:
+        """Persist one controlled content transaction, keyed by (run, txn).
+
+        A re-apply of the same ``(run_id, txn_id)`` is refused, so a controlled
+        content transaction is idempotent by identity rather than re-applied.
+        """
+        record = txn.to_dict()
+        self._conn.execute(
+            """INSERT INTO content_transactions
+               (run_id, txn_id, subject, subject_kind, baseline, applied_digest,
+                readback_digest, applied, verified, created_at, record)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record["run_id"],
+                record["txn_id"],
+                record["subject"],
+                record.get("subject_kind", ""),
+                record["baseline"],
+                record["applied_digest"],
+                record.get("readback_digest", ""),
+                1 if record.get("applied") else 0,
+                1 if bool(record.get("readback_digest"))
+                and record.get("readback_digest") == record.get("applied_digest")
+                else 0,
+                record.get("created_at", ""),
+                json.dumps(record),
+            ),
+        )
+        self._conn.commit()
+        return txn
+
+    def get_content_transaction(self, run_id: str, txn_id: str) -> Optional[dict]:
+        """The persisted content transaction for ``(run_id, txn_id)`` (or None)."""
+        row = self._conn.execute(
+            "SELECT record FROM content_transactions "
+            "WHERE run_id = ? AND txn_id = ?",
+            (run_id, txn_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["record"])
+
+    def save_cms_transaction(self, txn: Any, *, upsert: bool = False) -> Any:
+        """Persist one managed CMS transaction, keyed by (run, txn).
+
+        The *opening* write (``upsert=False``) is idempotent by identity: a
+        re-open of the same ``(run_id, txn_id)`` is refused, so a managed
+        transaction is never silently re-baselined.  A *stage advance*
+        (``upsert=True``) updates the same row, carrying the transaction to its
+        new stage -- the readback/restored hashes are re-derived by the frozen
+        record on read, so a tampered row fails closed.
+        """
+        record = txn.to_dict()
+        baseline = record.get("baseline_hashes") or {}
+        restored = 1 if record.get("restored") else 0
+        values = (
+            record["subject"],
+            record.get("subject_kind", ""),
+            record.get("subject_revision", ""),
+            record.get("adapter", ""),
+            record.get("stage", ""),
+            baseline.get("semantic", ""),
+            baseline.get("render", ""),
+            restored,
+            record.get("created_at", ""),
+            json.dumps(record),
+        )
+        if upsert:
+            self._conn.execute(
+                """UPDATE cms_transactions
+                   SET subject = ?, subject_kind = ?, subject_revision = ?,
+                       adapter = ?, stage = ?, baseline_semantic = ?,
+                       baseline_render = ?, restored = ?, created_at = ?,
+                       record = ?
+                   WHERE run_id = ? AND txn_id = ?""",
+                values + (record["run_id"], record["txn_id"]),
+            )
+        else:
+            self._conn.execute(
+                """INSERT INTO cms_transactions
+                   (run_id, txn_id, subject, subject_kind, subject_revision,
+                    adapter, stage, baseline_semantic, baseline_render, restored,
+                    created_at, record)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (record["run_id"], record["txn_id"]) + values,
+            )
+        self._conn.commit()
+        return txn
+
+    def get_cms_transaction(self, run_id: str, txn_id: str) -> Optional[dict]:
+        """The persisted managed CMS transaction for ``(run_id, txn_id)``."""
+        row = self._conn.execute(
+            "SELECT record FROM cms_transactions WHERE run_id = ? AND txn_id = ?",
+            (run_id, txn_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["record"])
+
+    # ── criterion 5: candidate-bound milestone receipt ─────────────────────
+
+    def save_cms_milestone_receipt(self, receipt: Any) -> Any:
+        """Persist a candidate-bound milestone receipt (criterion 5).
+
+        The receipt is keyed by ``candidate_sha`` -- a second save for the same
+        candidate overwrites the prior receipt (a re-qualification).  The
+        persisted record includes the content digest so a later read can detect
+        tampering.
+        """
+        payload = receipt.payload()
+        digest = receipt.digest or payload.get("digest", "")
+        record = json.dumps(receipt.to_dict())
+        self._conn.execute(
+            """INSERT OR REPLACE INTO cms_milestone_receipts
+               (candidate_sha, cli_assay_proof, mcp_assay_proof, stored_at,
+                schema_version, digest, record)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                receipt.candidate_sha,
+                receipt.cli_assay_proof,
+                receipt.mcp_assay_proof,
+                receipt.stored_at,
+                receipt.schema_version,
+                digest,
+                record,
+            ),
+        )
+        self._conn.commit()
+        return receipt
+
+    def get_cms_milestone_receipt(
+        self, candidate_sha: str
+    ) -> Optional[dict]:
+        """The persisted milestone receipt for ``candidate_sha``, or None."""
+        row = self._conn.execute(
+            "SELECT record FROM cms_milestone_receipts WHERE candidate_sha = ?",
+            (candidate_sha,),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["record"])
+
+    def assert_controller(self, fencing_token: int) -> None:
+        """Refuse a write whose fencing token is not the current held token.
+
+        This is the fence: a stale controller's write is refused with
+        :class:`StaleFencingTokenError` when the presented token is lower than
+        the held one, and with :class:`LeaseNotHeldError` when no lease is
+        held.  A caller must pass here before its durable effect is applied.
+        """
+        row = self._controller_lease_row()
+        if row is None or row["released_at"] is not None:
+            raise LeaseNotHeldError(fencing_token, None if row is None else row["holder"])
+        if row["fencing_token"] != fencing_token:
+            raise StaleFencingTokenError(fencing_token, row["fencing_token"])
+
+    # ---- Durable dispatch intents (SW-ORCH-001 criterion 2) ----
+
+    def _row_to_dispatch_intent(self, row) -> DispatchIntent:
+        return DispatchIntent(
+            intent_id=row["intent_id"],
+            run_id=row["run_id"],
+            task_id=row["task_id"],
+            attempt=row["attempt"],
+            execution_scope=row["execution_scope"],
+            step=row["step"],
+            state=row["state"],
+            fencing_token=row["fencing_token"],
+            route=row["route"],
+            session_id=row["session_id"],
+            process_identity=(
+                json.loads(row["process_identity"])
+                if row["process_identity"] else None
+            ),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def record_dispatch_intent(
+        self,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        execution_scope: str,
+        *,
+        step: str,
+        state: str = INTENT_LAUNCHED,
+        fencing_token: int = 0,
+        route: str = "",
+        session_id: str = "",
+        process_identity: Optional[dict] = None,
+        intent_id: Optional[str] = None,
+    ) -> DispatchIntent:
+        """Record one owned attempt's dispatch intent, refusing a duplicate.
+
+        A *claiming* intent (state in :data:`INTENT_CLAIMING_STATES`) for an
+        execution scope that already carries a claiming intent is refused with
+        :class:`DuplicateDispatchError`; the store's partial unique index
+        enforces the same invariant atomically, so two racing processes cannot
+        both launch the same scope.
+        """
+        import uuid
+
+        if state not in INTENT_STATES:
+            raise ValueError(
+                f"dispatch intent state {state!r} is not one of {sorted(INTENT_STATES)}"
+            )
+        iid = intent_id or str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        pid_json = json.dumps(process_identity) if process_identity is not None else None
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if state in INTENT_CLAIMING_STATES:
+                existing = self._conn.execute(
+                    "SELECT intent_id, run_id FROM dispatch_intents "
+                    "WHERE execution_scope = ? AND state IN "
+                    f"({','.join('?' for _ in INTENT_CLAIMING_STATES)})",
+                    (execution_scope, *sorted(INTENT_CLAIMING_STATES)),
+                ).fetchone()
+                if existing is not None:
+                    self._conn.rollback()
+                    raise DuplicateDispatchError(
+                        execution_scope, existing["intent_id"], existing["run_id"]
+                    )
+            self._conn.execute(
+                "INSERT INTO dispatch_intents "
+                "(intent_id, run_id, task_id, attempt, execution_scope, step, "
+                " state, fencing_token, route, session_id, process_identity, "
+                " created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (iid, run_id, task_id, attempt, execution_scope, step, state,
+                 fencing_token, route, session_id, pid_json, now, now),
+            )
+            self._conn.commit()
+        except DuplicateDispatchError:
+            raise
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        return DispatchIntent(
+            intent_id=iid, run_id=run_id, task_id=task_id, attempt=attempt,
+            execution_scope=execution_scope, step=step, state=state,
+            fencing_token=fencing_token, route=route, session_id=session_id,
+            process_identity=process_identity, created_at=now, updated_at=now,
+        )
+
+    def advance_dispatch_intent(
+        self, intent_id: str, state: str, *, step: Optional[str] = None
+    ) -> DispatchIntent:
+        """Advance an intent to ``state``; releases the scope when non-claiming.
+
+        Moving an intent out of a *claiming* state frees its execution scope at
+        the storage layer (the partial unique index no longer covers it), so a
+        subsequent attempt on the same scope is admitted.
+        """
+        if state not in INTENT_STATES:
+            raise ValueError(
+                f"dispatch intent state {state!r} is not one of {sorted(INTENT_STATES)}"
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        if step is None:
+            cur = self._conn.execute(
+                "UPDATE dispatch_intents SET state = ?, updated_at = ? "
+                "WHERE intent_id = ?",
+                (state, now, intent_id),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE dispatch_intents SET state = ?, step = ?, updated_at = ? "
+                "WHERE intent_id = ?",
+                (state, step, now, intent_id),
+            )
+        self._conn.commit()
+        if cur.rowcount == 0:
+            raise KeyError(f"dispatch intent {intent_id!r} does not exist")
+        return self.get_dispatch_intent(intent_id)
+
+    def advance_dispatch_intent_from(
+        self,
+        intent_id: str,
+        to_state: str,
+        *,
+        expected_state: str,
+        step: Optional[str] = None,
+    ) -> DispatchIntent:
+        """Advance an intent to ``to_state`` **only** from ``expected_state``.
+
+        This is the guarded counterpart to :meth:`advance_dispatch_intent`,
+        added additively and opt-in for the state-driven controller loop: unlike
+        the legacy unguarded update, the transition is a compare-and-set
+        (``WHERE state = expected_state``), so an out-of-order or
+        verdict-inconsistent advance of an intent that is not exactly in
+        ``expected_state`` is *refused* rather than silently applied.  Legacy
+        callers of :meth:`advance_dispatch_intent` keep their behaviour
+        unchanged.
+
+        Raises :class:`IntentStateConflictError` when the intent is missing or
+        its stored state is not ``expected_state``; nothing is written in that
+        case, so a stale or skipping advance cannot corrupt the loop.
+        """
+        if to_state not in INTENT_STATES:
+            raise ValueError(
+                f"dispatch intent state {to_state!r} is not one of "
+                f"{sorted(INTENT_STATES)}"
+            )
+        if expected_state not in INTENT_STATES:
+            raise ValueError(
+                f"dispatch intent expected state {expected_state!r} is not one "
+                f"of {sorted(INTENT_STATES)}"
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        if step is None:
+            cur = self._conn.execute(
+                "UPDATE dispatch_intents SET state = ?, updated_at = ? "
+                "WHERE intent_id = ? AND state = ?",
+                (to_state, now, intent_id, expected_state),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE dispatch_intents SET state = ?, step = ?, updated_at = ? "
+                "WHERE intent_id = ? AND state = ?",
+                (to_state, step, now, intent_id, expected_state),
+            )
+        self._conn.commit()
+        if cur.rowcount == 0:
+            current = self.get_dispatch_intent(intent_id)
+            actual = None if current is None else current.state
+            raise IntentStateConflictError(intent_id, expected_state, actual)
+        return self.get_dispatch_intent(intent_id)
+
+    def fail_dispatch_intent(self, intent_id: str) -> DispatchIntent:
+        """Mark an intent failed (a resolved, terminal outcome)."""
+        return self.advance_dispatch_intent(intent_id, INTENT_FAILED)
+
+    def latest_run_transition(self, run_id: str) -> Optional[dict[str, Any]]:
+        """Return the most recent ``transitions_log`` row for *run_id*.
+
+        The durable *review record* the controller reads its verdict from: the
+        MCP ``review_run`` tool writes this row (via :meth:`transition`) with
+        ``to_state='advance_or_stop'``, ``reason='Review verdict {verdict}: ...'``
+        and the authenticated reviewer ``role``.  Reading the record here -- not
+        a value the controller makes up -- is what makes the loop verdict-driven.
+        Returns ``None`` when the run has no transition yet.
+        """
+        row = self._conn.execute(
+            "SELECT run_id, from_state, to_state, reason, version, timestamp, role "
+            "FROM transitions_log WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "run_id": row["run_id"],
+            "from_state": row["from_state"],
+            "to_state": row["to_state"],
+            "reason": row["reason"],
+            "version": row["version"],
+            "timestamp": row["timestamp"],
+            "role": row["role"],
+        }
+
+    def list_run_transitions(self, run_id: str) -> list[dict[str, Any]]:
+        """Return every ``transitions_log`` row for *run_id*, oldest first."""
+        rows = self._conn.execute(
+            "SELECT run_id, from_state, to_state, reason, version, timestamp, role "
+            "FROM transitions_log WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ).fetchall()
+        return [
+            {
+                "run_id": r["run_id"],
+                "from_state": r["from_state"],
+                "to_state": r["to_state"],
+                "reason": r["reason"],
+                "version": r["version"],
+                "timestamp": r["timestamp"],
+                "role": r["role"],
+            }
+            for r in rows
+        ]
+
+    def get_dispatch_intent(self, intent_id: str) -> Optional[DispatchIntent]:
+        row = self._conn.execute(
+            "SELECT * FROM dispatch_intents WHERE intent_id = ?", (intent_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_dispatch_intent(row)
+
+    def find_dispatch_intent_by_scope(
+        self, execution_scope: str, *, claiming_only: bool = False
+    ) -> Optional[DispatchIntent]:
+        if claiming_only:
+            row = self._conn.execute(
+                "SELECT * FROM dispatch_intents WHERE execution_scope = ? AND "
+                f"state IN ({','.join('?' for _ in INTENT_CLAIMING_STATES)}) "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (execution_scope, *sorted(INTENT_CLAIMING_STATES)),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM dispatch_intents WHERE execution_scope = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (execution_scope,),
+            ).fetchone()
+        return None if row is None else self._row_to_dispatch_intent(row)
+
+    def list_dispatch_intents(
+        self, run_id: Optional[str] = None, *, claiming_only: bool = False
+    ) -> list[DispatchIntent]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if claiming_only:
+            clauses.append(
+                f"state IN ({','.join('?' for _ in INTENT_CLAIMING_STATES)})"
+            )
+            params.extend(sorted(INTENT_CLAIMING_STATES))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self._conn.execute(
+            "SELECT * FROM dispatch_intents" + where + " ORDER BY created_at, intent_id",
+            params,
+        ).fetchall()
+        return [self._row_to_dispatch_intent(r) for r in rows]
 
     # ---- Evidence persistence ----
 

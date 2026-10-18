@@ -34,6 +34,64 @@ def _start_process():
     return importlib.import_module("skillweave.runtime.runner_adapter").start_process
 
 
+def mint_fanout_grant(
+    *,
+    run_id: str,
+    task_id: str = "",
+    attempt: int = 0,
+    client_id: str = "",
+    db_path: Optional[str] = None,
+    mailbox_path: Optional[str] = None,
+    artifacts_path: Optional[str] = None,
+    stream_root: Optional[str] = None,
+    authority: Optional[Any] = None,
+) -> Any:
+    """Mint a controller session grant for a production fan-out (criterion 2).
+
+    A *production* dispatch that has configured a process service must drive
+    the same provision-then-verify seam the interactive path uses, rather than
+    calling :func:`fan_out_dispatch` bare. This composes the one durable
+    process service from the binding inputs (the caller's explicit paths, or
+    the server-owned defaults) and mints a ``harness-mcp-session-grant-v1``
+    scoped to the fan-out's run/task/attempt, so every child of the group is
+    launched with the granted MCP configuration and verified from its own
+    resolved environment.
+
+    The service is read from the *server-owned* binding
+    (``skillweave.mcp.control.service_for_binding``), so a caller cannot name an
+    isolated default store as the shared service; the token is minted by
+    ``issue_harness_session_grant`` against a bound authority, never authored by
+    the caller.
+    """
+    from skillweave.mcp import control as _control
+    from skillweave.mcp import server as _server
+
+    if authority is None:
+        authority = _server._bound_authority()
+    if authority is None:
+        raise RuntimeError(
+            "mint_fanout_grant requires a bound MCP authority: configure a "
+            "process service before driving production dispatch provisioning"
+        )
+    default_db, default_artifacts = _server.server_default_paths()
+    service = _control.service_for_binding(
+        db_path or default_db,
+        mailbox_path=mailbox_path or _control.default_mailbox_path(),
+        artifacts_path=artifacts_path or default_artifacts,
+        stream_root=stream_root,
+    )
+    return _server.issue_harness_session_grant(
+        authority=authority,
+        role="controller",
+        client_id=client_id or "fanout",
+        transport="stdio",
+        run_id=run_id,
+        task_id=task_id,
+        attempt=attempt,
+        service=service,
+    )
+
+
 #: The four machine outcomes a terminal child reports. Exactly one is set per
 #: child; a result that resolves to none (or more than one) is rejected.
 OUTCOME_EXIT_CODE = "exit_code"
@@ -352,6 +410,7 @@ def fan_out_dispatch(
     artifact_store: Optional[Any] = None,
     on_child_lifecycle: Optional[Callable[..., None]] = None,
     env: Optional[dict[str, str]] = None,
+    mcp_grant: Optional[Any] = None,
 ) -> FanOutResult:
     """Start every command as a real process, then wait for all.
 
@@ -414,6 +473,12 @@ def fan_out_dispatch(
     still reaped, and after the fan-out has finished the exception surfaces as a
     :class:`LifecycleObservationError` — never as an unreaped child and never as
     a silently dropped success.
+
+    ``mcp_grant`` (optional) is a
+    :class:`skillweave.mcp.bootstrap.HarnessMcpSessionGrant` provisioned into
+    every child's actual launch and verified from that child's own resolved
+    environment; a child that does not reach the granted authority/state
+    service is refused. Omitting it preserves the historical fan-out exactly.
     """
     created_at = created_at or datetime.now(timezone.utc).isoformat()
 
@@ -464,6 +529,30 @@ def fan_out_dispatch(
             return ctx.subject_repo, ctx.subject_commit, ctx.tool, ctx.cwd
         return subject_repo, subject_commit, tool, cwd
 
+    # ``mcp_grant`` (optional) is the same "provision then verify inside the
+    # actual child launch" seam the single-lane inline path uses: the granted
+    # MCP configuration is merged into the child's env and, immediately after
+    # the child starts, its *own* resolved environment is checked to reach the
+    # same authority/state service. A child that landed elsewhere is refused,
+    # never silently downgraded to the interactive harness profile. Omitting
+    # it (``None``, the default) preserves the historical fan-out exactly.
+    grant_env: Optional[dict[str, str]] = None
+    if mcp_grant is not None:
+        from skillweave.mcp import bootstrap as _mcp_bootstrap
+
+        grant_env = _mcp_bootstrap.grant_child_env(mcp_grant)
+        _mcp_bootstrap.assert_no_ambient_credentials(grant_env)
+
+    child_env: Optional[dict[str, str]] = env
+    child_allowlist: Optional[List[str]] = None
+    if grant_env is not None:
+        child_env = {**(env or {}), **grant_env}
+        # The granted child is launched under an *explicit* allowlist (the
+        # granted MCP keys plus whatever the caller named), so an ambient
+        # provider credential can never leak alongside the grant -- the same
+        # discipline the single-lane inline seam applies.
+        child_allowlist = sorted(set(env or ()) | set(grant_env))
+
     handles: List[Tuple[int, Any, List[str]]] = []
     for index, argv in enumerate(commands):
         child_run_id = f"{run_id}-{index}"
@@ -478,8 +567,11 @@ def fan_out_dispatch(
                 model=resolved_models[index],
                 created_at=created_at,
                 cwd=child_cwd,
-                env=env,
+                env=child_env,
+                env_allowlist=child_allowlist,
             )
+            if mcp_grant is not None:
+                handle = _mcp_bootstrap.verify_child_launch(mcp_grant, handle)
         except Exception as exc:  # noqa: BLE001
             # A child that never spawned is a launch failure, never a silent
             # gap: it still lands in ``children`` with its own outcome and a

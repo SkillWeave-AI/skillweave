@@ -49,9 +49,22 @@ parallelism are decided here declaratively, from observed data handed in.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, List, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence as TypingSequence
+
+# ``class Sequence`` below is a public scheduling primitive (exported in
+# ``__all__``); it deliberately shares the name of ``typing.Sequence``. The
+# typing alias is therefore imported as ``TypingSequence`` and every *generic
+# annotation* uses that alias, so ``TypingSequence[TypingSequence[Lane]]`` can
+# never resolve to the local class and raise
+# ``TypeError: type 'Sequence' is not subscriptable`` at import time.
 
 from .write_scope import resolve_scope_path, paths_overlap, WriteScopeClaim
+from ..trace.gate_receipt import (
+    ACCEPTANCE_TERMINAL,
+    MissingProducerArtifact,
+    UnsupportedContractVersion,
+    validate_independent_gate_receipt,
+)
 
 
 class CyclicGraphError(Exception):
@@ -62,7 +75,7 @@ class CyclicGraphError(Exception):
     cycle must surface as an error, not vanish into a missing task.
     """
 
-    def __init__(self, unresolved: Sequence[str]):
+    def __init__(self, unresolved: TypingSequence[str]):
         self.unresolved = sorted(unresolved)
         super().__init__(
             "Task graph contains a dependency cycle involving: "
@@ -126,7 +139,7 @@ class Lane:
         return self.task.id
 
 
-def build_batches(tasks: Sequence[Task]) -> List[Batch]:
+def build_batches(tasks: TypingSequence[Task]) -> List[Batch]:
     """Resolve ``tasks`` into an ordered list of batches.
 
     A batch is the earliest layer a task can belong to: batch 0 holds tasks
@@ -182,8 +195,8 @@ def _resolved_scopes(task: Task) -> List[str]:
 
 
 def _scope_conflicts(
-    scopes: Sequence[str],
-    others: Sequence[str],
+    scopes: TypingSequence[str],
+    others: TypingSequence[str],
 ) -> bool:
     """True when any path in ``scopes`` overlaps any path in ``others``.
 
@@ -199,7 +212,7 @@ def _scope_conflicts(
 
 
 def build_lanes(
-    tasks: Sequence[Task],
+    tasks: TypingSequence[Task],
     held_claims: tuple[WriteScopeClaim, ...] = (),
 ) -> List[List[Lane]]:
     """Build write-scope-aware lanes into parallel batches.
@@ -571,7 +584,7 @@ def _admit_by_budget(
 
 
 def _split_by_max_parallel(
-    lane_groups: Sequence[Sequence[Lane]],
+    lane_groups: TypingSequence[TypingSequence[Lane]],
     max_parallel: int,
 ) -> List[List[Lane]]:
     """Cap the number of lanes per group at ``max_parallel``.
@@ -591,6 +604,49 @@ def _split_by_max_parallel(
     return split
 
 
+def _gate_receipt_releases(
+    gate: str,
+    receipt: Any,
+) -> bool:
+    """Decide whether one gate's ``independent-gate-receipt-v1`` releases deps.
+
+    SW-1511-REVIEW criteria 1 and 3: the controller acceptance service's
+    consumer seam.  A gate is released only when its bound receipt records an
+    **accepted** attempt — the sole state that may release dependents — whose
+    required producer artifact is present.  This is the same rule
+    :func:`skillweave.trace.gate_receipt.release_dependents` enforces, applied
+    to the durable record a consumer hands in.
+
+    It is **fail-closed**: a receipt whose ``state`` is not the terminal
+    acceptance state, or that carries *accepted* without its producer artifact,
+    releases nothing (and a *launched* artifact-less attempt in particular
+    cannot release its dependents).  An unsupported contract version is
+    *refused* (:class:`UnsupportedContractVersion`), never coerced to v1.  A
+    non-mapping payload is refused as an invalid receipt.
+    """
+    if not isinstance(receipt, Mapping):
+        raise ValueError(
+            f"gate {gate!r} carries a gate receipt that is not a mapping; "
+            f"expected an independent-gate-receipt-v1 record"
+        )
+    # Fail-closed on any version this consumer does not support.
+    validate_independent_gate_receipt(receipt)
+    state = receipt.get("state")
+    if state != ACCEPTANCE_TERMINAL:
+        # Not yet accepted: the dependent is not released.
+        return False
+    if not receipt.get("accepted"):
+        return False
+    if not receipt.get("producer_artifact"):
+        # An accepted state without its producer artifact is refused outright,
+        # mirroring release_dependents (a launched skill that never produced
+        # its artifact cannot release dependents).
+        raise MissingProducerArtifact(
+            str(receipt.get("attempt_id", "")), str(receipt.get("producer_artifact", ""))
+        )
+    return True
+
+
 def build_schedule(
     sequence: Sequence,
     gate_results: Optional[Mapping[str, bool]] = None,
@@ -600,6 +656,7 @@ def build_schedule(
     route_capacity: Optional[RouteCapacitySnapshot] = None,
     reservations: Optional[ReservationSnapshot] = None,
     route_cost: Optional[Mapping[str, float]] = None,
+    gate_receipts: Optional[Mapping[str, Any]] = None,
     now: Optional[str] = None,
 ) -> Schedule:
     """Build a gated, parallel-capped schedule from a ``Sequence``.
@@ -612,6 +669,18 @@ def build_schedule(
       ``gate_results``) does NOT release its dependents (criterion 4). Blocked
       tasks — and anything downstream of them — are returned in
       ``Schedule.blocked`` rather than vanishing from the plan.
+
+    SW-1511-REVIEW (criteria 1 and 3) adds the *controller acceptance* consumer
+    seam, additively and opt-in: an optional ``gate_receipts`` mapping from a
+    dependency task's ``gate`` to its ``independent-gate-receipt-v1`` record.  A
+    gate backed by a receipt is released **only** when that receipt records the
+    terminal *accepted* state with its required producer artifact present; a
+    launched/running (or artifact-less) attempt therefore cannot release its
+    dependents.  When ``gate_receipts`` is omitted, ``gate_results`` is
+    consulted exactly as before and existing behaviour (and every v1 record) is
+    unchanged.  An unsupported receipt version fails closed
+    (:class:`~skillweave.trace.gate_receipt.UnsupportedContractVersion`), never
+    coerced.
 
     SW-1510-ADAPTIVE (criterion 1) makes admission *adaptive*.  When fresh
     ``route_capacity`` and/or ``reservations`` observations are supplied:
@@ -646,6 +715,7 @@ def build_schedule(
         max_parallel = measured
 
     results = dict(gate_results) if gate_results else {}
+    receipts = dict(gate_receipts) if gate_receipts else {}
 
     # Layering, cycle/dupe/unknown-dep validation, and determinism come from
     # build_batches. Gating is a release condition layered on top: a dependent
@@ -662,7 +732,13 @@ def build_schedule(
                 dep_task = by_id[dep]
                 dep_blocked = dep in blocked
                 gate = dep_task.gate
-                gate_failed = gate is not None and not results.get(gate, False)
+                if gate is not None and gate in receipts:
+                    # SW-1511-REVIEW criteria 1/3: the controller acceptance
+                    # consumer seam.  The receipt decides the release; a
+                    # launched/artifact-less or non-accepted attempt does not.
+                    gate_failed = not _gate_receipt_releases(gate, receipts[gate])
+                else:
+                    gate_failed = gate is not None and not results.get(gate, False)
                 if dep_blocked or gate_failed:
                     blocked.add(task.id)
                     break
@@ -944,8 +1020,8 @@ class SelectionLedger:
         kind: str,
         *,
         cause: str,
-        candidates: Sequence[str] = (),
-        rejected_routes: Sequence[str] = (),
+        candidates: TypingSequence[str] = (),
+        rejected_routes: TypingSequence[str] = (),
         budget_delta: float = 0.0,
         outcome: str = "",
         subject: str = "",

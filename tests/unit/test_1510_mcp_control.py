@@ -687,11 +687,23 @@ class TestDependencyHonesty:
             with pytest.raises(control.McpDependencyUnavailable):
                 call()
 
-    def test_main_refuses_and_dunder_main_exits_nonzero(self, tmp_path):
-        # ``main`` refuses with the diagnostic instead of no-op'ing.
+    def test_main_refuses_and_dunder_main_exits_nonzero(self, tmp_path, capsys):
+        # ``main`` is the entry the built wheel's console script calls, so a
+        # missing dependency is converted to the documented one-line diagnostic
+        # and ``EXIT_REFUSED`` -- a scriptable exit code, never a propagated
+        # traceback. The typed ``McpDependencyUnavailable`` contract is covered
+        # directly at the serving seams (``serve_legacy_stdio``/``serve``) below.
         if not control.mcp_available():
-            with pytest.raises(control.McpDependencyUnavailable):
+            with pytest.raises(SystemExit) as refusal:
                 mcp_server.main()
+
+            assert refusal.value.code == mcp_server.EXIT_REFUSED == 3
+            err = capsys.readouterr().err
+            assert "Traceback" not in err
+            lines = [line for line in err.splitlines() if line.strip()]
+            assert len(lines) == 1, err
+            assert lines[0].startswith("skillweave-mcp unavailable:")
+            assert control.DEGRADED_REASON in lines[0]
 
             # Running the module as __main__ exits non-zero with the diagnostic
             # on stderr -- proven in a real fresh interpreter.

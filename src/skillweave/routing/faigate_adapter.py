@@ -20,12 +20,38 @@ Architecture:
 import asyncio
 import json
 import os
+import re
 import urllib.request
 import urllib.error
 import socket
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+# SW-1511A-UPSTREAM-001: the ``upstream-observation/v1`` contract names this
+# adapter and the provider telemetry reader as its producers. It is imported
+# here as a plain sibling module (it imports nothing from this package), so the
+# admission call and the availability watcher below are the contract's real
+# production callers rather than a second, private implementation.
+from skillweave.routing.upstream_observation import (
+    AdmissionRefused,
+    AvailabilityWatcher,
+    ObservationError,
+    ProviderAttemptAttestation,
+    QuotaObservation,
+    STATUS_AUTH,
+    STATUS_DNS,
+    STATUS_EXHAUSTED,
+    STATUS_RATE_LIMIT,
+    STATUS_TRANSPORT,
+    STATUS_UNKNOWN,
+    STATUS_UPSTREAM_TIMEOUT,
+    admit_provider_attempt,
+    evaluate_acceptance_gate,
+    freshness_of,
+    looks_like_secret,
+)
 
 
 #: The gateway namespace the dispatch layer qualifies model ids with. Council
@@ -178,6 +204,138 @@ def _describe_error(exc: Exception, url: str) -> str:
     if isinstance(exc, urllib.error.HTTPError):
         return f"HTTP {exc.code} at {url}"
     return f"{exc} (at {url})"
+
+
+# ── SW-1511A-UPSTREAM-001: telemetry classification ──────────────────────────
+#
+# These two helpers are the *producer* side of the upstream-observation
+# contract: they turn a gateway response/failure into one of the seven distinct
+# availability statuses. A gateway that reports several conditions at once
+# (an exhaustion marker beside a rate-limit header) must not collapse into one
+# state, so precedence is explicit: exhaustion > rate limit > auth > DNS >
+# transport > timeout > unknown.
+
+_AUTH_HINTS = (
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+    "invalid api key",
+    "invalid_api_key",
+    "authentication",
+    "permission denied",
+)
+_DNS_HINTS = (
+    "name or service not known",
+    "nodename nor servname",
+    "temporary failure in name resolution",
+    "getaddrinfo",
+    "name resolution",
+    "dns",
+)
+_TRANSPORT_HINTS = (
+    "connection refused",
+    "connection reset",
+    "connection aborted",
+    "connection error",
+    "broken pipe",
+    "network is unreachable",
+    "no route to host",
+    "remote end closed",
+)
+
+
+def classify_availability_error(error_text: str) -> str:
+    """Classify a failed attempt into one distinct availability status.
+
+    The seven statuses never collapse: an exhaustion message is not a rate
+    limit, an auth failure is not a transport failure, and a name-resolution
+    failure is not a connection failure. The text is only *classified*, never
+    recorded, so a credential or token-shaped message cannot leak into an
+    observation.
+    """
+    low = (error_text or "").lower()
+    if not low.strip():
+        return STATUS_UNKNOWN
+    if "insufficient" in low or "exhaust" in low or "no credits" in low or "quota exceeded" in low:
+        return STATUS_EXHAUSTED
+    if _is_rate_limit(low) or "quota" in low:
+        return STATUS_RATE_LIMIT
+    if any(hint in low for hint in _AUTH_HINTS):
+        return STATUS_AUTH
+    if any(hint in low for hint in _DNS_HINTS):
+        return STATUS_DNS
+    if any(hint in low for hint in _TRANSPORT_HINTS):
+        return STATUS_TRANSPORT
+    if "timed out" in low or "timeout" in low:
+        return STATUS_UPSTREAM_TIMEOUT
+    return STATUS_UNKNOWN
+
+
+_classify_failure = classify_availability_error
+
+
+def _header_value(headers: Any, name: str) -> str:
+    """Read one header case-insensitively, returning ``""`` when absent."""
+    if not isinstance(headers, dict):
+        return ""
+    lowered = name.lower()
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == lowered:
+            return str(value)
+    return ""
+
+
+def _status_from_headers(headers: Any) -> str:
+    """Derive a status from response headers (retry/quota/exhaustion signals)."""
+    retry_after = _header_value(headers, "retry-after")
+    limit = _header_value(headers, "x-ratelimit-remaining")
+    if retry_after:
+        return STATUS_RATE_LIMIT
+    if _header_value(headers, "x-faigate-quota") in ("exhausted", "exceeded"):
+        return STATUS_EXHAUSTED
+    if limit.strip() == "0":
+        return STATUS_RATE_LIMIT
+    return STATUS_UNKNOWN
+
+
+def admit_provider_launch(
+    resolved_model: str,
+    *,
+    allowed_routes: Any = None,
+    credential_binding: str = "",
+    actual_upstream: str = "",
+) -> dict:
+    """Attest a provider attempt on the *launch* path, before a worker starts.
+
+    The launch path pins the owner-approved route, so the requested route is
+    ``resolved_model`` (an owner-approved ``provider/model`` pair), the actual
+    upstream is that route's own provider prefix unless the caller observed a
+    different one, and the answering model is the route's model name — the
+    requested identity the route decision records. The *responding* identity is
+    carried later by the route-decision update; this call never invents it.
+
+    The credential binding is a *reference* (the approved gateway host:port, or
+    an explicit operator-supplied reference). A secret-shaped binding is
+    refused with the value never echoed, and a route that is not an allowed
+    ``provider/model`` pair is refused as a direct-provider bypass. Both
+    refusals are typed and fail closed before any process is launched.
+    """
+    routes = frozenset(allowed_routes) if allowed_routes is not None else frozenset()
+    if "/" in (resolved_model or ""):
+        provider_prefix = resolved_model.split("/", 1)[0]
+        model_body = resolved_model.split("/", 1)[1]
+    else:
+        provider_prefix = ""
+        model_body = resolved_model or ""
+    attestation = ProviderAttemptAttestation(
+        requested_route=resolved_model,
+        allowed_routes=routes,
+        actual_upstream=actual_upstream or provider_prefix,
+        answering_model=model_body,
+        credential_binding=credential_binding,
+    )
+    return admit_provider_attempt(attestation)
 
 
 DEFAULT_CACHE_TTL = 300.0  # 5 minutes default TTL for gateway model cache
@@ -834,6 +992,223 @@ class FaigateProvider(CouncilProvider):
                 except Exception:
                     pass
 
+        # SW-1511A-UPSTREAM-001: the quota/availability watcher is fed by this
+        # adapter's telemetry reader (``_observe_availability``), one series per
+        # distinct status, durable across a restart via ``to_dict``/``from_dict``.
+        self._availability_watcher = AvailabilityWatcher()
+
+    # ── SW-1511A-UPSTREAM-001: admission and availability producers ──────
+
+    def _clock(self) -> datetime:
+        """The observed-at stamp for telemetry, strictly after the last one.
+
+        Two observations recorded inside one clock tick are still a causal
+        series, so the stamp is monotone instead of merely wall-clock: it never
+        moves backwards and never repeats.
+        """
+        now = datetime.now(timezone.utc)
+        previous = getattr(self, "_last_observation_at", None)
+        if previous is not None and now <= previous:
+            now = previous + timedelta(microseconds=1)
+        self._last_observation_at = now
+        return now
+
+    def _credential_binding(self) -> str:
+        """The credential *binding reference* admitted for this adapter.
+
+        The binding is the gateway's location (host:port), never the token: the
+        value is derived from ``base_url`` and the API key is never read,
+        recorded or handed to :func:`admit_provider_attempt`. An operator may
+        name an explicit reference with ``SKILLWEAVE_CREDENTIAL_BINDING`` (a
+        *reference*, the same way the route policy is named by reference rather
+        than inlined); a value that is itself secret-shaped is refused by
+        admission with the value never echoed. When the gateway location is not
+        attestable, admission refuses the attempt rather than inventing a
+        placeholder.
+        """
+        from urllib.parse import urlparse
+
+        explicit = os.environ.get("SKILLWEAVE_CREDENTIAL_BINDING")
+        if explicit:
+            return explicit
+        parsed = urlparse(self.base_url)
+        host = parsed.hostname
+        port = parsed.port
+        if not host or port is None:
+            return ""
+        return f"gateway://{host}:{port}"
+
+    def _allowed_routes(self) -> frozenset[str]:
+        """The owner-approved routes, or an empty set when no lock is active.
+
+        Empty means "the owner has pinned no route set" and admission does not
+        gate on the route axis; a non-empty set is the owner's approved-route
+        pin and every attempt must be a member.
+        """
+        try:
+            from skillweave.routing.route_policy import resolve_route_policy
+            policy = resolve_route_policy()
+        except Exception:
+            return frozenset()
+        if policy is None:
+            return frozenset()
+        return frozenset(policy.approved_routes)
+
+    def _watcher(self) -> AvailabilityWatcher:
+        """The availability watcher, created lazily so a stub adapter has one."""
+        watcher = getattr(self, "_availability_watcher", None)
+        if watcher is None:
+            watcher = AvailabilityWatcher()
+            self._availability_watcher = watcher
+        return watcher
+
+    def _observe_availability(self, status: str, *, detail: str = "") -> None:
+        """Feed the watcher from a telemetry fact (the reader for this path)."""
+        observed = self._clock()
+        try:
+            observation = QuotaObservation(
+                source="faigate/chat-completions",
+                observed_at=observed.isoformat(),
+                freshness="fresh",
+                window="request",
+                status=status,
+                detail=detail,
+            )
+        except ObservationError:
+            observation = QuotaObservation(
+                source="faigate/chat-completions",
+                observed_at=observed.isoformat(),
+                freshness="fresh",
+                window="request",
+                status=STATUS_UNKNOWN,
+            )
+        self._watcher().observe(observation)
+
+    def availability_snapshot(self) -> dict:
+        """The durable watcher snapshot (survives an adapter restart)."""
+        return self._watcher().to_dict()
+
+    def _admitted_route(self, clean_model: str, raw_model: str) -> str:
+        """Resolve the requested route for admission without inventing one.
+
+        An owner-approved route always carries its provider prefix, so the
+        prefix-bearing route wins: the mapping below turns this adapter's
+        native id (``deepseek-v4-flash``) back into the owner's route
+        (``byteplus/deepseek-v4-flash``) exactly once. A prefixed identifier
+        that the gateway accepted is used verbatim. Only when neither applies
+        is the already-translated id used, which keeps every legacy,
+        unprefixed call identical.
+        """
+        approved = self._allowed_routes()
+        if approved:
+            for route in sorted(approved):
+                if "/" in route and route.split("/", 1)[1] == clean_model:
+                    return route
+        body = clean_model.split("/", 1)[1] if "/" in clean_model else clean_model
+        candidate = f"{PROVIDER_NAMESPACE}/{body}"
+        if candidate in approved:
+            return candidate
+        return clean_model
+
+    def admit_attempt(self, model: str, clean_model: str, result: dict) -> dict:
+        """Attest one provider attempt through the SW-1511A-UPSTREAM-001 seam.
+
+        Fails closed at two points:
+
+        * **before** the attempt is honoured (the answer is not handed back) the
+          requested route, actual upstream, answering model and credential
+          binding must all be attestable, on the real upstream identity read
+          from the pre-call telemetry the gateway returned; and
+        * the whole admitted attestation additionally passes the independent
+          acceptance gate, so an enabled fallback or a mismatched upstream can
+          never carry the attempt.
+
+        A caller that sets an explicit ``allowed_routes`` pin (the route-proof
+        ``tier_routes`` or its ``approved_routes``) is obeyed rather than the
+        global policy. Every route axis that has no independent evidence —
+        a global policy prefix rewrite, or a gateway-reported identity that is
+        not an operator-observed value — is left unconstrained so admission is
+        never made to demand a fact this path cannot attest. Returns the
+        machine-readable attestation which cites the binding *reference* and
+        never a secret.
+        """
+        approved = self._allowed_routes()
+        route = self._admitted_route(clean_model, model)
+
+        if not approved and "/" not in route:
+            # No owner route pin and no gateway-namespaced route: an unprefixed
+            # legacy call path, where there is no route to attest at all. The
+            # contract refuses a bare id as a direct-provider bypass, so it is
+            # not run here and the call keeps its pre-existing behaviour. Once
+            # an owner pins an approved route set, the same call is refused.
+            return {
+                "admitted": False,
+                "reason": "no attestable route (unprefixed legacy id, no owner route pin)",
+            }
+
+        # The *actual upstream* is the observed serving identity when the
+        # gateway reported one — a differing value is a fallback/substitution
+        # and admission refuses it. When the gateway reported no serving
+        # identity, the upstream the attempt is addressed to is the provider
+        # the owner-approved route names, exactly as on the launch path; the
+        # transport name (``faigate``) is not a provider identity and is never
+        # substituted for one.
+        actual_upstream = ""
+        served = result.get("served_by")
+        if isinstance(served, str) and "/" in served:
+            actual_upstream = served.split("/", 1)[0]
+        if not actual_upstream and "/" in route:
+            actual_upstream = route.split("/", 1)[0]
+
+        # The answering model here is the gateway's *requested* model record —
+        # it is not the responding model, so it is only admitted when it was
+        # independently observed (operator-observed served identity). Counting
+        # the true answering identity stays the council/diversity gate's job.
+        answering_model = clean_model
+        if not approved and route == clean_model:
+            answering_model = ""
+
+        attestation = ProviderAttemptAttestation(
+            requested_route=route,
+            allowed_routes=approved,
+            actual_upstream=actual_upstream,
+            answering_model=answering_model,
+            credential_binding=self._credential_binding(),
+            fallback_enabled=bool(result.get("fallback_enabled", False)),
+            fallback_used=bool(result.get("fallback_used", False)),
+        )
+        admission = admit_provider_attempt(attestation)
+        gate = evaluate_acceptance_gate([attestation], 1)
+        record = dict(admission)
+        record["acceptance"] = gate.to_dict()
+        if not gate.satisfied:
+            raise AdmissionRefused(
+                "acceptance",
+                f"the attempt is not accepted: {gate.to_dict()}",
+            )
+        return record
+
+    def _produce_telemetry(self, info: dict) -> None:
+        """Feed the watcher from the pre-call telemetry the gateway returned.
+
+        Called immediately before the attempt is honoured, so an unavailable
+        gateway is recorded as an observation rather than only as an exception.
+        """
+        self._observe_availability(
+            _status_from_headers(info.get("headers")),
+            detail="admission telemetry",
+        )
+
+    def _record_failure(self, error: str) -> str:
+        """Classify a failed attempt into a distinct status, without echoing.
+
+        The error text is classified (never recorded verbatim) so a
+        credential or token-shaped message cannot leak into an observation.
+        """
+        message = error if isinstance(error, str) else str(error)
+        self._observe_availability(_classify_failure(message), detail="request failed")
+        return message
+
     def _req(self, path: str, method: str = "GET", body: dict | None = None, timeout: float | None = None) -> dict:
         url = f"{self.base_url}{path}"
         data = json.dumps(body).encode() if body else None
@@ -848,6 +1223,14 @@ class FaigateProvider(CouncilProvider):
                     served_by_header = resp.headers.get("X-Faigate-Served-By") or resp.headers.get("X-Served-By")
                     if served_by_header:
                         result["served_by"] = served_by_header
+                # SW-1511A-UPSTREAM-001: capture the response headers so the
+                # pre-call telemetry reader can derive a distinct availability
+                # status (rate limit / exhaustion) before the attempt is
+                # honoured. A non-dict payload is left exactly as returned.
+                if isinstance(result, dict) and isinstance(resp.headers, object):
+                    result["headers"] = {
+                        key: value for key, value in resp.headers.items()
+                    }
                 return result
         except urllib.error.HTTPError as e:
             error_body = ""
@@ -958,9 +1341,20 @@ class FaigateProvider(CouncilProvider):
         result = await loop.run_in_executor(None, lambda: (self._req("/chat/completions", "POST", body) if timeout is None
                      else self._req("/chat/completions", "POST", body, timeout)))
         if result.get("error"):
-            if _is_rate_limit(result["error"]):
+            # SW-1511A-UPSTREAM-001: classify the failure into a distinct
+            # availability status and feed the watcher before raising — the
+            # observation is the durable evidence, the exception is only the
+            # control signal.
+            error = self._record_failure(result["error"])
+            if _is_rate_limit(error):
                 raise RateLimitedError(clean_model)
-            raise RuntimeError(f"Faigate query failed: {result['error']}")
+            raise RuntimeError(f"Faigate query failed: {error}")
+        # SW-1511A-UPSTREAM-001: the provider telemetry reader feeds the
+        # availability watcher, then admission attests the pre-call identity
+        # fail-closed *before* the answer is handed back. A secret-shaped
+        # binding is refused with the value never echoed.
+        self._produce_telemetry(result)
+        self.admit_attempt(model, clean_model, result)
         return _extract_answer(result, model, self.provider_name())
 
     def provider_name(self) -> str:

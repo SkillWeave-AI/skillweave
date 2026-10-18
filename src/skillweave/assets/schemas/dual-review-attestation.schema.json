@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skillweave.dev/schemas/dual-review-attestation/v1",
+  "title": "Dual-Review Attestation Schema",
+  "description": "Strict dual-review attestation (SW1312-ATTESTATION-STRICT-001). A reusable, canonical contract that an SW1312 gate receipt validates against: one candidate_sha, exactly two diverse reviewer records (one Pro-class and one Flash-class), each binding reviewer_id, class, verdict and subject_sha, plus an explicit contradiction boolean. Full 40-hex SHAs are canonical lowercase. Unknown top-level and reviewer keys are rejected so a misspelled field such as contradiction_recorded can never be silently ignored.",
+  "type": "object",
+  "required": [
+    "candidate_sha",
+    "reviewers",
+    "contradiction"
+  ],
+  "properties": {
+    "candidate_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Canonical lowercase full 40-hex SHA of the candidate under attestation."
+    },
+    "reviewers": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "description": "Exactly two reviewer records, one Pro-class and one Flash-class.",
+      "items": { "$ref": "#/$defs/reviewer" }
+    },
+    "contradiction": {
+      "type": "boolean",
+      "description": "Explicit boolean. false = no material contradiction was recorded; a dual-review attestation with contradiction true never authorizes a gate."
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "reviewer": {
+      "type": "object",
+      "required": [
+        "reviewer_id",
+        "class",
+        "verdict",
+        "subject_sha"
+      ],
+      "properties": {
+        "reviewer_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Distinct reviewer identity; two reviewers may not share an identity."
+        },
+        "class": {
+          "type": "string",
+          "enum": ["pro", "flash"],
+          "description": "Reviewer capability class, provider-neutral."
+        },
+        "verdict": {
+          "type": "string",
+          "enum": ["REVIEW_PASS"],
+          "description": "Exact verdict. A dual-review attestation exists only in the REVIEW_PASS shape."
+        },
+        "subject_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "Canonical lowercase full 40-hex SHA of the immutable subject the reviewer inspected; must equal candidate_sha."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

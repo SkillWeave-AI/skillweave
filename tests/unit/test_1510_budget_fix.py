@@ -6,6 +6,17 @@ Covers the five concrete failures identified by the controller:
 3. Streaming native entry missing admission
 4. Silent store failure / fail-closed
 5. Uncommitted work
+
+Hermeticity (the repeatability repair): every test here builds its service
+against ``_stream_root()``, a fresh per-invocation parent directory, rather
+than a stream root placed directly under the shared scratch directory. The
+service derives its final-result root as the stream root's *parent*
+(``RunApplicationService._final_result_root``), so a shared scratch made the
+derived root shared too; the fixed run ids these tests reuse then rewrote an
+already-written ``(run_id, task_id, attempt)`` identity on a second run and
+were correctly refused. The collision was an artifact of the shared scratch
+root, not of the exactly-one store guarantee, which is left intact -- see the
+regression proofs in ``test_sw_1511a_final_result_production_wiring.py``.
 """
 
 from __future__ import annotations
@@ -14,6 +25,7 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -53,6 +65,27 @@ _SCRATCH = Path(
     )
 )
 _SCRATCH.mkdir(parents=True, exist_ok=True)
+
+
+def _stream_root() -> str:
+    """A unique, *hermetic* stream root for one test invocation.
+
+    The service derives its final-result root as the stream root's parent
+    (``RunApplicationService._final_result_root``), and the final-result store
+    keys each record by the full ``(run_id, task_id, attempt)`` identity. These
+    tests intentionally reuse fixed run ids, so if the stream root lived
+    directly under a *shared* scratch directory the derived final-result root
+    would be shared too, and a second test run would rewrite an identity it
+    already wrote. That is a genuine conflicting rewrite and the store rightly
+    refuses it -- but the collision is an artifact of the shared scratch, not
+    of the contract.
+
+    Handing each invocation its own fresh parent directory keeps the final
+    result root per-invocation (``<mkdtemp>/streams`` -> ``<mkdtemp>``), so
+    repeated execution passes with no manual cleanup while the store keeps its
+    exactly-one guarantee for a real reused identity.
+    """
+    return os.path.join(tempfile.mkdtemp(prefix="sw1510-stream-"), "streams")
 
 
 @pytest.fixture
@@ -376,7 +409,7 @@ class TestStreamingNativeIngress:
         s = SQLiteRunStore(db_path)
         j = EventJournal(s.db_path)
         r = RawArtifactStore()
-        stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+        stream_root = _stream_root()
         stream_store = DurableStreamStore(root=stream_root)
         rs = ReservationStore(db_path)
         svc = RunApplicationService(s, j, r, stream_store=stream_store,
@@ -414,7 +447,7 @@ class TestStreamingNativeIngress:
         s = SQLiteRunStore(db_path)
         j = EventJournal(s.db_path)
         r = RawArtifactStore()
-        stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+        stream_root = _stream_root()
         stream_store = DurableStreamStore(root=stream_root)
         rs = ReservationStore(db_path)
         svc = RunApplicationService(s, j, r, stream_store=stream_store,
@@ -459,7 +492,7 @@ class TestStreamingNativeIngress:
         s = SQLiteRunStore(db_path)
         j = EventJournal(s.db_path)
         r = RawArtifactStore()
-        stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+        stream_root = _stream_root()
         stream_store = DurableStreamStore(root=stream_root)
         rs = ReservationStore(db_path)
         svc = RunApplicationService(s, j, r, stream_store=stream_store,
@@ -683,7 +716,7 @@ class TestLaunchFailureCancelsReservation:
         s = SQLiteRunStore(db_path)
         j = EventJournal(s.db_path)
         r = RawArtifactStore()
-        stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+        stream_root = _stream_root()
         stream_store = DurableStreamStore(root=stream_root)
         rs = ReservationStore(db_path)
         svc = RunApplicationService(s, j, r, stream_store=stream_store,
@@ -944,7 +977,7 @@ class TestInstalledIngressWiresReservation:
             store = SQLiteRunStore(db_path)
             journal = EventJournal(db_path)
             raw = RawArtifactStore()
-            stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+            stream_root = _stream_root()
             stream_store = DurableStreamStore(root=stream_root)
             rs = ReservationStore(db_path)
             svc = RunApplicationService(
@@ -1004,7 +1037,7 @@ class TestInstalledIngressWiresReservation:
             store = SQLiteRunStore(db_path)
             journal = EventJournal(db_path)
             raw = RawArtifactStore()
-            stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+            stream_root = _stream_root()
             stream_store = DurableStreamStore(root=stream_root)
             rs = ReservationStore(db_path)
             svc = RunApplicationService(
@@ -1222,7 +1255,7 @@ class TestRetryScopeEnvelopeInheritance:
         s = SQLiteRunStore(db_path)
         j = EventJournal(s.db_path)
         r = RawArtifactStore()
-        stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+        stream_root = _stream_root()
         stream_store = DurableStreamStore(root=stream_root)
         rs = ReservationStore(db_path)
         svc = RunApplicationService(s, j, r, stream_store=stream_store,
@@ -1444,7 +1477,7 @@ class TestProductIngressTokenCostDimensions:
         s = SQLiteRunStore(db_path)
         j = EventJournal(s.db_path)
         r = RawArtifactStore()
-        stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+        stream_root = _stream_root()
         stream_store = DurableStreamStore(root=stream_root)
         rs = ReservationStore(db_path)
         svc = RunApplicationService(s, j, r, stream_store=stream_store,
@@ -1489,7 +1522,7 @@ class TestProductIngressTokenCostDimensions:
         s = SQLiteRunStore(db_path)
         j = EventJournal(s.db_path)
         r = RawArtifactStore()
-        stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+        stream_root = _stream_root()
         stream_store = DurableStreamStore(root=stream_root)
         rs = ReservationStore(db_path)
         svc = RunApplicationService(s, j, r, stream_store=stream_store,
@@ -1981,7 +2014,7 @@ class TestIngressHonoursOwnerEnvelope:
             s = SQLiteRunStore(db_path)
             j = EventJournal(db_path)
             raw = RawArtifactStore()
-            stream_root = str(_SCRATCH / f"stream_{uuid.uuid4().hex}")
+            stream_root = _stream_root()
             stream_store = DurableStreamStore(root=stream_root)
             rs2 = ReservationStore(db_path)
             svc = RunApplicationService(s, j, raw, stream_store, reservation_store=rs2)

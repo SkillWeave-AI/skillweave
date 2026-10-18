@@ -131,7 +131,12 @@ def _run_check(
     env.pop("PYTHONPATH", None)
     if extra_env:
         env.update(extra_env)
-    argv = [sys.executable, "-B", str(_CHECK), "--repo", str(repo)]
+    # ``-S`` (no site) is deliberate: it drops the *ambient* site-packages from
+    # the child so its ``installed`` fact reflects only what this test planted
+    # via ``extra_env["PYTHONPATH"]`` -- which ``-S`` still honours. Without it
+    # the child would see the harness venv's own installed skillweave and the
+    # environment would, not the code, decide these assertions.
+    argv = [sys.executable, "-S", "-B", str(_CHECK), "--repo", str(repo)]
     if extra_args:
         argv.extend(extra_args)
     return subprocess.run(argv, capture_output=True, text=True, env=env)

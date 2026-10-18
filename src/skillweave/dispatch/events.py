@@ -35,6 +35,7 @@ concrete tool and no concrete harness.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import RLock
@@ -152,8 +153,17 @@ class DispatchEventStream:
         construction, the sink write and the flush form one serialized
         emission operation, so on-disk/live-reader order is strictly
         increasing even under concurrency.
+
+        The encoded line is passed through the worker-credential guard
+        (:func:`skillweave.mcp.bootstrap.redact_worker_credentials`) before it
+        reaches the sink.  The dispatch stream is a real output path a worker
+        can write to, so a provider credential value that somehow reached an
+        event field is redacted here rather than being written verbatim; the
+        guard runs on the encoded line, not on a caller-supplied blob.
         """
-        self._sink.write(_encode_event(event) + "\n")
+        line = _encode_event(event)
+        line = _guard_worker_credentials(line)
+        self._sink.write(line + "\n")
         self._sink.flush()
         self._typed_events.append(_encode_event_dict(event))
         return event
@@ -614,6 +624,29 @@ def _looks_like_polling_payload(payload: Optional[dict[str, Any]]) -> None:
     for key in ("log_size", "log_file_size", "pid", "process_id"):
         if key in payload:
             _refuse_raw_output(key)
+
+
+def _guard_worker_credentials(line: str) -> str:
+    """Redact any ambient worker credential value from an encoded event line.
+
+    This is the stream's own output-path guard.  The dispatch stream writes to
+    a real sink (a JSONL file or ``sys.stdout``) that a restarted session may
+    reconnect to, so a worker's provider credential must never be observable
+    here even if a value reached an event field.  The guard is imported lazily
+    so this module keeps naming no concrete transport, and it never fails the
+    hot path: a credential value is replaced with the explicit redaction
+    marker, and any residual value is refused rather than written.
+    """
+    try:
+        from skillweave.mcp import bootstrap as _bootstrap
+    except Exception:  # pragma: no cover - import boundary must never break emission
+        return line
+    environ = os.environ
+    redacted = _bootstrap.redact_worker_credentials(line, environ)
+    # Fail closed: if a credential-shaped value still survives redaction, the
+    # line is refused outright rather than emitted verbatim.
+    _bootstrap.assert_worker_credentials_not_in_logs(redacted, environ)
+    return redacted
 
 
 __all__ = [

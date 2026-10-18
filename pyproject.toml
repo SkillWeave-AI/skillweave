@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skillweave"
-version = "1.5.10"
+version = "1.5.11"
 description = "Multi-agent AI skill orchestration with Next Level features"
 readme = "README.md"
 authors = [
@@ -74,6 +74,7 @@ skillweave-install = "skillweave.installer:main"
 skillweave-risk-mode = "skillweave.scripts.resolve_risk_mode:main"
 skillweave-interactive-mode = "skillweave.scripts.interactive_mode:main"
 skillweave = "skillweave.cli.main:main"
+skillweave-mcp = "skillweave.mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -84,5 +85,5 @@ py-modules = ["skillweave_degraded"]
 
 [tool.setuptools.package-data]
 skillweave = ["py.typed"]
-"skillweave.assets" = ["catalogue.yaml", "profiles/**/*", "lenses/**/*", "prompts/**/*", "templates/**/*"]
+"skillweave.assets" = ["catalogue.yaml", "profiles/**/*", "lenses/**/*", "prompts/**/*", "templates/**/*", "schemas/*.json"]
 "skillweave.studio.reference" = ["lean_startup.md"]

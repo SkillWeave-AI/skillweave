@@ -22,7 +22,15 @@ release_policy: decoupled_member_pins
 source_of_truth: pyproject.toml
 
 # release_prep: set ONLY on a release-preparation commit, never on a released
-# tree (see docs/version-truth.md for the mechanism).
+# tree (see docs/version-truth.md for the mechanism). It is a flat top-level
+# scalar -- the version-sync parser accepts only flat scalar keys and the
+# `locations` list -- so the automatic bump never rewrites it. While it equals
+# the candidate (pyproject == bundle) and is ahead of the latest annotated tag,
+# scripts/check-version-truth.py accepts the release-advertising positions
+# (README badge, "What's new" heading, CHANGELOG top) naming the candidate
+# because the release tag does not yet exist. Remove it (or it stops being
+# ahead) once the tag exists.
+release_prep: "1.5.11"
 
 # Prose release history is NOT a version surface. CHANGELOG.md carries a prose
 # heading per release and is written by hand; it is deliberately kept out of

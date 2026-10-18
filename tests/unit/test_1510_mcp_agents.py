@@ -311,6 +311,23 @@ class TestServerToolsAreScoped:
             "mailbox_replay": lambda: mcp_server.mailbox_replay(recipient="worker-1"),
             "mailbox_ack": lambda: mcp_server.mailbox_ack("m-1"),
             "agent_capabilities": lambda: mcp_server.agent_capabilities(),
+            # SW-1511-MCP-BOOTSTRAP: minting a scoped session grant is gated at
+            # the same seam -- no credential, no grant.
+            "harness_session_grant": lambda: mcp_server.harness_session_grant(),
+            # ...as are the two SW-1511 seams: the transport-adapter selection
+            # (criterion 5) and the independent-Review round trip (criterion 4).
+            "handoff_adapter": lambda: mcp_server.handoff_adapter(),
+            # ...and the SW-1511 recovered-controller reader (criterion 2's C
+            # fix): the persisted continuation decision is behind the same
+            # read_run gate, refused before the mailbox is opened.
+            "read_continuation_decision": lambda: mcp_server.read_continuation_decision(),
+            "review_action": lambda: mcp_server.review_action("read"),
+            # SW-1511-RECOVERY: the two-harness qualification (criterion 4), the
+            # child-capability recording (criterion 5) and the one recovered
+            # owned attempt (criterion 6) are gated at the same seam too.
+            "register_child_harness_capability": lambda: mcp_server.register_child_harness_capability(),
+            "qualified_harness_continuation": lambda: mcp_server.qualified_harness_continuation(),
+            "recover_owned_attempt": lambda: mcp_server.recover_owned_attempt("replay"),
         }
         assert set(calls) == set(mcp_control.MCP_AGENT_TOOLS)
         for name, call in calls.items():

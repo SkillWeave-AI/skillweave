@@ -2,10 +2,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 import hashlib
 import json
 import uuid
+
+# SW-1511-RECOVERY criterion 2: the capability name an adapter attests before an
+# actual session resume is admissible. Imported from the recovery contract so
+# the vocabulary name has one definition; only the *name* is used here (the
+# decision value type is imported lazily to keep module import acyclic).
+from skillweave.runtime.native_process import (
+    HARNESS_SESSION_RESUME_CAPABILITY,
+)
 
 
 class HandoffState(str, Enum):
@@ -276,6 +284,14 @@ class HarnessClientCapability:
     positive signal existed; ``False`` means the client was not observable and
     the surface was assumed *least capable*. ``reason`` names how the decision
     was reached, so a fallback is attributable rather than silent.
+
+    ``resume_capability_attested`` (SW-1511-RECOVERY criterion 2) is the
+    *positive* attestation that this client can resume an actual provider
+    session across a restart. It defaults to ``False`` -- absent a positive
+    attestation the capability is *not* assumed, so a recovered controller falls
+    closed to a checkpoint continuation rather than fabricating session
+    continuity. An explicit attestation supplies it through the
+    ``session-resume`` entry of ``features``.
     """
 
     client_id: str
@@ -283,6 +299,16 @@ class HarnessClientCapability:
     transports: frozenset[str]
     features: dict[str, Any]
     reason: str
+    resume_capability_attested: bool = False
+
+    @property
+    def supports_session_resume(self) -> bool:
+        """Whether this client attested it can resume an actual session.
+
+        Falls closed: only a genuine positive attestation is ``True``, so an
+        undetected or unattested client never grants actual session resume.
+        """
+        return bool(self.resume_capability_attested)
 
     @property
     def supports_notifications(self) -> bool:
@@ -307,7 +333,30 @@ class HarnessClientCapability:
             "features": dict(self.features),
             "reason": self.reason,
             "adapter_kind": self.adapter_kind(),
+            "resume_capability_attested": bool(self.resume_capability_attested),
         }
+
+    def continuation_decision(
+        self, run_id: str, *, prior_session_id: str = "", intent_id: str = ""
+    ) -> "HarnessContinuation":
+        """Decide how a recovered controller continues this client's work.
+
+        The decision is driven by the *attested* capability, never assumed: an
+        attested client with a recorded prior session resumes that session; any
+        other client (unattested, or attested but with no recorded session)
+        continues from the durable checkpoint and names the limitation. This is
+        the production decision a recovered controller reaches through the
+        client's capability surface (see
+        :func:`skillweave.runtime.native_process.plan_harness_continuation`).
+        """
+        from skillweave.runtime.native_process import plan_harness_continuation
+
+        return plan_harness_continuation(
+            run_id,
+            resume_capability_attested=self.supports_session_resume,
+            prior_session_id=prior_session_id,
+            intent_id=intent_id,
+        )
 
 
 #: The positive, file-backed presence anchor per known client. The name is the
@@ -389,6 +438,14 @@ def detect_client_capability(
         # A notification transport may not be claimed without also being the
         # client's own attested transport; an empty set is the polling fallback.
         features = dict(attestation.get("features") or {})
+        # SW-1511-RECOVERY criterion 2: a session-resume attestation is a
+        # *positive* fact. An explicit attestation may supply it either as a
+        # top-level ``session-resume`` key or within ``features``; anything else
+        # (absent, false) falls closed to no session resume.
+        resume = bool(
+            attestation.get(HARNESS_SESSION_RESUME_CAPABILITY)
+            or features.get(HARNESS_SESSION_RESUME_CAPABILITY)
+        )
         if not transports:
             transports = frozenset({TRANSPORT_FILE_POLL})
         return HarnessClientCapability(
@@ -397,6 +454,7 @@ def detect_client_capability(
             transports=transports,
             features=features,
             reason="explicit operator attestation",
+            resume_capability_attested=resume,
         )
 
     skill_root = None
@@ -459,6 +517,384 @@ def detect_capabilities(
 
 
 # ---------------------------------------------------------------------------
+# SW-1511-RECOVERY criterion 5: a child's capability, recorded from an actual
+# headless launch -- never inferred from the interactive/desktop settings
+# ---------------------------------------------------------------------------
+
+#: Why a child capability could not be recorded from a real launch.
+CHILD_CAPABILITY_UNOBSERVABLE = "child_launch_unobservable"
+CHILD_CAPABILITY_UNKNOWN_HARNESS = "unknown_child_harness"
+CHILD_CAPABILITY_TOKEN_MISMATCH = "child_session_token_mismatch"
+CHILD_CAPABILITY_NO_SERVICE_BINDING = "child_no_process_service_binding"
+CHILD_CAPABILITY_FOREIGN_SERVICE = "child_resolved_a_foreign_service"
+
+
+class ChildCapabilityError(ValueError):
+    """A child capability could not be honestly recorded from a real launch.
+
+    Every refusal names a stable ``code`` so an operator reads *why* the child
+    capability was not recorded -- an unobservable launch, an unattached child,
+    a child that resolved a foreign service. It is never upgraded to a pass.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"status": "refused", "code": self.code, "message": str(self)}
+
+
+def _attested_transports(observed_env: Mapping[str, str]) -> frozenset[str]:
+    """The transports the *observed child environment* attests, never the host.
+
+    The declared attestation is the only transport signal here: the child's own
+    ``SKILLWEAVE_CLIENT_CAPABILITY`` (if any). No config-file anchor, no
+    skill-root probe, and above all no desktop/interactive setting is consulted
+    -- criterion 5 requires the child's capability to come from the actual
+    headless launch. A child that attests nothing falls closed to the file-poll
+    adapter.
+    """
+    parsed = _parse_attestation(observed_env.get(CAPABILITY_ATTESTATION_ENV, ""))
+    if not parsed:
+        return frozenset({TRANSPORT_FILE_POLL})
+    raw = parsed.get("transports") or []
+    transports = frozenset(str(t) for t in raw)
+    return transports or frozenset({TRANSPORT_FILE_POLL})
+
+
+def capability_from_child_launch(
+    *,
+    client_id: str,
+    grant: Any,
+    observed_env: Optional[Mapping[str, str]],
+    attempt: str = "",
+) -> HarnessClientCapability:
+    """Record a child client's capability from its *actual* headless launch.
+
+    Criterion 5 is precise about the source: a child session's capabilities are
+    recorded **from an actual headless launch**, not inferred from the
+    interactive/desktop settings. So this reads only the child's own *observed*
+    environment -- the effective MCP configuration the launch provisioned -- and
+    never :data:`_MCP_CONFIG_ANCHORS` (the desktop anchors) or any skill-root
+    probe. Fails closed with a named :class:`ChildCapabilityError` when the
+    launch cannot be honestly characterised:
+
+    * the child's effective environment is unobservable;
+    * the child did not carry the server-issued session token (it never attached
+      to this controller), or resolved no process-service binding;
+    * the child resolved a *different* process service than the one the grant
+      names (an isolated per-harness controller), refused through the same
+      :func:`refuse_isolated_controller` seam the launch verification uses.
+
+    The recorded capability carries **no environment value** -- only detected
+    facts -- so a provider credential can never be captured into it.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    if not client_id:
+        raise ChildCapabilityError(
+            CHILD_CAPABILITY_UNKNOWN_HARNESS,
+            "a child capability requires the child harness's client id",
+        )
+    if observed_env is None:
+        raise ChildCapabilityError(
+            CHILD_CAPABILITY_UNOBSERVABLE,
+            "the child launch did not expose its resolved environment, so its "
+            "capabilities cannot be recorded from the actual launch",
+        )
+    token = observed_env.get(str(_bootstrap.ENV_MCP_SESSION_TOKEN), "")
+    if not token or token != getattr(grant, "session_token", ""):
+        raise ChildCapabilityError(
+            CHILD_CAPABILITY_TOKEN_MISMATCH,
+            "the child launch did not carry the granted session token; it did "
+            "not attach to this controller",
+        )
+    observed_service = _bootstrap.service_from_environment(observed_env)
+    if observed_service is None:
+        raise ChildCapabilityError(
+            CHILD_CAPABILITY_NO_SERVICE_BINDING,
+            "the child launch carried no observable process-service binding",
+        )
+    try:
+        _bootstrap.refuse_isolated_controller(grant.service, observed_service)
+    except _bootstrap.ProcessServiceMismatchRefused as exc:
+        raise ChildCapabilityError(CHILD_CAPABILITY_FOREIGN_SERVICE, str(exc))
+
+    parsed = _parse_attestation(observed_env.get(CAPABILITY_ATTESTATION_ENV, ""))
+    features = dict((parsed or {}).get("features") or {})
+    resume = bool(
+        (parsed or {}).get(HARNESS_SESSION_RESUME_CAPABILITY)
+        or features.get(HARNESS_SESSION_RESUME_CAPABILITY)
+    )
+    return HarnessClientCapability(
+        client_id=client_id,
+        detected=True,
+        transports=_attested_transports(observed_env),
+        features={
+            # Facts, never values: no credential, no path from the host.
+            "recorded_from": "headless-launch",
+            "session_token_present": True,
+            "service_bound": True,
+            "attempt": attempt,
+        },
+        reason="recorded from an actual headless child launch",
+        resume_capability_attested=resume,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SW-1511-RECOVERY criterion 6: one recovered owned attempt per independent
+# interruption, mailbox replay/ack by cursor, no duplicate dispatch
+# ---------------------------------------------------------------------------
+
+#: The two interruptions the criterion names, *independently*: the durable
+#: controller service is killed and restarted, or the interactive main harness
+#: is replaced. Each must produce exactly one recovered owned attempt.
+RECOVERY_TRIGGER_CONTROLLER_RESTART = "controller_restart"
+RECOVERY_TRIGGER_HARNESS_REPLACEMENT = "harness_replacement"
+RECOVERY_TRIGGERS: tuple[str, ...] = (
+    RECOVERY_TRIGGER_CONTROLLER_RESTART,
+    RECOVERY_TRIGGER_HARNESS_REPLACEMENT,
+)
+
+#: Why no owned attempt was recovered.
+RECOVERY_NO_OWNED_ATTEMPT = "no_owned_attempt"
+RECOVERY_FIRST_ATTEMPT_NOT_VERIFIED = "first_attempt_not_verified"
+RECOVERY_UNKNOWN_TRIGGER = "unknown_recovery_trigger"
+RECOVERY_SCOPE_NOT_BOUND = "recovery_scope_not_bound"
+
+
+@dataclass(frozen=True)
+class RecoveredOwnedAttempt:
+    """The single owned attempt an independent interruption recovers.
+
+    ``recovered`` is ``True`` only when the *ordering-first* in-flight attempt's
+    recorded identity still verifies. A first attempt that no longer verifies is
+    a fail-closed refusal that never adopts a later attempt, so one interruption
+    can never recover two attempts and a stolen frontier is never adopted. The
+    ``scope`` records the record's own run/task/attempt, never a relabel of the
+    caller's request.
+    """
+
+    trigger: str
+    run_id: str
+    task_id: str
+    attempt: int
+    intent_id: str
+    session_id: str
+    recovered: bool
+    reason: str = ""
+    cursor: Optional[dict[str, Any]] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "recovered-owned-attempt-v1",
+            "trigger": self.trigger,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "attempt": self.attempt,
+            "intent_id": self.intent_id,
+            "session_id": self.session_id,
+            "recovered": self.recovered,
+            "reason": self.reason,
+            "cursor": self.cursor,
+        }
+
+
+def _intent_scope(intent: Any) -> tuple[str, str, int]:
+    return (
+        str(getattr(intent, "run_id", "") or ""),
+        str(getattr(intent, "task_id", "") or ""),
+        int(getattr(intent, "attempt", 0) or 0),
+    )
+
+
+def plan_owned_attempt_recovery(
+    *,
+    trigger: str,
+    run_id: str,
+    intent_id: str,
+    session_id: str,
+    task_id: str = "",
+    attempt: int = 0,
+    intents: Optional[Sequence[Any]] = None,
+    cursor: Optional[dict[str, Any]] = None,
+) -> RecoveredOwnedAttempt:
+    """Resolve exactly one recovered owned attempt for an interruption.
+
+    The caller supplies the *already ordering-first, claiming-only* durable
+    intents for the run (the frontier ``created_at``/``intent_id`` order the
+    store returns) and the identity-verified first attempt it selected -- the
+    same selection :func:`skillweave.runtime.native_process.plan_harness_continuation`
+    and the controller's ``_resume_decision`` make. This resolver enforces the
+    criterion's shape on that selection:
+
+    * the ``trigger`` must be one of :data:`RECOVERY_TRIGGERS` -- controller
+      restart and harness replacement are the only two admissions;
+    * a ``run_id`` is required (an unbound recovery has no scope to recover);
+    * the selected attempt's *own* run/task/attempt must match the requested
+      scope -- a record that belongs to a different run/task/attempt is never
+      relabelled and never adopted;
+    * recovery is granted only when the frontier carried a verified owned
+      attempt (``intent_id``/``session_id`` non-empty). A frontier with no
+      attempt, or whose first attempt did not verify, is a named fail-closed
+      refusal that adopts nothing else.
+    """
+    if trigger not in RECOVERY_TRIGGERS:
+        return RecoveredOwnedAttempt(
+            trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+            intent_id="", session_id="", recovered=False,
+            reason=RECOVERY_UNKNOWN_TRIGGER,
+        )
+    if not run_id:
+        return RecoveredOwnedAttempt(
+            trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+            intent_id="", session_id="", recovered=False,
+            reason=RECOVERY_SCOPE_NOT_BOUND,
+        )
+    ordered = list(intents or ())
+    if not ordered or not intent_id or not session_id:
+        return RecoveredOwnedAttempt(
+            trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+            intent_id="", session_id="", recovered=False,
+            reason=RECOVERY_NO_OWNED_ATTEMPT,
+            cursor=cursor,
+        )
+    # The adopted record must be the frontier and must carry its *own* scope
+    # equal to the requested scope: never a relabel of a foreign record.
+    first = ordered[0]
+    if str(getattr(first, "intent_id", "") or "") != intent_id:
+        return RecoveredOwnedAttempt(
+            trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+            intent_id="", session_id="", recovered=False,
+            reason=RECOVERY_FIRST_ATTEMPT_NOT_VERIFIED,
+            cursor=cursor,
+        )
+    rec_run, rec_task, rec_attempt = _intent_scope(first)
+    scope_ok = rec_run == run_id and (
+        (not task_id and not rec_task) or rec_task == task_id
+    ) and (not attempt or rec_attempt == attempt)
+    if not scope_ok:
+        return RecoveredOwnedAttempt(
+            trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+            intent_id="", session_id="", recovered=False,
+            reason=RECOVERY_FIRST_ATTEMPT_NOT_VERIFIED,
+            cursor=cursor,
+        )
+    return RecoveredOwnedAttempt(
+        trigger=trigger, run_id=run_id, task_id=task_id, attempt=attempt,
+        intent_id=intent_id, session_id=session_id, recovered=True,
+        reason="", cursor=cursor,
+    )
+
+
+def mailbox_cursor_binding(
+    *,
+    after_seq: int = 0,
+    last_digest: str = "",
+) -> Any:
+    """The durable ``shared-process-mailbox-binding-v1`` cursor value type.
+
+    Built through the same bootstrap seam the child grant uses, so the cursor a
+    recovered session resends is the *exact* schema the mailbox verifies against
+    -- a cursor from a different mailbox or a rewritten/truncated channel is
+    refused by :meth:`SharedProcessMailboxBinding.verify_against` / the mailbox
+    read, never silently accepted.
+    """
+    from skillweave.mcp import bootstrap as _bootstrap
+
+    return _bootstrap.MailboxCursorBinding(
+        after_seq=int(after_seq), last_digest=last_digest
+    )
+
+
+def cursor_token(cursor: Any) -> tuple[int, str]:
+    """``(after_seq, last_digest)`` decoded from a durable cursor token.
+
+    A recovered session resends the **opaque token** a prior read emitted (the
+    mailbox's own ``MailboxCursor`` encoding), never a caller-chosen offset: the
+    token is decoded through :meth:`MailboxCursor.decode`, so a rewritten or
+    foreign token is a :class:`MessageChannelError`, not an accepted position.
+    An absent token is the empty position ``(0, "")``.
+    """
+    from skillweave.dispatch.messaging import MailboxCursor
+
+    if not cursor or not isinstance(cursor, str):
+        return 0, ""
+    decoded = MailboxCursor.decode(cursor)
+    if decoded is None:
+        return 0, ""
+    return int(decoded.after_seq), str(decoded.last_digest)
+
+
+def replay_by_cursor(
+    mailbox: Any,
+    *,
+    recipient: str,
+    principal: str,
+    cursor: Any = None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Replay a mailbox from a durable cursor token, returning ``(records, token)``.
+
+    This is criterion 6's *mailbox replay by cursor*: the read starts exactly
+    after the position the prior session persisted, so a session that never
+    observed the live notification still replays every durable message it had
+    not yet accepted, in append order. The ``cursor`` is the **opaque token the
+    mailbox itself emitted** (decoded via :meth:`MailboxCursor.decode`); the
+    mailbox verifies the pinned digest against the record it names, so a
+    truncated or rewritten channel is refused (:class:`MessageChannelError`)
+    rather than silently resumed past lost work. The returned token is the
+    mailbox's own next-cursor encoding, ready to persist.
+    """
+    from skillweave.dispatch.messaging import MailboxCursor
+
+    after_seq, _last_digest = cursor_token(cursor)
+    token = cursor if isinstance(cursor, str) else ""
+    records = mailbox.read(
+        recipient=recipient,
+        principal=principal,
+        resume_token=token,
+        after_seq=after_seq,
+    )
+    if records:
+        next_token = MailboxCursor(
+            after_seq=int(records[-1].get("seq", 0)),
+            last_digest=str(records[-1].get("digest", "")),
+        ).encode()
+    else:
+        next_token = token
+    return list(records), next_token
+
+
+def ack_by_cursor(
+    mailbox: Any,
+    *,
+    records: Sequence[Mapping[str, Any]],
+    recipient: str,
+    principal: str,
+    note: str = "",
+) -> list[dict[str, Any]]:
+    """Acknowledge each replayed record through the durable ``ack`` reply.
+
+    An ack is addressed to the message's *own* recipient under its *own* scoped
+    principal, and is idempotent by a derived reply id -- so a replayed ack
+    (a duplicate delivery after a second interruption) appends no second
+    acknowledgement. A record addressed to a different recipient/principal is
+    refused by the mailbox, never acknowledged on another's behalf.
+    """
+    acks: list[dict[str, Any]] = []
+    for record in records:
+        message_id = str(record.get("message_id", "") or "")
+        if not message_id:
+            continue
+        acks.append(
+            mailbox.ack(message_id, recipient=recipient, principal=principal, note=note)
+        )
+    return acks
+
+
+# ---------------------------------------------------------------------------
 # Transport adapters: the same authority contract over either transport
 # ---------------------------------------------------------------------------
 
@@ -470,12 +906,26 @@ class HandoffTransportAdapter:
     and an addressed ``recipient`` -- so switching a client between the live
     notification transport and the polling fallback never broadens what the
     client may see. The capability, not the transport, is what varies.
+
+    The *scope* an adapter enforces is not the adapter's own: it is an explicit
+    ``authority_contract`` supplied by the server-owned selection seam (see
+    :func:`select_handoff_adapter`). Every adapter therefore fails closed on a
+    read/write whose ``principal``/``recipient`` is outside that contract, so a
+    transport can never carry a principal other than the one the server
+    authenticated. A direct-caller adapter built without a contract carries no
+    scope (the historical in-process contract) and enforces only the
+    underlying mailbox's own ``(recipient, principal)`` addressing.
     """
 
     kind = ""
 
-    def __init__(self, capability: HarnessClientCapability) -> None:
+    def __init__(
+        self,
+        capability: HarnessClientCapability,
+        authority_contract: Any = None,
+    ) -> None:
         self.capability = capability
+        self.authority_contract = authority_contract
 
     @property
     def principal(self) -> str:
@@ -490,6 +940,31 @@ class HandoffTransportAdapter:
             code="ADAPTER_IS_NOT_AUTHORITY",
         )
 
+    def _enforce_contract(self, *, principal: str, recipient: str, action: str) -> None:
+        """Fail closed on a scope the server-owned contract did not grant.
+
+        The authoritative (non-None) contract comes from the authenticated
+        session, so a client can never read or send outside it: a differing
+        ``principal`` is a scope_escape (the same refusal the messaging seam
+        raises for a forged principal) and an un-addressed ``recipient`` is a
+        named refusal, never a silent wildcard.
+        """
+        contract = self.authority_contract
+        if contract is None:
+            return
+        if principal != contract.principal:
+            raise HandoffError(
+                f"principal {principal!r} is outside the {self.kind!r} "
+                f"adapter's authority contract ({contract.principal!r})",
+                code="scope_escape",
+            )
+        if recipient and recipient not in contract.recipients:
+            raise HandoffError(
+                f"recipient {recipient!r} is not addressed by the "
+                f"{self.kind!r} adapter's authority contract",
+                code="recipient_not_addressed",
+            )
+
     def read(self, *, principal: str, recipient: str, resume_token: str = "") -> list[dict[str, Any]]:
         raise NotImplementedError
 
@@ -497,7 +972,10 @@ class HandoffTransportAdapter:
         raise NotImplementedError
 
     def to_dict(self) -> dict[str, Any]:
-        return {"kind": self.kind, "capability": self.capability.to_dict()}
+        out = {"kind": self.kind, "capability": self.capability.to_dict()}
+        if self.authority_contract is not None:
+            out["authority_contract"] = self.authority_contract.to_dict()
+        return out
 
 
 class NotificationTransportAdapter(HandoffTransportAdapter):
@@ -511,8 +989,13 @@ class NotificationTransportAdapter(HandoffTransportAdapter):
 
     kind = TRANSPORT_MCP_NOTIFICATIONS
 
-    def __init__(self, capability: HarnessClientCapability, mailbox: Any) -> None:
-        super().__init__(capability)
+    def __init__(
+        self,
+        capability: HarnessClientCapability,
+        mailbox: Any,
+        authority_contract: Any = None,
+    ) -> None:
+        super().__init__(capability, authority_contract)
         if not capability.supports_notifications:
             raise HandoffError(
                 f"client {capability.client_id!r} does not support MCP "
@@ -523,11 +1006,17 @@ class NotificationTransportAdapter(HandoffTransportAdapter):
         self._notified: list[str] = []
 
     def read(self, *, principal: str, recipient: str, resume_token: str = "") -> list[dict[str, Any]]:
+        self._enforce_contract(principal=principal, recipient=recipient, action="read")
         return self._mailbox.read(
             recipient=recipient, principal=principal, resume_token=resume_token
         )
 
     def send(self, message: Any) -> dict[str, Any]:
+        self._enforce_contract(
+            principal=getattr(message, "principal", ""),
+            recipient=getattr(message, "recipient", ""),
+            action="send",
+        )
         record = self._mailbox.post(message)
         self._notified.append(str(record.get("message_id")))
         return {"transport": self.kind, "delivered": True, "record": record}
@@ -549,21 +1038,108 @@ class PollingTransportAdapter(HandoffTransportAdapter):
 
     kind = TRANSPORT_FILE_POLL
 
-    def __init__(self, capability: HarnessClientCapability, mailbox: Any) -> None:
-        super().__init__(capability)
+    def __init__(
+        self,
+        capability: HarnessClientCapability,
+        mailbox: Any,
+        authority_contract: Any = None,
+    ) -> None:
+        super().__init__(capability, authority_contract)
         self._mailbox = mailbox
 
     def read(self, *, principal: str, recipient: str, resume_token: str = "") -> list[dict[str, Any]]:
+        self._enforce_contract(principal=principal, recipient=recipient, action="read")
         return self._mailbox.read(
             recipient=recipient, principal=principal, resume_token=resume_token
         )
 
     def send(self, message: Any) -> dict[str, Any]:
+        self._enforce_contract(
+            principal=getattr(message, "principal", ""),
+            recipient=getattr(message, "recipient", ""),
+            action="send",
+        )
         record = self._mailbox.post(message)
         return {"transport": self.kind, "delivered": True, "record": record}
 
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()
+
+
+#: The transports an adapter may be selected for. A transport outside this set
+#: is a *named unsupported HOLD* -- never coerced to stdio/polling.
+SUPPORTED_HANDOFF_TRANSPORTS = frozenset(
+    {TRANSPORT_MCP_NOTIFICATIONS, TRANSPORT_FILE_POLL, TRANSPORT_CLI_POLL}
+)
+
+
+@dataclass(frozen=True)
+class HandoffAuthorityContract:
+    """The scope a selected transport adapter must enforce.
+
+    The *same* authority contract every adapter carries: the authenticated
+    ``principal`` (server-owned, never a caller field) and the ``recipients``
+    that principal may address. It is built by the server-owned selection seam
+    from the authenticated session, so a transport switch can never broaden
+    what a client may read or write.
+    """
+
+    principal: str
+    recipients: frozenset[str]
+
+    def allows(self, *, recipient: str) -> bool:
+        return recipient in self.recipients
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "principal": self.principal,
+            "recipients": sorted(self.recipients),
+        }
+
+
+def select_handoff_adapter(
+    capability: HarnessClientCapability,
+    mailbox: Any,
+    *,
+    authority_contract: Any = None,
+    requested_transport: str = "",
+) -> HandoffTransportAdapter:
+    """The real production selection path: capability -> qualified adapter.
+
+    An *explicit* ``requested_transport`` is honored only when it is a supported
+    transport (a client that demands a transport it does not attest is a named
+    ``TRANSPORT_NOT_SUPPORTED`` HOLD -- never a silent coerce). The default,
+    capability-driven path selects the notification adapter only for a client
+    that attested/detected notification support, and the file/CLI polling
+    adapter for every other client (including an undetected one). Every selected
+    adapter carries the same ``authority_contract``.
+    """
+    # An *unknown* requested transport is a named HOLD for *every* client class,
+    # checked before any capability-driven branch: a client that cannot receive
+    # notifications must never have an unrecognized transport silently coerced
+    # to the polling adapter.
+    if requested_transport and requested_transport not in SUPPORTED_HANDOFF_TRANSPORTS:
+        raise HandoffError(
+            f"unsupported handoff transport {requested_transport!r}; supported "
+            f"transports are {sorted(SUPPORTED_HANDOFF_TRANSPORTS)}",
+            code="TRANSPORT_NOT_SUPPORTED",
+        )
+    if not capability.supports_notifications:
+        # A client that cannot receive MCP notifications must never be handed
+        # the notification adapter: the fallback is the qualified polling
+        # adapter, which carries the same authority contract.
+        if requested_transport == TRANSPORT_MCP_NOTIFICATIONS:
+            raise HandoffError(
+                f"client {capability.client_id!r} does not support MCP "
+                f"notifications; use the polling adapter",
+                code="TRANSPORT_NOT_SUPPORTED",
+            )
+        return PollingTransportAdapter(
+            capability, mailbox, authority_contract
+        )
+    return NotificationTransportAdapter(
+        capability, mailbox, authority_contract
+    )
 
 
 def adapter_for_capability(

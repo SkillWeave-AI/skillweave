@@ -14,9 +14,17 @@ one.
 | Fact | Observation |
 |------|-------------|
 | Perplexity credential (`PERPLEXITY_API_KEY` / `PPLX_API_KEY` / `PERPLEXITY_TOKEN`) | **absent** |
-| Egress to `api.perplexity.ai:443` | **unreachable** (`socket.gaierror`, DNS does not resolve) |
-| Distribution `capacium-mcp` installed | present, version `0.3.0` |
-| Console script `/opt/homebrew/bin/capacium-mcp` | **present but unusable** — importing `capacium_mcp.server` raises `ModuleNotFoundError` |
+| Egress to `api.perplexity.ai:443` | reachable at capture time; irrelevant while no credential is present |
+| Distribution `capacium-mcp` installed | **absent** — `importlib.metadata.version("capacium-mcp")` raises `PackageNotFoundError` |
+| Console script `/opt/homebrew/bin/capacium-mcp` | present on `PATH`, but its distribution metadata is absent **and** `import capacium_mcp.server` raises `ModuleNotFoundError` (unusable) |
+
+The two facts above are why CORE-ZR-024 **drops the default launcher
+registration**: an installed console script can exist while its distribution is
+absent and its module unimportable, so a default launcher would resolve to a
+command that cannot serve `perplexity_search`. The resolver now ships **no**
+default registration and refuses before any query with a typed `tool_missing`
+(see `launcher.py` / `perplexity.py`). The live proof below is still gated on a
+credential that does not exist here.
 
 ## What the suites *do* prove (in the meantime)
 

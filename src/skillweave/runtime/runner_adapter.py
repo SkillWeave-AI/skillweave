@@ -60,7 +60,7 @@ This module imports from ``registry`` (receipt types) only. It does not touch
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import hashlib
 import os
@@ -293,6 +293,10 @@ class RunningProcess:
     _model: str
     _created_at: Optional[str] = None
     _cancelled: bool = False
+    #: the *effective* environment the child was launched with, so a downstream
+    #: verifier can prove the actual launch resolved the granted MCP service
+    #: rather than trusting the interactive harness profile (SW-1511-MCP-BOOTSTRAP).
+    _sw_effective_env: Optional[Dict[str, str]] = None
     _stderr_retain_limit: Optional[int] = None
     _stderr_observed: int = 0
     _stderr_backpressure: int = 0
@@ -653,6 +657,11 @@ def start_process(
         _tool=tool,
         _model=model,
         _created_at=created_at,
+        _sw_effective_env=(
+            {str(k): str(v) for k, v in child_env.items()}
+            if child_env is not None
+            else None
+        ),
         _stderr_retain_limit=stderr_retain_limit,
     )
 

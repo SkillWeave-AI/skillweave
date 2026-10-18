@@ -211,6 +211,12 @@ SURFACES: tuple[SurfaceSupport, ...] = (
         "Resume a run by launching a new identified attempt.",
     ),
     SurfaceSupport(
+        "native-controller", ROLE_EXECUTE, STATUS_SUPPORTED,
+        "skillweave.cli.native_controller:main",
+        "Drive the native process service: acquire the controller lease and "
+        "run one owned attempt through the declared six steps.",
+    ),
+    SurfaceSupport(
         "mcp", ROLE_OPERATE, STATUS_SUPPORTED,
         "skillweave.mcp.server",
         "MCP tools (create/status/cancel/resume/get_evidence/review) reading "
@@ -227,7 +233,8 @@ SURFACES: tuple[SurfaceSupport, ...] = (
 #: The router subcommands that are mounted as first-class surfaces.
 ROUTER_SURFACES: tuple[str, ...] = (
     "entry", "dispatch", "run", "rework", "planning-sync", "onboard",
-    "assess", "start", "inspect", "kill", "cancel", "resume", "support",
+    "assess", "start", "inspect", "kill", "cancel", "resume",
+    "native-controller", "support",
 )
 
 

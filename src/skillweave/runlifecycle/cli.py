@@ -349,6 +349,23 @@ def main_cancel(argv: Optional[Sequence[str]] = None) -> int:
     except StoreError as exc:
         sys.stderr.write(f"error: {exc}\n")
         return EXIT_CODES["error"]
+
+    # SW-1511A-GATE-001 (5b-ii): a cancel of an already-terminal run has
+    # nothing left to cancel.  The service reports the durable lifecycle
+    # (``result='already_terminal'``) rather than a contradicting ``unknown``;
+    # the CLI must not let that pass as an unqualified success, so it emits a
+    # meaningful diagnostic and the documented "not running" code (3), exactly
+    # as the ``kill`` surface does for its ``already_terminal`` outcome.
+    if result.get("result") == "already_terminal":
+        sys.stderr.write(
+            f"error: run {result.get('run_id')} is already terminal "
+            f"(state={result.get('state')}, "
+            f"lifecycle_state={result.get('lifecycle_state')}); "
+            "nothing was signalled\n"
+        )
+        sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
+        return EXIT_CODES["not_running"]
+
     sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
     return 0
 

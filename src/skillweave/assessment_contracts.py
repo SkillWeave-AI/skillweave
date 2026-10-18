@@ -74,7 +74,11 @@ _CORE_KEYS = (
 #: Every key a receipt may carry. Anything else is rejected.
 _TOP_LEVEL_KEYS = frozenset(_CORE_KEYS) | {"digest"}
 
-_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "schemas" / "assessment-receipt.schema.json"
+def _schema_path() -> Path:
+    """Resolve the shipped assessment-receipt schema from installed package data."""
+    from .assets import packaged_schema_path
+
+    return packaged_schema_path("assessment-receipt.schema.json")
 
 
 class AssessmentError(ValueError):
@@ -375,7 +379,7 @@ def validate(receipt: Mapping[str, Any]) -> AssessmentReceipt:
 
 def load_schema() -> dict[str, Any]:
     """Return the shipped assessment-receipt JSON schema, verbatim."""
-    return json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    return json.loads(_schema_path().read_text(encoding="utf-8"))
 
 
 __all__ = [

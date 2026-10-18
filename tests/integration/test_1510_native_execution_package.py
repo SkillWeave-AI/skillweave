@@ -709,7 +709,9 @@ def test_real_mcp_transport_initialize_call_and_status(tmp_path):
         for ln in proc.stdout.splitlines()
         if " " in ln
     }
-    assert lines["INIT"] == "SkillWeave 1.26.0"
+    from skillweave.cli.main import product_version
+
+    assert lines["INIT"] == f"SkillWeave {product_version()}"
     # The full served surface: the legacy six plus the SW-1510-MCP-AGENTS
     # durable handoff/mailbox tools, taken from the one place the served
     # surface is enumerated (``control``). The wire form is the sorted

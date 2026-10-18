@@ -120,9 +120,19 @@ class SelfHostRunner:
     the fetched SHA a review gate compares against (defaults to the pin itself,
     modelling a successful push/fetch)."""
 
-    def __init__(self, coordinator: Coordinator, review_gate: Optional[ReviewGate] = None):
+    def __init__(
+        self,
+        coordinator: Coordinator,
+        review_gate: Optional[ReviewGate] = None,
+        *,
+        process_service: Optional[Any] = None,
+    ):
         self.coordinator = coordinator
         self.review_gate = review_gate or ReviewGate()
+        #: Criterion 2: when a process service is configured, the ops fan-out
+        #: mints a controller session grant and provisions it into the actual
+        #: child launch (legacy pass-through when unset).
+        self.process_service = process_service
 
     def execute(
         self,
@@ -258,6 +268,19 @@ class SelfHostRunner:
             lane = lane_by_id.get(lid)
             value = lane.model if lane is not None and lane.model else "faigate/deepseek-v4-pro"
             specs.append(value if isinstance(value, ModelSpec) else from_value(value))
+
+        # Criterion 2: when a process service is configured, mint the controller
+        # session grant for this ops fan-out and let the adapter provision and
+        # verify it inside each child's actual launch. Unset -> legacy fan-out.
+        mcp_grant = None
+        if self.process_service is not None:
+            from skillweave.fanout.dispatch import mint_fanout_grant
+
+            mcp_grant = mint_fanout_grant(
+                run_id=f"{fixture.sequence_id}-ops",
+                client_id="selfhost-fanout",
+            )
+
         result = fan_out_dispatch(
             commands,
             run_id=f"{fixture.sequence_id}-ops",
@@ -266,6 +289,7 @@ class SelfHostRunner:
             tool="opencode",
             models=specs,
             created_at=datetime.now(timezone.utc).isoformat(),
+            mcp_grant=mcp_grant,
         )
         if not result.succeeded:
             raise RuntimeError("self-host ops fan-out did not succeed")

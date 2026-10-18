@@ -72,7 +72,9 @@ from .profile import (
 #: treated as satisfied. Kept in lockstep with
 #: ``skillweave.dispatch.harness_contract.CAPABILITIES`` (asserted by the
 #: integration test) — the two are one contract, declared on each side of the
-#: one-way ``dispatch -> routing`` dependency.
+#: one-way ``dispatch -> routing`` dependency. The routing package must not
+#: import across into ``runtime``/``dispatch`` (layering), so the name is a
+#: literal here and the lockstep test keeps the two vocabularies equal.
 HARNESS_CAPABILITIES: tuple[str, ...] = (
     "native-tool",
     "external-process",
@@ -82,6 +84,11 @@ HARNESS_CAPABILITIES: tuple[str, ...] = (
     "cancel",
     "state-namespace",
     "installed-skill-digest",
+    # SW-1511-RECOVERY criterion 2: an adapter attests this *only* when it can
+    # resume an actual provider session (the same session UUID) across a
+    # controller restart. A run that requires it is refused by name on any
+    # adapter that does not attest it, so session resume is never fabricated.
+    "session-resume",
 )
 
 #: The capability a plan must state for the native-tool admission gate to arm.

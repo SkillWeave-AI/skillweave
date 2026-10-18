@@ -608,6 +608,7 @@ def test_router_still_registers_every_subcommand():
         "kill",
         "cancel",
         "resume",
+        "native-controller",
         "support",
     }
 
