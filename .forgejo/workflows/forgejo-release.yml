@@ -438,19 +438,18 @@ jobs:
           # Relative names: the checksum file travels with the assets it lists.
           (cd release-assets && sha256sum *.tar.gz *.whl > SHA256SUMS)
           (cd release-assets && sha256sum -c SHA256SUMS)
-      - name: Publish the release to every destination
+      # The release object is not created here. Under the Forgejo-first model
+      # the ops-engine ReleaseHandler alone writes it on tag_push. This workflow
+      # keeps the release artifact obligations that the engine does not own, and
+      # the mirror-tag obligation below: the canonical tag ref is pushed onto the
+      # mirror BEFORE any release object exists, then both tags are peeled and
+      # compared.
+      - name: Mirror the canonical tag
         env:
           TAG_NAME: "${{ github.event.inputs.tag_name || github.ref_name }}"
-          NOTES: "${{ steps.notes.outputs.notes }}"
-          NAME_TEMPLATE: "${{ steps.title.outputs.product_name }} {tag_name}"
-          FORGEJO_REPOSITORY: "${{ github.repository }}"
-          FORGEJO_BASE_URL: "${{ github.server_url }}"
-          FORGEJO_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
           GH_MIRROR_TOKEN: "${{ secrets.GH_MIRROR_TOKEN }}"
         run: |
           set -euo pipefail
-
-          mkdir -p release-assets
 
           # The engine installs into an isolated venv outside the source tree:
           # the runner's system interpreter is PEP 668 externally managed, and an
@@ -475,23 +474,15 @@ jobs:
                   % (got, REQUIRED)
               )
               sys.exit(2)
-          from ops_engine.adapters.factory import Credential  # noqa: F401
-          sys.stdout.write("engine: ops-engine %s, per-destination Credential present\n" % got)
+          sys.stdout.write("engine: ops-engine %s\n" % got)
           VERSION_GATE_PY
 
-          "$ENGINE_VENV/bin/python" - <<'PUBLISH_PY'
-          import asyncio
+          "$ENGINE_VENV/bin/python" - <<'MIRROR_TAG_PY'
           import os
           import subprocess
           import sys
 
-          from ops_engine.adapters.factory import Credential, adapters_for
-          from ops_engine.config_loader import (
-              OpsEngineConfig,
-              OpsYamlError,
-              load_ops_yaml,
-          )
-          from ops_engine.modules.release import ReleaseHandler
+          from ops_engine.config_loader import OpsYamlError, load_ops_yaml
 
           # Destinations come from the committed .ops.yaml at the repository
           # root. A missing or empty file is a named refusal, never a silently
@@ -522,37 +513,7 @@ jobs:
               )
               sys.exit(2)
 
-          repo = os.environ["FORGEJO_REPOSITORY"]
           tag_name = os.environ["TAG_NAME"]
-          release_notes = os.environ["NOTES"]
-          name_template = os.environ["NAME_TEMPLATE"]
-          forgejo_base_url = os.environ["FORGEJO_BASE_URL"]
-
-          # Materialise the Layer-3 destinations into a typed Layer-2 config so
-          # that publish_release's internal resolve_destinations re-resolves the
-          # same list.
-          org, _, repo_name = repo.partition("/")
-          config = OpsEngineConfig.load(
-              {
-                  "orgs": {
-                      org: {
-                          "repositories": {
-                              repo_name: {
-                                  "destinations": [
-                                      {
-                                          "forge": d.forge,
-                                          "repo": d.repo,
-                                          "role": d.role,
-                                          "visibility": d.visibility,
-                                      }
-                                      for d in destinations
-                                  ]
-                              }
-                          }
-                      }
-                  }
-              }
-          )
 
           # The mirror tag is pushed from the CANONICAL tag object, never invented
           # by the release API. GitHub's POST /releases takes a `tag_name` and, when
@@ -622,54 +583,23 @@ jobs:
                   sys.exit(1)
               print("mirror tag verified: %s -> %s" % (tag_name, mirror_target))
 
-          async def main():
-              # Push the canonical tag object onto the mirror BEFORE the engine
-              # publishes, so the github create_release cannot invent a tag.
-              if mirror_dest is not None:
-                  _push_mirror_tag(_mirror_remote(mirror_dest.repo))
-
-              credentials = {
-                  "forgejo": Credential(token=os.environ["FORGEJO_TOKEN"]),
-                  "github": Credential(token=os.environ["GH_MIRROR_TOKEN"]),
-              }
-              adapters = adapters_for(
-                  destinations,
-                  credentials=credentials,
-                  base_url=forgejo_base_url,
+          if mirror_dest is None:
+              print(
+                  "::error::MissingMirrorDestinationError: .ops.yaml declares no "
+                  "github destination; the canonical tag has no mirror to carry "
+                  "and there is nothing to push or verify.",
+                  file=sys.stderr,
               )
+              sys.exit(2)
 
-              report = await ReleaseHandler.publish_release(
-                  config,
-                  repo,
-                  tag_name,
-                  release_notes,
-                  "release-assets",
-                  name_template=name_template,
-                  adapters=adapters,
-              )
-
-              published = ", ".join(report.published) or "(none)"
-              failed = ", ".join(report.failed) or "(none)"
-              print(f"published destinations: {published}")
-              print(f"failed destinations:    {failed}")
-              if report.failed:
-                  # A partial publication is a reported failure, never a silent
-                  # success: the run goes red so the operator sees the drift.
-                  print(
-                      "::error::PartialPublicationError: the release was not "
-                      "published to every destination; failed: " + failed
-                  )
-                  sys.exit(1)
-
-              # After publication, refuse by name if the mirror tag does not target
-              # the same commit the canonical tag does.
-              if mirror_dest is not None:
-                  _verify_mirror_tag(
-                      _canonical_tag_target(), _mirror_remote(mirror_dest.repo)
-                  )
-
-          asyncio.run(main())
-          PUBLISH_PY
+          # Push the canonical tag object onto the mirror. git, not a forge API,
+          # decides where the tag points.
+          repository = _mirror_remote(mirror_dest.repo)
+          _push_mirror_tag(repository)
+          # Then refuse by name if the mirror tag does not target the same
+          # commit the canonical tag does.
+          _verify_mirror_tag(_canonical_tag_target(), repository)
+          MIRROR_TAG_PY
 
       # Publication is not verification. The step above proves the engine
       # accepted the release; it cannot prove that the release a consumer

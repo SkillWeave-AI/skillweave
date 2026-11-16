@@ -11,7 +11,8 @@ downloads actually carries the built assets. An engine that attaches a missing,
 extra or truncated asset still reports a successful publication.
 
 This module pins the close: one step, "Verify the published release attachments",
-placed after "Publish the release to every destination", running
+running last in the job (RFL-013 removed the local publish step, so the engine's
+release object is the one verified) and running
 ``scripts/verify-release-attachments.py`` against the release API.
 
 The step's ``run`` text is read from the workflow verbatim and executed with
@@ -49,7 +50,11 @@ TEST_REL = "tests/release/test_release_attachment_verification.py"
 # diff rather than a claim.
 BASE_COMMIT = "afdf20d93874a0084e41b89ba0952be571ae63d4"
 
+# RFL-013 removed this step: the ops-engine ReleaseHandler alone writes the
+# release object, so this job no longer publishes one. The verifier stays — it
+# now reads the release object the engine produced for the same tag.
 PUBLISH_STEP_NAME = "Publish the release to every destination"
+MIRROR_STEP_NAME = "Mirror the canonical tag"
 VERIFY_STEP_NAME = "Verify the published release attachments"
 VERIFY_SCRIPT_REL = "scripts/verify-release-attachments.py"
 
@@ -105,9 +110,13 @@ def test_verify_step_exists_after_publish_and_is_absent_at_base():
         "this change closes"
     )
     assert cand_names.count(VERIFY_STEP_NAME) == 1, "the step appears exactly once"
-    assert cand_names.index(VERIFY_STEP_NAME) > cand_names.index(PUBLISH_STEP_NAME), (
-        "post-publication means after the publish step; a verification that runs "
-        "before publication verifies nothing"
+    # RFL-013 removed the local publish step; the verification still runs last,
+    # after every step that can make the release object reachable.
+    assert PUBLISH_STEP_NAME not in cand_names, (
+        "the local release-object writer must be gone; the engine owns it"
+    )
+    assert cand_names.index(VERIFY_STEP_NAME) > cand_names.index(MIRROR_STEP_NAME), (
+        "the attachment verification must be the last step in the job"
     )
 
 
@@ -120,6 +129,10 @@ def test_no_other_step_run_text_moved():
         matches = [
             s for s in cand_steps if (s.get("name") or s.get("uses")) == key
         ]
+        if key == PUBLISH_STEP_NAME:
+            # RFL-013's removal, asserted by name in the test above.
+            assert matches == [], f"{key!r} must be gone"
+            continue
         assert len(matches) == 1, f"step {key!r} is not preserved exactly once"
         assert matches[0] == base_step, (
             f"step {key!r} changed; the verification must be additive"
