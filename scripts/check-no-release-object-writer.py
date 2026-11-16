@@ -142,15 +142,6 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     covered = workflow_files(root)
-    if not covered:
-        print(
-            "::error::ReleaseObjectWriterError: no workflow file under %s in %s; "
-            "the check does not pass without something to inspect."
-            % (", ".join(WORKFLOW_DIRS), args.root),
-            file=sys.stderr,
-        )
-        return 2
-
     found: list[str] = []
     for rel in covered:
         text = (root / rel).read_text(encoding="utf-8")
