@@ -139,8 +139,12 @@ def test_diff_is_exactly_one_step_inserted_before_publish():
     )
     assert cand_names.count(BUILD_STEP_NAME) == 1, "the build step appears once"
 
-    # The build step still runs in the same job that carries the assets to the
-    # mirror, so the built assets remain attached to the release.
+    # The build step still runs before the mirror step, and its
+    # ``release-assets`` directory is still what the final verification step
+    # reads (``--assets-dir release-assets``). This job no longer hands that
+    # directory to a release writer — the engine owns publication — so ordering
+    # here says where the assets are produced and verified, not that this job
+    # attaches them.
     assert cand_names.index(SUCCESSOR_STEP_NAME) > cand_names.index(BUILD_STEP_NAME), (
         f"{BUILD_STEP_NAME!r} must still precede {SUCCESSOR_STEP_NAME!r}"
     )
