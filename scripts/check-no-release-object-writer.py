@@ -279,7 +279,33 @@ _HTTP_METHOD = re.compile(
 # sends a POST even though the outer line has no unquoted ``;``. The
 # substitution alternatives therefore sit beside the quoted ones, before the
 # plain-character alternative can walk into them.
-_SUBSTITUTION = r"(?:\$\((?:[^()]|\([^()]*\))*\)|`[^`]*`|[<>]\((?:[^()]|\([^()]*\))*\))"
+#
+# The parentheses inside a substitution are counted quote-aware: ``$(echo '(';
+# true)`` closes at the real ``)``, not at the one the shell reads as the
+# string ``'('``. An earlier fragment saw ``[^()]`` only, so the quoted `(`
+# ended the substitution early, the rest of the body fell back to the
+# plain-character alternative, and a ``; true`` and a following ``-d`` looked
+# like a new command — hiding a real POST behind a quoting trick. Nesting is
+# bounded because this is a regular expression and not the shell's parser; a
+# substitution nested deeper than the bound stays opaque to the outer command,
+# which is the safe direction (the whole span is then one unread argument).
+_SUBSTITUTION_ATOM = r"(?:[^()'\"\\]|\\[^\n]|'[^']*'|\"(?:\\.|[^\"\\])*\")"
+
+
+def _nested_substitution(depth: int) -> str:
+    """An inner expression that counts ``(``/``)`` up to ``depth`` levels."""
+    inner = _SUBSTITUTION_ATOM
+    for _ in range(depth):
+        inner = r"(?:" + _SUBSTITUTION_ATOM + r"|\((?:" + inner + r")\))*"
+    return inner
+
+
+_SUBSTITUTION_INNER = _nested_substitution(4)
+_SUBSTITUTION = (
+    r"(?:\$\((?:\((?:" + _SUBSTITUTION_INNER + r")\)|(?:" + _SUBSTITUTION_INNER +
+    r"))\)|`[^`]*`|[<>]\((?:\((?:" + _SUBSTITUTION_INNER + r")\)|(?:" +
+    _SUBSTITUTION_INNER + r"))\))"
+)
 _QUOTED_SPAN = (
     r"(?:'[^']*'"
     r"|\"(?:\\.|[^\"\\])*\""

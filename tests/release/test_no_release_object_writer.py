@@ -478,6 +478,23 @@ _WRITE_SPELLINGS = {
         "curl $(echo -d) 'x'"
         " $(echo https://forge/api/v1/repos/o/r/releases)"
     ),
+    # A substitution's own parentheses are counted quote-aware: `'('` is the
+    # string `(` to the shell, not the end of `$(...)`, so the `; true` stays
+    # inside the argument and the `-d` that follows is still curl's flag.
+    "substitution_quotes_a_paren": (
+        "curl $(echo '('; true) -d '{\"tag_name\":\"v1\"}'"
+        " https://forge/api/v1/repos/o/r/releases"
+    ),
+    # The same trick with the closing paren quoted, and with two levels of
+    # literal parens inside a script substitution.
+    "substitution_quotes_the_closer": (
+        "curl $(echo ')'; true) -d '{\"tag_name\":\"v1\"}'"
+        " https://forge/api/v1/repos/o/r/releases"
+    ),
+    "substitution_nested_parens": (
+        "curl $(f (a (b) c) d; true) -d '{\"tag_name\":\"v1\"}'"
+        " https://forge/api/v1/repos/o/r/releases"
+    ),
 }
 
 # A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a
@@ -955,6 +972,13 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
             tmp_path / "substitution-yields-data",
             "curl -fsSL -H \"X-Note: $(echo read)\""
             " https://forge/api/v1/repos/o/r/releases/tags/v1",
+        ),
+        # The quote-aware paren count must not turn a read into a write: a
+        # quoted paren in a substitution that merely names the tag path is
+        # still a GET.
+        _synthetic_tree(
+            tmp_path / "substitution-quoted-paren-read",
+            "curl -fsSL $(echo '(' /repos/o/r/releases/tags/v1 ')')",
         ),
     ]
 
