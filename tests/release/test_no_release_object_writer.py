@@ -303,6 +303,15 @@ _WRITE_SPELLINGS = {
     "curl_bundled_method_with_body": (
         "curl -sSX POST -d '{}' https://forge/api/v1/repos/o/r/releases"
     ),
+    # An option's value is data, not another option: `-d -G` posts the string
+    # `-G`, and `--data -X GET` posts the string `-X GET`. A GET-looking value
+    # must not switch off the body signal that is actually writing.
+    "curl_option_argument_is_data": (
+        "curl -d -G https://forge/api/v1/repos/o/r/releases"
+    ),
+    "curl_long_option_argument_is_data": (
+        "curl --data -X GET https://forge/api/v1/repos/o/r/releases"
+    ),
 }
 
 # A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a
@@ -659,6 +668,13 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
         _synthetic_tree(
             tmp_path / "curl-bundled-method-get",
             "curl -sSX GET https://forge/api/v1/repos/o/r/releases",
+        ),
+        # The reverse of the option-argument case: a body flag whose *value*
+        # names a method is data (`curl -H 'X: y' -G ...`), so the read stands.
+        _synthetic_tree(
+            tmp_path / "curl-header-then-forced-get",
+            "curl -H 'Accept: json' -G --data-urlencode x=y"
+            " https://forge/api/v1/repos/o/r/releases",
         ),
     ]
 

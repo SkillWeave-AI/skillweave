@@ -253,19 +253,17 @@ _HTTP_BODY = re.compile(
     r")"
 )
 # An explicit *read* method: the body signal must not turn it into a write.
-# `curl -G` moves the body into the query string, and `-X GET`/`--request GET`
-# (curl) or `--method GET` (gh api) names a read that merely carries a query
-# parameter — `gh api --method GET .../releases -f per_page=100` is documented
-# usage for a filtered read, not a release write. Only the body signal is
-# suppressed; an explicit write method still counts. The GET must be inside the
-# client's own segment, delimited like the body signal: a GET for one URL must
-# not mask a body-only POST after `;`, `&&`, `|` or a newline on the same line.
+# `gh api --method GET .../releases -f per_page=100` is documented usage for a
+# filtered read, not a release write. Only the body signal is suppressed; an
+# explicit write method still counts. curl's own read spellings (``-G``,
+# ``--get``, ``-X GET``) are read by ``_curl_signals`` from the option table
+# instead, because — unlike ``gh api --method`` — they can be bundled and their
+# arguments can look like flags. The GET must be inside the client's own
+# segment: a GET for one URL must not mask a body-only POST after `;`, `&&`,
+# `|` or a newline on the same line.
 _READ_METHOD = re.compile(
-    r"(?:"
-    r"\bcurl\b[^|\n;&]*?\s--get\b"
-    r"|\b(?:curl|gh(?:\s+api)?)\b[^|\n;&]*?"
-    r"(?:-X|--request|--method|-method)\s*=?\s*['\"]?GET\b"
-    r")",
+    r"\bgh(?:\s+api)?\b[^|\n;&]*?"
+    r"(?:-X|--request|--method|-method)\s*=?\s*['\"]?GET\b",
     re.IGNORECASE,
 )
 # A client invocation starts at the line's head or after `;`, `&&`/`||`, a pipe
@@ -285,6 +283,26 @@ _CURL_SEGMENT = re.compile(r"\bcurl\b[^|\n;&]*")
 # ``-sSXPOST`` a write while ``-fsSL`` is four booleans.
 _CURL_SHORT_WITH_ARG = frozenset(
     "AbcCdDeEFHKmoPQrtTuUwxXyYz"
+)
+# The long options whose value is the next word when no `=` joins them. Their
+# value is data too: ``curl --data -G url`` posts the string ``-G``.
+_CURL_LONG_WITH_ARG = frozenset(
+    (
+        "--data",
+        "--data-raw",
+        "--data-binary",
+        "--data-urlencode",
+        "--data-ascii",
+        "--form",
+        "--form-string",
+        "--upload-file",
+        "--json",
+        "--request",
+        "--header",
+        "--output",
+        "--user",
+        "--url",
+    )
 )
 _WRITE_VERBS = frozenset(("POST", "PATCH", "PUT", "DELETE"))
 # `gh api` infers POST from a body field or an input file and needs no method
@@ -515,32 +533,54 @@ def _curl_signals(line: str) -> tuple[bool, bool, bool]:
     read, and ``-fsSL`` is four booleans. A letter class cannot model this:
     ``-[A-Za-z]*[dTF]`` misses the detached ``-sSX POST`` and matches an
     attached value that merely contains ``d``/``T``/``F``.
+
+    The value of an option is data, never another option: ``curl -d -G url``
+    posts the string ``-G`` and ``curl --data -X POST url`` posts the string
+    ``-X POST``, so a value word is consumed and not scanned.
     """
     method_write = body_write = read = False
     for segment in _CURL_SEGMENT.findall(line):
-        for match in re.finditer(r"\S+", segment):
-            token = match.group(0)
-            if not token.startswith("-") or token.startswith("--"):
+        words = segment.split()
+        index = 0
+        while index < len(words):
+            token = words[index]
+            index += 1
+            if token.startswith("--"):
+                option, has_value = token.split("=", 1)[0], "=" in token
+                if option == "--get":
+                    read = True
+                if not has_value and option in _CURL_LONG_WITH_ARG:
+                    # The next word is this option's value — data, not flags.
+                    index += 1
                 continue
-            cluster = token[1:]
-            for index, char in enumerate(cluster):
+            if not token.startswith("-") or token == "-":
+                continue
+            rest = token[1:]
+            while rest:
+                char = rest[0]
+                rest = rest[1:]
                 if char == "G":
                     read = True
-                    break
-                if char not in _CURL_SHORT_WITH_ARG:
                     continue
-                value = cluster[index + 1:]
-                if not value:
-                    tail = segment[match.end():].split()
-                    value = tail[0] if tail else ""
-                if char in "dTF":
-                    body_write = True
-                elif char == "X":
-                    if value.upper() in _WRITE_VERBS:
-                        method_write = True
-                    elif value.upper() == "GET":
-                        read = True
-                break
+                if char in _CURL_SHORT_WITH_ARG:
+                    if char in "dTF":
+                        body_write = True
+                    elif char == "X":
+                        value = rest
+                        if not value:
+                            value = words[index] if index < len(words) else ""
+                            index += 1
+                        if value.upper() in _WRITE_VERBS:
+                            method_write = True
+                        elif value.upper() == "GET":
+                            read = True
+                        break
+                    # The value of this option is the rest of the cluster or,
+                    # when the cluster ends here, the next word. Either way the
+                    # value is data and is not scanned for flags.
+                    if not rest:
+                        index += 1
+                    break
     return method_write, body_write, read
 
 
