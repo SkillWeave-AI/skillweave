@@ -168,21 +168,24 @@ def test_every_other_step_run_text_is_byte_identical_to_base():
                 f"step {key!r} changed; the diff must touch no other step"
             )
 
-    # Whole-document equality once inserted steps are removed and the removed
-    # release-object writer is set aside on both sides: nothing else in the
-    # workflow — no job key, no trigger, no comment-adjacent scalar — moved.
-    # Later units may insert their own steps; removing every step absent from
-    # base keeps this "the diff inserted steps and touched nothing else" rather
-    # than a frozen "exactly one step" that any later additive unit would break.
+    # Whole-document equality once inserted steps are removed and the one named
+    # removal is set aside: nothing else in the workflow — no job key, no
+    # trigger, no comment-adjacent scalar — moved. Later units may insert their
+    # own steps, so steps present only in the candidate are dropped from the
+    # candidate side alone. The base side drops exactly ``PUBLISH_STEP_NAME``
+    # and nothing else: subtracting the same key set from both sides would let a
+    # base step that vanished or was renamed be removed from *expected* as well,
+    # which is the one direction this assertion exists to catch. (The per-step
+    # loop above catches it too; this keeps the document assertion from being
+    # redundant in the same direction rather than a second, weaker copy of it.)
     base_keys = {_step_key(s) for s in base_steps}
-    cand_keys = {_step_key(s) for s in cand_steps}
     stripped = _candidate_doc()
     stripped["jobs"]["release"]["steps"] = [
         s for s in _steps(stripped) if _step_key(s) in base_keys
     ]
     expected = _base_doc()
     expected["jobs"]["release"]["steps"] = [
-        s for s in _steps(expected) if _step_key(s) in cand_keys
+        s for s in _steps(expected) if _step_key(s) != PUBLISH_STEP_NAME
     ]
     assert stripped == expected, (
         "the workflow must be the base plus inserted steps and nothing else"
