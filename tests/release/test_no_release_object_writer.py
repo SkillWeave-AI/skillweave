@@ -269,6 +269,26 @@ _WRITE_SPELLINGS = {
         "curl -X GET https://forge/api/v1/repos/o/r/releases;"
         " curl -X POST https://forge/api/v1/repos/o/r/releases -d '{}'"
     ),
+    # A GET on the line must not explain away a *body-only* write that follows
+    # it: the whole point of the read suppression is that the two signals belong
+    # to one command. Each row below has no write verb at all - only the body.
+    "curl_get_then_body_only": (
+        "curl -X GET https://forge/api/v1/repos/o/r/releases;"
+        " curl -d '{\"tag_name\":\"v1\"}' https://forge/api/v1/repos/o/r/releases"
+    ),
+    "gh_get_then_field_only": (
+        "gh api --method GET repos/o/r/releases;"
+        " gh api repos/o/r/releases -f tag_name=v1"
+    ),
+    "curl_get_then_wget_post": (
+        "curl -X GET https://forge/api/v1/repos/o/r/releases;"
+        " wget --post-data='tag_name=v1'"
+        " https://forge/api/v1/repos/o/r/releases"
+    ),
+    "curl_get_piped_then_gh_field": (
+        "curl -X GET https://forge/api/v1/repos/o/r/releases | jq .;"
+        " gh api repos/o/r/releases -f tag_name=v1"
+    ),
 }
 
 # A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a

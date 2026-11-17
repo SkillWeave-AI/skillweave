@@ -250,13 +250,24 @@ _HTTP_BODY = re.compile(
 # (curl) or `--method GET` (gh api) names a read that merely carries a query
 # parameter — `gh api --method GET .../releases -f per_page=100` is documented
 # usage for a filtered read, not a release write. Only the body signal is
-# suppressed; an explicit write method still counts.
+# suppressed; an explicit write method still counts. The GET must be inside the
+# client's own segment, delimited like the body signal: a GET for one URL must
+# not mask a body-only POST after `;`, `&&`, `|` or a newline on the same line.
 _READ_METHOD = re.compile(
     r"(?:"
-    r"\bcurl\b[^\n]*?(?:\s-G\s|\s--get\b)"
-    r"|(?:-X|--request|--method|-method)\s*=?\s*['\"]?GET\b"
+    r"\bcurl\b[^|\n;&]*?(?:\s-G\s|\s--get\b)"
+    r"|\b(?:curl|gh(?:\s+api)?)\b[^|\n;&]*?"
+    r"(?:-X|--request|--method|-method)\s*=?\s*['\"]?GET\b"
     r")",
     re.IGNORECASE,
+)
+# A client invocation starts at the line's head or after `;`, `&&`/`||`, a pipe
+# or a subshell `(`. The read-method suppression only applies when the line
+# carries one invocation: with two, the GET may belong to the first and the
+# body signal to the second (`curl -X GET ...; curl -d ... .../releases`), so
+# suppressing line-wide would hide a write behind an unrelated read.
+_CLIENT_START = re.compile(
+    r"(?:^|[;|&(\n])\s*(?:curl|wget|gh|https?|xh)\b"
 )
 # `gh api` infers POST from a body field or an input file and needs no method
 # token; only the releases path is interesting here. `-F` is gh's short
@@ -476,6 +487,18 @@ def _marker_hit(line: str) -> str | None:
     return None
 
 
+def _read_suppresses(line: str) -> bool:
+    """Whether an explicit GET may switch off the body signal for ``line``.
+
+    Only for a line carrying a single client invocation: the body signal and
+    the GET must belong to the same command for a GET to explain the body away.
+    """
+    return (
+        _READ_METHOD.search(line) is not None
+        and len(_CLIENT_START.findall(line)) <= 1
+    )
+
+
 def _http_kind(line: str) -> str | None:
     """Classify a resolved command that addresses a release path.
 
@@ -498,14 +521,14 @@ def _http_kind(line: str) -> str | None:
         # body signal is suppressed there. An explicit write method still counts.
         or (
             _HTTP_BODY.search(line) is not None
-            and not _READ_METHOD.search(line)
+            and not _read_suppresses(line)
         )
     ):
         return "http"
     if "gh api" in line and _GH_API_BODY.search(line):
         # `gh api --method GET .../releases -f per_page=100` turns the fields
         # into a query string: a read. An explicit write method still counts.
-        if _READ_METHOD.search(line) is None:
+        if not _read_suppresses(line):
             return "gh"
     return None
 
