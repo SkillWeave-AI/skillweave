@@ -289,6 +289,20 @@ _WRITE_SPELLINGS = {
         "curl -X GET https://forge/api/v1/repos/o/r/releases | jq .;"
         " gh api repos/o/r/releases -f tag_name=v1"
     ),
+    # ── Round 7: a method flag bundled with boolean flags. curl reads the
+    #    cluster left to right and `X` takes an argument, so `-sSX POST` and
+    #    `-sSXPOST` are both `-X POST`, and `-sSXGET` is a read. Independent
+    #    verification found the detached form passing while it writes over the
+    #    wire, because a letter-class pattern cannot see a detached argument.
+    "curl_bundled_method_detached": (
+        "curl -sSX POST https://forge/api/v1/repos/o/r/releases"
+    ),
+    "curl_bundled_method_attached": (
+        "curl -sSXPOST https://forge/api/v1/repos/o/r/releases"
+    ),
+    "curl_bundled_method_with_body": (
+        "curl -sSX POST -d '{}' https://forge/api/v1/repos/o/r/releases"
+    ),
 }
 
 # A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a
@@ -624,6 +638,27 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
             tmp_path / "curl-explicit-get-with-data",
             "curl -X GET -d per_page=100"
             " https://forge/api/v1/repos/o/r/releases",
+        ),
+        # A bundled forced-GET is still a GET: `-sG` bundles `G` with the
+        # boolean `s`, exactly as `-sSX POST` bundles a method. Independent
+        # verification found this legitimate read being refused.
+        _synthetic_tree(
+            tmp_path / "curl-long-forced-get",
+            "curl -s --get --data-urlencode x=y"
+            " https://forge/api/v1/repos/o/r/releases",
+        ),
+        _synthetic_tree(
+            tmp_path / "curl-bundled-get",
+            "curl -sG --data-urlencode x=y"
+            " https://forge/api/v1/repos/o/r/releases",
+        ),
+        _synthetic_tree(
+            tmp_path / "curl-bundled-get-attached",
+            "curl -sGd x=y https://forge/api/v1/repos/o/r/releases",
+        ),
+        _synthetic_tree(
+            tmp_path / "curl-bundled-method-get",
+            "curl -sSX GET https://forge/api/v1/repos/o/r/releases",
         ),
     ]
 

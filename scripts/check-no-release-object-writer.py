@@ -49,6 +49,13 @@ path, not one canonical command:
   inferred body item (``http URL name=value`` is a POST; ``name==value`` is a
   query parameter and is not) — because a write needs no method flag at all
   when a body is present;
+
+curl's short options are read as curl reads them, not as letters in a word: a
+cluster such as ``-sSd``, ``-sSX POST``, ``-sSXPOST`` or ``-sG`` is walked left
+to right, the first letter that takes an argument (``d``/``T``/``F``/``X``/
+``G``/``H``/…) owns the rest of the token or the next word, and later letters
+are that argument. So a bundled method or forced-GET is recognised in both its
+detached and attached form, while ``-fsSL`` stays four boolean flags;
 * **``gh api`` body forms** — ``-f``/``-F``/``--field``/``--raw-field``/
   ``--input`` (gh infers POST from any of them);
 * **language clients** — ``requests``/``httpx`` ``.post(`` (any of
@@ -215,19 +222,19 @@ _HTTP_METHOD = re.compile(
 )
 # A body makes a write without any method token: curl's data/upload/form/json
 # flags, wget's post-data, a client's `data=` argument, and httpie/xh's body
-# item (`http URL tag_name=v1` is a POST). curl's short body flags are ``-d``,
-# ``-T`` and ``-F``; they bundle with boolean flags (``-sSd body``) and take
-# their argument either as the next token (``-d body``) or attached (``-d'x'``,
-# ``-dx``, ``-dnoeq``, ``-Tfile.zip``, ``-Ff=@x``). The match is case-sensitive
-# on purpose: ``-fsSL`` is four lowercase/uppercase boolean flags and contains
-# no ``d``/``T``/``F``, so it is not mistaken for a form. The curl segment
-# stops at a pipe, `;` or `&&`, so a downstream ``tar -T -`` is not read as an
-# upload.
+# item (`http URL tag_name=v1` is a POST). curl's *short* options are not
+# tested by a letter-class regex and cannot be: a cluster such as ``-sSd``,
+# ``-dx`` or ``-sSX POST`` is read in curl's own order, where the first letter
+# that takes an argument owns the rest of the token, and every later letter is
+# that argument rather than a flag. A pattern like ``-[A-Za-z]*[dTF]`` both
+# misses the detached form (``-sSX POST``) and misreads an attached value that
+# happens to contain ``d``/``T``/``F``. ``_curl_signals`` walks the option
+# table instead. The curl segment stops at a pipe, `;` or `&&`, so a
+# downstream ``tar -T -`` is not read as an upload.
 _HTTP_BODY = re.compile(
     r"(?:"
     r"\bcurl\b[^|\n;&]*?(?:"
-    r"(?:^|\s)-[A-Za-z]*[dTF](?:\s|\S)"
-    r"|--data(?:-(?:raw|binary|urlencode|ascii))?(?:\s|=)"
+    r"--data(?:-(?:raw|binary|urlencode|ascii))?(?:\s|=)"
     r"|--form(?:-string)?(?:\s|=)"
     r"|--upload-file(?:\s|=)"
     r"|--json(?:\s|=)"
@@ -255,7 +262,7 @@ _HTTP_BODY = re.compile(
 # not mask a body-only POST after `;`, `&&`, `|` or a newline on the same line.
 _READ_METHOD = re.compile(
     r"(?:"
-    r"\bcurl\b[^|\n;&]*?(?:\s-G\s|\s--get\b)"
+    r"\bcurl\b[^|\n;&]*?\s--get\b"
     r"|\b(?:curl|gh(?:\s+api)?)\b[^|\n;&]*?"
     r"(?:-X|--request|--method|-method)\s*=?\s*['\"]?GET\b"
     r")",
@@ -269,6 +276,17 @@ _READ_METHOD = re.compile(
 _CLIENT_START = re.compile(
     r"(?:^|[;|&(\n])\s*(?:curl|wget|gh|https?|xh)\b"
 )
+# One curl invocation: from the command word to the first pipe, `;`, `&&`.
+_CURL_SEGMENT = re.compile(r"\bcurl\b[^|\n;&]*")
+# curl's short options that take an argument (``-d``, ``-T``, ``-F``, ``-X``,
+# ``-H``, ``-o``, ...). The first such letter in a cluster owns the rest of the
+# token as its argument, so later letters are data, not flags. The write and
+# body letters are in this set, which is what makes ``-sSd`` a body and
+# ``-sSXPOST`` a write while ``-fsSL`` is four booleans.
+_CURL_SHORT_WITH_ARG = frozenset(
+    "AbcCdDeEFHKmoPQrtTuUwxXyYz"
+)
+_WRITE_VERBS = frozenset(("POST", "PATCH", "PUT", "DELETE"))
 # `gh api` infers POST from a body field or an input file and needs no method
 # token; only the releases path is interesting here. `-F` is gh's short
 # `--field` and switches the request to POST exactly as `-f` does.
@@ -487,6 +505,45 @@ def _marker_hit(line: str) -> str | None:
     return None
 
 
+def _curl_signals(line: str) -> tuple[bool, bool, bool]:
+    """``(method_write, body_write, read)`` from curl's short-option clusters.
+
+    curl reads a cluster such as ``-sSX`` left to right: a boolean letter is a
+    flag, the first letter that takes an argument owns the rest of the token
+    and — if the token ends there — the next word as its value. So ``-sSd`` is
+    a body, ``-sSXPOST`` and ``-sSX POST`` name a method, ``-sSXGET`` is a
+    read, and ``-fsSL`` is four booleans. A letter class cannot model this:
+    ``-[A-Za-z]*[dTF]`` misses the detached ``-sSX POST`` and matches an
+    attached value that merely contains ``d``/``T``/``F``.
+    """
+    method_write = body_write = read = False
+    for segment in _CURL_SEGMENT.findall(line):
+        for match in re.finditer(r"\S+", segment):
+            token = match.group(0)
+            if not token.startswith("-") or token.startswith("--"):
+                continue
+            cluster = token[1:]
+            for index, char in enumerate(cluster):
+                if char == "G":
+                    read = True
+                    break
+                if char not in _CURL_SHORT_WITH_ARG:
+                    continue
+                value = cluster[index + 1:]
+                if not value:
+                    tail = segment[match.end():].split()
+                    value = tail[0] if tail else ""
+                if char in "dTF":
+                    body_write = True
+                elif char == "X":
+                    if value.upper() in _WRITE_VERBS:
+                        method_write = True
+                    elif value.upper() == "GET":
+                        read = True
+                break
+    return method_write, body_write, read
+
+
 def _read_suppresses(line: str) -> bool:
     """Whether an explicit GET may switch off the body signal for ``line``.
 
@@ -494,7 +551,7 @@ def _read_suppresses(line: str) -> bool:
     the GET must belong to the same command for a GET to explain the body away.
     """
     return (
-        _READ_METHOD.search(line) is not None
+        (_READ_METHOD.search(line) is not None or _curl_signals(line)[2])
         and len(_CLIENT_START.findall(line)) <= 1
     )
 
@@ -515,12 +572,14 @@ def _http_kind(line: str) -> str | None:
         and not _RAW_SOCKET_LISTENER.search(line)
     ):
         return "http"
+    method_write, body_write, _ = _curl_signals(line)
     if (
         _HTTP_METHOD.search(line) is not None
+        or method_write
         # A curl `-G` turns the body into a query string: it is a read, so the
         # body signal is suppressed there. An explicit write method still counts.
         or (
-            _HTTP_BODY.search(line) is not None
+            (_HTTP_BODY.search(line) is not None or body_write)
             and not _read_suppresses(line)
         )
     ):
