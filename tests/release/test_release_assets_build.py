@@ -2,10 +2,14 @@
 
 The Forgejo release workflow used to publish no built distribution: the
 ``release-assets`` directory was created empty and the engine attached nothing.
-CORE-ZR-026 inserts exactly one step, "Build the release assets", immediately
-before "Publish the release to every destination", so the published release
+CORE-ZR-026 inserts exactly one step, "Build the release assets", so a release
 carries the wheel, the sdist and a ``SHA256SUMS`` a download can be verified
 against with ``sha256sum -c``.
+
+RFL-013 removes the "Publish the release to every destination" step: under the
+Forgejo-first model the ops-engine ``ReleaseHandler`` alone writes the release
+object. The build step stays, and this module continues to bind it to the base
+commit ``4ff639e6`` while allowing exactly that one step to disappear.
 
 This test does not paraphrase that step. It reads the workflow YAML, extracts
 the step's real ``run`` text verbatim and executes it with ``bash`` against a
@@ -44,7 +48,10 @@ TEST_REL = "tests/release/test_release_assets_build.py"
 BASE_COMMIT = "4ff639e60041b2cb3000f56a7c70364706b90920"
 
 BUILD_STEP_NAME = "Build the release assets"
+# Removed by RFL-013 (the engine is the only release-object writer). Kept only
+# so the diff assertion can name exactly the one step that may disappear.
 PUBLISH_STEP_NAME = "Publish the release to every destination"
+SUCCESSOR_STEP_NAME = "Mirror the canonical tag"
 
 # The single permitted skip: the ``build`` package is unavailable, so the
 # extracted block cannot be executed at all.
@@ -118,23 +125,28 @@ def test_diff_is_exactly_one_step_inserted_before_publish():
     removed = [n for n in base_names if n not in cand_names]
 
     # This test owns the step CORE-ZR-026 inserted: it is present exactly once
-    # and no base step was removed. Later units may add steps of their own
-    # (SW-1511-GATE criterion 9 adds the post-publication attachment check);
+    # and it is still in place after RFL-013. Later units may add steps of their
+    # own (SW-1511-GATE criterion 9 adds the post-publication attachment check);
     # their addition must not be needed here, and each such unit proves its own
     # step is additive, so the assertion is on this step, not on a frozen total.
     assert added.count(BUILD_STEP_NAME) == 1, (
-        f"{BUILD_STEP_NAME!r} must be added exactly once; added={added!r}"
+        f"{BUILD_STEP_NAME!r} must be present exactly once; added={added!r}"
     )
-    assert removed == [], f"no base step may be removed; removed={removed!r}"
-    assert cand_names.count(BUILD_STEP_NAME) == 1, "the new step appears once"
+    # RFL-013 removes exactly one base step: the release-object writer. Nothing
+    # else may be removed; the artifact steps stay.
+    assert removed == [PUBLISH_STEP_NAME], (
+        f"only {PUBLISH_STEP_NAME!r} may be removed; removed={removed!r}"
+    )
+    assert cand_names.count(BUILD_STEP_NAME) == 1, "the build step appears once"
 
-    # It sits immediately before the publish step, so the engine attaches the
-    # freshly built assets in the same job.
-    i_build = cand_names.index(BUILD_STEP_NAME)
-    i_publish = cand_names.index(PUBLISH_STEP_NAME)
-    assert i_publish - i_build == 1, (
-        f"{BUILD_STEP_NAME!r} must directly precede {PUBLISH_STEP_NAME!r}; "
-        f"got index {i_build} vs {i_publish}"
+    # The build step still runs before the mirror step, and its
+    # ``release-assets`` directory is still what the final verification step
+    # reads (``--assets-dir release-assets``). This job no longer hands that
+    # directory to a release writer — the engine owns publication — so ordering
+    # here says where the assets are produced and verified, not that this job
+    # attaches them.
+    assert cand_names.index(SUCCESSOR_STEP_NAME) > cand_names.index(BUILD_STEP_NAME), (
+        f"{BUILD_STEP_NAME!r} must still precede {SUCCESSOR_STEP_NAME!r}"
     )
 
 
@@ -145,24 +157,37 @@ def test_every_other_step_run_text_is_byte_identical_to_base():
     for base_step in base_steps:
         key = _step_key(base_step)
         matches = [s for s in cand_steps if _step_key(s) == key]
-        assert len(matches) == 1, f"step {key!r} is not preserved exactly once"
-        # Whole-step equality: the run text, its env, and (for action steps) the
-        # ``uses``/``with`` — nothing about a pre-existing step may move.
-        assert matches[0] == base_step, (
-            f"step {key!r} changed; the diff must touch no other step"
-        )
+        if key == PUBLISH_STEP_NAME:
+            # RFL-013 removes exactly this step; it is asserted by name above.
+            assert matches == [], f"{key!r} must be gone"
+        else:
+            assert len(matches) == 1, f"step {key!r} is not preserved exactly once"
+            # Whole-step equality: the run text, its env, and (for action steps)
+            # the ``uses``/``with`` — nothing about a pre-existing step may move.
+            assert matches[0] == base_step, (
+                f"step {key!r} changed; the diff must touch no other step"
+            )
 
-    # Whole-document equality once the new step is removed: nothing else in the
-    # workflow — no job key, no trigger, no comment-adjacent scalar — moved.
-    # Later units may insert their own steps; removing every step absent from
-    # base keeps this "the diff inserted steps and touched nothing else" rather
-    # than a frozen "exactly one step" that any later additive unit would break.
+    # Whole-document equality once inserted steps are removed and the one named
+    # removal is set aside: nothing else in the workflow — no job key, no
+    # trigger, no comment-adjacent scalar — moved. Later units may insert their
+    # own steps, so steps present only in the candidate are dropped from the
+    # candidate side alone. The base side drops exactly ``PUBLISH_STEP_NAME``
+    # and nothing else: subtracting the same key set from both sides would let a
+    # base step that vanished or was renamed be removed from *expected* as well,
+    # which is the one direction this assertion exists to catch. (The per-step
+    # loop above catches it too; this keeps the document assertion from being
+    # redundant in the same direction rather than a second, weaker copy of it.)
     base_keys = {_step_key(s) for s in base_steps}
     stripped = _candidate_doc()
     stripped["jobs"]["release"]["steps"] = [
         s for s in _steps(stripped) if _step_key(s) in base_keys
     ]
-    assert stripped == _base_doc(), (
+    expected = _base_doc()
+    expected["jobs"]["release"]["steps"] = [
+        s for s in _steps(expected) if _step_key(s) != PUBLISH_STEP_NAME
+    ]
+    assert stripped == expected, (
         "the workflow must be the base plus inserted steps and nothing else"
     )
 
