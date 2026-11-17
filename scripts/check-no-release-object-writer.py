@@ -103,6 +103,14 @@ something the workflow never writes down — the output of another command, a
 secret, a script fetched while running, or a computed expression — cannot be
 resolved here, and an obfuscated call (base64, an alias) is out of reach.
 
+A here-document is read the way the shell reads it: the body belongs to the
+command whose line carries the ``<<`` operator, so a request line in
+``nc host 443 <<'EOF'`` is that command's input rather than a statement of its
+own, and ``cat <<'EOF' | nc host 443`` keeps its pipeline whole for the same
+reason. A substitution whose result is written down (``$(echo -d)``) is
+resolved to that word, so a flag spelled indirectly is still seen; any other
+substitution stays opaque.
+
 A raw TCP write that spells the HTTP request as bytes is modelled when the
 request line is written down: a ``POST``/``PATCH``/``PUT``/``DELETE`` line
 addressing ``/releases`` piped into ``nc``/``ncat``/``netcat``/``socat``/
@@ -469,6 +477,111 @@ def strip_comments(text: str) -> str:
     return "\n".join(kept)
 
 
+def _heredoc_operator(text: str, index: int) -> tuple[int, str, bool] | None:
+    """Parse a ``<<``/``<<-`` redirection operator starting at ``index``.
+
+    Returns ``(delimiter_start, delimiter, strip_tabs)`` — the index just past
+    the operator and any ``-``, the delimiter word with its quoting removed,
+    and whether the ``<<-`` form strips leading tabs. ``None`` when the
+    characters at ``index`` are not a here-document operator (``<<<`` is a
+    here-*string*, whose payload is written on the command itself, and ``<<``
+    inside a longer token such as ``2<<3`` is arithmetic).
+    """
+    if not text.startswith("<<", index) or text.startswith("<<<", index):
+        return None
+    cursor = index + 2
+    strip_tabs = False
+    if cursor < len(text) and text[cursor] == "-":
+        strip_tabs = True
+        cursor += 1
+    while cursor < len(text) and text[cursor] in " \t":
+        cursor += 1
+    start = cursor
+    delimiter: list[str] = []
+    quote = ""
+    while cursor < len(text):
+        char = text[cursor]
+        if quote:
+            if char == quote:
+                quote = ""
+            else:
+                delimiter.append(char)
+        elif char in ("'", '"'):
+            quote = char
+        elif char.isspace() or char in ";&|<>()":
+            break
+        elif char == "\\" and cursor + 1 < len(text):
+            cursor += 1
+            delimiter.append(text[cursor])
+        else:
+            delimiter.append(char)
+        cursor += 1
+    word = "".join(delimiter)
+    if not word:
+        return None
+    return start, word, strip_tabs
+
+
+def _heredoc_body_end(
+    text: str, start: int, delimiter: str, strip_tabs: bool
+) -> tuple[int, int]:
+    """Locate a here-document body that begins at ``start``.
+
+    Returns ``(body_end, next_line_start)``: the index where the body text
+    stops (the delimiter line) and the index of the line after the delimiter,
+    which is where the command that owns the here-document continues. The
+    shell collects the body from the lines *after* the whole command line, so
+    the caller passes the end of that line as ``start``. When the delimiter is
+    never found, the end of the text is returned.
+    """
+    cursor = start
+    while cursor <= len(text):
+        newline = text.find("\n", cursor)
+        line_end = len(text) if newline == -1 else newline
+        line = text[cursor:line_end]
+        if strip_tabs:
+            line = line.lstrip("\t")
+        if line == delimiter:
+            return cursor, len(text) if newline == -1 else newline + 1
+        if newline == -1:
+            return len(text), len(text)
+        cursor = newline + 1
+    return len(text), len(text)
+
+
+def _heredocs_in(text: str) -> list[tuple[str, bool]]:
+    """Every here-document operator on one command line, in order.
+
+    Quote-aware: ``echo 'a << b'`` opens nothing. ``<<<`` is a here-*string*
+    and is skipped, exactly as ``_heredoc_operator`` does.
+    """
+    ops: list[tuple[str, bool]] = []
+    index = 0
+    quote = ""
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == "\\" and quote == '"' and index + 1 < len(text):
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            index += 1
+            continue
+        if char == "<":
+            parsed = _heredoc_operator(text, index)
+            if parsed is not None:
+                ops.append((parsed[1], parsed[2]))
+                index += 2
+                continue
+        index += 1
+    return ops
+
+
 def _substitution_end(text: str, index: int) -> int:
     """End index (exclusive) of a substitution starting at ``index``, else -1.
 
@@ -515,6 +628,57 @@ def _substitution_end(text: str, index: int) -> int:
     return -1
 
 
+def _split_by_pipe_real(text: str) -> list[str]:
+    """Split ``text`` on the ``|`` characters the shell itself sees.
+
+    Quote-aware and substitution-aware: ``-H 'X: a|b'`` and
+    ``$(a | b)`` carry no pipeline break. ``||`` and ``|&`` are command
+    separators too and split the same way, at the operator's start.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    quote = ""
+    depth = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            current.append(char)
+            if char == "\\" and quote == '"' and index + 1 < len(text):
+                index += 1
+                current.append(text[index])
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        if char in "$`<>":
+            end = _substitution_end(text, index)
+            if end != -1:
+                current.append(text[index:end])
+                index = end
+                continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(depth - 1, 0)
+        elif char == "|" and depth == 0:
+            parts.append("".join(current))
+            current = []
+            index += 1
+            if index < len(text) and text[index] in "|&":
+                index += 1
+            continue
+        current.append(char)
+        index += 1
+    parts.append("".join(current))
+    return parts
+
+
 def _command_segments(text: str) -> list[str]:
     """Split a shell block into commands, quote-aware.
 
@@ -525,6 +689,13 @@ def _command_segments(text: str) -> list[str]:
     it. A backslash-newline is deleted with no separator, exactly as the shell
     does it. Each returned segment is one command, which is what makes a body
     flag in one command attributable to that command alone.
+
+    A here-document is read the way the shell reads it: the body is the block
+    of lines after the command line, and it is the *input* of that command, so
+    it is appended to the command that opens it rather than parsed as commands
+    of its own. The pipeline that reads it is kept whole for the same reason —
+    ``cat <<'EOF' | nc host 443`` puts the request line in the body and the
+    transport in the pipeline, and they only describe one write together.
     """
     segments: list[str] = []
     current: list[str] = []
@@ -560,7 +731,34 @@ def _command_segments(text: str) -> list[str]:
             current.append(text[index + 1])
             index += 2
             continue
+        if char == "\n":
+            line = "".join(current)
+            bodies: list[str] = []
+            next_line = index + 1
+            for delimiter, strip_tabs in _heredocs_in(line):
+                body_end, next_line = _heredoc_body_end(
+                    text, next_line, delimiter, strip_tabs
+                )
+                bodies.append(text[index + 1:body_end])
+            if bodies and "|" in line:
+                current = [line, "\n", "\n".join(bodies)]
+                index = next_line
+                continue
+            if bodies:
+                segment = (line + "\n" + "\n".join(bodies)).strip()
+                if segment:
+                    segments.append(segment)
+                current = []
+                index = next_line
+                continue
         if char in ";|&\n":
+            # A command line that opens a here-document keeps its pipeline
+            # together: the body is the stdin of the last command in it, and
+            # `cat <<'EOF' | nc host 443` only describes one write as a whole.
+            if _heredocs_in("".join(current)):
+                current.append(char)
+                index += 1
+                continue
             segment = "".join(current).strip()
             if segment:
                 segments.append(segment)
@@ -573,6 +771,30 @@ def _command_segments(text: str) -> list[str]:
     if segment:
         segments.append(segment)
     return segments
+
+
+def _literal_substitution(span: str) -> str | None:
+    """The literal result of a substitution that is just ``echo WORD``.
+
+    ``$(echo -d)`` is evaluated by the shell and handed to curl as the word
+    ``-d``, so a flag can be written where no flag is visible. Only a single
+    ``echo`` of one quote-free, expansion-free word is modelled; anything
+    else stays opaque, and an unknown result is not silently read as a read.
+    """
+    inner = span
+    if inner.startswith("$(") and inner.endswith(")"):
+        inner = inner[2:-1]
+    elif inner.startswith("`") and inner.endswith("`"):
+        inner = inner[1:-1]
+    else:
+        return None
+    words = inner.split()
+    if len(words) != 2 or words[0] != "echo":
+        return None
+    value = words[1].strip("\"'")
+    if not value or any(char in value for char in "$`\\<>|&;()"):
+        return None
+    return value
 
 
 def _shell_words(text: str) -> list[str]:
@@ -605,7 +827,9 @@ def _shell_words(text: str) -> list[str]:
         if char in ("$", "`", "<", ">"):
             end = _substitution_end(text, index - 1)
             if end != -1:
-                current.append(text[index - 1:end])
+                span = text[index - 1:end]
+                literal = _literal_substitution(span)
+                current.append(literal if literal is not None else span)
                 index = end
                 continue
         if char.isspace():
@@ -913,7 +1137,7 @@ def _socket_send(line: str) -> bool:
     """
     if _DEV_TCP.search(line):
         return True
-    for segment in re.split(r"\|", line):
+    for segment in _split_by_pipe_real(line):
         tokens = [t.strip("\"'") for t in _shell_tokens(segment)]
         if not tokens:
             continue
@@ -977,8 +1201,11 @@ def _socket_address_sends(args: list[str]) -> bool:
 
 
 # A stdin redirect from a file (`openssl s_client ... < payload.http`). The
-# `3<>/dev/tcp/...` fd-open and the `<<`/`<<<`/`<&` forms are not file
-# redirects and are handled elsewhere.
+# `3<>/dev/tcp/...` fd-open is not a redirect of stdin, `<<<` is a here-string
+# whose payload is written on the command line, `<&` duplicates an fd, and
+# `<<` is a here-document whose body is parsed by ``_heredocs_in`` and kept
+# with the command that reads it — none of those names a file this pattern
+# should report.
 _FILE_REDIRECT = re.compile(r"(?<!<)<(?!<|>|&)\s*([^\s;&|<>]+)")
 
 

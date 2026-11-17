@@ -439,6 +439,45 @@ _WRITE_SPELLINGS = {
         "printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n'"
         " | socat - TCP:forge.example:443,connect-timeout=5"
     ),
+    # ── Round 11: a here-document body is the *input* of the command that
+    #    opens it, not a sequence of commands of its own. Independent
+    #    verification wire-proved `cat <<'EOF' | nc` and `nc <<'EOF'` as a real
+    #    `POST /api/v1/repos/o/r/releases` while the check exited 0, because
+    #    each body line had become its own segment and the transport was never
+    #    in the same view as the request line.
+    "heredoc_piped_to_nc": (
+        "cat <<'EOF' | nc forge.example 443\n"
+        "POST /api/v1/repos/o/r/releases HTTP/1.1\n"
+        "Host: forge.example\n"
+        "EOF"
+    ),
+    "heredoc_stdin_of_nc": (
+        "nc forge.example 443 <<'EOF'\n"
+        "POST /api/v1/repos/o/r/releases HTTP/1.1\n"
+        "Host: forge.example\n"
+        "EOF"
+    ),
+    "heredoc_stdin_of_socat": (
+        "socat - TCP:forge.example:443 <<'EOF'\n"
+        "POST /api/v1/repos/o/r/releases HTTP/1.1\n"
+        "EOF"
+    ),
+    "heredoc_stdin_of_openssl": (
+        "openssl s_client -quiet -connect forge.example:443 <<EOF\n"
+        "POST /api/v1/repos/o/r/releases HTTP/1.1\n"
+        "EOF"
+    ),
+    "heredoc_double_quoted_delimiter": (
+        'cat <<"BODY" | socat - TCP:forge.example:443\n'
+        "POST /api/v1/repos/o/r/releases HTTP/1.1\n"
+        "BODY"
+    ),
+    # A substitution may yield curl's *flag*, not only its data:
+    # `curl $(echo -d) x URL` posts `x`, and no flag is visible on the line.
+    "substitution_yields_body_flag": (
+        "curl $(echo -d) 'x'"
+        " $(echo https://forge/api/v1/repos/o/r/releases)"
+    ),
 }
 
 # A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a
@@ -887,6 +926,35 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
             tmp_path / "socat-listen-request-line",
             "printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n'"
             " | socat - TCP-LISTEN:8080,reuseaddr",
+        ),
+        # A here-document body is data too: a `GET` request line fed to a
+        # socket is a read, and a here-document handed to a non-sender (a
+        # Python script, a shell reading its own input) carries no transport.
+        _synthetic_tree(
+            tmp_path / "heredoc-get-over-socket",
+            "nc forge.example 443 <<'EOF'\n"
+            "GET /api/v1/repos/o/r/releases/tags/v1 HTTP/1.1\n"
+            "Host: forge.example\n"
+            "EOF",
+        ),
+        _synthetic_tree(
+            tmp_path / "heredoc-to-python",
+            "python3 - <<'PY'\n"
+            "print('POST /api/v1/repos/o/r/releases')\n"
+            "PY",
+        ),
+        _synthetic_tree(
+            tmp_path / "heredoc-to-listener",
+            "cat <<'EOF' | nc -l 9000\n"
+            "POST /api/v1/repos/o/r/releases HTTP/1.1\n"
+            "EOF",
+        ),
+        # A substitution that yields a plain word is not a flag: an `echo` of
+        # a query value leaves the read intact.
+        _synthetic_tree(
+            tmp_path / "substitution-yields-data",
+            "curl -fsSL -H \"X-Note: $(echo read)\""
+            " https://forge/api/v1/repos/o/r/releases/tags/v1",
         ),
     ]
 
