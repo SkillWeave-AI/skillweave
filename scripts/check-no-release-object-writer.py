@@ -56,7 +56,12 @@ path, not one canonical command:
 * **forge actions and octokit names** — the list in ``WRITER_MARKERS``.
 
 Backslash continuations are folded first, so a method on one physical line and
-the URL on the next are inspected as one command. A pipe, ``;`` or ``&&`` ends
+the URL on the next are inspected as one command. The shell deletes a
+backslash-newline with no separator, so a token split across the break
+(``relea\\`` then ``ses``) is one token; the fold concatenates the pieces
+verbatim for that reason, and inspects a spaced view beside it because the YAML
+block indentation gives the ordinary ``curl -X POST \\`` + URL spelling a
+separation the shell never sees. A hit in either view is reported. A pipe, ``;`` or ``&&`` ends
 a curl segment, so a body flag in one command is not attributed to a
 downstream one (``curl … | tar -T -`` is a download, not an upload). Literal ``NAME=value``
 assignments in the same workflow are substituted into ``$NAME``/``${NAME}``
@@ -253,13 +258,27 @@ def strip_comment(line: str) -> str:
     return line
 
 
-def logical_lines(text: str) -> list[tuple[int, str]]:
+def logical_lines(text: str) -> list[tuple[int, str, str]]:
     """Fold backslash continuations into one logical line, kept with its number.
 
     A method token and the URL it applies to frequently live on different
     physical lines inside a YAML ``run:`` block; folding first means the
     writer test sees the command the shell would actually execute. The number
     reported is the first physical line of the folded command.
+
+    The shell deletes a backslash-newline with **no** separator, so the
+    fragments are concatenated verbatim after each physical line is stripped:
+    ``relea\\`` followed by ``ses`` is the single token ``releases``, and a
+    fold that inserted a space would make the write token and the URL it
+    addresses invisible. Two views are therefore returned for every folded
+    command. The first joins with nothing and is what the shell executes; the
+    second joins with a space because the raw YAML text still carries block
+    scalar indentation, which the shell never sees — a continuation that the
+    shell joins with no separator can still look separated here. Both views
+    are inspected and a hit in either counts: the split token is caught in the
+    verbatim view, and the ordinary ``curl -X POST \\`` + URL spelling (whose
+    separation came from the indentation) in the spaced one. Over-reporting is
+    the safe direction for a gate.
 
     Comments are stripped *before* folding, one physical line at a time.
     Folding first would let a ``#`` comment absorb the following line — its
@@ -268,9 +287,13 @@ def logical_lines(text: str) -> list[tuple[int, str]]:
     that following line. A folded command is reported from the physical line
     it begins on.
     """
-    folded: list[tuple[int, str]] = []
+    folded: list[tuple[int, str, str]] = []
     pending: list[str] = []
     start = 0
+
+    def joined(parts: list[str], separator: str) -> str:
+        return separator.join(p for p in parts if p)
+
     for number, raw in enumerate(text.splitlines(), start=1):
         stripped = strip_comment(raw).strip()
         if not pending:
@@ -279,40 +302,59 @@ def logical_lines(text: str) -> list[tuple[int, str]]:
             pending.append(stripped[:-1].strip())
             continue
         pending.append(stripped)
-        folded.append((start, " ".join(p for p in pending if p)))
+        folded.append((start, joined(pending, ""), joined(pending, " ")))
         pending = []
     if pending:
-        folded.append((start, " ".join(p for p in pending if p)))
+        folded.append((start, joined(pending, ""), joined(pending, " ")))
     return folded
 
 
 def findings(text: str, workflow_rel: str) -> list[str]:
-    """Every release-object writer found in ``text``, named with its line."""
+    """Every release-object writer found in ``text``, named with its line.
+
+    Each folded command is inspected in both views ``logical_lines`` returns —
+    the separator-less one the shell executes and the spaced one that still
+    carries the YAML block indentation — and a hit in either is reported once
+    for that line.
+    """
     found: list[str] = []
     bound = literals("\n".join(strip_comment(line) for line in text.splitlines()))
-    for number, line in logical_lines(text):
-        if not line:
+    for number, verbatim, spaced in logical_lines(text):
+        if not verbatim and not spaced:
             continue
+        hit = None
         for marker in WRITER_MARKERS:
-            if marker in line:
-                found.append("%s:%d %s" % (workflow_rel, number, marker))
+            if marker in verbatim or marker in spaced:
+                hit = "%s:%d %s" % (workflow_rel, number, marker)
                 break
-        resolved = resolve(line, bound)
-        writes_release = _REST_PATH.search(resolved) is not None
-        method = _HTTP_METHOD.search(resolved) is not None
-        # A curl `-G` turns the body into a query string: it is a read, so the
-        # body signal is suppressed there. An explicit write method still counts.
-        body = _HTTP_BODY.search(resolved) is not None and not _CURL_FORCED_GET.search(
-            resolved
-        )
-        if writes_release and (method or body):
-            found.append(
-                "%s:%d HTTP write to a release path" % (workflow_rel, number)
-            )
-        elif writes_release and "gh api" in resolved and _GH_API_BODY.search(resolved):
-            found.append(
-                "%s:%d gh api body field writes a release path" % (workflow_rel, number)
-            )
+        if hit is None:
+            http_hit = False
+            gh_hit = False
+            for line in (verbatim, spaced):
+                resolved = resolve(line, bound)
+                writes_release = _REST_PATH.search(resolved) is not None
+                if not writes_release:
+                    continue
+                method = _HTTP_METHOD.search(resolved) is not None
+                # A curl `-G` turns the body into a query string: it is a read,
+                # so the body signal is suppressed there. An explicit write
+                # method still counts.
+                body = _HTTP_BODY.search(
+                    resolved
+                ) is not None and not _CURL_FORCED_GET.search(resolved)
+                if method or body:
+                    http_hit = True
+                elif "gh api" in resolved and _GH_API_BODY.search(resolved):
+                    gh_hit = True
+            if http_hit:
+                hit = "%s:%d HTTP write to a release path" % (workflow_rel, number)
+            elif gh_hit:
+                hit = (
+                    "%s:%d gh api body field writes a release path"
+                    % (workflow_rel, number)
+                )
+        if hit is not None:
+            found.append(hit)
     return found
 
 

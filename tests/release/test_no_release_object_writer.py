@@ -204,6 +204,20 @@ _WRITE_SPELLINGS = {
     "xh_json_body_item": (
         "xh --json POST https://forge/api/v1/repos/o/r/releases tag_name=v1"
     ),
+    # ── Tokens split across a backslash continuation (round 5). A shell deletes
+    #    backslash-newline with *no* separator, so `relea\` + `ses` is the one
+    #    token `releases`; a fold that inserted a space would hide both the
+    #    write word and the URL from the check (independent verification
+    #    caught this). ────────────────────────────────────────────────────────
+    "split_url_token": (
+        "curl -X POST https://forge/api/v1/repos/o/r/relea\\\nses"
+    ),
+    "split_gh_release_token": "gh release cre\\\nate v1.0.0 --notes x",
+    "split_action_token": "uses: softprops/action-gh-rele\\\nase@v2",
+    "split_octokit_token": "github.rest.repos.createRele\\\nase({owner, repo})",
+    "split_release_path_token": (
+        "curl -X POST https://forge/api/v1/repos/o/r/\\\nreleases"
+    ),
 }
 
 # The one shape this syntactic check cannot resolve: the target is assembled at
