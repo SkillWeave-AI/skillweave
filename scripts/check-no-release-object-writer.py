@@ -113,7 +113,15 @@ listener later on a pipeline does not switch off an earlier sender. The request
 *target* is what is tested, so a write to another endpoint that merely quotes
 ``/releases`` in its body is not a release write. ``gh api``'s endpoint is read
 from its first bare argument, so a relative endpoint is seen the same as an
-absolute one.
+absolute one. For ``curl``/``wget`` a target may omit the scheme — ``curl -d …
+a.b/x`` sends to ``http://a.b/x`` — so a host-shaped word (a dotted name or
+``localhost``, optionally with a port) followed by a path is a target too; the
+word must look like a host and the client must be a fetcher, so a relative
+path quoted in a body and a non-fetcher's ``host/path`` argument are not
+targets. ``socat``'s address may carry options after a comma
+(``TCP:host:port,connect-timeout=5``) and ``OPENSSL:host:port`` is the same
+outbound sender over TLS; the ``-LISTEN`` option marks a listener in either
+spelling.
 
 One shape is deliberately over-reported: a socket sender whose payload is read
 from a *file* (``openssl s_client ... < payload.http``). The bytes are not
@@ -760,6 +768,17 @@ _PATH_SPAN = re.compile(
     r"(?:^|[\s'\"`=:(])(/[A-Za-z0-9._~%\-]+(?:/[A-Za-z0-9._~%\-]+)+)"
     r"(?=[\s'\"`),;]|$)"
 )
+# curl and wget both accept a URL with the scheme left off: `curl -d … a.b/x`
+# sends to `http://a.b/x`. The host must look like a host (a dotted name or
+# `localhost`, optionally with a port) so a relative path merely quoted in a
+# request body — `see repos/o/r/releases` — is not read as a target.
+_BARE_URL_SPAN = re.compile(
+    r"(?:^|[\s'\"`=:(])"
+    r"((?:localhost|(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+)"
+    r"(?::\d{1,5})?/[^\s'\"`),;]+)"
+)
+# The clients that accept a scheme-less URL as a target.
+_FETCHER = re.compile(r"(?:^|\s)(?:curl|wget)(?:\s|$)")
 # The request target of a raw HTTP request line is the first token after the
 # method. Reading the target rather than the whole line keeps a body or a
 # comment that mentions ``/releases`` from satisfying the path test. Any method
@@ -781,8 +800,13 @@ _ARGV_PUNCTUATION = re.compile(r"[\[\](),]")
 _GH_RELEASE_SPLIT = re.compile(
     r"\bgh\s+release\s+(?:create|edit|delete|upload)\b"
 )
-# socat's address forms: `TCP:host:port` sends, `TCP-LISTEN:port` listens.
-_SOCAT_SEND = re.compile(r"^(?:TCP|UDP)(?:4|6)?:[^\s]*:\d{1,5}$")
+# socat's address forms: `TCP:host:port` sends, `TCP-LISTEN:port` listens. The
+# address may carry options after a comma (`TCP:h:443,connect-timeout=5`),
+# and `OPENSSL:host:port` is the same sender wrapped in TLS.
+_SOCAT_SEND = re.compile(
+    r"^(?:TCP|UDP)(?:4|6)?:[^\s,:]*:\d{1,5}(?:,[^\s]*)?$"
+    r"|^OPENSSL(?:[46])?:[^\s,:]*:\d{1,5}(?:,[^\s]*)?$"
+)
 _SOCAT_LISTEN = re.compile(r"-LISTEN", re.IGNORECASE)
 _HOST_PORT = re.compile(r"^[^\s:]+:\d{1,5}$")
 _SOCKET_SHORT_WITH_ARG = frozenset("bcDeEimMoOqstTvVwXx")
@@ -810,6 +834,11 @@ def _release_spans(line: str) -> list[str]:
     """Every URL or multi-segment path on ``line`` that addresses ``/releases``."""
     spans = [s for s in _URL_SPAN.findall(line) if _REST_PATH.search(s)]
     spans.extend(s for s in _PATH_SPAN.findall(line) if _REST_PATH.search(s))
+    # A scheme-less host/path is a target too, but only worth naming when the
+    # line is a fetcher's: `docker pull a.b/c` is not an HTTP request, and the
+    # write signal is required separately anyway.
+    if _FETCHER.search(" ".join(_shell_tokens(line))):
+        spans.extend(s for s in _BARE_URL_SPAN.findall(line) if _REST_PATH.search(s))
     return spans
 
 

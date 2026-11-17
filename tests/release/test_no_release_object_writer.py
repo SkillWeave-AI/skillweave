@@ -420,6 +420,25 @@ _WRITE_SPELLINGS = {
         "curl -d @<(echo '{\"tag_name\":\"v1\"}')"
         " https://forge/api/v1/repos/o/r/releases"
     ),
+    # ── Round 11: target spellings curl and wget accept with no scheme, plus
+    #    socat's TLS and option forms. Independent verification named these as
+    #    real misses *inside* the scope the docstring claimed: the URL is
+    #    written down verbatim, so calling it a "computed target" was wrong.
+    "scheme_less_curl": (
+        "curl -d '{\"tag_name\":\"v1\"}' forge.example/api/v1/repos/o/r/releases"
+    ),
+    "scheme_less_wget": (
+        "wget --post-data=tag_name=v1"
+        " localhost:3000/api/v1/repos/o/r/releases"
+    ),
+    "socat_openssl_send": (
+        "printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n'"
+        " | socat - OPENSSL:forge.example:443"
+    ),
+    "socat_send_with_option": (
+        "printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n'"
+        " | socat - TCP:forge.example:443,connect-timeout=5"
+    ),
 }
 
 # A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a
@@ -834,6 +853,40 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
             tmp_path / "backtick-read",
             "curl -fsSL `echo"
             " https://forge/api/v1/repos/o/r/releases/tags/v1`",
+        ),
+        # A scheme-less host is a target for a fetcher, but the body check
+        # still decides: a scheme-less *read* stays green, a relative path
+        # merely quoted in a body is not a target, and a non-fetcher's
+        # `host/path` word (`docker pull a.b/c`) is not a URL at all.
+        _synthetic_tree(
+            tmp_path / "scheme-less-read",
+            "curl -fsSL forge.example/api/v1/repos/o/r/releases/tags/v1",
+        ),
+        _synthetic_tree(
+            tmp_path / "relative-path-in-body",
+            "curl -d '{\"body\":\"see repos/o/r/releases\"}'"
+            " https://forge/api/v1/repos/o/r/issues",
+        ),
+        _synthetic_tree(
+            tmp_path / "non-fetcher-host-path-word",
+            "docker pull registry.example/repo/releases",
+        ),
+        # socat's listeners, including the option-bearing and TLS spellings:
+        # `-LISTEN` is a listen option in any position, and `OPENSSL-LISTEN`
+        # starts no outbound connection.
+        _synthetic_tree(
+            tmp_path / "socat-tcp-listen-option",
+            "socat - TCP-LISTEN:8080,reuseaddr,fork",
+        ),
+        _synthetic_tree(
+            tmp_path / "socat-openssl-listen",
+            "socat - OPENSSL-LISTEN:8443,cert=server.pem,reuseaddr",
+        ),
+        # A request line piped to a listening socat is inert data.
+        _synthetic_tree(
+            tmp_path / "socat-listen-request-line",
+            "printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n'"
+            " | socat - TCP-LISTEN:8080,reuseaddr",
         ),
     ]
 
