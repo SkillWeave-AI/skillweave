@@ -66,13 +66,28 @@ a curl segment, so a body flag in one command is not attributed to a
 downstream one (``curl … | tar -T -`` is a download, not an upload). Literal ``NAME=value``
 assignments in the same workflow are substituted into ``$NAME``/``${NAME}``
 references (a few levels deep), so a URL held in a shell variable is inspected
-as the URL it is rather than as an opaque ``$URL``.
+as the URL it is rather than as an opaque ``$URL``. A job- or step-level
+``env:`` mapping binds a variable the same way, so ``$RELEASE_API`` set there is
+resolved too; only an expression-valued (``${{ ... }}``) or otherwise computed
+binding stays opaque.
+
+A folded YAML scalar (``run: >`` / ``run: >-``) joins its physical lines with
+spaces, so a method on one line and the URL on the next are one command the
+runner executes. That join is YAML's, not the shell's, so a second pass parses
+the document and re-checks each step's resolved ``run`` text. PyYAML is
+required for that pass; a missing parser is refused (exit 2) rather than
+silently skipped, because a check that quietly loses a pass is a check that
+quietly reopens a gap.
 
 This is a syntactic guard, not a sandbox. A target assembled at run time from
 something the workflow never writes down — the output of another command, a
-secret, a script fetched while running — cannot be resolved here, and an
-obfuscated call (base64, an alias) is out of reach. That limit is stated
-rather than claimed closed.
+secret, a script fetched while running, or a computed expression — cannot be
+resolved here, and an obfuscated call (base64, an alias) is out of reach. The
+same hold for a raw TCP write that spells the request as bytes (``nc``,
+``openssl s_client``, bash ``/dev/tcp``): the request line is data, not a
+command, and is not modelled. These limits are stated rather than claimed
+closed, and the ``env:``/folded-scalar cases above are *not* among them: the
+target there is written down verbatim in the workflow.
 
 ``--root`` exists so the very same check can be run against an untouched base
 tree (where it must exit non-zero) and against the candidate tree (where it
@@ -81,8 +96,8 @@ those two invocations plus a table of write spellings, so the check is red in
 CI if it stops catching a spelling it claims to catch.
 
 Exit status: 0 when no covered workflow carries a release-object writer, 1 when
-any does, 2 when a required workflow file or the workflow tree is absent (the
-check cannot pass by not running).
+any does, 2 when a required workflow file or the workflow tree is absent, or
+when PyYAML is unavailable (the check cannot pass by not running).
 """
 
 from __future__ import annotations
@@ -131,6 +146,22 @@ WRITER_MARKERS = (
     "gh release upload",
 )
 
+# The Forgejo/Gitea-native CLI writes the release object with `tea release
+# create` (and `tea releases create` — both spellings exist). `tea releases
+# list`/`show` are reads and must stay green, so this is a write-verb regex
+# rather than a bare marker.
+_TEA_WRITE = re.compile(
+    r"\btea\s+releases?\s+(?:create|edit|delete|attach)\b", re.IGNORECASE
+)
+# A language client's release writer, usually called as a dotted path
+# (`Github(...).get_repo(...).create_git_release(...)`). The dotted names in
+# ``WRITER_MARKERS`` are CamelCase octokit spellings; these snake_case ones
+# belong to PyGithub and friends.
+_DOTTED_WRITER = re.compile(
+    r"\b(?:create_git_release|create_release|edit_release|delete_release"
+    r"|upload_release_asset)\s*\("
+)
+
 _REST_PATH = re.compile(r"/releases\b")
 # The method token, wherever it sits in the command: `curl -XPOST`,
 # `curl -X POST`, `gh api --method=post`, `curl --request PATCH`, httpie's
@@ -169,12 +200,17 @@ _HTTP_BODY = re.compile(
     r"|--upload-file(?:\s|=)"
     r"|--json(?:\s|=)"
     r")"
-    r"|\bwget\b[^|\n;&]*?--post-(?:data|file)(?:\s|=)"
+    # GNU wget's `--body-data`/`--body-file` are documented aliases of
+    # `--post-data`/`--post-file` and send the same POST.
+    r"|\bwget\b[^|\n;&]*?--(?:post|body)-(?:data|file)(?:\s|=)"
     r"|\burlopen\s*\([^\n]*?\bdata\s*="
-    # httpie/xh infer a POST from a body item (`name=value`; query params use
-    # `==` and are not a body), with optional flag options before the URL.
+    # httpie/xh infer a POST from a body item, with optional flag options
+    # before the URL. A body item is `name=value` (a query parameter is
+    # `name==value` and is not a body), raw JSON `name:=value` (httpie/xh
+    # default to `application/json`), or a file field `name@path`. A bare
+    # `=` must not match the `==` query form, hence the lookahead.
     r"|(?:^|[\s;&|])(?:https?|xh)(?:\s+--?[A-Za-z0-9_-]+)*\s+"
-    r"[^\n]*?\b[A-Za-z_][A-Za-z0-9_-]*=(?!=)"
+    r"[^\n]*?\b[A-Za-z_][A-Za-z0-9_-]*(?:=(?!=)|:=|@)"
     r")"
 )
 # `curl -G` turns a body into a query string: a read, not a write. Only the
@@ -194,6 +230,8 @@ _ASSIGNMENT = re.compile(
     r"(?:^|[\s;&|])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(?:\"([^\"\n]*)\"|'([^'\n]*)'|(\S+))"
 )
 _VAR_REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+# One key/value line inside an ``env:`` block (`RELEASE_API: https://...`).
+_ENV_KEY = re.compile(r"^\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$")
 
 
 def literals(text: str) -> dict[str, str]:
@@ -309,52 +347,185 @@ def logical_lines(text: str) -> list[tuple[int, str, str]]:
     return folded
 
 
+def env_literals(text: str) -> dict[str, str]:
+    """Literal values bound by a job- or step-level ``env:`` mapping.
+
+    ``env:`` binds a variable the same way a shell assignment does:
+    ``env:\\n  RELEASE_API: https://.../releases`` makes ``$RELEASE_API``
+    resolve at run time. Only a literal scalar inside an ``env:`` block is
+    captured; an expression (``${{ ... }}``), a block scalar or a computed value
+    stays unresolved, exactly as a computed shell value does, and the stated
+    limit still covers it.
+    """
+    bound: dict[str, str] = {}
+    env_indent: int | None = None
+    for raw in text.splitlines():
+        line = strip_comment(raw)
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if env_indent is not None:
+            if indent > env_indent:
+                match = _ENV_KEY.match(line)
+                if match:
+                    value = match.group(2).strip()
+                    if (
+                        value
+                        and not value.startswith(("${{", "|", ">", "&", "*"))
+                        and "${{" not in value
+                    ):
+                        bound[match.group(1)] = value.strip("\"'")
+                continue
+            env_indent = None
+        if line.strip() == "env:":
+            env_indent = indent
+    return bound
+
+
+def rendered_runs(text: str) -> list[tuple[str, str]]:
+    """The ``run`` text of every step, *as the runner executes it*.
+
+    A YAML folded scalar (``run: >`` / ``run: >-``) joins its physical lines
+    with spaces, so a method on one line and the URL on the next become one
+    command the runner runs. The backslash fold in ``logical_lines`` cannot see
+    that, so this pass parses the document and re-checks each step's resolved
+    ``run`` text. A document PyYAML rejects yields nothing here and the
+    textual passes still run; a *missing* PyYAML is refused by ``main`` rather
+    than silently skipping this pass. The step's name (or index) is reported
+    beside each hit.
+    """
+    import yaml  # noqa: PLC0415 — required; ``main`` refuses without it
+
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(doc, dict):
+        return []
+
+    runs: list[tuple[str, str]] = []
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, dict):
+        return []
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        for index, step in enumerate(job.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            run = step.get("run")
+            if isinstance(run, str) and run.strip():
+                label = step.get("name") or "step %d" % index
+                runs.append((str(label), run))
+    return runs
+
+
+def _marker_hit(line: str) -> str | None:
+    """The writer marker on a command, if any — name, CLI verb or client call."""
+    for marker in WRITER_MARKERS:
+        if marker in line:
+            return marker
+    match = _TEA_WRITE.search(line)
+    if match:
+        return match.group(0).strip()
+    match = _DOTTED_WRITER.search(line)
+    if match:
+        return match.group(0).rstrip("( ").strip()
+    return None
+
+
+def _http_kind(line: str) -> str | None:
+    """Classify a resolved command that addresses a release path.
+
+    Returns ``"http"`` for a method token or request body, ``"gh"`` for a
+    ``gh api`` body field, and ``None`` for a read or an unrelated line.
+    """
+    if _REST_PATH.search(line) is None:
+        return None
+    if (
+        _HTTP_METHOD.search(line) is not None
+        # A curl `-G` turns the body into a query string: it is a read, so the
+        # body signal is suppressed there. An explicit write method still counts.
+        or (
+            _HTTP_BODY.search(line) is not None
+            and not _CURL_FORCED_GET.search(line)
+        )
+    ):
+        return "http"
+    if "gh api" in line and _GH_API_BODY.search(line):
+        return "gh"
+    return None
+
+
 def findings(text: str, workflow_rel: str) -> list[str]:
     """Every release-object writer found in ``text``, named with its line.
 
     Each folded command is inspected in both views ``logical_lines`` returns —
     the separator-less one the shell executes and the spaced one that still
     carries the YAML block indentation — and a hit in either is reported once
-    for that line.
+    for that line. A second pass parses the YAML and re-checks every step's
+    resolved ``run`` text, so a folded scalar (whose line joins are YAML's, not
+    the shell's) is inspected as the single command the runner executes. The
+    second pass reports a hit by the step that carries it; the textual pass
+    cannot map a rendered command back to a physical line, so a hit found only
+    there is named by step rather than by line.
     """
     found: list[str] = []
     bound = literals("\n".join(strip_comment(line) for line in text.splitlines()))
+    # A step/job ``env:`` mapping binds a URL just as a shell assignment does.
+    # Shell assignments win (they are later at run time), so ``env`` fills only
+    # names the shell left unbound.
+    for name, value in env_literals(text).items():
+        bound.setdefault(name, value)
+
+    seen: set[str] = set()
     for number, verbatim, spaced in logical_lines(text):
         if not verbatim and not spaced:
             continue
         hit = None
-        for marker in WRITER_MARKERS:
-            if marker in verbatim or marker in spaced:
-                hit = "%s:%d %s" % (workflow_rel, number, marker)
-                break
-        if hit is None:
-            http_hit = False
-            gh_hit = False
+        marker = _marker_hit(verbatim) or _marker_hit(spaced)
+        if marker is not None:
+            hit = "%s:%d %s" % (workflow_rel, number, marker)
+        else:
+            kinds = set()
             for line in (verbatim, spaced):
-                resolved = resolve(line, bound)
-                writes_release = _REST_PATH.search(resolved) is not None
-                if not writes_release:
-                    continue
-                method = _HTTP_METHOD.search(resolved) is not None
-                # A curl `-G` turns the body into a query string: it is a read,
-                # so the body signal is suppressed there. An explicit write
-                # method still counts.
-                body = _HTTP_BODY.search(
-                    resolved
-                ) is not None and not _CURL_FORCED_GET.search(resolved)
-                if method or body:
-                    http_hit = True
-                elif "gh api" in resolved and _GH_API_BODY.search(resolved):
-                    gh_hit = True
-            if http_hit:
+                kind = _http_kind(resolve(line, bound))
+                if kind:
+                    kinds.add(kind)
+            if "http" in kinds:
                 hit = "%s:%d HTTP write to a release path" % (workflow_rel, number)
-            elif gh_hit:
+            elif "gh" in kinds:
                 hit = (
                     "%s:%d gh api body field writes a release path"
                     % (workflow_rel, number)
                 )
-        if hit is not None:
+        if hit is not None and hit not in seen:
+            seen.add(hit)
             found.append(hit)
+
+    for label, run in rendered_runs(text):
+        resolved = "\n".join(strip_comment(l) for l in run.splitlines())
+        for command in resolved.splitlines():
+            command = resolve(command, bound)
+            marker = _marker_hit(command)
+            kind = _http_kind(command)
+            if marker is not None:
+                hit = "%s: step %r %s" % (workflow_rel, label, marker)
+            elif kind == "http":
+                hit = "%s: step %r HTTP write to a release path" % (
+                    workflow_rel,
+                    label,
+                )
+            elif kind == "gh":
+                hit = "%s: step %r gh api body field writes a release path" % (
+                    workflow_rel,
+                    label,
+                )
+            else:
+                continue
+            if hit not in seen:
+                seen.add(hit)
+                found.append(hit)
     return found
 
 
@@ -371,6 +542,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     root = Path(args.root)
+
+    try:
+        import yaml  # noqa: F401, PLC0415 — the YAML pass needs a real parser
+    except ImportError:
+        print(
+            "::error::ReleaseObjectWriterError: PyYAML is unavailable, so the "
+            "folded-scalar pass cannot run and the check does not pass. Install "
+            "PyYAML (the release workflow's test job already does).",
+            file=sys.stderr,
+        )
+        return 2
 
     missing = [rel for rel in REQUIRED_WORKFLOWS_REL if not (root / rel).is_file()]
     if missing:

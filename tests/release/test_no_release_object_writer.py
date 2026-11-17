@@ -218,7 +218,52 @@ _WRITE_SPELLINGS = {
     "split_release_path_token": (
         "curl -X POST https://forge/api/v1/repos/o/r/\\\nreleases"
     ),
+    # ── Round 5: ordinary, non-obfuscated spellings (independent verification
+    #    found all of these passing). The Forgejo-native CLI, httpie/xh's raw
+    #    JSON and file body items, a PyGithub client call, GNU wget's body
+    #    aliases, and a URL held in a step `env:` mapping. ────────────────────
+    "tea_releases_create": (
+        "tea releases create --tag v1 --title v1 --repo o/r"
+    ),
+    "tea_release_create": "tea release create --tag v1 --title v1",
+    "tea_releases_edit": "tea releases edit v1 --title x",
+    "http_raw_json": "http https://forge/api/v1/repos/o/r/releases tag_name:=v1",
+    "xh_raw_json": "xh https://forge/api/v1/repos/o/r/releases tag_name:=v1",
+    "http_file_field": (
+        "http https://forge/api/v1/repos/o/r/releases tag_name@body.json"
+    ),
+    "xh_file_field": "xh https://forge/api/v1/repos/o/r/releases tag_name@body.json",
+    "pygithub_create_git_release": (
+        "python3 -c \"from github import Github; "
+        "Github('t').get_repo('o/r').create_git_release('v1','v1','n')\""
+    ),
+    "wget_body_data": (
+        "wget --body-data='tag_name=v1' https://forge/api/v1/repos/o/r/releases"
+    ),
+    "wget_body_file": (
+        "wget --body-file=@body.json https://forge/api/v1/repos/o/r/releases"
+    ),
 }
+
+# A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a
+# method on one line and the URL on the next are one command the runner
+# executes. These rows cannot use the `run: |` tree below, so they are built by
+# a dedicated tree helper and asserted separately.
+_FOLDED_SCALAR_WRITES = {
+    "folded_curl": "curl -X POST\nhttps://forge/api/v1/repos/o/r/releases",
+    "folded_gh": "gh api -X POST\nhttps://forge/api/v1/repos/o/r/releases",
+    "folded_curl_body": "curl -d tag_name=v1\nhttps://forge/api/v1/repos/o/r/releases",
+}
+
+# A URL held in a step `env:` mapping is written down in the workflow, so it is
+# resolvable — not the documented "assembled at run time" limit. The identical
+# shell-assignment form is already in ``_WRITE_SPELLINGS``.
+_ENV_MAPPING_WRITE = (
+    "env:\n"
+    '          RELEASE_API: "https://forge/api/v1/repos/o/r/releases"\n'
+    "        run: |\n"
+    '          curl -X POST "$RELEASE_API"'
+)
 
 # The one shape this syntactic check cannot resolve: the target is assembled at
 # run time from something the workflow never writes down. Pinned as an explicit
@@ -248,6 +293,21 @@ def _synthetic_tree(root: Path, body: str) -> Path:
     return root
 
 
+def _tree_with_step(root: Path, step_yaml: str) -> Path:
+    """A tree whose single step is ``step_yaml`` verbatim (already indented)."""
+    (root / ".forgejo" / "workflows").mkdir(parents=True)
+    (root / ".github" / "workflows").mkdir(parents=True)
+    (root / CANDIDATE_WORKFLOW_REL).write_text(
+        "jobs:\n"
+        "  release:\n"
+        "    steps:\n"
+        "      - name: candidate\n" + step_yaml + "\n",
+        encoding="utf-8",
+    )
+    (root / GITHUB_WORKFLOW_REL).write_text("jobs: {}\n", encoding="utf-8")
+    return root
+
+
 @pytest.mark.parametrize("spelling", sorted(_WRITE_SPELLINGS))
 def test_each_write_spelling_is_refused(tmp_path, spelling):
     body = _WRITE_SPELLINGS[spelling]
@@ -261,6 +321,93 @@ def test_each_write_spelling_is_refused(tmp_path, spelling):
     )
     assert "ReleaseObjectWriterError" in proc.stderr
     assert CANDIDATE_WORKFLOW_REL in proc.stderr, "the file must be named"
+
+
+# ── YAML folded scalars and env: mappings (round 5) ────────────────────────
+# A `run: >-` block joins its physical lines with spaces, so a method on one
+# line and the URL on the next are one command the runner executes — a write
+# the backslash fold cannot see because the join is YAML's, not the shell's.
+@pytest.mark.parametrize("spelling", sorted(_FOLDED_SCALAR_WRITES))
+def test_a_folded_scalar_write_is_refused(tmp_path, spelling):
+    body = _FOLDED_SCALAR_WRITES[spelling].replace("\n", "\n          ")
+    step = "        run: >-\n          " + body + "\n"
+    root = _tree_with_step(tmp_path, step)
+
+    proc = _run(root)
+
+    assert proc.returncode == 1, (
+        f"a folded scalar {spelling!r} executes a release write; the check "
+        f"passed it; rc={proc.returncode}\n{proc.stderr}"
+    )
+    assert "ReleaseObjectWriterError" in proc.stderr
+
+
+def test_a_folded_scalar_does_not_refuse_a_read(tmp_path):
+    """The folded pass must not refuse a legitimate read rendered the same way."""
+    step = (
+        "        run: >-\n"
+        "          curl -fsSL\n"
+        "          https://forge/api/v1/repos/o/r/releases/tags/v1\n"
+    )
+    root = _tree_with_step(tmp_path, step)
+
+    proc = _run(root)
+
+    assert proc.returncode == 0, (
+        "a folded-scalar GET must not be refused; "
+        f"rc={proc.returncode}\n{proc.stderr}"
+    )
+
+
+def test_a_url_bound_in_an_env_mapping_is_resolved(tmp_path):
+    """A step `env:` mapping binds a URL just as a shell assignment does. The
+    URL is written down verbatim in the workflow, so this is a gap to close,
+    not the "assembled at run time" limit."""
+    root = _tree_with_step(tmp_path, "        " + _ENV_MAPPING_WRITE + "\n")
+
+    proc = _run(root)
+
+    assert proc.returncode == 1, (
+        "a URL held in an env: mapping and POSTed must be refused; "
+        f"rc={proc.returncode}\n{proc.stderr}"
+    )
+    assert "ReleaseObjectWriterError" in proc.stderr
+
+
+def test_a_read_of_an_env_bound_url_is_not_refused(tmp_path):
+    step = (
+        "        env:\n"
+        '          RELEASE_API: "https://forge/api/v1/repos/o/r/releases"\n'
+        "        run: |\n"
+        '          curl -fsSL "$RELEASE_API/tags/v1"\n'
+    )
+    root = _tree_with_step(tmp_path, step)
+
+    proc = _run(root)
+
+    assert proc.returncode == 0, (
+        f"a GET of an env-bound URL must not be refused; rc={proc.returncode}"
+        f"\n{proc.stderr}"
+    )
+
+
+def test_a_computed_env_value_is_the_stated_limit(tmp_path):
+    """An expression-valued env var is not resolvable, and stays the stated
+    limit rather than being claimed closed."""
+    step = (
+        "        env:\n"
+        '          RELEASE_API: "${{ steps.x.outputs.url }}"\n'
+        "        run: |\n"
+        '          curl -X POST "$RELEASE_API"\n'
+    )
+    root = _tree_with_step(tmp_path, step)
+
+    proc = _run(root)
+
+    assert proc.returncode == 0, (
+        "a computed env value is expected to pass; it is the stated limit\n"
+        f"{proc.stderr}"
+    )
 
 
 # ── A comment does not hide the line after it ──────────────────────────────
@@ -390,6 +537,16 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
         _synthetic_tree(
             tmp_path / "httpie-query",
             "http -h https://forge/api/v1/repos/o/r/releases tag==v1",
+        ),
+        # The Forgejo-native CLI's reads, and httpie/xh's `==` query form, are
+        # not writes and must stay green. round 5 added the write verbs.
+        _synthetic_tree(
+            tmp_path / "tea-list",
+            "tea releases list --repo o/r",
+        ),
+        _synthetic_tree(
+            tmp_path / "xh-query",
+            "xh https://forge/api/v1/repos/o/r/releases tag==v1",
         ),
     ]
 
