@@ -312,6 +312,40 @@ _WRITE_SPELLINGS = {
     "curl_long_option_argument_is_data": (
         "curl --data -X GET https://forge/api/v1/repos/o/r/releases"
     ),
+    # ── Round 8: raw sockets, argv lists and indirected command names. Each
+    #    was found passing by independent verification, and each carries a
+    #    POST request line for a release path to a socket that actually sends.
+    #    A listener later on the same line (`| nc -l 9000`) must not switch
+    #    off the sender that precedes it.
+    "socket_pipe_after_listener": (
+        "printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n'"
+        " | nc forgejo.example 443 | nc -l 9000"
+    ),
+    # The here-string form: the request line is in the same command, so it is
+    # read exactly rather than treated as opaque.
+    "openssl_here_string": (
+        "openssl s_client -quiet -connect forgejo.example:443"
+        " <<< 'POST /api/v1/repos/o/r/releases HTTP/1.1'"
+    ),
+    # The payload comes from a file the check cannot read: certifying it a
+    # read would be a guess, so it is reported (over-reporting is the safe
+    # direction for a gate).
+    "openssl_file_fed": (
+        "openssl s_client -quiet -connect forgejo.example:443 < /tmp/payload.http"
+    ),
+    # A bash `/dev/tcp` fd can be opened on one step line and written on the
+    # next; the request line lives on the second.
+    "dev_tcp_fd_across_lines": (
+        "exec 3<>/dev/tcp/forgejo.example/443\n"
+        "printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n' >&3"
+    ),
+    # An argv list spells the command with punctuation between its words, and
+    # a variable can hold the command name itself.
+    "argv_list_gh_release_create": (
+        "python -c 'import subprocess;"
+        " subprocess.run([\"gh\",\"release\",\"create\",\"v1\"])'"
+    ),
+    "variable_indirected_command": 'CMD=gh\n"$CMD" release create v1',
 }
 
 # A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a
@@ -675,6 +709,28 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
             tmp_path / "curl-header-then-forced-get",
             "curl -H 'Accept: json' -G --data-urlencode x=y"
             " https://forge/api/v1/repos/o/r/releases",
+        ),
+        # A clustered listener flag (`-lp`, `-lk`) is a listener: the option
+        # letter `l` is bundled with a boolean. The sender parse must not read
+        # the port as a remote peer.
+        _synthetic_tree(
+            tmp_path / "nc-clustered-listen-p",
+            "printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n' | nc -lp 8080",
+        ),
+        _synthetic_tree(
+            tmp_path / "nc-clustered-listen-k",
+            "printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n' | nc -lk 8080",
+        ),
+        # The request *target* is what counts. A write to some other endpoint
+        # that merely quotes the release path in its body addresses no release.
+        _synthetic_tree(
+            tmp_path / "non-release-target-mentions-path-in-body",
+            "curl -X POST https://forge/api/v1/repos/o/r/issues"
+            " -d '{\"body\":\"see /releases\"}'",
+        ),
+        _synthetic_tree(
+            tmp_path / "gh-non-release-target-mentions-path-in-body",
+            "gh api -X POST /repos/o/r/issues -f body='see /releases'",
         ),
     ]
 

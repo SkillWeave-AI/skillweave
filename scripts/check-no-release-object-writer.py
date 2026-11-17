@@ -95,12 +95,22 @@ A raw TCP write that spells the HTTP request as bytes is modelled when the
 request line is written down: a ``POST``/``PATCH``/``PUT``/``DELETE`` line
 addressing ``/releases`` piped into ``nc``/``ncat``/``netcat``/``socat``/
 ``openssl s_client``, a socket tool given a port, or a ``/dev/tcp`` redirect is
-refused. What stays out of reach is the same class as any other computed
-target — a request line or path assembled at run time, or a writer fetched and
-executed — and a ``| nc -l`` listener, which cannot reach the forge. These
-limits are stated rather than claimed closed, and the ``env:``/folded-scalar/
-raw-request-line cases above are *not* among them: the target there is written
-down verbatim in the workflow.
+refused. Sender and listener are told apart by the tool's own arguments, so
+``| nc -l`` (clustered or not) cannot reach the forge and is not refused, and a
+listener later on a pipeline does not switch off an earlier sender. The request
+*target* is what is tested, so a write to another endpoint that merely quotes
+``/releases`` in its body is not a release write. ``gh api``'s endpoint is read
+from its first bare argument, so a relative endpoint is seen the same as an
+absolute one.
+
+One shape is deliberately over-reported: a socket sender whose payload is read
+from a *file* (``openssl s_client ... < payload.http``). The bytes are not
+written down, so classifying the command as a read would be a guess; a gate
+reports it instead. What stays out of reach is the same class as any other
+computed target — a request line or path assembled at run time, or a writer
+fetched and executed. These limits are stated rather than claimed closed, and
+the ``env:``/folded-scalar/raw-request-line cases above are *not* among them:
+the target there is written down verbatim in the workflow.
 
 ``--root`` exists so the very same check can be run against an untouched base
 tree (where it must exit non-zero) and against the candidate tree (where it
@@ -188,19 +198,11 @@ _REST_PATH = re.compile(r"/releases\b")
 _RAW_REQUEST_LINE = re.compile(
     r"\b(?:POST|PATCH|PUT|DELETE)\s+\S*/releases\b", re.IGNORECASE
 )
-_RAW_SOCKET = re.compile(
-    r"(?:"
-    r"\|\s*(?:nc|ncat|netcat|socat|openssl\s+s_client)\b"
-    r"|\b(?:nc|ncat|netcat|socat)\b[^|\n;&]*\s\d{2,5}\b"
-    r"|/dev/(?:tcp|udp)/"
-    r")"
-)
-# `nc -l` is a listener, not a sender: it cannot reach the forge, so data piped
-# into it is not a release write. Suppress the raw-socket signal for that form
-# so a debug listener piping a documented request line is not a false positive.
-_RAW_SOCKET_LISTENER = re.compile(
-    r"\|\s*(?:nc|ncat|netcat)\b[^|\n;&]*\s(?:-l|--listen)\b"
-)
+# A bash `/dev/tcp` redirect is the fourth transport. It is inspected at file
+# scope as well as per line, because an fd can be opened on one line
+# (`exec 3<>/dev/tcp/host/443`) and written on the next (`printf ... >&3`).
+_DEV_TCP = re.compile(r"/dev/(?:tcp|udp)/")
+_SOCKET_TOOLS = frozenset(("nc", "ncat", "netcat", "socat"))
 
 # The method token, wherever it sits in the command: `curl -XPOST`,
 # `curl -X POST`, `gh api --method=post`, `curl --request PATCH`, httpie's
@@ -509,11 +511,261 @@ def rendered_runs(text: str) -> list[tuple[str, str]]:
     return runs
 
 
+_SHELL_TOKEN = re.compile(r"'[^'\n]*'|\"[^\"\n]*\"|[^\s]+")
+# A request *target* is an absolute URL or a path of at least two segments.
+# Searching for ``/releases`` anywhere in the command would read a request
+# *body* that merely mentions it — `-d '{"body":"see /releases"}'` — as
+# addressing a release path, which is a false positive on every issue/comment
+# write that quotes the endpoint.
+_URL_SPAN = re.compile(r"(?:https?://|//)[^\s'\"`]+")
+_PATH_SPAN = re.compile(
+    r"(?:^|[\s'\"`=:(])(/[A-Za-z0-9._~%\-]+(?:/[A-Za-z0-9._~%\-]+)+)"
+    r"(?=[\s'\"`),;]|$)"
+)
+# The request target of a raw HTTP request line is the first token after the
+# method. Reading the target rather than the whole line keeps a body or a
+# comment that mentions ``/releases`` from satisfying the path test. Any method
+# is captured: a visible ``GET`` request line says the command is a read. A
+# method at the start of a quoted payload counts, so the tokens are split on
+# quote characters as well as whitespace.
+_REQUEST_LINE = re.compile(
+    r"(?:^|[\s'\"`])(GET|HEAD|OPTIONS|POST|PATCH|PUT|DELETE)\s+(\S+)",
+    re.IGNORECASE,
+)
+_QUOTED_TOKEN = re.compile(
+    r"'([^'\n]*)'|\"([^\"\n]*)\"|([^\s'\"]+)"
+)
+# A command assembled as an argv list — ``subprocess.run(["gh","release",
+# "create","v1"])`` — spells the CLI verb with JSON punctuation between the
+# words, so the plain ``gh release create`` marker never occurs. Only the
+# punctuation between tokens is normalised; quoted strings stay words.
+_ARGV_PUNCTUATION = re.compile(r"[\[\](),]")
+_GH_RELEASE_SPLIT = re.compile(
+    r"\bgh\s+release\s+(?:create|edit|delete|upload)\b"
+)
+# socat's address forms: `TCP:host:port` sends, `TCP-LISTEN:port` listens.
+_SOCAT_SEND = re.compile(r"^(?:TCP|UDP)(?:4|6)?:[^\s]*:\d{1,5}$")
+_SOCAT_LISTEN = re.compile(r"-LISTEN", re.IGNORECASE)
+_HOST_PORT = re.compile(r"^[^\s:]+:\d{1,5}$")
+_SOCKET_SHORT_WITH_ARG = frozenset("bcDeEimMoOqstTvVwXx")
+_SOCKET_LONG_WITH_ARG = frozenset(
+    ("--exec", "--idle-timeout", "--interval", "--max-conns", "--output",
+     "--source", "--source-port", "--tcp", "--timeout", "--udp")
+)
+
+
+def _shell_tokens(line: str) -> list[str]:
+    """The words of ``line``, with quote characters removed.
+
+    A quoted payload (``printf 'POST /releases HTTP/1.1'``) is split on its
+    own whitespace, so the request line inside it becomes the words a reader
+    sees. Every word ends up bare.
+    """
+    tokens: list[str] = []
+    for match in _QUOTED_TOKEN.finditer(line):
+        part = next(g for g in match.groups() if g is not None)
+        tokens.extend(part.split())
+    return tokens
+
+
+def _release_spans(line: str) -> list[str]:
+    """Every URL or multi-segment path on ``line`` that addresses ``/releases``."""
+    spans = [s for s in _URL_SPAN.findall(line) if _REST_PATH.search(s)]
+    spans.extend(s for s in _PATH_SPAN.findall(line) if _REST_PATH.search(s))
+    return spans
+
+
+def _release_targets(line: str) -> bool:
+    """Whether an argument of ``line`` is a URL/path addressing ``/releases``."""
+    return bool(_release_spans(line))
+
+
+# ``gh api`` takes its endpoint as the first bare argument after the subcommand,
+# and an endpoint may be spelled relative (``repos/o/r/releases``) just as often
+# as absolute. Reading the endpoint argument — rather than any path-looking word
+# on the line — keeps a field value that quotes the path out of the target test.
+_GH_API_OPTION_WITH_VALUE = frozenset((
+    "-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header",
+    "-q", "--jq", "-p", "--preview", "--input", "-t", "--template",
+    "--hostname", "--cache",
+))
+
+
+def _gh_api_endpoint(line: str) -> str | None:
+    tokens = _shell_tokens(line)
+    for index, token in enumerate(tokens):
+        if token.rsplit("/", 1)[-1] != "gh" or tokens[index + 1:index + 2] != ["api"]:
+            continue
+        skip = False
+        for arg in tokens[index + 2:]:
+            if skip:
+                skip = False
+                continue
+            if arg.startswith("-"):
+                option = arg.split("=", 1)[0]
+                if "=" not in arg and option in _GH_API_OPTION_WITH_VALUE:
+                    skip = True
+                continue
+            return arg
+    return None
+
+
+def _gh_api_addresses_release(line: str) -> bool:
+    endpoint = _gh_api_endpoint(line)
+    return endpoint is not None and _REST_PATH.search(endpoint) is not None
+
+
+def _request_target(line: str) -> str | None:
+    """The target of a raw HTTP request line on ``line``, if there is one."""
+    text = " ".join(_shell_tokens(line))
+    match = _REQUEST_LINE.search(text)
+    if match:
+        return match.group(2)
+    return None
+
+
+def _raw_request_is_write(line: str) -> bool:
+    """A raw request line carries a write method, not a read one.
+
+    ``printf 'GET ...' | nc h 443`` sends a *read* over the socket; only a
+    ``POST``/``PATCH``/``PUT``/``DELETE`` request line is a release write.
+    """
+    text = " ".join(_shell_tokens(line))
+    match = _REQUEST_LINE.search(text)
+    return bool(match) and match.group(1).upper() in _WRITE_VERBS
+
+
+def _socket_send(line: str) -> bool:
+    """Whether ``line`` hands data to a socket *sender*.
+
+    A pipe into ``nc``/``ncat``/``netcat``/``socat`` with a host and a port, a
+    socket tool addressed with ``host:port``, ``openssl s_client -connect``, or
+    a ``/dev/tcp`` redirect. A listener (``nc -l``, ``nc -lp``, ``nc -lk``,
+    ``socat TCP-LISTEN:``) receives and cannot reach the forge, so it is not a
+    sender.
+    """
+    if _DEV_TCP.search(line):
+        return True
+    for segment in re.split(r"\|", line):
+        tokens = [t.strip("\"'") for t in _shell_tokens(segment)]
+        if not tokens:
+            continue
+        name = tokens[0].rsplit("/", 1)[-1]
+        args = tokens[1:]
+        if name == "openssl":
+            if (
+                "s_client" in args
+                and any(
+                    a == "-connect" or a.startswith("-connect=") for a in args
+                )
+            ):
+                return True
+            continue
+        if name not in _SOCKET_TOOLS:
+            continue
+        if _socket_address_sends(args):
+            return True
+    return False
+
+
+def _socket_address_sends(args: list[str]) -> bool:
+    """Whether a socket tool's arguments name a remote peer to send to."""
+    listen = False
+    host = False
+    index = 0
+    while index < len(args):
+        token = args[index]
+        index += 1
+        if _SOCAT_LISTEN.search(token):
+            listen = True
+            continue
+        if token in ("-l", "--listen") or token.startswith("--listen="):
+            listen = True
+            continue
+        if token.startswith("--"):
+            option = token.split("=", 1)[0]
+            if option in _SOCKET_LONG_WITH_ARG and "=" not in token:
+                index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            rest = token[1:]
+            for offset, char in enumerate(rest):
+                if char == "l":
+                    listen = True
+                    continue
+                if char in _SOCKET_SHORT_WITH_ARG:
+                    # The rest of the cluster is this option's value.
+                    if offset + 1 == len(rest):
+                        index += 1
+                    break
+            continue
+        if _SOCAT_SEND.match(token):
+            return not listen
+        if _HOST_PORT.match(token):
+            return not listen
+        if token.isdigit() and host:
+            return not listen
+        host = True
+    return False
+
+
+# A stdin redirect from a file (`openssl s_client ... < payload.http`). The
+# `3<>/dev/tcp/...` fd-open and the `<<`/`<<<`/`<&` forms are not file
+# redirects and are handled elsewhere.
+_FILE_REDIRECT = re.compile(r"(?<!<)<(?!<|>|&)\s*([^\s;&|<>]+)")
+
+
+def _opaque_raw_write(*views: str) -> str | None:
+    """A socket sender fed a payload from a file, so its content is invisible.
+
+    A request line written down in the workflow is classified exactly (a
+    ``GET`` is a read, a ``POST`` is a write). A payload read from a *file* is
+    not written down: the workflow names a path whose bytes the check cannot
+    read. Certifying such a command as a read would be a guess, so it is
+    reported — the same "over-reporting is the safe direction for a gate"
+    rule the folded-line views follow. ``/dev/null`` is empty and exempt.
+    """
+    for view in views:
+        if _request_target(view) is not None or not _socket_send(view):
+            continue
+        for match in _FILE_REDIRECT.finditer(view):
+            path = match.group(1)
+            if path != "/dev/null":
+                return path
+    return None
+
+
+def _raw_request_target(*views: str) -> str | None:
+    """A raw request target that a socket transport on the same command sends.
+
+    The request line and the transport may sit on different physical lines of
+    one folded command; both views carry the whole command, so any view that
+    has a target and a sender names the write.
+    """
+    for view in views:
+        target = _request_target(view)
+        if (
+            target is not None
+            and _release_targets(target)
+            and _raw_request_is_write(view)
+            and _socket_send(view)
+        ):
+            return target
+    return None
+
+
 def _marker_hit(line: str) -> str | None:
     """The writer marker on a command, if any — name, CLI verb or client call."""
     for marker in WRITER_MARKERS:
         if marker in line:
             return marker
+    # A command name quoted as a word (`"$CMD" release create`) or spelled as
+    # an argv list puts punctuation between the verb's words; normalise only
+    # those separators so the marker is still seen.
+    spaced = _ARGV_PUNCTUATION.sub(" ", line.replace('"', " ").replace("'", " "))
+    match = _GH_RELEASE_SPLIT.search(spaced)
+    if match:
+        return match.group(0).strip()
     match = _TEA_WRITE.search(line)
     if match:
         return match.group(0).strip()
@@ -596,21 +848,35 @@ def _read_suppresses(line: str) -> bool:
     )
 
 
-def _http_kind(line: str) -> str | None:
+def _http_kind(line: str, *extra_views: str) -> str | None:
     """Classify a resolved command that addresses a release path.
 
     Returns ``"http"`` for a method token or request body, ``"gh"`` for a
     ``gh api`` body field, and ``None`` for a read or an unrelated line.
+
+    ``extra_views`` are other renderings of the same command (the folded
+    command's verbatim and spaced views). A raw request line and its socket
+    transport may be split between them, so the raw-socket test sees every
+    view; every other test runs on ``line``, the view being classified.
     """
-    if _REST_PATH.search(line) is None:
-        return None
-    # A raw-socket write: the HTTP request line is data, and a socket tool or a
-    # /dev/tcp redirect carries it. `printf 'POST .../releases ...' | nc h 443`.
-    if (
-        _RAW_REQUEST_LINE.search(line)
-        and _RAW_SOCKET.search(line)
-        and not _RAW_SOCKET_LISTENER.search(line)
+    if _opaque_raw_write(line, *extra_views) is not None:
+        # A socket sender fed a payload this check cannot read. Whether it is a
+        # write is unknowable, so it is reported rather than certified a read.
+        return "http"
+    if not (
+        _release_targets(line)
+        or _gh_api_addresses_release(line)
+        or any(
+            _release_targets(view) or _gh_api_addresses_release(view)
+            for view in extra_views
+        )
+        or _raw_request_target(line, *extra_views) is not None
     ):
+        return None
+    # A raw-socket write: the HTTP request line is data, and a socket sender
+    # carries it. `printf 'POST .../releases ...' | nc h 443`, the same line
+    # through `openssl s_client -connect`, or a `/dev/tcp` redirect.
+    if _raw_request_target(line, *extra_views) is not None:
         return "http"
     method_write, body_write, _ = _curl_signals(line)
     if (
@@ -658,13 +924,22 @@ def findings(text: str, workflow_rel: str) -> list[str]:
         if not verbatim and not spaced:
             continue
         hit = None
+        resolved = (resolve(verbatim, bound), resolve(spaced, bound))
+        # A literal variable can hold the command name as well as the URL
+        # (`CMD=gh; "$CMD" release create v1`), so the marker is tested after
+        # substitution too.
         marker = _marker_hit(verbatim) or _marker_hit(spaced)
+        if marker is None:
+            marker = _marker_hit(resolved[0]) or _marker_hit(resolved[1])
         if marker is not None:
             hit = "%s:%d %s" % (workflow_rel, number, marker)
         else:
             kinds = set()
-            for line in (verbatim, spaced):
-                kind = _http_kind(resolve(line, bound))
+            # Both views of the one folded command are passed so a request
+            # line and its socket transport split across them are seen as one
+            # write.
+            for line, *others in (resolved, resolved[::-1]):
+                kind = _http_kind(line, *others)
                 if kind:
                     kinds.add(kind)
             if "http" in kinds:
@@ -679,11 +954,24 @@ def findings(text: str, workflow_rel: str) -> list[str]:
             found.append(hit)
 
     for label, run in rendered_runs(text):
-        resolved = "\n".join(strip_comment(l) for l in run.splitlines())
-        for command in resolved.splitlines():
+        whole = "\n".join(strip_comment(l) for l in run.splitlines())
+        # A `/dev/tcp` fd can be opened on one line of a step's block and
+        # written on the next. The request line and the transport are then in
+        # different commands, so the whole step block is the second view: a
+        # request line in a block whose any line opens a socket is a write.
+        block_writes = bool(_DEV_TCP.search(whole)) and _raw_request_target(whole)
+        for command in whole.splitlines():
             command = resolve(command, bound)
             marker = _marker_hit(command)
             kind = _http_kind(command)
+            if (
+                kind is None
+                and block_writes
+                and _raw_request_is_write(whole)
+                and _request_target(command) is not None
+                and _release_targets(" ".join(_shell_tokens(command)))
+            ):
+                kind = "http"
             if marker is not None:
                 hit = "%s: step %r %s" % (workflow_rel, label, marker)
             elif kind == "http":
