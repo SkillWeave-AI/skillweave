@@ -346,6 +346,53 @@ _WRITE_SPELLINGS = {
         " subprocess.run([\"gh\",\"release\",\"create\",\"v1\"])'"
     ),
     "variable_indirected_command": 'CMD=gh\n"$CMD" release create v1',
+    # ── Round 9: the operators and flags that live *inside* a quoted argument.
+    #    Independent verification wire-proved every row below: the shell sends
+    #    a POST to /api/v1/repos/o/r/releases while the check exited 0, because
+    #    the splitter was quote-blind. A newline, `;`, `|`, `&` or a `-G` in a
+    #    header value or request body is data, not shell syntax or a curl flag.
+    "pretty_printed_d_body": (
+        "curl -d '{\n"
+        '  "tag_name": "v1"\n'
+        "}' https://forge/api/v1/repos/o/r/releases"
+    ),
+    "pretty_printed_json_body": (
+        "curl --json '{\n"
+        '  "tag_name": "v1"\n'
+        "}' https://forge/api/v1/repos/o/r/releases"
+    ),
+    "quoted_semicolon_header": (
+        "curl -H 'X-Note: a;b' -d '{\"tag_name\":\"v1\"}'"
+        " https://forge/api/v1/repos/o/r/releases"
+    ),
+    "url_first_quoted_semicolon_header": (
+        "curl 'https://forge/api/v1/repos/o/r/releases' -H 'X-Note: a;b'"
+        " -d '{\"tag_name\":\"v1\"}'"
+    ),
+    "quoted_ampersand_url": (
+        "curl -d '{\"tag_name\":\"v1\"}'"
+        " 'https://forge/api/v1/repos/o/r/releases?x=1&y=2'"
+    ),
+    "quoted_pipe_header": (
+        "curl -H 'X-Note: a|b' -d '{\"tag_name\":\"v1\"}'"
+        " https://forge/api/v1/repos/o/r/releases"
+    ),
+    # A header value that *looks* like curl's forced-GET or method flag is the
+    # value of `-H`, not a flag: it must not cancel the body signal.
+    "quoted_forced_get_header": (
+        "curl -H 'X-Note: -G' -d '{\"tag_name\":\"v1\"}'"
+        " https://forge/api/v1/repos/o/r/releases"
+    ),
+    "quoted_get_header": (
+        "curl -H 'X-Note: -X GET' -d '{\"tag_name\":\"v1\"}'"
+        " https://forge/api/v1/repos/o/r/releases"
+    ),
+    # A quoted `;` must not let a GET in the first command explain away the
+    # body-only write in the second: the real separators still separate.
+    "quoted_header_then_body_only_write": (
+        "curl -H 'X: a;b' -X GET https://forge/api/v1/repos/o/r/releases;"
+        " curl -d '{}' https://forge/api/v1/repos/o/r/releases"
+    ),
 }
 
 # A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a
@@ -731,6 +778,23 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
         _synthetic_tree(
             tmp_path / "gh-non-release-target-mentions-path-in-body",
             "gh api -X POST /repos/o/r/issues -f body='see /releases'",
+        ),
+        # A quoted operator in a *read* is data too: the quote-aware splitter
+        # must not turn one GET into two commands, nor read a header value as
+        # a flag.
+        _synthetic_tree(
+            tmp_path / "quoted-pipe-header-read",
+            "curl -H 'X-Note: a|b' -fsSL"
+            " https://forge/api/v1/repos/o/r/releases/tags/v1",
+        ),
+        _synthetic_tree(
+            tmp_path / "quoted-semicolon-url-read",
+            "curl -fsSL 'https://forge/api/v1/repos/o/r/releases?x=1;y=2'",
+        ),
+        _synthetic_tree(
+            tmp_path / "pretty-printed-query-read",
+            "curl -sG --data-urlencode 'q={\n  \"a\": \"b\"\n}'"
+            " https://forge/api/v1/repos/o/r/releases",
         ),
     ]
 

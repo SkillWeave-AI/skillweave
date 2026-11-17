@@ -70,7 +70,14 @@ verbatim for that reason, and inspects a spaced view beside it because the YAML
 block indentation gives the ordinary ``curl -X POST \\`` + URL spelling a
 separation the shell never sees. A hit in either view is reported. A pipe, ``;`` or ``&&`` ends
 a curl segment, so a body flag in one command is not attributed to a
-downstream one (``curl … | tar -T -`` is a download, not an upload). Literal ``NAME=value``
+downstream one (``curl … | tar -T -`` is a download, not an upload). Those
+separators are read *quote-aware*: a ``;``, ``|``, ``&`` or newline inside a
+quoted argument — a header value ``-H 'X: a;b'``, a pretty-printed request
+body ``-d '{\\n … }'``, a URL with a query string — is data and neither ends
+the command early nor starts a new one, and an option's value is taken as one
+word, so ``-H 'X: -G'`` is a header value rather than curl's forced-GET flag.
+That is what keeps the body flag and the release URL in the same command for
+inspection rather than hiding one behind the other. Literal ``NAME=value``
 assignments in the same workflow are substituted into ``$NAME``/``${NAME}``
 references (a few levels deep), so a URL held in a shell variable is inspected
 as the URL it is rather than as an opaque ``$URL``. A job- or step-level
@@ -233,9 +240,20 @@ _HTTP_METHOD = re.compile(
 # happens to contain ``d``/``T``/``F``. ``_curl_signals`` walks the option
 # table instead. The curl segment stops at a pipe, `;` or `&&`, so a
 # downstream ``tar -T -`` is not read as an upload.
+# A quoted span is opaque to an operator: a `;`, `|`, `&` or newline inside it
+# is data, not shell syntax, and a word that merely *looks* like a flag
+# (`-H 'X-Note: -G'`) is a value. Every scan that walked to "the end of the
+# command" with `[^|;&]*` was quote-blind, so a header value or request body
+# containing one of those characters ended the segment early and hid the body
+# flag and the URL from the check while the shell executed a real POST. These
+# fragments step over a whole quoted span (newlines included) while still
+# stopping at an unquoted operator, and the plain-character alternative
+# excludes quotes so an unmatched-looking `'` cannot be walked through one
+# character at a time.
+_QUOTED_SPAN = r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|[^|;&'\"\n])"
 _HTTP_BODY = re.compile(
     r"(?:"
-    r"\bcurl\b[^|\n;&]*?(?:"
+    r"\bcurl\b" + _QUOTED_SPAN + r"*?(?:"
     r"--data(?:-(?:raw|binary|urlencode|ascii))?(?:\s|=)"
     r"|--form(?:-string)?(?:\s|=)"
     r"|--upload-file(?:\s|=)"
@@ -243,15 +261,15 @@ _HTTP_BODY = re.compile(
     r")"
     # GNU wget's `--body-data`/`--body-file` are documented aliases of
     # `--post-data`/`--post-file` and send the same POST.
-    r"|\bwget\b[^|\n;&]*?--(?:post|body)-(?:data|file)(?:\s|=)"
-    r"|\burlopen\s*\([^\n]*?\bdata\s*="
+    r"|\bwget\b" + _QUOTED_SPAN + r"*?--(?:post|body)-(?:data|file)(?:\s|=)"
+    r"|\burlopen\s*\([^)]*?\bdata\s*="
     # httpie/xh infer a POST from a body item, with optional flag options
     # before the URL. A body item is `name=value` (a query parameter is
     # `name==value` and is not a body), raw JSON `name:=value` (httpie/xh
     # default to `application/json`), or a file field `name@path`. A bare
     # `=` must not match the `==` query form, hence the lookahead.
     r"|(?:^|[\s;&|])(?:https?|xh)(?:\s+--?[A-Za-z0-9_-]+)*\s+"
-    r"[^\n]*?\b[A-Za-z_][A-Za-z0-9_-]*(?:=(?!=)|:=|@)"
+    + _QUOTED_SPAN + r"*?\b[A-Za-z_][A-Za-z0-9_-]*(?:=(?!=)|:=|@)"
     r")"
 )
 # An explicit *read* method: the body signal must not turn it into a write.
@@ -264,20 +282,26 @@ _HTTP_BODY = re.compile(
 # segment: a GET for one URL must not mask a body-only POST after `;`, `&&`,
 # `|` or a newline on the same line.
 _READ_METHOD = re.compile(
-    r"\bgh(?:\s+api)?\b[^|\n;&]*?"
+    r"\bgh(?:\s+api)\b" + _QUOTED_SPAN + r"*?"
     r"(?:-X|--request|--method|-method)\s*=?\s*['\"]?GET\b",
     re.IGNORECASE,
 )
-# A client invocation starts at the line's head or after `;`, `&&`/`||`, a pipe
-# or a subshell `(`. The read-method suppression only applies when the line
-# carries one invocation: with two, the GET may belong to the first and the
-# body signal to the second (`curl -X GET ...; curl -d ... .../releases`), so
-# suppressing line-wide would hide a write behind an unrelated read.
+# A client invocation starts at the command's head or after `;`, `&&`/`||`, a
+# pipe or a subshell `(`. The read-method suppression only applies when the
+# command carries one invocation: with two, the GET may belong to the first and
+# the body signal to the second (`curl -X GET ...; curl -d ... .../releases`),
+# so suppressing command-wide would hide a write behind an unrelated read. The
+# scan runs on an operator view split by ``_command_segments``, so a `;` or `|`
+# inside a quoted argument does not start a new command and a quoted `-G` does
+# not appear as a flag.
 _CLIENT_START = re.compile(
     r"(?:^|[;|&(\n])\s*(?:curl|wget|gh|https?|xh)\b"
 )
-# One curl invocation: from the command word to the first pipe, `;`, `&&`.
-_CURL_SEGMENT = re.compile(r"\bcurl\b[^|\n;&]*")
+# One curl invocation: from the command word to the end of the segment, which
+# ``_command_segments`` already cut at the unquoted pipes, `;` and `&&`. The
+# quoted-span fragment keeps a ``;`` or ``|`` inside a header value or body
+# from ending the segment early.
+_CURL_SEGMENT = re.compile(r"\bcurl\b" + _QUOTED_SPAN + r"*")
 # curl's short options that take an argument (``-d``, ``-T``, ``-F``, ``-X``,
 # ``-H``, ``-o``, ...). The first such letter in a cluster owns the rest of the
 # token as its argument, so later letters are data, not flags. The write and
@@ -359,32 +383,159 @@ def workflow_files(root: Path) -> list[str]:
     return sorted(set(found))
 
 
-def strip_comment(line: str) -> str:
-    """Remove a shell comment from one physical line, quote-aware.
+def _strip_line_carry(line: str, quote: str) -> tuple[str, str]:
+    """Strip one physical line's comment, carrying the quote state in and out.
 
     A ``#`` starts a comment only when it begins a word (line start, after
     whitespace, or after an operator such as ``;``/``&``/``|``/``(``); inside
-    quotes or inside a word it is literal. Everything from that ``#`` to the
-    end of the physical line goes — including a trailing backslash, which the
-    shell does not treat as a continuation once a comment has begun.
+    quotes or inside a word it is literal. The *opening* quote may sit on an
+    earlier physical line: a newline inside a quote is just a character of the
+    quoted word, so the quote state is passed from line to line. Everything
+    from a comment's ``#`` to the end of the physical line goes — including a
+    trailing backslash, which the shell does not treat as a continuation once
+    a comment has begun.
     """
-    quote = ""
-    previous = ""
+    out: list[str] = []
     escaped = False
-    for index, char in enumerate(line):
+    previous = ""
+    for char in line:
         if quote:
+            out.append(char)
             if escaped:
                 escaped = False
             elif char == "\\" and quote == '"':
                 escaped = True
             elif char == quote:
                 quote = ""
-        elif char in ("'", '"'):
+            previous = char
+            continue
+        if char in ("'", '"'):
             quote = char
-        elif char == "#" and (index == 0 or previous in " \t;&|()<>"):
-            return line[:index]
+            out.append(char)
+            previous = char
+            continue
+        if char == "#" and (not out or previous in " \t;&|()<>"):
+            break
+        out.append(char)
         previous = char
-    return line
+    return "".join(out), quote
+
+
+def strip_comment(line: str) -> str:
+    """Remove a shell comment from one physical line, quote-aware."""
+    return _strip_line_carry(line, "")[0]
+
+
+def strip_comments(text: str) -> str:
+    """Remove shell comments from a block, carrying quote state across lines.
+
+    A newline inside a quoted string is not a line end to the shell, so a ``#``
+    on the next physical line is still inside the quote and is literal. The
+    per-line ``strip_comment`` cannot see that; this one can, which is what
+    keeps a multi-line quoted request body intact for inspection.
+    """
+    quote = ""
+    kept: list[str] = []
+    for line in text.split("\n"):
+        stripped, quote = _strip_line_carry(line, quote)
+        kept.append(stripped)
+    return "\n".join(kept)
+
+
+def _command_segments(text: str) -> list[str]:
+    """Split a shell block into commands, quote-aware.
+
+    A ``;``, ``|``, ``&`` or newline ends a command only when it is unquoted:
+    the operators inside ``-d '{"a":"b;c"}'`` or ``-H 'X: a|b'`` belong to the
+    argument, not to the shell. A quoted newline is part of the argument too,
+    so a pretty-printed request body stays attached to the command that sends
+    it. A backslash-newline is deleted with no separator, exactly as the shell
+    does it. Each returned segment is one command, which is what makes a body
+    flag in one command attributable to that command alone.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            current.append(char)
+            if char == "\\" and quote == '"' and index + 1 < len(text):
+                index += 1
+                current.append(text[index])
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(text):
+            if text[index + 1] == "\n":
+                index += 2
+                continue
+            current.append(char)
+            current.append(text[index + 1])
+            index += 2
+            continue
+        if char in ";|&\n":
+            segment = "".join(current).strip()
+            if segment:
+                segments.append(segment)
+            current = []
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    segment = "".join(current).strip()
+    if segment:
+        segments.append(segment)
+    return segments
+
+
+def _shell_words(text: str) -> list[str]:
+    """The words of one command, quote-aware, with quote characters removed.
+
+    A quoted span is one word even when it contains whitespace or an operator:
+    ``-H 'X-Note: -G'`` yields the two words ``-H`` and ``X-Note: -G``, so the
+    header value cannot look like a curl flag. An attached quoted value
+    (``-d'{...}'``) stays one word with the flag prefix.
+    """
+    words: list[str] = []
+    current: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        index += 1
+        if quote:
+            if char == "\\" and quote == '"' and index < len(text):
+                current.append(text[index])
+                index += 1
+            elif char == quote:
+                quote = ""
+            else:
+                current.append(char)
+            continue
+        if char in ("'", '"'):
+            quote = char
+            continue
+        if char.isspace():
+            if current:
+                words.append("".join(current))
+                current = []
+            continue
+        if char == "\\" and index < len(text):
+            current.append(text[index])
+            index += 1
+            continue
+        current.append(char)
+    if current:
+        words.append("".join(current))
+    return words
 
 
 def logical_lines(text: str) -> list[tuple[int, str, str]]:
@@ -409,32 +560,42 @@ def logical_lines(text: str) -> list[tuple[int, str, str]]:
     separation came from the indentation) in the spaced one. Over-reporting is
     the safe direction for a gate.
 
-    Comments are stripped *before* folding, one physical line at a time.
-    Folding first would let a ``#`` comment absorb the following line — its
-    trailing backslash folds into the comment, the result starts with ``#`` and
-    is skipped — while the shell ends the comment at the newline and executes
-    that following line. A folded command is reported from the physical line
-    it begins on.
+    The verbatim view keeps trailing whitespace: a backslash is a continuation
+    only when it is the last *character* of the physical line. The spaced view
+    strips, so the YAML indentation yields the ordinary separated spelling.
+
+    Comments are stripped *before* folding, one physical line at a time, with
+    the quote state carried across lines **and across continuations** exactly
+    as the shell carries it. Folding first would let a ``#`` comment absorb the
+    following line — its trailing backslash folds into the comment, the result
+    starts with ``#`` and is skipped — while the shell ends the comment at the
+    newline and executes that following line. Carrying the quote state is what
+    keeps a ``#`` on the line after a still-open quote literal instead of
+    mistaken for a comment. A folded command is reported from the physical
+    line it begins on.
     """
     folded: list[tuple[int, str, str]] = []
-    pending: list[str] = []
+    pending: list[tuple[str, str]] = []
     start = 0
 
-    def joined(parts: list[str], separator: str) -> str:
-        return separator.join(p for p in parts if p)
+    def joined(parts: list[tuple[str, str]], which: int) -> str:
+        return "".join(p[which] for p in parts if p[which])
 
+    quote = ""
     for number, raw in enumerate(text.splitlines(), start=1):
-        stripped = strip_comment(raw).strip()
+        stripped, quote = _strip_line_carry(raw, quote)
+        verbatim = stripped.rstrip()
+        spaced = stripped.strip()
         if not pending:
             start = number
-        if stripped.endswith("\\"):
-            pending.append(stripped[:-1].strip())
+        if verbatim.endswith("\\"):
+            pending.append((verbatim[:-1], spaced[:-1]))
             continue
-        pending.append(stripped)
-        folded.append((start, joined(pending, ""), joined(pending, " ")))
+        pending.append((verbatim, spaced))
+        folded.append((start, joined(pending, 0), joined(pending, 1)))
         pending = []
     if pending:
-        folded.append((start, joined(pending, ""), joined(pending, " ")))
+        folded.append((start, joined(pending, 0), joined(pending, 1)))
     return folded
 
 
@@ -788,11 +949,13 @@ def _curl_signals(line: str) -> tuple[bool, bool, bool]:
 
     The value of an option is data, never another option: ``curl -d -G url``
     posts the string ``-G`` and ``curl --data -X POST url`` posts the string
-    ``-X POST``, so a value word is consumed and not scanned.
+    ``-X POST``, so a value word is consumed and not scanned. The words are
+    taken quote-aware, so a header value that spells ``-X GET`` or ``-G`` is
+    one word (the value of ``-H``) and never a flag of its own.
     """
     method_write = body_write = read = False
     for segment in _CURL_SEGMENT.findall(line):
-        words = segment.split()
+        words = _shell_words(segment)
         index = 0
         while index < len(words):
             token = words[index]
@@ -839,8 +1002,10 @@ def _curl_signals(line: str) -> tuple[bool, bool, bool]:
 def _read_suppresses(line: str) -> bool:
     """Whether an explicit GET may switch off the body signal for ``line``.
 
-    Only for a line carrying a single client invocation: the body signal and
+    Only for a command carrying a single client invocation: the body signal and
     the GET must belong to the same command for a GET to explain the body away.
+    ``line`` is one segment, so a `;` or `|` inside a quoted argument cannot
+    make one command look like two.
     """
     return (
         (_READ_METHOD.search(line) is not None or _curl_signals(line)[2])
@@ -854,10 +1019,17 @@ def _http_kind(line: str, *extra_views: str) -> str | None:
     Returns ``"http"`` for a method token or request body, ``"gh"`` for a
     ``gh api`` body field, and ``None`` for a read or an unrelated line.
 
+    ``line`` is split into commands quote-aware and each is classified on its
+    own: a ``;``, ``|``, ``&`` or newline inside a quoted header value or
+    request body is data, so it neither ends the command early (hiding the body
+    flag and URL behind it) nor starts a new one (letting an unrelated read
+    explain a write away).
+
     ``extra_views`` are other renderings of the same command (the folded
     command's verbatim and spaced views). A raw request line and its socket
     transport may be split between them, so the raw-socket test sees every
-    view; every other test runs on ``line``, the view being classified.
+    view; every other test runs on the commands of ``line``, the view being
+    classified.
     """
     if _opaque_raw_write(line, *extra_views) is not None:
         # A socket sender fed a payload this check cannot read. Whether it is a
@@ -878,24 +1050,32 @@ def _http_kind(line: str, *extra_views: str) -> str | None:
     # through `openssl s_client -connect`, or a `/dev/tcp` redirect.
     if _raw_request_target(line, *extra_views) is not None:
         return "http"
-    method_write, body_write, _ = _curl_signals(line)
-    if (
-        _HTTP_METHOD.search(line) is not None
-        or method_write
-        # A curl `-G` turns the body into a query string: it is a read, so the
-        # body signal is suppressed there. An explicit write method still counts.
-        or (
-            (_HTTP_BODY.search(line) is not None or body_write)
-            and not _read_suppresses(line)
-        )
-    ):
-        return "http"
-    if "gh api" in line and _GH_API_BODY.search(line):
-        # `gh api --method GET .../releases -f per_page=100` turns the fields
-        # into a query string: a read. An explicit write method still counts.
-        if not _read_suppresses(line):
-            return "gh"
-    return None
+    gh_body = False
+    for command in _command_segments(line):
+        if not (
+            _release_targets(command) or _gh_api_addresses_release(command)
+        ):
+            continue
+        method_write, body_write, _ = _curl_signals(command)
+        if (
+            _HTTP_METHOD.search(command) is not None
+            or method_write
+            # A curl `-G` turns the body into a query string: it is a read, so
+            # the body signal is suppressed there. An explicit write method
+            # still counts.
+            or (
+                (_HTTP_BODY.search(command) is not None or body_write)
+                and not _read_suppresses(command)
+            )
+        ):
+            return "http"
+        if "gh api" in command and _GH_API_BODY.search(command):
+            # `gh api --method GET .../releases -f per_page=100` turns the
+            # fields into a query string: a read. An explicit write method
+            # still counts.
+            if not _read_suppresses(command):
+                gh_body = True
+    return "gh" if gh_body else None
 
 
 def findings(text: str, workflow_rel: str) -> list[str]:
@@ -912,7 +1092,7 @@ def findings(text: str, workflow_rel: str) -> list[str]:
     there is named by step rather than by line.
     """
     found: list[str] = []
-    bound = literals("\n".join(strip_comment(line) for line in text.splitlines()))
+    bound = literals(strip_comments(text))
     # A step/job ``env:`` mapping binds a URL just as a shell assignment does.
     # Shell assignments win (they are later at run time), so ``env`` fills only
     # names the shell left unbound.
@@ -937,7 +1117,10 @@ def findings(text: str, workflow_rel: str) -> list[str]:
             kinds = set()
             # Both views of the one folded command are passed so a request
             # line and its socket transport split across them are seen as one
-            # write.
+            # write. A raw request line is compared against its *masked* view
+            # so a quoted `;`/`|`/`&`/newline cannot split the transport from
+            # the request line it carries; the body/method scans on a segment
+            # are quote-aware through ``_command_segments``.
             for line, *others in (resolved, resolved[::-1]):
                 kind = _http_kind(line, *others)
                 if kind:
@@ -954,13 +1137,15 @@ def findings(text: str, workflow_rel: str) -> list[str]:
             found.append(hit)
 
     for label, run in rendered_runs(text):
-        whole = "\n".join(strip_comment(l) for l in run.splitlines())
+        whole = strip_comments(run)
         # A `/dev/tcp` fd can be opened on one line of a step's block and
         # written on the next. The request line and the transport are then in
         # different commands, so the whole step block is the second view: a
         # request line in a block whose any line opens a socket is a write.
-        block_writes = bool(_DEV_TCP.search(whole)) and _raw_request_target(whole)
-        for command in whole.splitlines():
+        block_writes = bool(_DEV_TCP.search(whole)) and bool(
+            _raw_request_target(whole)
+        )
+        for command in _command_segments(whole):
             command = resolve(command, bound)
             marker = _marker_hit(command)
             kind = _http_kind(command)
