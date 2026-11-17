@@ -18,9 +18,20 @@ workflow is covered the moment it is added:
   (Homebrew asset job), which must never take the release-object duty back.
 
 This check reads the workflow text of the tree it is pointed at and refuses by
-name. A comment line is not executable text and is skipped; every other logical
-line is inspected, so a marker that appears only in prose does not trip the
-check and a marker that actually runs cannot hide.
+name. Comment text is not executable, so it is removed before the writer test:
+a marker that appears only in prose does not trip the check, and a marker that
+actually runs cannot hide. The removal follows the shell's own rule rather than
+a "line starts with #" guess. A ``#`` that begins a word (start of line, after
+whitespace, or after ``;``/``&``/``|``/``(`` etc.) starts a comment that runs to
+the end of the *logical* line — so a backslash inside that comment does **not**
+continue the line, and the next physical line is a separate statement that the
+shell executes. Folding continuations first and then skipping a line that looks
+like a comment would therefore hide a real write: a comment ending in a
+backslash followed by ``curl -X POST ...`` folds into one line that starts with
+``#``. Instead the comment is cut at its ``#`` and the following line is
+inspected on its own. ``#`` is not special inside quotes (``'a#b'``, ``"a#b"``),
+nor inside a word (``url#frag``), and comments are removed before literal
+assignments are collected, so a commented-out ``URL=`` cannot rebind a real one.
 
 A shell write can be spelled many ways, and a check that only knew one of them
 would be bypassed by the next author, not defended against. The write test is
@@ -214,6 +225,34 @@ def workflow_files(root: Path) -> list[str]:
     return sorted(set(found))
 
 
+def strip_comment(line: str) -> str:
+    """Remove a shell comment from one physical line, quote-aware.
+
+    A ``#`` starts a comment only when it begins a word (line start, after
+    whitespace, or after an operator such as ``;``/``&``/``|``/``(``); inside
+    quotes or inside a word it is literal. Everything from that ``#`` to the
+    end of the physical line goes — including a trailing backslash, which the
+    shell does not treat as a continuation once a comment has begun.
+    """
+    quote = ""
+    previous = ""
+    escaped = False
+    for index, char in enumerate(line):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "#" and (index == 0 or previous in " \t;&|()<>"):
+            return line[:index]
+        previous = char
+    return line
+
+
 def logical_lines(text: str) -> list[tuple[int, str]]:
     """Fold backslash continuations into one logical line, kept with its number.
 
@@ -221,18 +260,25 @@ def logical_lines(text: str) -> list[tuple[int, str]]:
     physical lines inside a YAML ``run:`` block; folding first means the
     writer test sees the command the shell would actually execute. The number
     reported is the first physical line of the folded command.
+
+    Comments are stripped *before* folding, one physical line at a time.
+    Folding first would let a ``#`` comment absorb the following line — its
+    trailing backslash folds into the comment, the result starts with ``#`` and
+    is skipped — while the shell ends the comment at the newline and executes
+    that following line. A folded command is reported from the physical line
+    it begins on.
     """
     folded: list[tuple[int, str]] = []
     pending: list[str] = []
     start = 0
     for number, raw in enumerate(text.splitlines(), start=1):
-        stripped = raw.rstrip()
+        stripped = strip_comment(raw).strip()
         if not pending:
             start = number
         if stripped.endswith("\\"):
             pending.append(stripped[:-1].strip())
             continue
-        pending.append(stripped.strip())
+        pending.append(stripped)
         folded.append((start, " ".join(p for p in pending if p)))
         pending = []
     if pending:
@@ -243,9 +289,9 @@ def logical_lines(text: str) -> list[tuple[int, str]]:
 def findings(text: str, workflow_rel: str) -> list[str]:
     """Every release-object writer found in ``text``, named with its line."""
     found: list[str] = []
-    bound = literals(text)
+    bound = literals("\n".join(strip_comment(line) for line in text.splitlines()))
     for number, line in logical_lines(text):
-        if not line or line.startswith("#"):
+        if not line:
             continue
         for marker in WRITER_MARKERS:
             if marker in line:

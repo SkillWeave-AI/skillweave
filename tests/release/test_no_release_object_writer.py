@@ -249,6 +249,86 @@ def test_each_write_spelling_is_refused(tmp_path, spelling):
     assert CANDIDATE_WORKFLOW_REL in proc.stderr, "the file must be named"
 
 
+# ── A comment does not hide the line after it ──────────────────────────────
+# The shell ends a comment at the newline: a trailing backslash inside one is
+# just a character of the comment, not a continuation. Folding continuations
+# first and then skipping anything that looks like a comment let this shape
+# through (independent verification caught it), so the comment is now cut
+# before folding and the following line is inspected as the statement it is.
+_COMMENT_HIDING_WRITES = {
+    # The exact shape that bypassed the check: `# ... \` then the write.
+    "comment_backslash_then_curl": (
+        "# note about the release \\\n"
+        "curl -X POST https://forge/api/v1/repos/o/r/releases"
+    ),
+    "comment_backslash_then_engine": (
+        "# publish it \\\nReleaseHandler.publish_release(release)"
+    ),
+    "comment_backslash_then_action": (
+        "# attach assets \\\nuses: softprops/action-gh-release@v2"
+    ),
+    "comment_backslash_then_gh_release": (
+        "# cut it \\\ngh release create v1.0.0"
+    ),
+    "comment_backslash_then_octokit": (
+        "# make it \\\ngithub.rest.repos.createRelease({owner, repo})"
+    ),
+}
+
+# Comment text that is *not* a comment, so it must not be cut (and must not
+# hide a writer that follows on the folded line).
+_COMMENT_LOOKALIKES = (
+    'echo "https://docs/x#frag" \\\n'
+    "curl -X POST https://forge/api/v1/repos/o/r/releases",
+    "echo https://docs/y#frag \\\n"
+    "curl -X POST https://forge/api/v1/repos/o/r/releases",
+)
+
+
+@pytest.mark.parametrize("spelling", sorted(_COMMENT_HIDING_WRITES))
+def test_a_comment_cannot_hide_the_release_write_after_it(tmp_path, spelling):
+    body = _COMMENT_HIDING_WRITES[spelling]
+    root = _synthetic_tree(tmp_path, body)
+
+    proc = _run(root)
+
+    assert proc.returncode == 1, (
+        f"{spelling!r} executes a release write after a comment; the check "
+        f"passed it; rc={proc.returncode}\n{proc.stderr}"
+    )
+    assert "ReleaseObjectWriterError" in proc.stderr
+
+
+@pytest.mark.parametrize("body", _COMMENT_LOOKALIKES)
+def test_a_hash_inside_quotes_or_a_word_is_not_a_comment(tmp_path, body):
+    root = _synthetic_tree(tmp_path, body)
+
+    proc = _run(root)
+
+    assert proc.returncode == 1, (
+        "a literal '#' must not swallow the write on the folded line; "
+        f"rc={proc.returncode}\n{proc.stderr}"
+    )
+
+
+def test_a_commented_out_assignment_does_not_rebind_a_url(tmp_path):
+    """A commented-out ``URL=`` must not be read as the live binding: the
+    comment is removed before literals are collected, so ``$URL`` stays
+    unresolved rather than borrowing a value from a disabled line."""
+    body = (
+        "# URL=https://forge/api/v1/repos/o/r/releases\n"
+        'curl -X POST "$URL"'
+    )
+    root = _synthetic_tree(tmp_path, body)
+
+    proc = _run(root)
+
+    assert proc.returncode == 0, (
+        "the commented assignment must not resolve a live URL; "
+        f"rc={proc.returncode}\n{proc.stderr}"
+    )
+
+
 def test_an_unresolvable_target_is_a_stated_limit_not_a_passing_check(tmp_path):
     """The check cannot see a URL the workflow never writes down. That is a
     limit, and it is pinned here rather than left to prose: this spelling is
