@@ -114,27 +114,46 @@ _REST_PATH = re.compile(r"/releases\b")
 # `http POST`, and a method keyword passed to a client.
 _HTTP_METHOD = re.compile(
     r"(?:"
-    r"(?:-X|--request)\s*=?\s*(?:POST|PATCH|PUT|DELETE)\b"
-    r"|--method\s*=?\s*(?:POST|PATCH|PUT|DELETE)\b"
-    r"|(?:^|\s)HTTP?:?\s+(?:POST|PATCH|PUT|DELETE)\b"  # httpie: `http POST url`
-    r"|\bmethod\s*=\s*['\"]?(?:POST|PATCH|PUT|DELETE)\b"
+    r"(?:-X|--request)\s*=?\s*['\"]?(?:POST|PATCH|PUT|DELETE)\b"
+    r"|(?:--method|-method)\s*=?\s*['\"]?(?:POST|PATCH|PUT|DELETE)\b"
+    # httpie/xh name the method bare: `http POST url`, `xh PATCH url`.
+    r"|(?:^|\s)(?:https?|xh)\s+(?:POST|PATCH|PUT|DELETE)\b"
+    # A method keyword passed to a client: `method="POST"` (Python),
+    # `method: "POST"` (JS), `-Method Post` (PowerShell, above).
+    r"|\bmethod\s*[:=]\s*['\"]?(?:POST|PATCH|PUT|DELETE)\b"
     r"|\brequest\s*\(\s*['\"](?:POST|PATCH|PUT|DELETE)\b"
     r"|\.(?:post|patch|put|delete)\s*\("
     r")",
     re.IGNORECASE,
 )
-# A body makes a write without any method token: curl's data/upload/form flags,
-# wget's post-data, and a client's `data=` argument. `-d`/`-T`/`-F` are matched
-# only in curl's own command so an unrelated short flag cannot trip them.
+# A body makes a write without any method token: curl's data/upload/form/json
+# flags, wget's post-data, and a client's `data=` argument. Each flag accepts
+# the separated form (`-d body`) and the attached/equals form (`-d'body'`,
+# `-dtag=x`, `-Tfile.zip`, `-Ff=@x`, `--data=body`). A bare attached tail of
+# letters is not enough — `curl -fsSL` is one bundled token of benign short
+# flags — so the attached forms require the punctuation an argument carries.
 _HTTP_BODY = re.compile(
     r"(?:"
-    r"\bcurl\b[^\n]*?(?:\s-d\s|\s--data(?:-(?:raw|binary|urlencode))?\s"
-    r"|\s-T\s|\s--upload-file\s|\s-F\s|\s--form\s)"
-    r"|\bwget\b[^\n]*?--post-(?:data|file)\b"
+    r"\bcurl\b[^\n]*?(?:"
+    r"\s-d(?:\s|[='\"@{\[])"
+    r"|\s-d[A-Za-z0-9_]*[=@{\[\"']"
+    r"|\s--data(?:-(?:raw|binary|urlencode))?(?:\s|=)"
+    r"|\s-T(?:\s|[./@])"
+    r"|\s-T[^-\s]*[./@]"
+    r"|\s--upload-file(?:\s|=)"
+    r"|\s-F(?:\s|[=@\"'])"
+    r"|\s-F[A-Za-z0-9_]*[=@]"
+    r"|\s--form(?:\s|=)"
+    r"|\s--json(?:\s|=)"
+    r")"
+    r"|\bwget\b[^\n]*?--post-(?:data|file)(?:\s|=)"
     r"|\burlopen\s*\([^\n]*?\bdata\s*="
     r")",
     re.IGNORECASE,
 )
+# `curl -G` turns a body into a query string: a read, not a write. Only the
+# body signal is suppressed; an explicit write method still counts.
+_CURL_FORCED_GET = re.compile(r"\bcurl\b[^\n]*?(?:\s-G\s|\s--get\b)", re.IGNORECASE)
 # `gh api` infers POST from a body field or an input file and needs no method
 # token; only the releases path is interesting here.
 _GH_API_BODY = re.compile(
@@ -223,9 +242,13 @@ def findings(text: str, workflow_rel: str) -> list[str]:
                 break
         resolved = resolve(line, bound)
         writes_release = _REST_PATH.search(resolved) is not None
-        if writes_release and (
-            _HTTP_METHOD.search(resolved) or _HTTP_BODY.search(resolved)
-        ):
+        method = _HTTP_METHOD.search(resolved) is not None
+        # A curl `-G` turns the body into a query string: it is a read, so the
+        # body signal is suppressed there. An explicit write method still counts.
+        body = _HTTP_BODY.search(resolved) is not None and not _CURL_FORCED_GET.search(
+            resolved
+        )
+        if writes_release and (method or body):
             found.append(
                 "%s:%d HTTP write to a release path" % (workflow_rel, number)
             )

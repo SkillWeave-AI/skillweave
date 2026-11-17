@@ -155,6 +155,32 @@ _WRITE_SPELLINGS = {
         "URL=https://forge/api/v1/repos/o/r/releases\n"
         'curl -X POST "$URL"'
     ),
+    # ── Attached/equals flag forms and non-shell clients (round 3). `curl
+    #    -d'x'` is how the flag is usually written; the first check only knew
+    #    the space-separated form, and `-fsSL` must NOT be mistaken for `-F`. ──
+    "curl_data_attached": "curl -d'tag_name=v1' https://forge/api/v1/repos/o/r/releases",
+    "curl_data_equals": (
+        "curl --data='tag_name=v1' https://forge/api/v1/repos/o/r/releases"
+    ),
+    "curl_data_binary_equals": (
+        "curl --data-binary=@body.json https://forge/api/v1/repos/o/r/releases"
+    ),
+    "curl_upload_attached": (
+        "curl -Tpayload.zip https://forge/api/v1/repos/o/r/releases"
+    ),
+    "curl_form_attached": "curl -Ff=@x https://forge/api/v1/repos/o/r/releases",
+    "curl_json": (
+        "curl --json '{\"tag_name\":\"v1\"}' https://forge/api/v1/repos/o/r/releases"
+    ),
+    "node_fetch": (
+        "node -e 'fetch(\"https://forge/api/v1/repos/o/r/releases\","
+        "{method:\"POST\"})'"
+    ),
+    "powershell_irm": (
+        "pwsh -Command \"Invoke-RestMethod -Uri "
+        "https://forge/api/v1/repos/o/r/releases -Method Post -Body $b\""
+    ),
+    "xh_method": "xh POST https://forge/api/v1/repos/o/r/releases tag_name=v1",
 }
 
 # The one shape this syntactic check cannot resolve: the target is assembled at
