@@ -30,17 +30,24 @@ path, not one canonical command:
 * **method tokens** — ``-X POST``, ``-XPOST``, ``--request PATCH``,
   ``--method=put``, httpie's bare ``http POST``, and method keywords inside a
   client call (``method="POST"``, ``.request("PUT", ...)``);
-* **request bodies** — curl ``-d``/``--data``/``--data-raw``/``--data-binary``/
-  ``--data-urlencode``, ``-T``/``--upload-file``, ``-F``/``--form``, wget
-  ``--post-data``/``--post-file``, and ``urlopen(..., data=...)`` — because a
-  write needs no method flag at all when a body is present;
-* **``gh api`` body forms** — ``-f``/``--field``/``--raw-field``/``--input``;
+* **request bodies** — curl's short ``-d``/``-T``/``-F`` (bare, bundled with
+  boolean flags as in ``-sSd``, or attached as in ``-dx``), every long spelling
+  of them (``--data`` and its ``-raw``/``-binary``/``-urlencode``/``-ascii``
+  variants, ``--form``/``--form-string``, ``--upload-file``, ``--json``), wget
+  ``--post-data``/``--post-file``, ``urlopen(..., data=...)``, and httpie/xh's
+  inferred body item (``http URL name=value`` is a POST; ``name==value`` is a
+  query parameter and is not) — because a write needs no method flag at all
+  when a body is present;
+* **``gh api`` body forms** — ``-f``/``-F``/``--field``/``--raw-field``/
+  ``--input`` (gh infers POST from any of them);
 * **language clients** — ``requests``/``httpx`` ``.post(`` (any of
   post/patch/put/delete);
 * **forge actions and octokit names** — the list in ``WRITER_MARKERS``.
 
 Backslash continuations are folded first, so a method on one physical line and
-the URL on the next are inspected as one command. Literal ``NAME=value``
+the URL on the next are inspected as one command. A pipe, ``;`` or ``&&`` ends
+a curl segment, so a body flag in one command is not attributed to a
+downstream one (``curl … | tar -T -`` is a download, not an upload). Literal ``NAME=value``
 assignments in the same workflow are substituted into ``$NAME``/``${NAME}``
 references (a few levels deep), so a URL held in a shell variable is inspected
 as the URL it is rather than as an opaque ``$URL``.
@@ -116,8 +123,9 @@ _HTTP_METHOD = re.compile(
     r"(?:"
     r"(?:-X|--request)\s*=?\s*['\"]?(?:POST|PATCH|PUT|DELETE)\b"
     r"|(?:--method|-method)\s*=?\s*['\"]?(?:POST|PATCH|PUT|DELETE)\b"
-    # httpie/xh name the method bare: `http POST url`, `xh PATCH url`.
-    r"|(?:^|\s)(?:https?|xh)\s+(?:POST|PATCH|PUT|DELETE)\b"
+    # httpie/xh name the method bare: `http POST url`, `xh PATCH url`, and
+    # flag options may sit between the tool and the method: `xh --json POST url`.
+    r"|(?:^|\s)(?:https?|xh)(?:\s+--?[A-Za-z0-9_-]+)*\s+(?:POST|PATCH|PUT|DELETE)\b"
     # A method keyword passed to a client: `method="POST"` (Python),
     # `method: "POST"` (JS), `-Method Post` (PowerShell, above).
     r"|\bmethod\s*[:=]\s*['\"]?(?:POST|PATCH|PUT|DELETE)\b"
@@ -127,37 +135,40 @@ _HTTP_METHOD = re.compile(
     re.IGNORECASE,
 )
 # A body makes a write without any method token: curl's data/upload/form/json
-# flags, wget's post-data, and a client's `data=` argument. Each flag accepts
-# the separated form (`-d body`) and the attached/equals form (`-d'body'`,
-# `-dtag=x`, `-Tfile.zip`, `-Ff=@x`, `--data=body`). A bare attached tail of
-# letters is not enough — `curl -fsSL` is one bundled token of benign short
-# flags — so the attached forms require the punctuation an argument carries.
+# flags, wget's post-data, a client's `data=` argument, and httpie/xh's body
+# item (`http URL tag_name=v1` is a POST). curl's short body flags are ``-d``,
+# ``-T`` and ``-F``; they bundle with boolean flags (``-sSd body``) and take
+# their argument either as the next token (``-d body``) or attached (``-d'x'``,
+# ``-dx``, ``-dnoeq``, ``-Tfile.zip``, ``-Ff=@x``). The match is case-sensitive
+# on purpose: ``-fsSL`` is four lowercase/uppercase boolean flags and contains
+# no ``d``/``T``/``F``, so it is not mistaken for a form. The curl segment
+# stops at a pipe, `;` or `&&`, so a downstream ``tar -T -`` is not read as an
+# upload.
 _HTTP_BODY = re.compile(
     r"(?:"
-    r"\bcurl\b[^\n]*?(?:"
-    r"\s-d(?:\s|[='\"@{\[])"
-    r"|\s-d[A-Za-z0-9_]*[=@{\[\"']"
-    r"|\s--data(?:-(?:raw|binary|urlencode))?(?:\s|=)"
-    r"|\s-T(?:\s|[./@])"
-    r"|\s-T[^-\s]*[./@]"
-    r"|\s--upload-file(?:\s|=)"
-    r"|\s-F(?:\s|[=@\"'])"
-    r"|\s-F[A-Za-z0-9_]*[=@]"
-    r"|\s--form(?:\s|=)"
-    r"|\s--json(?:\s|=)"
+    r"\bcurl\b[^|\n;&]*?(?:"
+    r"(?:^|\s)-[A-Za-z]*[dTF](?:\s|\S)"
+    r"|--data(?:-(?:raw|binary|urlencode|ascii))?(?:\s|=)"
+    r"|--form(?:-string)?(?:\s|=)"
+    r"|--upload-file(?:\s|=)"
+    r"|--json(?:\s|=)"
     r")"
-    r"|\bwget\b[^\n]*?--post-(?:data|file)(?:\s|=)"
+    r"|\bwget\b[^|\n;&]*?--post-(?:data|file)(?:\s|=)"
     r"|\burlopen\s*\([^\n]*?\bdata\s*="
-    r")",
-    re.IGNORECASE,
+    # httpie/xh infer a POST from a body item (`name=value`; query params use
+    # `==` and are not a body), with optional flag options before the URL.
+    r"|(?:^|[\s;&|])(?:https?|xh)(?:\s+--?[A-Za-z0-9_-]+)*\s+"
+    r"[^\n]*?\b[A-Za-z_][A-Za-z0-9_-]*=(?!=)"
+    r")"
 )
 # `curl -G` turns a body into a query string: a read, not a write. Only the
 # body signal is suppressed; an explicit write method still counts.
 _CURL_FORCED_GET = re.compile(r"\bcurl\b[^\n]*?(?:\s-G\s|\s--get\b)", re.IGNORECASE)
 # `gh api` infers POST from a body field or an input file and needs no method
-# token; only the releases path is interesting here.
+# token; only the releases path is interesting here. `-F` is gh's short
+# `--field` and switches the request to POST exactly as `-f` does.
 _GH_API_BODY = re.compile(
-    r"(?:^|\s)(?:-f|--field|--raw-field|--input)(?:\s|=)"
+    r"(?:^|\s)(?:-f|-F|--field|--raw-field|--input)(?:\s|=|[A-Za-z0-9_][A-Za-z0-9_-]*=)"
 )
 # Literal shell assignments (`URL=https://...`) and the value they bind, so a
 # URL held in a variable is resolved before the path test. Only literal

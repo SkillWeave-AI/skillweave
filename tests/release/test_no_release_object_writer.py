@@ -181,6 +181,29 @@ _WRITE_SPELLINGS = {
         "https://forge/api/v1/repos/o/r/releases -Method Post -Body $b\""
     ),
     "xh_method": "xh POST https://forge/api/v1/repos/o/r/releases tag_name=v1",
+    # ── Bundled short flags, long flag synonyms and inferred-body clients
+    #    (round 4). curl bundles boolean flags with its body flag (`-sSd body`),
+    #    every long spelling of a body flag counts (`--data-ascii`,
+    #    `--form-string`), gh's `-F` infers POST like `-f`, and httpie/xh infer
+    #    a POST from a `name=value` body item with no method word at all. A
+    #    pipe ends the curl command, so a downstream `tar -T -` is not read as
+    #    an upload. ──────────────────────────────────────────────────────────
+    "gh_short_field": "gh api -F tag_name=v1 /repos/o/r/releases",
+    "gh_short_field_attached": "gh api -Ftag_name=v1 /repos/o/r/releases",
+    "curl_data_ascii": (
+        "curl --data-ascii 'tag_name=v1' https://forge/api/v1/repos/o/r/releases"
+    ),
+    "curl_form_string": (
+        "curl --form-string 'tag_name=v1' https://forge/api/v1/repos/o/r/releases"
+    ),
+    "curl_bundled_short": "curl -sSd 'tag_name=v1' https://forge/api/v1/repos/o/r/releases",
+    "curl_d_attached_word": "curl -dx https://forge/api/v1/repos/o/r/releases",
+    "curl_d_attached_novalue": "curl -dnoeq https://forge/api/v1/repos/o/r/releases",
+    "curl_t_file": "curl -Tpayload.zip https://forge/api/v1/repos/o/r/releases",
+    "httpie_body_item": "http https://forge/api/v1/repos/o/r/releases tag_name=v1",
+    "xh_json_body_item": (
+        "xh --json POST https://forge/api/v1/repos/o/r/releases tag_name=v1"
+    ),
 }
 
 # The one shape this syntactic check cannot resolve: the target is assembled at
@@ -246,11 +269,13 @@ def test_an_unresolvable_target_is_a_stated_limit_not_a_passing_check(tmp_path):
 def test_a_read_of_the_release_path_is_not_refused(tmp_path):
     """The check is about writes. Reading a release (GET /releases) and running
     the verification script are legitimate and must stay green, or the check
-    would fight the workflow it protects."""
+    would fight the workflow it protects. The piped-download and forced-GET
+    shapes are here because a body flag in the same command line as a
+    *downstream* `tar -T -` or a `-G` must not be mistaken for a write."""
     roots = [
         _synthetic_tree(
             tmp_path / "get",
-            "curl -sS https://forge/api/v1/repos/o/r/releases/tags/v1.0.0",
+            "curl -fsSL https://forge/api/v1/repos/o/r/releases/tags/v1.0.0",
         ),
         _synthetic_tree(
             tmp_path / "gh-get", "gh api /repos/o/r/releases/tags/v1.0.0"
@@ -258,6 +283,19 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
         _synthetic_tree(
             tmp_path / "verify",
             "python3 scripts/verify-release-attachments.py --tag v1.0.0",
+        ),
+        _synthetic_tree(
+            tmp_path / "pipe-download",
+            "curl -fsSL https://forge/api/v1/repos/o/r/releases/download/v1/a.tar.gz"
+            " | tar -xz -T -",
+        ),
+        _synthetic_tree(
+            tmp_path / "forced-get",
+            "curl -G --data-urlencode x=y https://forge/api/v1/repos/o/r/releases",
+        ),
+        _synthetic_tree(
+            tmp_path / "httpie-query",
+            "http -h https://forge/api/v1/repos/o/r/releases tag==v1",
         ),
     ]
 
