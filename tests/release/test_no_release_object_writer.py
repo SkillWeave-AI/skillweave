@@ -19,9 +19,16 @@ Two things are asserted and cannot be satisfied by prose:
 The synthetic trees are tiny: two required workflow files plus one ``run:``
 block. Nothing here touches the repository's own workflows or the network.
 
-Honest scope: this is a syntactic guard over workflow text. An obfuscated
-writer (base64, an alias, a script fetched at run time) is outside its reach;
-that limit is stated in the script's docstring rather than papered over.
+Honest scope: this is a syntactic guard over workflow text, not a sandbox. Two
+shapes are outside its reach, and both are pinned as *stated limits* rather
+than left to prose: an obfuscated writer (base64, an alias, a script fetched
+while running), and a target assembled at run time from something the workflow
+never writes down. Literal ``NAME=value`` assignments *are* resolved, so a URL
+held in a plain shell variable is still inspected; only a computed one escapes.
+``test_an_unresolvable_target_is_a_stated_limit_not_a_passing_check`` asserts
+that the second shape passes today, so a change in that fact forces the
+docstrings and this module to be corrected instead of the gap being quietly
+relabelled as closed.
 """
 
 from __future__ import annotations
@@ -121,7 +128,44 @@ _WRITE_SPELLINGS = {
     ),
     # octokit through actions/github-script.
     "octokit": "github.rest.repos.createRelease({owner, repo})",
+    # ── A body writes without any method token (independent verification
+    #    found all of these passing the first version of the check) ──────────
+    "curl_data": 'curl -d "tag_name=v1" https://forge/api/v1/repos/o/r/releases',
+    "curl_data_binary": (
+        "curl --data-binary @body.json https://forge/api/v1/repos/o/r/releases"
+    ),
+    "curl_upload_file": "curl -T payload.zip https://forge/api/v1/repos/o/r/releases",
+    "curl_form": "curl -F file=@x https://forge/api/v1/repos/o/r/releases",
+    "wget_post_data": (
+        'wget --post-data="tag_name=v1" https://forge/api/v1/repos/o/r/releases'
+    ),
+    "urlopen_data": (
+        "python3 -c \"from urllib.request import urlopen; "
+        "urlopen('https://forge/api/v1/repos/o/r/releases', data=b'x')\""
+    ),
+    # httpie names the method bare, with no flag at all.
+    "httpie_method": "http POST https://forge/api/v1/repos/o/r/releases",
+    # actions/github-script's generic request carries the method in the path
+    # argument; four workflows in this repository already enable that action.
+    "github_request_post": (
+        'return github.request("POST /repos/o/r/releases", {tag_name: "v1"})'
+    ),
+    # A URL held in a literal shell variable is resolved before the path test.
+    "variable_url_literal": (
+        "URL=https://forge/api/v1/repos/o/r/releases\n"
+        'curl -X POST "$URL"'
+    ),
 }
+
+# The one shape this syntactic check cannot resolve: the target is assembled at
+# run time from something the workflow never writes down. Pinned as an explicit
+# *stated limit* so nobody mistakes the absence of a finding for a proof of
+# safety. If a later change claims to close it, this test goes red and forces
+# the docstrings and this table to be updated honestly.
+_STATED_LIMIT_SPELLING = (
+    "RFL013_UNRESOLVABLE_URL=https://forge/api/v1/repos/o/r/releases\n"
+    'curl -X POST "$RELEASE_URL"'
+)
 
 
 def _synthetic_tree(root: Path, body: str) -> Path:
@@ -154,6 +198,23 @@ def test_each_write_spelling_is_refused(tmp_path, spelling):
     )
     assert "ReleaseObjectWriterError" in proc.stderr
     assert CANDIDATE_WORKFLOW_REL in proc.stderr, "the file must be named"
+
+
+def test_an_unresolvable_target_is_a_stated_limit_not_a_passing_check(tmp_path):
+    """The check cannot see a URL the workflow never writes down. That is a
+    limit, and it is pinned here rather than left to prose: this spelling is
+    *not* refused (rc=0). If the check ever learns to refuse it, this test
+    fails, the docstrings have to be corrected, and the gap is not quietly
+    claimed closed by a comment."""
+    root = _synthetic_tree(tmp_path, _STATED_LIMIT_SPELLING)
+
+    proc = _run(root)
+
+    assert proc.returncode == 0, (
+        "the unresolvable-target case is expected to pass; if the check now "
+        "refuses it, update the docstrings' stated limit and this test\n"
+        f"{proc.stderr}"
+    )
 
 
 def test_a_read_of_the_release_path_is_not_refused(tmp_path):
