@@ -393,6 +393,33 @@ _WRITE_SPELLINGS = {
         "curl -H 'X: a;b' -X GET https://forge/api/v1/repos/o/r/releases;"
         " curl -d '{}' https://forge/api/v1/repos/o/r/releases"
     ),
+    # ── Round 10: the same operators *inside an unquoted command
+    #    substitution*. `$( ... )` and backticks are one argument to curl: a
+    #    `;`, `|` or newline within them is data, and the outer command has no
+    #    operator. Independent verification wire-proved `curl -d $(echo
+    #    '{"tag_name":"v1"}'; true) URL` as a POST while the check exited 0.
+    "unquoted_substitution_semicolon": (
+        "curl -d $(echo '{\"tag_name\":\"v1\"}'; true)"
+        " https://forge/api/v1/repos/o/r/releases"
+    ),
+    "unquoted_substitution_pipe": (
+        "curl -d $(printf x; printf y) https://forge/api/v1/repos/o/r/releases"
+    ),
+    "unquoted_substitution_newline": (
+        "curl -d $(echo '{\"tag_name\":\"v1\"}'\n"
+        "true) https://forge/api/v1/repos/o/r/releases"
+    ),
+    "backtick_semicolon_body": (
+        "curl -d `echo x; echo y` https://forge/api/v1/repos/o/r/releases"
+    ),
+    "quoted_substitution_semicolon": (
+        "curl -d \"$(echo '{\"tag_name\":\"v1\"}'; true)\""
+        " https://forge/api/v1/repos/o/r/releases"
+    ),
+    "process_substitution_body": (
+        "curl -d @<(echo '{\"tag_name\":\"v1\"}')"
+        " https://forge/api/v1/repos/o/r/releases"
+    ),
 }
 
 # A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a
@@ -795,6 +822,18 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
             tmp_path / "pretty-printed-query-read",
             "curl -sG --data-urlencode 'q={\n  \"a\": \"b\"\n}'"
             " https://forge/api/v1/repos/o/r/releases",
+        ),
+        # A command substitution in a *read* is still a read: the path is the
+        # release-tags read path, and there is no body.
+        _synthetic_tree(
+            tmp_path / "substitution-read",
+            "curl -fsSL $(echo"
+            " https://forge/api/v1/repos/o/r/releases/tags/v1)",
+        ),
+        _synthetic_tree(
+            tmp_path / "backtick-read",
+            "curl -fsSL `echo"
+            " https://forge/api/v1/repos/o/r/releases/tags/v1`",
         ),
     ]
 

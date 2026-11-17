@@ -76,6 +76,11 @@ quoted argument — a header value ``-H 'X: a;b'``, a pretty-printed request
 body ``-d '{\\n … }'``, a URL with a query string — is data and neither ends
 the command early nor starts a new one, and an option's value is taken as one
 word, so ``-H 'X: -G'`` is a header value rather than curl's forced-GET flag.
+A command substitution is opaque for the same reason: ``$(...)``, ``<( ... )``
+and backticks are evaluated by the shell and handed to curl as one argument, so
+``curl -d $(echo '{"tag_name":"v1"}'; true) URL`` sends a POST even though the
+outer command has no unquoted ``;``. The substitution's ``;``, ``|``, ``&`` and
+newlines belong to the argument, and the outer command is kept intact.
 That is what keeps the body flag and the release URL in the same command for
 inspection rather than hiding one behind the other. Literal ``NAME=value``
 assignments in the same workflow are substituted into ``$NAME``/``${NAME}``
@@ -250,7 +255,21 @@ _HTTP_METHOD = re.compile(
 # stopping at an unquoted operator, and the plain-character alternative
 # excludes quotes so an unmatched-looking `'` cannot be walked through one
 # character at a time.
-_QUOTED_SPAN = r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|[^|;&'\"\n])"
+#
+# A command substitution is opaque to the outer command for the same reason a
+# quoted span is: the shell runs ``$(...)`` and hands its result to curl as one
+# argument, so a ``;``, ``|`` or newline *inside* it is part of the argument and
+# not a command boundary. ``curl -d $(echo '{"tag_name":"v1"}'; true) URL``
+# sends a POST even though the outer line has no unquoted ``;``. The
+# substitution alternatives therefore sit beside the quoted ones, before the
+# plain-character alternative can walk into them.
+_SUBSTITUTION = r"(?:\$\((?:[^()]|\([^()]*\))*\)|`[^`]*`|[<>]\((?:[^()]|\([^()]*\))*\))"
+_QUOTED_SPAN = (
+    r"(?:'[^']*'"
+    r"|\"(?:\\.|[^\"\\])*\""
+    r"|" + _SUBSTITUTION +
+    r"|[^|;&'\"\n])"
+)
 _HTTP_BODY = re.compile(
     r"(?:"
     r"\bcurl\b" + _QUOTED_SPAN + r"*?(?:"
@@ -442,6 +461,52 @@ def strip_comments(text: str) -> str:
     return "\n".join(kept)
 
 
+def _substitution_end(text: str, index: int) -> int:
+    """End index (exclusive) of a substitution starting at ``index``, else -1.
+
+    ``$(...)``, ``<( ... )``/``>( ... )`` and backticks are parsed to their own
+    closing delimiter, quote-aware and with nested ``(``/``)`` counted, so the
+    characters inside — including ``;``, ``|``, ``&`` and newlines — are not
+    mistaken for syntax of the command that contains the substitution.
+    """
+    if text.startswith("$(", index) or text.startswith("<(", index) or text.startswith(">(", index):
+        opening = index + 1
+        depth = 0
+        quote = ""
+        cursor = opening
+        while cursor < len(text):
+            char = text[cursor]
+            if quote:
+                if char == "\\" and quote == '"' and cursor + 1 < len(text):
+                    cursor += 2
+                    continue
+                if char == quote:
+                    quote = ""
+                cursor += 1
+                continue
+            if char in ("'", '"'):
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return cursor + 1
+            cursor += 1
+        return -1
+    if text.startswith("`", index):
+        cursor = index + 1
+        while cursor < len(text):
+            if text[cursor] == "\\" and cursor + 1 < len(text):
+                cursor += 2
+                continue
+            if text[cursor] == "`":
+                return cursor + 1
+            cursor += 1
+        return -1
+    return -1
+
+
 def _command_segments(text: str) -> list[str]:
     """Split a shell block into commands, quote-aware.
 
@@ -473,6 +538,12 @@ def _command_segments(text: str) -> list[str]:
             current.append(char)
             index += 1
             continue
+        if char in ("$", "`", "<", ">"):
+            end = _substitution_end(text, index)
+            if end != -1:
+                current.append(text[index:end])
+                index = end
+                continue
         if char == "\\" and index + 1 < len(text):
             if text[index + 1] == "\n":
                 index += 2
@@ -523,6 +594,12 @@ def _shell_words(text: str) -> list[str]:
         if char in ("'", '"'):
             quote = char
             continue
+        if char in ("$", "`", "<", ">"):
+            end = _substitution_end(text, index - 1)
+            if end != -1:
+                current.append(text[index - 1:end])
+                index = end
+                continue
         if char.isspace():
             if current:
                 words.append("".join(current))
