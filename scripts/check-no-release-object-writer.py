@@ -245,9 +245,19 @@ _HTTP_BODY = re.compile(
     r"[^\n]*?\b[A-Za-z_][A-Za-z0-9_-]*(?:=(?!=)|:=|@)"
     r")"
 )
-# `curl -G` turns a body into a query string: a read, not a write. Only the
-# body signal is suppressed; an explicit write method still counts.
-_CURL_FORCED_GET = re.compile(r"\bcurl\b[^\n]*?(?:\s-G\s|\s--get\b)", re.IGNORECASE)
+# An explicit *read* method: the body signal must not turn it into a write.
+# `curl -G` moves the body into the query string, and `-X GET`/`--request GET`
+# (curl) or `--method GET` (gh api) names a read that merely carries a query
+# parameter — `gh api --method GET .../releases -f per_page=100` is documented
+# usage for a filtered read, not a release write. Only the body signal is
+# suppressed; an explicit write method still counts.
+_READ_METHOD = re.compile(
+    r"(?:"
+    r"\bcurl\b[^\n]*?(?:\s-G\s|\s--get\b)"
+    r"|(?:-X|--request|--method|-method)\s*=?\s*['\"]?GET\b"
+    r")",
+    re.IGNORECASE,
+)
 # `gh api` infers POST from a body field or an input file and needs no method
 # token; only the releases path is interesting here. `-F` is gh's short
 # `--field` and switches the request to POST exactly as `-f` does.
@@ -488,12 +498,15 @@ def _http_kind(line: str) -> str | None:
         # body signal is suppressed there. An explicit write method still counts.
         or (
             _HTTP_BODY.search(line) is not None
-            and not _CURL_FORCED_GET.search(line)
+            and not _READ_METHOD.search(line)
         )
     ):
         return "http"
     if "gh api" in line and _GH_API_BODY.search(line):
-        return "gh"
+        # `gh api --method GET .../releases -f per_page=100` turns the fields
+        # into a query string: a read. An explicit write method still counts.
+        if _READ_METHOD.search(line) is None:
+            return "gh"
     return None
 
 

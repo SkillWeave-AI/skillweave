@@ -258,6 +258,17 @@ _WRITE_SPELLINGS = {
         "exec 3<>/dev/tcp/forge/443;"
         " printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n' >&3"
     ),
+    # ── Round 6: a read method does not hide behind a body flag. These are
+    #    writes only via the body signal; the explicit write verb must survive
+    #    the read-method suppression added alongside the read controls. ───────
+    "gh_get_then_post": (
+        "gh api --method GET /repos/o/r/releases;"
+        " gh api --method POST /repos/o/r/releases -f tag_name=v1"
+    ),
+    "curl_get_then_post": (
+        "curl -X GET https://forge/api/v1/repos/o/r/releases;"
+        " curl -X POST https://forge/api/v1/repos/o/r/releases -d '{}'"
+    ),
 }
 
 # A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a
@@ -576,6 +587,23 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
         _synthetic_tree(
             tmp_path / "nc-listener",
             "grep -n 'POST /api/v1/repos/o/r/releases' docs/release.md | nc -l 9000",
+        ),
+        # An explicit read method with a body-shaped flag is still a read:
+        # `-X GET`/`--method GET` name the verb, and the data flag carries a
+        # query parameter. `gh api --method GET ... -f per_page=100` is the
+        # documented way to send those as a query string.
+        _synthetic_tree(
+            tmp_path / "gh-get-with-fields",
+            "gh api --method GET /repos/o/r/releases -f per_page=100",
+        ),
+        _synthetic_tree(
+            tmp_path / "gh-get-fields-equals",
+            "gh api --method=GET /repos/o/r/releases --field per_page=100",
+        ),
+        _synthetic_tree(
+            tmp_path / "curl-explicit-get-with-data",
+            "curl -X GET -d per_page=100"
+            " https://forge/api/v1/repos/o/r/releases",
         ),
     ]
 
