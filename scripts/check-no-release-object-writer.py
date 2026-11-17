@@ -82,12 +82,18 @@ quietly reopens a gap.
 This is a syntactic guard, not a sandbox. A target assembled at run time from
 something the workflow never writes down — the output of another command, a
 secret, a script fetched while running, or a computed expression — cannot be
-resolved here, and an obfuscated call (base64, an alias) is out of reach. The
-same hold for a raw TCP write that spells the request as bytes (``nc``,
-``openssl s_client``, bash ``/dev/tcp``): the request line is data, not a
-command, and is not modelled. These limits are stated rather than claimed
-closed, and the ``env:``/folded-scalar cases above are *not* among them: the
-target there is written down verbatim in the workflow.
+resolved here, and an obfuscated call (base64, an alias) is out of reach.
+
+A raw TCP write that spells the HTTP request as bytes is modelled when the
+request line is written down: a ``POST``/``PATCH``/``PUT``/``DELETE`` line
+addressing ``/releases`` piped into ``nc``/``ncat``/``netcat``/``socat``/
+``openssl s_client``, a socket tool given a port, or a ``/dev/tcp`` redirect is
+refused. What stays out of reach is the same class as any other computed
+target — a request line or path assembled at run time, or a writer fetched and
+executed — and a ``| nc -l`` listener, which cannot reach the forge. These
+limits are stated rather than claimed closed, and the ``env:``/folded-scalar/
+raw-request-line cases above are *not* among them: the target there is written
+down verbatim in the workflow.
 
 ``--root`` exists so the very same check can be run against an untouched base
 tree (where it must exit non-zero) and against the candidate tree (where it
@@ -163,6 +169,32 @@ _DOTTED_WRITER = re.compile(
 )
 
 _REST_PATH = re.compile(r"/releases\b")
+
+# A raw-socket writer sends its HTTP request as *data*, not as a command line:
+# ``printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\r\n' | nc forge 443``, the
+# same payload through ``openssl s_client``, or a ``/dev/tcp`` redirect. The
+# release path therefore does not appear beside a method flag; instead a
+# request line (``POST <path>/releases HTTP/1.1``) appears and a transport
+# supplies the socket. A quoted request line on its own is inert data piped to
+# nothing, so a `|` into a socket tool, a socket tool with a port, or a
+# `/dev/tcp` redirect is required as well.
+_RAW_REQUEST_LINE = re.compile(
+    r"\b(?:POST|PATCH|PUT|DELETE)\s+\S*/releases\b", re.IGNORECASE
+)
+_RAW_SOCKET = re.compile(
+    r"(?:"
+    r"\|\s*(?:nc|ncat|netcat|socat|openssl\s+s_client)\b"
+    r"|\b(?:nc|ncat|netcat|socat)\b[^|\n;&]*\s\d{2,5}\b"
+    r"|/dev/(?:tcp|udp)/"
+    r")"
+)
+# `nc -l` is a listener, not a sender: it cannot reach the forge, so data piped
+# into it is not a release write. Suppress the raw-socket signal for that form
+# so a debug listener piping a documented request line is not a false positive.
+_RAW_SOCKET_LISTENER = re.compile(
+    r"\|\s*(?:nc|ncat|netcat)\b[^|\n;&]*\s(?:-l|--listen)\b"
+)
+
 # The method token, wherever it sits in the command: `curl -XPOST`,
 # `curl -X POST`, `gh api --method=post`, `curl --request PATCH`, httpie's
 # `http POST`, and a method keyword passed to a client.
@@ -442,6 +474,14 @@ def _http_kind(line: str) -> str | None:
     """
     if _REST_PATH.search(line) is None:
         return None
+    # A raw-socket write: the HTTP request line is data, and a socket tool or a
+    # /dev/tcp redirect carries it. `printf 'POST .../releases ...' | nc h 443`.
+    if (
+        _RAW_REQUEST_LINE.search(line)
+        and _RAW_SOCKET.search(line)
+        and not _RAW_SOCKET_LISTENER.search(line)
+    ):
+        return "http"
     if (
         _HTTP_METHOD.search(line) is not None
         # A curl `-G` turns the body into a query string: it is a read, so the

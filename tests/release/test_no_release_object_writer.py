@@ -243,6 +243,21 @@ _WRITE_SPELLINGS = {
     "wget_body_file": (
         "wget --body-file=@body.json https://forge/api/v1/repos/o/r/releases"
     ),
+    # ── Round 6: raw-socket writes (round 5 named these as accepted). The HTTP
+    #    request is data, so the release path appears inside a quoted request
+    #    line; a socket transport carries it. A `| nc -l` listener and a
+    #    documented request line with no transport are not writes. ────────────
+    "raw_nc": (
+        "printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n' | nc forge 443"
+    ),
+    "raw_openssl_s_client": (
+        "printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n'"
+        " | openssl s_client -connect forge:443"
+    ),
+    "raw_dev_tcp": (
+        "exec 3<>/dev/tcp/forge/443;"
+        " printf 'POST /api/v1/repos/o/r/releases HTTP/1.1\\r\\n' >&3"
+    ),
 }
 
 # A folded scalar (`run: >` / `run: >-`) joins its lines with spaces, so a
@@ -547,6 +562,20 @@ def test_a_read_of_the_release_path_is_not_refused(tmp_path):
         _synthetic_tree(
             tmp_path / "xh-query",
             "xh https://forge/api/v1/repos/o/r/releases tag==v1",
+        ),
+        # A request line is data; without a socket transport (and with `nc -l`
+        # a listener, not a sender) there is no release write to refuse.
+        _synthetic_tree(
+            tmp_path / "raw-get-over-socket",
+            "printf 'GET /api/v1/repos/o/r/releases HTTP/1.1\\r\\n' | nc forge 443",
+        ),
+        _synthetic_tree(
+            tmp_path / "documented-request-line",
+            "echo 'POST /api/v1/repos/o/r/releases is documented at docs/release.md'",
+        ),
+        _synthetic_tree(
+            tmp_path / "nc-listener",
+            "grep -n 'POST /api/v1/repos/o/r/releases' docs/release.md | nc -l 9000",
         ),
     ]
 
