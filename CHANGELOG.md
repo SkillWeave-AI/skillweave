@@ -1,3 +1,11 @@
+## v1.5.12 (2026-11-18) — Release flow
+
+No change to the skills.
+
+- The release object, its title and its body are written by the ops-engine on the canonical Forgejo and on the GitHub mirror; no workflow of the repository creates or edits it any more.
+- A check over every workflow file fails when one of them writes a release object, so a second release writer cannot come back unnoticed.
+- Documentation: the pinned SDK is installed from its tag before the wheel; two older changelog entries are translated to English.
+
 ## v1.5.11 (2026-10-17) — Control-Loop Hardening
 
 SkillWeave v1.5.11 delivers the control-loop hardening built since v1.5.10: a task lifecycle ledger, an unambiguous final attempt result, owned-attempt liveness and cancellation evidence, declared reproducible test environments with attestation, upstream model and quota evidence at the admission boundary, a cumulative role-safe integration gate, and an exactly-once controller handoff. Every entry below is derived from the shipped commits and cites them. Live qualification is performed separately and is not claimed by this entry.
