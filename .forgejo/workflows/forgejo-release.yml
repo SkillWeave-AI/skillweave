@@ -199,20 +199,12 @@ jobs:
       # mirrored, so this needs no credential — the same fetch the version gate
       # in mirror.yml already uses.
       #
-      # Pinned to the v3.4.2 tag. An earlier revision of this workflow pinned a
-      # commit instead, because the mirror's v3.4.0 tag pointed twenty commits
-      # behind the canonical one and installing from it delivered 3.4.0's name
-      # with 3.3.0's code. ops-engine closed that at its source: its own release
-      # job now pushes the canonical tag ref onto the mirror before publishing
-      # and refuses by name when the two peel to different commits. Measured
-      # here: v3.4.0, v3.4.1 and v3.4.2 target the same commit on both forges,
-      # and this script is byte-identical between the mirror tag and the
-      # canonical one. The tag is a fixed point again, so the pin follows it.
+      # Pinned to the v3.7.0 tag.
       - name: Fetch the audience gate (canonical, ops-engine)
         run: |
           set -euo pipefail
           curl -fsSL \
-            "https://raw.githubusercontent.com/LangeVC/ops-engine/v3.4.2/scripts/release_notes_audience_gate.py" \
+            "https://raw.githubusercontent.com/LangeVC/ops-engine/v3.7.0/scripts/release_notes_audience_gate.py" \
             -o "$RUNNER_TEMP/release_notes_audience_gate.py"
 
           # Prove what arrived. Without this the step reports success even when
@@ -438,187 +430,134 @@ jobs:
           # Relative names: the checksum file travels with the assets it lists.
           (cd release-assets && sha256sum *.tar.gz *.whl > SHA256SUMS)
           (cd release-assets && sha256sum -c SHA256SUMS)
-      # The release object is not created here. Under the Forgejo-first model
-      # the ops-engine ReleaseHandler alone writes it on tag_push. This workflow
-      # keeps the release artifact obligations that the engine does not own, and
-      # the mirror-tag obligation below: the canonical tag ref is pushed onto the
-      # mirror BEFORE any release object exists, then both tags are peeled and
-      # compared.
-      - name: Mirror the canonical tag
+      # The workflow calls the engine's entry point CLI to publish; it does not
+      # reimplement publication. ops-engine-release-attach finds or creates the
+      # release, converges it, attaches the built files and verifies the declared
+      # asset set on every destination.
+      #
+      # Before the engine publishes, the canonical tag ref is pushed onto the
+      # mirror with git, not a forge API, so the release API never gets the
+      # chance to invent a tag at the mirror's default-branch HEAD.
+      #
+      # The engine wheel is not available until the engine is released (v3.7.0).
+      # The install line below is correct for the released engine; the owner
+      # merges these branches only after that release, so the line cannot be
+      # tested until then.
+      - name: Publish the release to every destination
         env:
           TAG_NAME: "${{ github.event.inputs.tag_name || github.ref_name }}"
+          NOTES: "${{ steps.notes.outputs.notes }}"
+          NAME_TEMPLATE: "${{ steps.title.outputs.product_name }} {tag_name}"
+          FORGEJO_REPOSITORY: "${{ github.repository }}"
+          FORGEJO_BASE_URL: "${{ github.server_url }}"
+          FORGEJO_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
           GH_MIRROR_TOKEN: "${{ secrets.GH_MIRROR_TOKEN }}"
         run: |
           set -euo pipefail
 
-          # The engine installs into an isolated venv outside the source tree:
-          # the runner's system interpreter is PEP 668 externally managed, and an
-          # in-tree venv would become part of anything this repository packages.
+          NOTES_FILE="$(mktemp)"
+          trap 'rm -f "$NOTES_FILE"' EXIT
+          printf '%s\n' "$NOTES" > "$NOTES_FILE"
+
+          # The engine installs from the public wheel. This line is correct for
+          # the released v3.7.0 wheel and cannot be tested until that release
+          # exists.
           ENGINE_VENV="$(mktemp -d)/engine-venv"
           python3 -m venv "$ENGINE_VENV"
           "$ENGINE_VENV/bin/python" -m pip install --quiet \
-            "git+https://github.com/LangeVC/ops-engine@v3.4.2"
+            "https://github.com/LangeVC/ops-engine/releases/download/v3.7.0/ops_engine-3.7.0-py3-none-any.whl"
 
-          # Prove what was installed. A silently older engine is the failure
-          # mode this whole step exists to remove.
-          "$ENGINE_VENV/bin/python" - <<'VERSION_GATE_PY'
-          import importlib.metadata as md
-          import sys
+          # Prove what was installed.
+          "$ENGINE_VENV/bin/python" -c "
+import importlib.metadata as md, sys
+REQUIRED = '3.7.0'
+got = md.version('ops-engine')
+if got != REQUIRED:
+    sys.stderr.write('EngineVersionError: installed ops-engine %s, required %s.\n' % (got, REQUIRED))
+    sys.exit(2)
+sys.stdout.write('engine: ops-engine %s\n' % got)
+"
 
-          REQUIRED = "3.4.2"
-          got = md.version("ops-engine")
-          if got != REQUIRED:
-              sys.stderr.write(
-                  "EngineVersionError: installed ops-engine %s, required %s. "
-                  "Refusing to publish with an engine other than the pinned one.\n"
-                  % (got, REQUIRED)
-              )
-              sys.exit(2)
-          sys.stdout.write("engine: ops-engine %s\n" % got)
-          VERSION_GATE_PY
+          # Build a minimal config.yml from the Layer-3 .ops.yaml destinations.
+          # Each destination carries its credential_variable so the CLI reads
+          # the token from the runner's environment.
+          python3 -c "
+import os, sys
+from pathlib import Path
 
-          "$ENGINE_VENV/bin/python" - <<'MIRROR_TAG_PY'
-          import os
-          import subprocess
-          import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+from ops_engine.config_loader import load_ops_yaml, OpsYamlError
 
-          from ops_engine.config_loader import OpsYamlError, load_ops_yaml
+try:
+    layer3 = load_ops_yaml('.')
+except OpsYamlError as exc:
+    print(f'::error::OpsYamlError: {exc}', file=sys.stderr)
+    exit(2)
+if layer3 is None:
+    print('::error::MissingOpsYamlError: no .ops.yaml at the repository root.', file=sys.stderr)
+    exit(2)
+dests = layer3.destinations
+if not dests:
+    print('::error::MissingReleaseDestinationsError: .ops.yaml declares no destinations.', file=sys.stderr)
+    exit(2)
 
-          # Destinations come from the committed .ops.yaml at the repository
-          # root. A missing or empty file is a named refusal, never a silently
-          # narrowed release: "no destinations" resolving to a Forgejo-only
-          # publication that reports success is exactly what must not ship.
-          try:
-              layer3 = load_ops_yaml(".")
-          except OpsYamlError as exc:
-              print(f"::error::OpsYamlError: {exc}", file=sys.stderr)
-              sys.exit(2)
+org, _, repo_name = os.environ['FORGEJO_REPOSITORY'].partition('/')
 
-          if layer3 is None:
-              print(
-                  "::error::MissingOpsYamlError: no .ops.yaml at the repository "
-                  "root; the release destination is a committed file, not a CI "
-                  "variable. Refusing to publish with no declared destinations.",
-                  file=sys.stderr,
-              )
-              sys.exit(2)
+_CREDENTIAL_VARS = {'forgejo': 'FORGEJO_TOKEN', 'github': 'GH_MIRROR_TOKEN'}
 
-          destinations = layer3.destinations
-          if not destinations:
-              print(
-                  "::error::MissingReleaseDestinationsError: .ops.yaml declares "
-                  "no destinations; refusing to publish to zero forges rather "
-                  "than silently narrowing the release.",
-                  file=sys.stderr,
-              )
-              sys.exit(2)
+dest_list = []
+for d in dests:
+    entry = {'forge': d.forge, 'repo': d.repo, 'role': d.role, 'visibility': d.visibility}
+    var = _CREDENTIAL_VARS.get(d.forge.strip().lower())
+    if var:
+        entry['credential_variable'] = var
+    dest_list.append(entry)
 
-          tag_name = os.environ["TAG_NAME"]
+config = {
+    'orgs': {
+        org: {
+            'repositories': {
+                repo_name: {
+                    'destinations': dest_list
+                }
+            }
+        }
+    }
+}
+config_path = Path(os.environ['RUNNER_TEMP']) / 'release-config.yml'
+with open(config_path, 'w') as fh:
+    import yaml
+    yaml.dump(config, fh, default_flow_style=False)
+print(f'config written to {config_path}', file=sys.stderr)
+"
 
-          # The mirror tag is pushed from the CANONICAL tag object, never invented
-          # by the release API. GitHub's POST /releases takes a `tag_name` and, when
-          # that tag does not yet exist on the mirror, CREATES it at the mirror's
-          # default-branch HEAD at that moment — so the mirror tag points at a commit
-          # this repository never tagged. ops-engine shipped exactly that in v3.4.0:
-          # its mirror tag landed on the commit whose pyproject read 3.3.0, and a real
-          # `pip install` from the mirror tag delivered 3.4.0's name with 3.3.0's code.
-          # mirror.yml pushes tags too, but on its own schedule, and this step must not
-          # race it.
-          #
-          # git, not a forge API, decides where the tag points.
-          mirror_dest = next(
-              (d for d in destinations if d.forge.strip().lower() == "github"), None
-          )
+          # Push the canonical tag onto the mirror with git first, so the
+          # release API never gets to invent a tag at the mirror's default-branch
+          # HEAD.
+          mirror_repo="$(
+            python3 -c "
+import os, sys
+from pathlib import Path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+from ops_engine.config_loader import load_ops_yaml
+layer3 = load_ops_yaml('.')
+for d in layer3.destinations:
+    if d.forge.strip().lower() == 'github':
+        print(d.repo)
+        break
+"
+          )"
+          if [ -n "$mirror_repo" ]; then
+            git push --force \
+              "https://x-access-token:${GH_MIRROR_TOKEN}@github.com/${mirror_repo}.git" \
+              "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          fi
 
-          def _mirror_remote(github_repo: str) -> str:
-              """The github destination's push remote, built from the repo value the
-              config layer resolved plus the mirror credential. The repository itself
-              is never a literal here — it came from load_ops_yaml above."""
-              return (
-                  "https://x-access-token:%s@github.com/%s.git"
-                  % (os.environ["GH_MIRROR_TOKEN"], github_repo)
-              )
-
-          def _canonical_tag_target() -> str:
-              """The commit the canonical tag peels to. The peel normalises annotated
-              and lightweight tags onto their commit, so the comparison below is
-              always commit-vs-commit."""
-              return subprocess.check_output(
-                  ["git", "rev-parse", "refs/tags/%s^{}" % tag_name], text=True
-              ).strip()
-
-          def _push_mirror_tag(remote: str) -> None:
-              subprocess.run(
-                  ["git", "push", "--force", remote,
-                   "refs/tags/%s:refs/tags/%s" % (tag_name, tag_name)],
-                  check=True,
-              )
-
-          def _verify_mirror_tag(canonical: str, remote: str) -> None:
-              """Peel the tag on both forges and refuse by name when they differ. For an
-              annotated mirror tag `ls-remote` emits the peeled line; for a lightweight
-              one it emits none and the bare ref IS the commit. Query both and prefer
-              the peeled form."""
-              ls = subprocess.run(
-                  ["git", "ls-remote", remote,
-                   "refs/tags/%s" % tag_name, "refs/tags/%s^{}" % tag_name],
-                  capture_output=True, text=True,
-              )
-              targets = {}
-              for line in ls.stdout.splitlines():
-                  sha, _, ref = line.partition("\t")
-                  targets[ref] = sha.strip()
-              mirror_target = (
-                  targets.get("refs/tags/%s^{}" % tag_name)
-                  or targets.get("refs/tags/%s" % tag_name, "")
-              )
-              if not mirror_target or mirror_target != canonical:
-                  print(
-                      "::error::MirrorTagDriftError: tag %s targets %s on the "
-                      "canonical forge but %s on the mirror; the mirror tag does "
-                      "not mirror the canonical tag. Refusing the release."
-                      % (tag_name, canonical, mirror_target or "(absent)"),
-                      file=sys.stderr,
-                  )
-                  sys.exit(1)
-              print("mirror tag verified: %s -> %s" % (tag_name, mirror_target))
-
-          if mirror_dest is None:
-              print(
-                  "::error::MissingMirrorDestinationError: .ops.yaml declares no "
-                  "github destination; the canonical tag has no mirror to carry "
-                  "and there is nothing to push or verify.",
-                  file=sys.stderr,
-              )
-              sys.exit(2)
-
-          # Push the canonical tag object onto the mirror. git, not a forge API,
-          # decides where the tag points.
-          repository = _mirror_remote(mirror_dest.repo)
-          _push_mirror_tag(repository)
-          # Then refuse by name if the mirror tag does not target the same
-          # commit the canonical tag does.
-          _verify_mirror_tag(_canonical_tag_target(), repository)
-          MIRROR_TAG_PY
-
-      # Publication is not verification. The step above proves the engine
-      # accepted the release; it cannot prove that the release a consumer
-      # downloads carries the assets this job built. A partially uploaded
-      # attachment, an extra file, or bytes that do not match the reviewed
-      # SHA256SUMS all publish "successfully". Re-read the release object from
-      # the forge and hold the run red, by name, if the attached set is not the
-      # set SHA256SUMS declares.
-      - name: Verify the published release attachments
-        env:
-          TAG_NAME: "${{ github.event.inputs.tag_name || github.ref_name }}"
-          FORGEJO_REPOSITORY: "${{ github.repository }}"
-          FORGEJO_BASE_URL: "${{ github.server_url }}"
-          FORGEJO_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-        run: |
-          set -euo pipefail
-
-          python3 scripts/verify-release-attachments.py \
+          "$ENGINE_VENV/bin/python" -m ops_engine.release_attach \
+            --config "$RUNNER_TEMP/release-config.yml" \
+            --repo "$FORGEJO_REPOSITORY" \
             --tag "$TAG_NAME" \
-            --base-url "$FORGEJO_BASE_URL" \
-            --repository "$FORGEJO_REPOSITORY" \
-            --assets-dir release-assets
+            --artifacts release-assets \
+            --repo-dir . \
+            --name-template "$NAME_TEMPLATE" \
+            --notes-file "$NOTES_FILE"

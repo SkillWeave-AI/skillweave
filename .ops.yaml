@@ -31,3 +31,24 @@ destinations:
 # it accepts 29 of 35 version sections and refuses six historical ones by name.
 # Must stay on ONE line — the extractor reads a single `tracker_prefixes:` line.
 tracker_prefixes: [ADR, ART, AUTH, BRIEF, CAT, CHAIN, CI, CLAIM, CN, DEPR, DEPS, DR, ENV, EPIC, FAI, FFR, GATE, GLE, GNF, IDEMP, LC, LIVE, LOCK, LVC, MODEL, OPT, ROUTE, RT, RTF, SCOPE, SKILL, STATE, SUITE, SVC, SW, UOW, VOCAB, XPA]
+
+# REA-040: the files this repository's release must carry. The build step in
+# .forgejo/workflows/forgejo-release.yml produces exactly these three names into
+# release-assets/, and ops-engine-release-attach verifies them by reading the
+# release back on every destination.
+#
+# The release block is declared whole, not field by field: Layer 3 replaces the
+# Layer-2 release section whole, so `enabled`/`trigger`/`tag_pattern` are
+# restated deliberately.
+release:
+  enabled: true
+  trigger: tag_push
+  tag_pattern: "v*"
+  name_template: "SkillWeave {tag_name}"
+  assets:
+    - type: github_release_zip
+      name: "skillweave-<version>-py3-none-any.whl"
+    - type: github_release_zip
+      name: "skillweave-<version>.tar.gz"
+    - type: github_release_tarball
+      name: "SHA256SUMS"
