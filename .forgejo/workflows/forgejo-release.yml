@@ -654,77 +654,13 @@ jobs:
           sys.stdout.write("engine: ops-engine %s\n" % got)
           ENGINE_VERSION_PY
 
-          # Build a minimal config.yml from the Layer-3 .ops.yaml destinations.
-          # Each destination carries its credential_variable so the CLI reads
-          # the token from the runner's environment.
-          #
-          # This runs in the engine venv, which holds ops_engine and PyYAML:
-          # the checkout's src/ is never put on the path, because a `python -`
-          # script has no `__file__` to derive it from and the installed wheel
-          # is the only engine this run may use.
-          "$ENGINE_VENV/bin/python" - <<'CONFIG_PY'
-          import os
-          import sys
-          from pathlib import Path
-
-          import yaml
-
-          from ops_engine.config_loader import OpsYamlError, load_ops_yaml
-
-          try:
-              layer3 = load_ops_yaml(".")
-          except OpsYamlError as exc:
-              print(f"::error::OpsYamlError: {exc}", file=sys.stderr)
-              sys.exit(2)
-          if layer3 is None:
-              print(
-                  "::error::MissingOpsYamlError: no .ops.yaml at the "
-                  "repository root.",
-                  file=sys.stderr,
-              )
-              sys.exit(2)
-          dests = layer3.destinations
-          if not dests:
-              print(
-                  "::error::MissingReleaseDestinationsError: .ops.yaml "
-                  "declares no destinations.",
-                  file=sys.stderr,
-              )
-              sys.exit(2)
-
-          org, _, repo_name = os.environ["FORGEJO_REPOSITORY"].partition("/")
-
-          # The credential variable each forge's destination reads. Declaring
-          # it here, next to the token the runner exports, is what lets the CLI
-          # resolve a per-destination credential without a second config file.
-          CREDENTIAL_VARS = {"forgejo": "FORGEJO_TOKEN", "github": "GH_MIRROR_TOKEN"}
-
-          dest_list = []
-          for d in dests:
-              entry = {
-                  "forge": d.forge,
-                  "repo": d.repo,
-                  "role": d.role,
-                  "visibility": d.visibility,
-              }
-              var = CREDENTIAL_VARS.get(d.forge.strip().lower())
-              if var:
-                  entry["credential_variable"] = var
-              dest_list.append(entry)
-
-          config = {
-              "orgs": {
-                  org: {"repositories": {repo_name: {"destinations": dest_list}}}
-              }
-          }
-          config_path = Path(os.environ["RUNNER_TEMP"]) / "release-config.yml"
-          with open(config_path, "w", encoding="utf-8") as fh:
-              yaml.dump(config, fh, default_flow_style=False)
-          print(f"config written to {config_path}", file=sys.stderr)
-          CONFIG_PY
-
+          # Publication is one command. The entry point reads the destinations,
+          # the release block and release.assets from the .ops.yaml in
+          # --repo-dir — the same declaration the census reads — so this
+          # workflow ships no second declaration that could drift from the
+          # layover's release block. Each destination reads its token from the
+          # variable it declares.
           "$ENGINE_VENV/bin/python" -m ops_engine.release_attach \
-            --config "$RUNNER_TEMP/release-config.yml" \
             --repo "$FORGEJO_REPOSITORY" \
             --tag "$TAG_NAME" \
             --artifacts release-assets \

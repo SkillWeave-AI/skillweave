@@ -8,15 +8,22 @@
 # release object, so the public "latest release" stood at v1.3.11 for nine days.
 #
 # The forge is a value, not a key name. Order is publication order.
+#
+# credential_variable names the environment variable the release workflow
+# exports for that destination. The entry point reads the token by exactly this
+# name, so the declaration and the runner's env cannot drift apart: without it
+# the destination would look for a variable named after the forge.
 destinations:
   - forge: forgejo
     repo: skillweave/skillweave
     role: release
     visibility: public
+    credential_variable: FORGEJO_TOKEN
   - forge: github
     repo: SkillWeave-AI/skillweave
     role: release
     visibility: public
+    credential_variable: GH_MIRROR_TOKEN
 
 # This repository's tracker prefixes. The release workflow reads them from here and
 # hands them to the audience gate, so no workflow carries a vocabulary as a literal.
