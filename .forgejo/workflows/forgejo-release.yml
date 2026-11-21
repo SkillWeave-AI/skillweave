@@ -455,7 +455,7 @@ jobs:
           ENGINE_VENV="$(mktemp -d)/engine-venv"
           python3 -m venv "$ENGINE_VENV"
           "$ENGINE_VENV/bin/python" -m pip install --quiet \
-            "https://github.com/LangeVC/ops-engine/releases/download/v3.7.0/ops_engine-3.7.0-py3-none-any.whl"
+            "https://github.com/LangeVC/ops-engine/releases/download/v3.7.1/ops_engine-3.7.1-py3-none-any.whl"
 
           # Prove what was installed. A silently older engine is the failure
           # mode this whole step exists to remove.
@@ -463,7 +463,7 @@ jobs:
           import importlib.metadata as md
           import sys
 
-          REQUIRED = "3.7.0"
+          REQUIRED = "3.7.1"
           got = md.version("ops-engine")
           if got != REQUIRED:
               sys.stderr.write(
@@ -634,7 +634,7 @@ jobs:
           ENGINE_VENV="$(mktemp -d)/engine-venv"
           python3 -m venv "$ENGINE_VENV"
           "$ENGINE_VENV/bin/python" -m pip install --quiet \
-            "https://github.com/LangeVC/ops-engine/releases/download/v3.7.0/ops_engine-3.7.0-py3-none-any.whl"
+            "https://github.com/LangeVC/ops-engine/releases/download/v3.7.1/ops_engine-3.7.1-py3-none-any.whl"
 
           # Prove what was installed. The version is read back from the same
           # interpreter that runs the CLI below, so a wheel that installed but
@@ -643,7 +643,7 @@ jobs:
           import importlib.metadata as md
           import sys
 
-          REQUIRED = "3.7.0"
+          REQUIRED = "3.7.1"
           got = md.version("ops-engine")
           if got != REQUIRED:
               sys.stderr.write(
