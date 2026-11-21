@@ -2,8 +2,9 @@ name: Create Forgejo Release
 
 # Forgejo is canonical; GitHub is the public mirror. This workflow no longer
 # writes a release object itself — it gates the release, then hands publication
-# to the ops-engine ReleaseHandler, which publishes to every destination in
-# .ops.yaml and reports a partial publication instead of swallowing it.
+# to the ops-engine-release-attach entry point, which publishes to every
+# destination in .ops.yaml and reports a partial publication instead of
+# swallowing it.
 #
 # What this replaces, and why. The previous job built the release body from
 # `git log --oneline` and assembled it with `printf "...%s" "$CHANGES"` after
@@ -199,15 +200,12 @@ jobs:
       # mirrored, so this needs no credential — the same fetch the version gate
       # in mirror.yml already uses.
       #
-      # Pinned to the v3.4.2 tag. An earlier revision of this workflow pinned a
-      # commit instead, because the mirror's v3.4.0 tag pointed twenty commits
-      # behind the canonical one and installing from it delivered 3.4.0's name
-      # with 3.3.0's code. ops-engine closed that at its source: its own release
-      # job now pushes the canonical tag ref onto the mirror before publishing
-      # and refuses by name when the two peel to different commits. Measured
-      # here: v3.4.0, v3.4.1 and v3.4.2 target the same commit on both forges,
-      # and this script is byte-identical between the mirror tag and the
-      # canonical one. The tag is a fixed point again, so the pin follows it.
+      # Pinned to the v3.4.2 tag. The gate is a standalone, stdlib-only script
+      # run by the runner's own interpreter, so its ref is independent of the
+      # engine version that publishes; it stays at the ref the surrounding
+      # release-contract commits pinned, which is what those commits' additive
+      # tests assert byte-for-byte. Bumping it is a change to the gate, not to
+      # publication, and belongs to whichever unit owns the gate.
       - name: Fetch the audience gate (canonical, ops-engine)
         run: |
           set -euo pipefail
@@ -271,8 +269,8 @@ jobs:
             --ticket-prefixes "$PREFIXES_FILE" \
             "$NOTES_FILE"
 
-      # The workflow calls the engine to publish; it does not reimplement
-      # publication. ReleaseHandler.publish_release creates the release on EVERY
+      # The workflow calls the engine's entry point to publish; it does not
+      # reimplement publication. The entry point creates the release on EVERY
       # destination resolved from the committed .ops.yaml and reports a partial
       # publication rather than swallowing it — which is precisely the failure
       # that left five tags on GitHub with no release object.
@@ -438,12 +436,12 @@ jobs:
           # Relative names: the checksum file travels with the assets it lists.
           (cd release-assets && sha256sum *.tar.gz *.whl > SHA256SUMS)
           (cd release-assets && sha256sum -c SHA256SUMS)
-      # The release object is not created here. Under the Forgejo-first model
-      # the ops-engine ReleaseHandler alone writes it on tag_push. This workflow
-      # keeps the release artifact obligations that the engine does not own, and
-      # the mirror-tag obligation below: the canonical tag ref is pushed onto the
-      # mirror BEFORE any release object exists, then both tags are peeled and
-      # compared.
+
+      # The release object is not created here. The entry point in the step
+      # below creates it on every destination. This step keeps the mirror-tag
+      # obligation the engine does not own: the canonical tag ref is pushed onto
+      # the mirror BEFORE any release object exists, then both tags are peeled
+      # and compared.
       - name: Mirror the canonical tag
         env:
           TAG_NAME: "${{ github.event.inputs.tag_name || github.ref_name }}"
@@ -457,7 +455,7 @@ jobs:
           ENGINE_VENV="$(mktemp -d)/engine-venv"
           python3 -m venv "$ENGINE_VENV"
           "$ENGINE_VENV/bin/python" -m pip install --quiet \
-            "git+https://github.com/LangeVC/ops-engine@v3.4.2"
+            "https://github.com/LangeVC/ops-engine/releases/download/v3.7.0/ops_engine-3.7.0-py3-none-any.whl"
 
           # Prove what was installed. A silently older engine is the failure
           # mode this whole step exists to remove.
@@ -465,7 +463,7 @@ jobs:
           import importlib.metadata as md
           import sys
 
-          REQUIRED = "3.4.2"
+          REQUIRED = "3.7.0"
           got = md.version("ops-engine")
           if got != REQUIRED:
               sys.stderr.write(
@@ -601,13 +599,86 @@ jobs:
           _verify_mirror_tag(_canonical_tag_target(), repository)
           MIRROR_TAG_PY
 
-      # Publication is not verification. The step above proves the engine
+      # The workflow calls the engine's entry point CLI to publish; it does not
+      # reimplement publication. ops-engine-release-attach finds or creates the
+      # release, converges it, attaches the built files and verifies the declared
+      # asset set on every destination.
+      #
+      # The mirror tag was pushed by the step above, with git, so the release
+      # API never gets the chance to invent a tag at the mirror's default-branch
+      # HEAD.
+      #
+      # The engine wheel is not available until the engine is released (v3.7.0).
+      # The install line below is correct for the released engine; the owner
+      # merges these branches only after that release, so the line cannot be
+      # tested until then.
+      - name: Publish the release via the engine entry point
+        env:
+          TAG_NAME: "${{ github.event.inputs.tag_name || github.ref_name }}"
+          NOTES: "${{ steps.notes.outputs.notes }}"
+          NAME_TEMPLATE: "${{ steps.title.outputs.product_name }} {tag_name}"
+          FORGEJO_REPOSITORY: "${{ github.repository }}"
+          FORGEJO_BASE_URL: "${{ github.server_url }}"
+          FORGEJO_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GH_MIRROR_TOKEN: "${{ secrets.GH_MIRROR_TOKEN }}"
+        run: |
+          set -euo pipefail
+
+          NOTES_FILE="$(mktemp)"
+          trap 'rm -f "$NOTES_FILE"' EXIT
+          printf '%s\n' "$NOTES" > "$NOTES_FILE"
+
+          # The engine installs from the public wheel. This line is correct for
+          # the released v3.7.0 wheel and cannot be tested until that release
+          # exists.
+          ENGINE_VENV="$(mktemp -d)/engine-venv"
+          python3 -m venv "$ENGINE_VENV"
+          "$ENGINE_VENV/bin/python" -m pip install --quiet \
+            "https://github.com/LangeVC/ops-engine/releases/download/v3.7.0/ops_engine-3.7.0-py3-none-any.whl"
+
+          # Prove what was installed. The version is read back from the same
+          # interpreter that runs the CLI below, so a wheel that installed but
+          # left a stale version behind is named here rather than at publication.
+          "$ENGINE_VENV/bin/python" - <<'ENGINE_VERSION_PY'
+          import importlib.metadata as md
+          import sys
+
+          REQUIRED = "3.7.0"
+          got = md.version("ops-engine")
+          if got != REQUIRED:
+              sys.stderr.write(
+                  "EngineVersionError: installed ops-engine %s, required %s.\n"
+                  % (got, REQUIRED)
+              )
+              sys.exit(2)
+          sys.stdout.write("engine: ops-engine %s\n" % got)
+          ENGINE_VERSION_PY
+
+          # Publication is one command. The entry point reads the destinations,
+          # the release block and release.assets from the .ops.yaml in
+          # --repo-dir — the same declaration the census reads — so this
+          # workflow ships no second declaration that could drift from the
+          # layover's release block. Each destination reads its token from the
+          # variable it declares.
+          "$ENGINE_VENV/bin/python" -m ops_engine.release_attach \
+            --repo "$FORGEJO_REPOSITORY" \
+            --tag "$TAG_NAME" \
+            --artifacts release-assets \
+            --repo-dir . \
+            --name-template "$NAME_TEMPLATE" \
+            --notes-file "$NOTES_FILE"
+
+      # Publication is not verification. The step above proves the entry point
       # accepted the release; it cannot prove that the release a consumer
       # downloads carries the assets this job built. A partially uploaded
       # attachment, an extra file, or bytes that do not match the reviewed
       # SHA256SUMS all publish "successfully". Re-read the release object from
-      # the forge and hold the run red, by name, if the attached set is not the
-      # set SHA256SUMS declares.
+      # the canonical forge and hold the run red, by name, if the attached set
+      # is not the set SHA256SUMS declares.
+      #
+      # This reads the Forgejo release through the API, which the CLI does not
+      # take a base URL for (REA-015's argv carries no --base-url); the
+      # canonical base URL comes from the runner's own context here instead.
       - name: Verify the published release attachments
         env:
           TAG_NAME: "${{ github.event.inputs.tag_name || github.ref_name }}"

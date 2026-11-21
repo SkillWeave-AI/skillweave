@@ -348,7 +348,7 @@ jobs:
                       if ":" not in field:
                           raise LookupError("unexpected destinations sequence entry")
                       key, _, value = field.partition(":")
-                      if key not in ("forge", "repo", "role", "visibility"):
+                      if key not in ("forge", "repo", "role", "visibility", "credential_variable", "host"):
                           raise LookupError("unknown destination field: %r" % key)
                       value, marker = _clean_scalar(value)
                       if marker:
@@ -371,7 +371,7 @@ jobs:
                           raise LookupError(
                               "destination value must be `key: value` at line %d" % lineno
                           )
-                      if key not in ("forge", "repo", "role", "visibility"):
+                      if key not in ("forge", "repo", "role", "visibility", "credential_variable", "host"):
                           raise LookupError("unknown destination field: %r" % key)
                       value, marker = _clean_scalar(value)
                       if marker:
