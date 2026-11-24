@@ -200,27 +200,40 @@ jobs:
       # mirrored, so this needs no credential — the same fetch the version gate
       # in mirror.yml already uses.
       #
-      # Pinned to the v3.4.2 tag. The gate is a standalone, stdlib-only script
-      # run by the runner's own interpreter, so its ref is independent of the
-      # engine version that publishes; it stays at the ref the surrounding
-      # release-contract commits pinned, which is what those commits' additive
-      # tests assert byte-for-byte. Bumping it is a change to the gate, not to
-      # publication, and belongs to whichever unit owns the gate.
+      # Pinned to the v3.7.3 tag, the engine version the release job below
+      # installs, so this repository names one ops-engine version and not two.
+      # An earlier revision pinned v3.4.2 with the gate as a standalone file;
+      # since OE-007 that is no longer true: the script loads
+      # `check_release_notes_audience` from
+      # `src/ops_engine/modules/release_gates.py` by a path relative to its own
+      # location and carries no copy of the ticket check. Fetching only the
+      # script would fail at import time, so BOTH files are fetched into the
+      # same relative layout, which keeps the engine's own gate authoritative
+      # instead of reintroducing a private copy of the ticket regex.
       - name: Fetch the audience gate (canonical, ops-engine)
         run: |
           set -euo pipefail
-          curl -fsSL \
-            "https://raw.githubusercontent.com/LangeVC/ops-engine/v3.4.2/scripts/release_notes_audience_gate.py" \
-            -o "$RUNNER_TEMP/release_notes_audience_gate.py"
+          GATE_ROOT="$RUNNER_TEMP/ops-engine-gate"
+          mkdir -p "$GATE_ROOT/scripts" "$GATE_ROOT/src/ops_engine/modules"
+          BASE="https://raw.githubusercontent.com/LangeVC/ops-engine/v3.7.3"
+          curl -fsSL "$BASE/scripts/release_notes_audience_gate.py" \
+            -o "$GATE_ROOT/scripts/release_notes_audience_gate.py"
+          curl -fsSL "$BASE/src/ops_engine/modules/release_gates.py" \
+            -o "$GATE_ROOT/src/ops_engine/modules/release_gates.py"
 
           # Prove what arrived. Without this the step reports success even when
           # it fetched an HTML page: a redirect to a login page returns 200 and
           # curl -f never triggers, so the failure surfaces later as a
-          # SyntaxError on "<!DOCTYPE html>".
-          python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" \
-            "$RUNNER_TEMP/release_notes_audience_gate.py" \
-            || { echo "fetched file is not Python — first three lines:"; \
-                 head -3 "$RUNNER_TEMP/release_notes_audience_gate.py"; exit 1; }
+          # SyntaxError on "<!DOCTYPE html>". Both files are parsed; the gate
+          # resolves the second by its path relative to the first, so a syntax
+          # error in either is a broken gate.
+          for fetched in \
+            "$GATE_ROOT/scripts/release_notes_audience_gate.py" \
+            "$GATE_ROOT/src/ops_engine/modules/release_gates.py"; do
+            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$fetched" \
+              || { echo "fetched file is not Python — first three lines:"; \
+                   head -3 "$fetched"; exit 1; }
+          done
 
       # The release body is addressed at an external reader. A section that
       # still names an internal ticket addresses the tracker that produced the
@@ -265,7 +278,7 @@ jobs:
           Path(out).write_text("\n".join(prefixes) + ("\n" if prefixes else ""),
                                encoding="utf-8")
           PREFIXES_PY
-          python3 "$RUNNER_TEMP/release_notes_audience_gate.py" \
+          python3 "$RUNNER_TEMP/ops-engine-gate/scripts/release_notes_audience_gate.py" \
             --ticket-prefixes "$PREFIXES_FILE" \
             "$NOTES_FILE"
 
