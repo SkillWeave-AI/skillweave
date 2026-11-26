@@ -229,13 +229,13 @@ jobs:
           # The fetch is PINNED to a tag, not master. A gate that does not bump
           # must not follow a moving branch: master could carry a version-sync.py
           # change that changes what "in sync" means between two releases of this
-          # repo. The pin is v3.7.3, the same release the release workflow installs
+          # repo. The pin is v3.7.4, the same release the release workflow installs
           # as its engine, so this repository names one ops-engine version and not
-          # two. version-sync.py is byte-identical across v3.4.2 and v3.7.3 (and
+          # two. version-sync.py is byte-identical across v3.4.2 and v3.7.4 (and
           # across v3.0.0 and v3.4.0 before them), so the gate decides exactly
           # what it decided before.
           curl -fsSL \
-            "https://raw.githubusercontent.com/LangeVC/ops-engine/v3.7.3/scripts/version-sync.py" \
+            "https://raw.githubusercontent.com/LangeVC/ops-engine/v3.7.4/scripts/version-sync.py" \
             -o "$RUNNER_TEMP/version-sync.py"
 
           # Prove what arrived. Without this the step reports success even

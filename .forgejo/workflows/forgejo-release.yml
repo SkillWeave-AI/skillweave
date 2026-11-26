@@ -200,7 +200,7 @@ jobs:
       # mirrored, so this needs no credential — the same fetch the version gate
       # in mirror.yml already uses.
       #
-      # Pinned to the v3.7.3 tag, the engine version the release job below
+      # Pinned to the v3.7.4 tag, the engine version the release job below
       # installs, so this repository names one ops-engine version and not two.
       # An earlier revision pinned v3.4.2 with the gate as a standalone file;
       # since OE-007 that is no longer true: the script loads
@@ -215,7 +215,7 @@ jobs:
           set -euo pipefail
           GATE_ROOT="$RUNNER_TEMP/ops-engine-gate"
           mkdir -p "$GATE_ROOT/scripts" "$GATE_ROOT/src/ops_engine/modules"
-          BASE="https://raw.githubusercontent.com/LangeVC/ops-engine/v3.7.3"
+          BASE="https://raw.githubusercontent.com/LangeVC/ops-engine/v3.7.4"
           curl -fsSL "$BASE/scripts/release_notes_audience_gate.py" \
             -o "$GATE_ROOT/scripts/release_notes_audience_gate.py"
           curl -fsSL "$BASE/src/ops_engine/modules/release_gates.py" \
@@ -468,7 +468,7 @@ jobs:
           ENGINE_VENV="$(mktemp -d)/engine-venv"
           python3 -m venv "$ENGINE_VENV"
           "$ENGINE_VENV/bin/python" -m pip install --quiet \
-            "https://github.com/LangeVC/ops-engine/releases/download/v3.7.3/ops_engine-3.7.3-py3-none-any.whl"
+            "https://github.com/LangeVC/ops-engine/releases/download/v3.7.4/ops_engine-3.7.4-py3-none-any.whl"
 
           # Prove what was installed. A silently older engine is the failure
           # mode this whole step exists to remove.
@@ -476,7 +476,7 @@ jobs:
           import importlib.metadata as md
           import sys
 
-          REQUIRED = "3.7.3"
+          REQUIRED = "3.7.4"
           got = md.version("ops-engine")
           if got != REQUIRED:
               sys.stderr.write(
@@ -647,7 +647,7 @@ jobs:
           ENGINE_VENV="$(mktemp -d)/engine-venv"
           python3 -m venv "$ENGINE_VENV"
           "$ENGINE_VENV/bin/python" -m pip install --quiet \
-            "https://github.com/LangeVC/ops-engine/releases/download/v3.7.3/ops_engine-3.7.3-py3-none-any.whl"
+            "https://github.com/LangeVC/ops-engine/releases/download/v3.7.4/ops_engine-3.7.4-py3-none-any.whl"
 
           # Prove what was installed. The version is read back from the same
           # interpreter that runs the CLI below, so a wheel that installed but
@@ -656,7 +656,7 @@ jobs:
           import importlib.metadata as md
           import sys
 
-          REQUIRED = "3.7.3"
+          REQUIRED = "3.7.4"
           got = md.version("ops-engine")
           if got != REQUIRED:
               sys.stderr.write(
